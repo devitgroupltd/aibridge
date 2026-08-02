@@ -1,7 +1,7 @@
 ---
-version: 0.8.0
+version: 0.9.0
 status: draft
-last_modified_utc: 2026-08-02T21:30:00Z
+last_modified_utc: 2026-08-02T18:52:58Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,19 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.9.0 (2026-08-02): Pass 1 review - HIGH: corrected Telegram's bot file-download limit from 50MB
+    to the actual documented 20MB (§5.6). HIGH: added a retry/backoff policy for non-429 Telegram API
+    failures, so a failed P0 permission-prompt send is never silently assumed delivered (§5.4).
+    MEDIUM: added the six v{semver}_touched_sections blocks missing since 0.2.0 (v020, v070, v071,
+    v072, v073, v080), reconstructed from their own changelog entries. MEDIUM: softened the
+    channelsEnabled 'no error anywhere' claim now that current docs describe a startup-time admin
+    banner (§4.1). MEDIUM: P-1 now names the Bun-specific node-pty NAN-vs-NAPI ABI loading risk
+    separately from the build-toolchain risk (§12). MEDIUM: removed the speculative Transport
+    interface claim in favour of a plain Telegram module until a second transport exists (§11,
+    YAGNI). MEDIUM: added aibridge's own ERROR/WARN/INFO logging convention for the Bridge's
+    operational log (§9). MEDIUM: added an exhaustive sessions.state transition table, including the
+    dead-topic-message edge case (§4.3). LOW: Phase 6a's exit criterion now cites scenarios 24 and 37
+    like every other phase (§12)"
   - "0.8.0 (2026-08-02): EXTRACTED into its own repo, github.com/devitgroupltd/aibridge, so the same
     Bridge can drive sessions across any number of registered projects rather than living inside
     SeoWrite's plans/ folder. Renamed swtg -> aibridge throughout (env vars, socket/pipe paths, the
@@ -65,6 +78,84 @@ changelog:
   - "0.3.0 (2026-08-02): Pass 2 - open questions and risks investigated against the docs and closed. CORRECTION: v0.2.0's central finding was wrong. A PreToolUse hook returning `allow` does NOT pre-empt the permission system; the docs state deny and ask rules are evaluated regardless of hook output. The fix is an `ask` rule in the generated per-session settings, so guard-git-write.ps1 needs no change and the AIBRIDGE_SESSION gate is withdrawn (§6.1.1). Adopted the OS-level Bash sandbox, which works on WSL2 and inverts the allowlist strategy (§6.7). Replaced the 540s AskUserQuestion auto-answer with the documented per-hook `timeout` field and the official updatedInput/answers shape (§6.4). Added a non-blocking PermissionRequest observer hook, which makes prompt reconciliation exact instead of heuristic (§6.5). Second bot token for feed traffic: Telegram limits are per bot, so P2 gets its own 20/min (§5.4). Launch dialogs are three, not one, and two are avoidable via user-level config (§2.4, §10.1). Added the usage/cost risk (§10.5). §9 grew to 30 scenarios"
   - "0.2.0 (2026-08-02): Pass 1 review - CRITICAL: guard-git-write.ps1 Layer 3 now auto-allows commit/push, which pre-empts the channel relay and would let a phone commit unapproved; added the AIBRIDGE_SESSION escalation gate (§6.1.1) and moved P-3 to a Phase 2 blocker. CRITICAL: editMessageText shares the sendMessage rate budget, so fixed 3s coalescing overruns the 20/min group limit at 2+ sessions; replaced with session-count-scaled intervals and a 12/min P2 reservation (§5.4). Expanded the bash-port parity requirements and pinned both implementations to test_claude_hook_guards (§7.3, scenarios 11-12). Renumbered §9 to 24 contiguous scenarios and corrected every cross-reference"
   - "0.1.0 (2026-08-02): Initial plan - Telegram-driven multi-session Claude Code control via a custom MCP channel server, hook-fed activity feed and inline-button permission relay, hosted on WSL2"
+v090_touched_sections:
+  - section: "§5.6 Attachments and compaction"
+    type: modified
+    summary: "Corrected Telegram's bot file-download cap from 50MB to the actual documented 20MB"
+  - section: "§5.4 Rate limits: the real budget"
+    type: modified
+    summary: "Added a retry/backoff policy for non-429 Telegram API failures (5xx/timeout/network), so a P0 permission-prompt send failure is never silently assumed delivered"
+  - section: "§4.1 Prerequisites"
+    type: modified
+    summary: "Softened the channelsEnabled 'no error anywhere' claim - current docs show a startup-time admin banner now exists; only per-event mid-session delivery stays silent"
+  - section: "§4.3 The routing table"
+    type: added
+    summary: "New exhaustive state-transition table for sessions.state, including the dead-topic-message edge case"
+  - section: "§9 Testing"
+    type: modified
+    summary: "Added aibridge's own logging-level convention (ERROR/WARN/INFO) for the Bridge's operational log, alongside the existing testing convention"
+  - section: "§11 Deliberately not building"
+    type: modified
+    summary: "Removed the speculative Transport interface claim (YAGNI, one concrete implementation) - Telegram code stays in its own module until a second transport justifies the seam"
+  - section: "§12 Phases"
+    type: modified
+    summary: "P-1 now distinguishes the node-pty build-toolchain risk from a separate Bun NAN-vs-NAPI ABI loading risk; Phase 6a's exit criterion now cites scenarios 24 and 37"
+v080_touched_sections:
+  - section: "§Overview Four decisions already made"
+    type: modified
+    summary: "Added decision 5: ship as its own reusable repo (aibridge), project identity is a repos.toml lookup, not code"
+  - section: "§4.1.1 One operator, one instance - a second person means a second, fully independent instance"
+    type: modified
+    summary: "Reframed from 'this repo's second developer' to the general one-operator-one-instance rule, with SeoWrite/Devitgroup kept as a labelled worked example"
+  - section: "§6.1.1 Why a target repo's own guard hook does not defeat this"
+    type: modified
+    summary: "Reframed: SeoWrite's guard-git-write.ps1 is now explicitly a worked example from the pilot project, not aibridge's own file - aibridge touches no file in any target repo"
+  - section: "§7.3 A target repo's own guard hook needs no work from aibridge"
+    type: modified
+    summary: "Reframed from 'this repo's second developer' framing to the general target-repo framing"
+  - section: "§9 Testing"
+    type: modified
+    summary: "Scenario 13 reframed as a target-repo's own testing responsibility, not aibridge's"
+  - section: "§7.6 The WSL2 migration, held for Phase 6"
+    type: modified
+    summary: "Bash-port item reframed as a target repo's own porting responsibility"
+v073_touched_sections:
+  - section: "§4.1.1 One operator, one instance - a second person means a second, fully independent instance"
+    type: modified
+    summary: "Refined with three Owner-confirmed facts: channelsEnabled is not per-developer, §10.5's concurrency/burn-rate figures are per-instance arithmetic not a portable policy, and the P-4 probe need not be repeated per operator"
+  - section: "§10.5 Usage limits and cost"
+    type: modified
+    summary: "Flagged the weighted-concurrency cap and burn-rate threshold as Max-5x-specific arithmetic, not a universal policy - a second operator needs their own pass through the method"
+v072_touched_sections:
+  - section: "§4.1.1 One operator, one instance - a second person means a second, fully independent instance"
+    type: added
+    summary: "New section: each developer runs a fully independent instance (own machine, clone, supergroup, tokens); records why §4.1 setup cannot be scripted via the Bot API"
+v071_touched_sections:
+  - section: "§10.1 Research-preview churn"
+    type: modified
+    summary: "Corrected: escape from --dangerously-load-development-channels is self-service via allowedChannelPlugins in managed settings, not a wait on Anthropic; noted an empty allowedChannelPlugins blocks the allowlist but not the dev flag"
+v070_touched_sections:
+  - section: "§10.0 Inbound channel delivery: RESOLVED, proven end to end on 2026-08-02"
+    type: modified
+    summary: "Rewritten from a failure record to a proof record - the go/no-go passed, all 20 pushed events reached Claude's context"
+  - section: "§10.1.1 channelsEnabled is an org switch we do not control"
+    type: added
+    summary: "New: the two failed probes were channelsEnabled being unset on the org, not a protocol fault; documents the mitigation (startup nonce probe, periodic re-probe)"
+  - section: "§6.5 Reconciliation, and what the protocol does not give us"
+    type: modified
+    summary: "PermissionRequest hook carries no tool_use_id/permission_rule_id/permission_rule_text; stops joining and renders the approval card from the channel payload alone; resolution falls back to (session_id, tool_name, deep-equal tool_input)"
+  - section: "§2.4 Session launch: registration, identity and the three dialogs"
+    type: modified
+    summary: "Dialog table grows from three to five with the first-run onboarding blockers (theme picker, fullscreen-renderer offer)"
+  - section: "§3.2 Inbound: Telegram to Claude"
+    type: modified
+    summary: "source is reserved and must never appear in meta; the liveness warning must key on hook activity since a reply is not a per-event acknowledgement"
+  - section: "§6.2 The per-session settings baseline"
+    type: modified
+    summary: "mcp__aibridge__reply joins the baseline allowlist since MCP tool calls raise their own permission dialog"
+  - section: "§4.3 The routing table"
+    type: modified
+    summary: "Every path key must be canonicalised - ~/.claude.json holds duplicate drive-letter-case project entries"
 v060_touched_sections:
   - section: "§10.0 Inbound channel delivery is unproven, and one probe of it failed"
     type: added
@@ -169,6 +260,19 @@ v030_touched_sections:
   - section: "§12 Phases"
     type: modified
     summary: "P-1 gains the sandbox dependencies, P-3 loses the AIBRIDGE_SESSION gate, P-4 becomes an explicit six-item protocol probe"
+v020_touched_sections:
+  - section: "§6.1.1 Why a target repo's own guard hook does not defeat this"
+    type: modified
+    summary: "CRITICAL: found guard-git-write.ps1 Layer 3 auto-allows commit/push, pre-empting the channel relay; added the AIBRIDGE_SESSION escalation gate (later withdrawn in v0.3.0) and moved P-3 to a Phase 2 blocker"
+  - section: "§5.4 Rate limits: the real budget"
+    type: modified
+    summary: "CRITICAL: fixed 3s coalescing overruns the 20/min group limit at 2+ sessions; replaced with session-count-scaled intervals and a 12/min P2 reservation"
+  - section: "§7.3 A target repo's own guard hook needs no work from aibridge"
+    type: modified
+    summary: "Expanded bash-port parity requirements, pinned both implementations to test_claude_hook_guards"
+  - section: "§9 Testing"
+    type: modified
+    summary: "Renumbered to 24 contiguous scenarios and corrected every cross-reference"
 ---
 
 # Telegram Claude Session Control
@@ -583,8 +687,10 @@ session index, and never hosts a session.
 **`channelsEnabled: true` on the claude.ai organisation.** Not optional and not local: on Team and
 Enterprise, channels are blocked until an Owner enables them at **claude.ai -> Admin settings ->
 Claude Code -> Channels**. Without it the whole system connects cleanly and delivers nothing, with no
-error anywhere. Enabled for Devitgroup Ltd on 2026-08-02. See §10.1.1 for why this stays a live risk
-rather than a one-time setup step.
+per-message error - current docs describe a startup-time banner nudging an admin to enable it, but
+per-event delivery during an already-running session still fails silently, which is why §10.1.1's own
+liveness probe remains necessary rather than a one-time setup step. Enabled for Devitgroup Ltd on
+2026-08-02. See §10.1.1 for why this stays a live risk regardless.
 
 **Pre-seeded onboarding keys in `~/.claude.json`** (theme, fullscreen renderer). A fresh config
 deadlocks at the theme picker before printing anything (§2.4).
@@ -723,6 +829,23 @@ CREATE TABLE sessions (
 
 `slug` is the primary key rather than `session_id` precisely because `session_id` is unknown at topic
 creation time and changes on `--resume`. Everything external addresses a session by slug.
+
+**`state` transitions.** No transition is implicit; the table below is exhaustive, including the two
+back-to-baseline cases that are easiest to leave out:
+
+| From | To | Trigger |
+|---|---|---|
+| - | `starting` | `/new`, or an orphaned process adopted on Bridge restart (§4.5) |
+| `starting` | `idle` | `SessionStart` hook fires |
+| `idle` | `working` | `UserPromptSubmit`, or an inbound channel push with no prior turn (§3.2) |
+| `working` | `awaiting_input` | A blocking `AskUserQuestion` hook, or a relayed permission prompt outstanding (§6) |
+| `awaiting_input` | `working` | The question or permission prompt resolves, from any surface (§6.5) |
+| `working` | `idle` | `Stop` / `StopFailure` hook |
+| any | `dead` | `SessionEnd`, a `claude_code.api_error` quota stop (§10.5), or reconciliation finding the process gone (§4.5) |
+| `dead` | `starting` | Never automatically - slugs are unique (§9 scenario 27), so a dead row is a terminal state until `/rm` |
+
+A message sent to a topic whose row is `dead` is acknowledged with "this session has ended" rather than
+queued or silently dropped, which is the one case the table above does not cover on its own.
 
 ### 4.4 Naming
 
@@ -893,6 +1016,16 @@ Handling `429`: honour `retry_after` from the response body exactly, pause the w
 duration (not just the failing lane), and never retry a P2 edit after a 429 - re-render from current
 state instead.
 
+**Handling everything that is not a 429.** A network error, timeout, or 5xx is not rate-limiting and
+gets its own policy rather than falling through unhandled. P0 and P1 sends retry up to 3 times with a
+short fixed backoff (1s, 2s, 4s), because these carry permission prompts and Claude's own replies,
+which must not silently vanish; a P2 edit is never retried, consistent with the drop-oldest-first policy
+above, since a newer frame supersedes it anyway. If a P0 send for a permission prompt still fails after
+retries - the one case that matters most, because it is the operator's only path to answer a blocked
+tool call - the Bridge logs it at `ERROR` (§9) and leaves the underlying request unresolved rather than
+assuming it was delivered: it stays live for §6.5's terminal-side reconciliation and expires at the
+normal 30-minute ceiling like any other unanswered prompt, never silently re-sent without bound.
+
 ### 5.5 The `details` button
 
 `callback_data` is capped at **64 bytes**, so it carries a reference, never content: `d:<slug>:<turn>`.
@@ -912,7 +1045,7 @@ screenshot. Photos and documents sent to a session topic are downloaded by the B
 
 Claude then reads it with the normal file tools, which is the whole trick: no protocol extension is
 needed, because a path in context is enough. The official Telegram plugin uses the same inbox pattern
-and caps at Telegram's 50MB bot-download limit; we inherit both. The inbox sits inside the session
+and caps at Telegram's 20MB bot-download limit; we inherit both. The inbox sits inside the session
 state directory rather than the worktree, so nothing accidentally gets committed.
 
 **Outbound files** already exist as the `details` mechanism (§5.5): anything over 4096 characters goes
@@ -1707,6 +1840,15 @@ aibridge's own testing convention: tooling code must unit-test any helper whose 
 **silent-wrong** rather than a loud abort, plus every exit-code or protocol contract another component
 branches on. Framework: `bun test`. Gate: `bun test` in the package's CI job, plus `tsc --noEmit`.
 
+**aibridge's own logging convention.** The Bridge's own operational log - distinct from the
+Telegram-facing feed in §5, which is fully specified there - uses three levels: `ERROR` for anything
+that strands a pending operator-facing prompt or drops a message the operator needed to see (an
+exhausted-retry P0 send per §5.4, a crashed reconciliation pass); `WARN` for degraded-but-recovering
+conditions already named elsewhere in this plan (a 429 pause, a version-skew connection, a coalescing
+quiet-mode trigger); `INFO` for ordinary lifecycle events (session start/stop, topic create, Bridge
+start/restart). Nothing above `INFO` may contain a bot token, a git credential, or full tool input -
+the same exclusion §5.7 already applies to telemetry.
+
 Everything below is silent-wrong by nature: a dropped meta key, a mis-derived permission rule and a
 mis-parsed verdict all produce a system that appears to work.
 
@@ -2125,7 +2267,7 @@ fragile coupling this plan avoids elsewhere. Accepted, and revisit if Anthropic 
 |---|---|---|
 | Raw TUI mirror | Decision 2. Unreadable on a phone and unaffordable within the rate budget | `stream-json` per §5.2 |
 | Multi-user / team access | Single operator. Multi-user means per-user authorisation and audit, which is a different system | - |
-| Discord, Slack, iMessage | The bot layer is abstracted behind a `Transport` interface, but only Telegram is implemented | Second transport implementation |
+| Discord, Slack, iMessage | Telegram's bot-API client lives in its own module, but no `Transport` interface is built ahead of a second implementation - one concrete transport doesn't justify the seam yet (YAGNI) | Extract the interface then, from two concrete implementations instead of a guess at one |
 | Cloud or VPS hosting | Decision 1 | Bridge and channel server are OS-neutral (§7.6); the port is a service unit plus a clone |
 | Voice input | Out of scope | Telegram voice messages plus transcription, as `RichardAtCT/claude-code-telegram` does |
 | Marketplace publication | Requires an Anthropic partner contact and does not help a single operator | Phase 5 packages as a plugin anyway |
@@ -2156,7 +2298,11 @@ Prerequisites, before Phase 1:
 
 - **P-1** Windows host prepared. Bun installed; `node-pty` building against the installed toolchain
   (it is a native module, so this is the one dependency that can fail on a clean machine, and it fails
-  at `bun install` rather than at runtime). Defender exclusion for `c:\data\worktrees` and
+  at `bun install` rather than at runtime). This is two distinct risks, not one: a missing build
+  toolchain fails the install outright, but `node-pty`'s older builds predate Bun's N-API support and
+  can also fail to *load* the compiled `.node` file at runtime under Bun specifically, with an
+  ABI-shaped error that survives a clean `bun install` - check for a NAPI-based `node-pty` release
+  before pinning a version. Defender exclusion for `c:\data\worktrees` and
   `LongPathsEnabled` set (§7.1). `claude` logged in as the account the Bridge will run as - interactive,
   browser-based, once. A fleet-only SSH key loaded into the **OpenSSH Authentication Agent** service,
   set to Automatic. `user.name` / `user.email` set in each registered clone. `$STATE\repos.toml`
@@ -2266,8 +2412,8 @@ unattended running defensible, and **should not be skipped just because Phases 1
 - Stale-inbound handling and monotonic timers (§7.4), verified across a real modern-standby suspend.
 - Quiet mode.
 - The Task Scheduler task and a README covering setup, recovery and the VPS escape hatch.
-- **Exit:** kill the Bridge mid-turn with a permission prompt open, restart it, and the system converges
-  to a correct state with no dead buttons.
+- **Exit:** scenarios 24 and 37 pass under a real restart - kill the Bridge mid-turn with a permission
+  prompt open, restart it, and the system converges to a correct state with no dead buttons.
 
 **6b, the migration (§7.6),** triggered by wanting unattended overnight runs, by prompts-per-hour
 showing an uncomfortably broad allowlist, or by adding a repo other than this one:
