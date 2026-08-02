@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.log
+
+# aibridge's own runtime state, if ever run from inside this checkout
+.aibridge-state/
+
+# secrets - bot tokens live in %APPDATA%\aibridge\.env / ~/.config/aibridge/.env, never here
+.env
+.env.*
