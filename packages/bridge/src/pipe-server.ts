@@ -1,6 +1,17 @@
 import net from "node:net";
 import { encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protocol";
-import type { ChannelMetaFields, HelloAck, InboundMessage, Message, ReplyMessage } from "@aibridge/protocol";
+import type {
+  ChannelMetaFields,
+  HelloAck,
+  InboundMessage,
+  Message,
+  PermissionRequestMessage,
+  ReplyMessage,
+  VerdictBehavior,
+  VerdictMessage,
+} from "@aibridge/protocol";
+import { buildPermissionKeyboard, renderPermissionCard } from "./permission-callback.ts";
+import { PermissionRegistry, type PendingPermissionRequest } from "./permission-registry.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import type { Routing } from "./routing.ts";
 import type { SendMessageSource } from "./telegram.ts";
@@ -29,6 +40,16 @@ export interface PipeServerHandle {
   /** Pushes an `inbound` message to the connected channel server for `slug`, if any. Returns
    * whether a connection was found to send it to. */
   sendInbound(slug: string, content: string, meta: ChannelMetaFields): boolean;
+  /** Pushes a `verdict` to the connected channel server for `slug`. Returns whether a connection
+   * was found to send it to (§6.3's round trip - the channel server relays this on to Claude). */
+  sendVerdict(slug: string, requestId: string, behavior: VerdictBehavior): boolean;
+  /** Resolves (and removes) a pending permission request by id - undefined for unknown or expired
+   * ids (§9 scenarios 6-7), never throws. */
+  resolvePermission(requestId: string): PendingPermissionRequest | undefined;
+  /** Edits a permission card in place once resolved, stripping its keyboard (§6.5). */
+  finalizePermissionMessage(messageId: number, text: string): Promise<void>;
+  /** The registry itself, exposed for the expiry sweep (§6.5: strip + mark "expired" past 30min). */
+  permissionRegistry: PermissionRegistry;
 }
 
 /**
@@ -40,6 +61,7 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
   const pipePath = opts.pipePath ?? DEFAULT_PIPE_PATH;
   const log = opts.log ?? (() => {});
   const connectionsBySlug = new Map<string, net.Socket>();
+  const permissionRegistry = new PermissionRegistry();
 
   async function handleReply(msg: ReplyMessage): Promise<void> {
     try {
@@ -52,6 +74,42 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       opts.onReplySent?.(msg.topic_id);
     } catch (err) {
       log("ERROR", `failed to deliver reply for slug "${msg.slug}": ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * §6.3's relay: post an inline-keyboard card and register it as pending. The card renders from
+   * this notification's own fields alone (§6.5 - no join against a hook payload), and a post
+   * failure (e.g. Telegram briefly unreachable) leaves nothing registered rather than a pending
+   * entry with no way for the operator to ever see or answer it.
+   */
+  async function handlePermissionRequest(msg: PermissionRequestMessage): Promise<void> {
+    const route = opts.routing.get(msg.slug);
+    if (!route) {
+      log("WARN", `permission_request for unknown slug "${msg.slug}" - dropped`);
+      return;
+    }
+    try {
+      const text = renderPermissionCard({
+        slug: msg.slug,
+        toolName: msg.tool_name,
+        description: msg.description,
+        inputPreview: msg.input_preview,
+      });
+      const sent = await opts.controlBot.sendMessage(opts.chatId, route.topicId, text, {
+        inline_keyboard: buildPermissionKeyboard(msg.request_id),
+      });
+      permissionRegistry.add({
+        requestId: msg.request_id,
+        slug: msg.slug,
+        toolName: msg.tool_name,
+        description: msg.description,
+        inputPreview: msg.input_preview,
+        topicId: route.topicId,
+        messageId: sent.message_id,
+      });
+    } catch (err) {
+      log("ERROR", `failed to post permission request for slug "${msg.slug}": ${(err as Error).message}`);
     }
   }
 
@@ -82,6 +140,9 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
         return;
       case "reply":
         void handleReply(msg);
+        return;
+      case "permission_request":
+        void handlePermissionRequest(msg);
         return;
       default:
         log("WARN", `ignoring unrecognised message type "${(msg as { type?: unknown }).type}"`);
@@ -134,5 +195,25 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     return true;
   }
 
-  return { server, sendInbound };
+  function sendVerdict(slug: string, requestId: string, behavior: VerdictBehavior): boolean {
+    const socket = connectionsBySlug.get(slug);
+    if (!socket) {
+      log("WARN", `no connected channel server for slug "${slug}" - verdict dropped`);
+      return false;
+    }
+    const msg: VerdictMessage = { v: PROTOCOL_VERSION, type: "verdict", slug, request_id: requestId, behavior };
+    socket.write(encodeMessage(msg));
+    return true;
+  }
+
+  function resolvePermission(requestId: string): PendingPermissionRequest | undefined {
+    return permissionRegistry.resolve(requestId);
+  }
+
+  async function finalizePermissionMessage(messageId: number, text: string): Promise<void> {
+    if (!opts.controlBot.editMessageText) return;
+    await opts.controlBot.editMessageText(opts.chatId, messageId, text, { inline_keyboard: [] });
+  }
+
+  return { server, sendInbound, sendVerdict, resolvePermission, finalizePermissionMessage, permissionRegistry };
 }

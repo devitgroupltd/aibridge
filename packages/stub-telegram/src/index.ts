@@ -175,6 +175,7 @@ export class StubTelegramServer {
       message_thread_id: body.message_thread_id === undefined ? undefined : Number(body.message_thread_id),
       text: String(body.text ?? ""),
       message_id: messageId,
+      reply_markup: body.reply_markup,
     });
     return jsonResponse({ ok: true, result: { message_id: messageId, chat: { id: Number(body.chat_id) }, text: body.text } });
   }

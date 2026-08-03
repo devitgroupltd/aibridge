@@ -1,7 +1,7 @@
 ---
-version: 0.16.0
+version: 0.17.0
 status: solid
-last_modified_utc: 2026-08-03T11:49:45Z
+last_modified_utc: 2026-08-03T12:33:15Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,27 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.17.0 (2026-08-03): Phase 2 (permission relay) implemented and live-verified end to end - the
+    plan's one open risk here (§3.1/§6.3's claude/channel/permission capability, never
+    live-verified before now, unlike every other keystroke/protocol primitive this plan already
+    measured) is resolved in favour of the design as written, not a guess: a throwaway spike
+    handler in channel-server logged a real notifications/claude/channel/permission_request for a
+    genuine Write call under manual mode, matching §6.3's worked example field-for-field
+    (request_id/tool_name/description/input_preview, nothing more, nothing less), and an
+    auto-allow verdict sent back closed the local terminal dialog with no keystroke - proving both
+    halves of the round trip before any real implementation was written on top of it. Built:
+    settings.ts (§6.2's baseline, generated fresh per launch, wired into session-launcher.ts's
+    --settings flag), rule-derivation.ts (§6.6's Always-rule derivation with the metacharacter
+    guard), permission-registry.ts (pending-request tracking with 30-minute expiry, no
+    persistence - a restart still loses pending prompts per §4.5/§6.5), permission-callback.ts
+    (the perm:<id>:<a|d|A> callback_data scheme and card renderer), and the channel-server/pipe-server/
+    index.ts wiring connecting all of it. Verified live a second time end to end against the real
+    Telegram group (not just the stub): a real Write permission card was tapped Allow from the
+    operator's actual phone, and the resulting git commit ask-prompt was tapped Allow too, landing
+    a real commit - confirming both the relay itself and that the generated ask-list settings
+    genuinely gate git commit on a live session, not just in a unit test. §9 scenarios 4-13 and 30
+    covered by new unit/integration tests (131 tests passing across all packages, tsc clean).
+    Phase 2 is complete"
   - "0.16.0 (2026-08-03): Added /restart, a gap noticed live: the fleet's own session, after
     implementing a feature to the Bridge, said unprompted 'this needs a Bridge restart to take
     effect - I can't hot-reload the process I'm running under', and there was no way to trigger that
@@ -180,6 +201,16 @@ changelog:
   - "0.3.0 (2026-08-02): Pass 2 - open questions and risks investigated against the docs and closed. CORRECTION: v0.2.0's central finding was wrong. A PreToolUse hook returning `allow` does NOT pre-empt the permission system; the docs state deny and ask rules are evaluated regardless of hook output. The fix is an `ask` rule in the generated per-session settings, so guard-git-write.ps1 needs no change and the AIBRIDGE_SESSION gate is withdrawn (§6.1.1). Adopted the OS-level Bash sandbox, which works on WSL2 and inverts the allowlist strategy (§6.7). Replaced the 540s AskUserQuestion auto-answer with the documented per-hook `timeout` field and the official updatedInput/answers shape (§6.4). Added a non-blocking PermissionRequest observer hook, which makes prompt reconciliation exact instead of heuristic (§6.5). Second bot token for feed traffic: Telegram limits are per bot, so P2 gets its own 20/min (§5.4). Launch dialogs are three, not one, and two are avoidable via user-level config (§2.4, §10.1). Added the usage/cost risk (§10.5). §9 grew to 30 scenarios"
   - "0.2.0 (2026-08-02): Pass 1 review - CRITICAL: guard-git-write.ps1 Layer 3 now auto-allows commit/push, which pre-empts the channel relay and would let a phone commit unapproved; added the AIBRIDGE_SESSION escalation gate (§6.1.1) and moved P-3 to a Phase 2 blocker. CRITICAL: editMessageText shares the sendMessage rate budget, so fixed 3s coalescing overruns the 20/min group limit at 2+ sessions; replaced with session-count-scaled intervals and a 12/min P2 reservation (§5.4). Expanded the bash-port parity requirements and pinned both implementations to test_claude_hook_guards (§7.3, scenarios 11-12). Renumbered §9 to 24 contiguous scenarios and corrected every cross-reference"
   - "0.1.0 (2026-08-02): Initial plan - Telegram-driven multi-session Claude Code control via a custom MCP channel server, hook-fed activity feed and inline-button permission relay, hosted on WSL2"
+v0170_touched_sections:
+  - section: "§3.1 Capability declaration"
+    type: modified
+    summary: "Noted the claude/channel/permission notification shape is now live-verified, not quoted from docs - matches §6.3's fields exactly"
+  - section: "§9 Test scenarios"
+    type: modified
+    summary: "Scenarios 4-13 and 30 implemented as real unit/integration tests (131 total passing) rather than a checklist"
+  - section: "§12 Phase 2 - permission relay"
+    type: modified
+    summary: "Marked complete; recorded what shipped vs. what's deliberately deferred to Phase 3 (the PermissionRequest hook's resolution-heuristic role) vs. genuinely unverified (settings hot-reload mid-session)"
 v0160_touched_sections:
   - section: "§4.2 Commands (control topic)"
     type: modified
@@ -2873,21 +2904,36 @@ anything on top of it.
 
 ### Phase 2 - permission relay
 
-**Unblocked.** P-4 item 4 was the last gate and the 2026-08-02 sitting resolved it by removing the
-dependency rather than satisfying it (§6.5). P-3 is gone (§7.3) and item 3 is moot until §7.6.
+~~**Unblocked.**~~ **Done 2026-08-03.** P-4 item 4 was the last gate and the 2026-08-02 sitting
+resolved it by removing the dependency rather than satisfying it (§6.5). P-3 is gone (§7.3) and
+item 3 is moot until §7.6.
 
-- `claude/channel/permission` capability; the request handler and verdict emitter.
-- The non-blocking `PermissionRequest` observer hook and the pairing registry (§6.5).
-- Inline keyboard, `callback_data` encoding, callback sender re-check.
-- The settings baseline of §6.2 including the `ask` list, generated per session. Write the ask rules
-  **content-scoped from the start**, even though the bare-rule caveat is inert without a sandbox, so
-  §7.6 is not a rewrite of the policy (§6.1.1).
+- ~~`claude/channel/permission` capability; the request handler and verdict emitter.~~ **Done, and
+  live-verified before being built on**: a throwaway spike confirmed the notification actually
+  fires (§6.3's four fields, exact) and a verdict genuinely closes the local dialog, before any
+  real code was written on top of the assumption.
+- The non-blocking `PermissionRequest` observer hook and the pairing registry (§6.5): **deferred to
+  Phase 3.** §6.5 already concludes the card renders from the channel notification alone and does
+  not need this hook; the hook's only remaining job is the *resolution* heuristic (detecting a
+  prompt answered at the terminal instead of the phone), which needs the compiled hook client that
+  is itself a Phase 3 deliverable. Phase 2 ships with 30-minute expiry as the only resolution path
+  in the meantime - an honest gap, not a silent one.
+- ~~Inline keyboard, `callback_data` encoding, callback sender re-check.~~ **Done**
+  (`permission-callback.ts`).
+- ~~The settings baseline of §6.2 including the `ask` list, generated per session.~~ **Done**
+  (`settings.ts`, wired into `session-launcher.ts`'s `--settings` flag), content-scoped from the
+  start per §6.1.1.
 - Verify SeoWrite's own `guard-git-write.ps1` still fires for a Bridge-launched session carrying a
-  generated `--settings` file. Settings precedence across that override and the worktree's own
-  `.claude/settings.json` is the risk, not PowerShell (§7.3, scenarios 11-12); the same check applies
-  to any other registered repo's own guard hook, if it has one.
-- `♾️ Always` with rule derivation and the metacharacter guard.
-- **Exit:** scenario 30 passes, plus scenarios 4-13.
+  generated `--settings` file: **not applicable to this pass** - the live verification ran against
+  aibridge's own `test-session` (this repo, no such hook). Still open for the first real registered
+  target repo that has one.
+- ~~`♾️ Always` with rule derivation and the metacharacter guard.~~ **Done**
+  (`rule-derivation.ts`). One open question flagged rather than solved: whether a running session
+  hot-reloads its `--settings` file mid-conversation, so an `Always` tap's derived rule is
+  confirmed *written*, not confirmed *effective on the very next matching call* - unverified.
+- **Exit:** scenario 30 passes (automated, and live-verified twice against the real Telegram group -
+  a Write card and the resulting `git commit` ask-card, both tapped from the operator's actual
+  phone, the second one landing a real commit), plus scenarios 4-13. **Phase 2 is complete.**
 
 ### Phase 3 - activity feed
 

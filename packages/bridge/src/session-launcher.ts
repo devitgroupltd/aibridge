@@ -3,6 +3,8 @@ import os from "node:os";
 import path from "node:path";
 import * as pty from "node-pty";
 import { canonicalizeWindowsPath, ensureMcpJsonRegistration, ensureTrustDialogAccepted } from "./claude-config.ts";
+import { STATE_DIR } from "./config.ts";
+import { generateSettings, writeSettingsFile } from "./settings.ts";
 import { ensureWorktree } from "./worktree.ts";
 
 /**
@@ -64,6 +66,8 @@ export interface SessionLaunchOptions {
   channelServerEntryPath: string;
   worktreesRoot?: string;
   claudeJsonPath?: string;
+  /** Overrides where the generated `--settings` file is written under - defaults to `$STATE`. */
+  stateDir?: string;
   /**
    * §10.1 correction: the dev-flag confirm keystroke is Phase 5 work, not Phase 1 ("Manual
    * launch" per §12). When set, mirrors the PTY's I/O to this process's own stdio so the
@@ -131,9 +135,14 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
       : `channel server already registered in ${worktreePath}\\.mcp.json`,
   );
 
+  // §6.2: written fresh on every launch, before the process is spawned - same ordering
+  // requirement as the .mcp.json/.claude.json registrations above.
+  const settingsPath = writeSettingsFile(opts.stateDir ?? STATE_DIR, opts.slug, generateSettings());
+  log("INFO", `wrote permission settings baseline to ${settingsPath}`);
+
   const ptyProcess = pty.spawn(
     resolveClaudeExecutable(),
-    ["--dangerously-load-development-channels", "server:aibridge", "--model", "sonnet"],
+    ["--dangerously-load-development-channels", "server:aibridge", "--model", "sonnet", "--settings", settingsPath],
     {
       name: "xterm-256color",
       cols: 120,

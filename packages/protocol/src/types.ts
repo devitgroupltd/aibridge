@@ -56,19 +56,38 @@ export interface InboundMessage extends EnvelopeBase {
   meta: ChannelMetaFields;
 }
 
-// --- channel server <-> Bridge (Phase 2, defined now, unused until then) ------------------
+// --- channel server <-> Bridge (Phase 2) --------------------------------------------------
 
+/**
+ * §6.3's "four relay fields", live-verified 2026-08-03 against a real `Write` call gated by
+ * manual mode: the notification arrives with exactly `request_id`, `tool_name`, `description`
+ * and `input_preview`, matching the plan's worked example field-for-field.
+ */
 export interface PermissionRequestMessage extends EnvelopeBase {
   type: "permission_request";
-  // Exact fields are the "four relay fields" of §6.3, not yet read/verified for this stage -
-  // deliberately left loose rather than guessed.
-  [key: string]: unknown;
+  request_id: string;
+  tool_name: string;
+  description: string;
+  input_preview: string;
 }
+
+export type VerdictBehavior = "allow" | "deny";
 
 export interface VerdictMessage extends EnvelopeBase {
   type: "verdict";
   request_id: string;
-  behavior: "allow" | "deny";
+  behavior: VerdictBehavior;
+}
+
+/**
+ * §9 scenario 4: the verdict shape crosses a process boundary (Bridge to channel server, then
+ * channel server to Claude Code as a notification), so `behavior` can't rely on the type system
+ * alone - a typo or a future third state must throw loudly here rather than get forwarded as-is.
+ */
+export function assertValidBehavior(behavior: string): asserts behavior is VerdictBehavior {
+  if (behavior !== "allow" && behavior !== "deny") {
+    throw new Error(`invalid verdict behavior "${behavior}" - must be "allow" or "deny"`);
+  }
 }
 
 // --- hook client <-> Bridge (Phase 3/4, defined now, unused until then) ------------------

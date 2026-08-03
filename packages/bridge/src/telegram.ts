@@ -42,8 +42,13 @@ export interface SendMessageSource {
     text: string,
     replyMarkup?: InlineKeyboardMarkup,
   ): Promise<{ message_id: number }>;
-  /** Optional: only needed by callers that edit a previously-sent message (the thinking placeholder). */
-  editMessageText?(chatId: string | number, messageId: number, text: string): Promise<void>;
+  /**
+   * Optional: only needed by callers that edit a previously-sent message (the thinking
+   * placeholder, and the permission relay stripping a resolved request's keyboard). Telegram
+   * only replaces/removes the existing keyboard when `reply_markup` is explicitly passed on the
+   * edit - omitting it leaves whatever keyboard the message already had.
+   */
+  editMessageText?(chatId: string | number, messageId: number, text: string, replyMarkup?: InlineKeyboardMarkup): Promise<void>;
 }
 
 export interface SendChatActionSource {
@@ -131,11 +136,21 @@ export class TelegramClient implements UpdatesSource {
     await parseTelegramResponse(res, "sendChatAction");
   }
 
-  async editMessageText(chatId: string | number, messageId: number, text: string): Promise<void> {
+  async editMessageText(
+    chatId: string | number,
+    messageId: number,
+    text: string,
+    replyMarkup?: InlineKeyboardMarkup,
+  ): Promise<void> {
     const res = await fetch(this.url("editMessageText"), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, message_id: messageId, text }),
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_id: messageId,
+        text,
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      }),
     });
     await parseTelegramResponse(res, "editMessageText");
   }

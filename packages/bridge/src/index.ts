@@ -4,10 +4,14 @@ import type { ChannelMetaFields } from "@aibridge/protocol";
 import { renderChannelTag } from "@aibridge/protocol";
 import { loadConfig } from "./config.ts";
 import { buildCmdShimText, buildCommandKeyboard, isBuiltinPassthroughCommand, listRepoCommands, resolveCommandAction } from "./commands.ts";
+import { STATE_DIR } from "./config.ts";
+import { resolvePermCallback } from "./permission-callback.ts";
 import { launchSession } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
+import { deriveAlwaysRule, ruleAlreadyCovered } from "./rule-derivation.ts";
 import { Routing } from "./routing.ts";
 import { buildModeKeystrokes, isSessionCommandAttempt, MODELS, MODES, parseSessionCommand } from "./session-commands.ts";
+import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
 import { startPolling, TelegramClient, validateTokens } from "./telegram.ts";
 import { createThinkingPlaceholder } from "./thinking-placeholder.ts";
 import { createTypingIndicator } from "./typing-indicator.ts";
@@ -58,7 +62,7 @@ async function main(): Promise<void> {
   // §10.1.2: inbound delivery no longer goes through the channel server (see the onUpdate
   // handler below), but the pipe server still owns outbound reply relay and stays the
   // transport for Phase 2+ (permission_request/verdict), so it's still started unconditionally.
-  startPipeServer({
+  const pipeHandle = startPipeServer({
     routing,
     controlBot,
     chatId: config.supergroupChatId,
@@ -66,6 +70,17 @@ async function main(): Promise<void> {
     onReplySent: (topicId) => typingIndicator.stop(topicId),
     log,
   });
+
+  // §6.5: strip the keyboard and mark "expired" on any pending permission request past its TTL -
+  // a stale button left live would look tappable but silently do nothing.
+  setInterval(() => {
+    for (const entry of pipeHandle.permissionRegistry.expired()) {
+      pipeHandle.permissionRegistry.remove(entry.requestId);
+      pipeHandle
+        .finalizePermissionMessage(entry.messageId, `⌛ expired: ${entry.toolName} (no answer in time)`)
+        .catch((err) => log("WARN", `failed to mark permission request as expired: ${(err as Error).message}`));
+    }
+  }, 60_000);
 
   if (process.env.AIBRIDGE_SKIP_LAUNCH !== "1") {
     const channelServerEntryPath = path.resolve(import.meta.dirname, "../../channel-server/src/index.ts");
@@ -156,6 +171,38 @@ async function main(): Promise<void> {
           .answerCallbackQuery(callbackQuery.id)
           .catch((err) => log("WARN", `answerCallbackQuery failed: ${(err as Error).message}`));
         if (callbackQuery.message?.message_thread_id !== config.phase1.topicId) return;
+
+        // §6.3's approve/deny/always keyboard - checked before the /help-style command keyboard
+        // since the two callback_data namespaces ("perm:" vs "run:") never collide.
+        const permAction = callbackQuery.data ? resolvePermCallback(callbackQuery.data) : null;
+        if (permAction) {
+          // Resolve pops the entry - a stale/expired/unknown id is a silent no-op (§9 scenarios 6-7),
+          // not an error, since a race against the 30-minute sweep or a duplicate tap is expected.
+          const pending = pipeHandle.resolvePermission(permAction.requestId);
+          if (!pending) return;
+
+          const behavior = permAction.action === "deny" ? "deny" : "allow";
+          pipeHandle.sendVerdict(pending.slug, pending.requestId, behavior);
+
+          let confirmText = `${behavior === "allow" ? "✅ Allowed" : "⛔ Denied"}: ${pending.toolName}`;
+          if (permAction.action === "always") {
+            const rule = deriveAlwaysRule(pending.toolName, pending.inputPreview);
+            const settings = readSettingsFile(STATE_DIR, pending.slug);
+            if (!rule) {
+              confirmText += " (allow-once only - command isn't safe to generalise)";
+            } else if (ruleAlreadyCovered(rule, settings)) {
+              confirmText += ` (\`${rule}\` already covered by an existing rule)`;
+            } else {
+              writeSettingsFile(STATE_DIR, pending.slug, addAlwaysRule(settings, rule));
+              confirmText += `, and added \`${rule}\` for this session`;
+            }
+          }
+          pipeHandle
+            .finalizePermissionMessage(pending.messageId, confirmText)
+            .catch((err) => log("WARN", `failed to finalize permission message: ${(err as Error).message}`));
+          return;
+        }
+
         const action = callbackQuery.data ? resolveCommandAction(callbackQuery.data, listRepoCommands(worktreePath)) : null;
         if (!action) return;
         if (action.kind === "builtin") {

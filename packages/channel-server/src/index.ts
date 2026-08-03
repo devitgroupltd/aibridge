@@ -2,8 +2,8 @@ import { appendFileSync } from "node:fs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { buildMeta, PROTOCOL_VERSION } from "@aibridge/protocol";
-import type { InboundMessage, Message, ReplyMessage } from "@aibridge/protocol";
+import { assertValidBehavior, buildMeta, PROTOCOL_VERSION } from "@aibridge/protocol";
+import type { InboundMessage, Message, PermissionRequestMessage, ReplyMessage, VerdictMessage } from "@aibridge/protocol";
 import { PipeClient } from "./pipe-client.ts";
 
 // This component only ever exists because the Bridge spawned it with AIBRIDGE_SLUG set (§2.4) -
@@ -30,13 +30,17 @@ function log(level: "INFO" | "WARN" | "ERROR", message: string): void {
   }
 }
 
-// §3.1: Phase 1 declares only `claude/channel` + `tools` - no `claude/channel/permission` yet (Phase 2).
+// §3.1: Phase 2 - `claude/channel/permission` opts in to the permission relay. Live-verified
+// 2026-08-03: a real `Write` call under manual mode produced exactly the notification shape below,
+// and a `notifications/claude/channel/permission` verdict genuinely closed the local dialog with
+// no keystroke sent to the terminal - the plan's one open risk here is resolved, not assumed.
 const server = new Server(
   { name: "aibridge", version: "0.1.0" },
   {
     capabilities: {
       experimental: {
         "claude/channel": {},
+        "claude/channel/permission": {},
       },
       tools: {},
     },
@@ -99,15 +103,65 @@ async function forwardInbound(msg: InboundMessage): Promise<void> {
   log("INFO", "server.notification() resolved without error");
 }
 
+/** §6.3's send-side: relays a Bridge verdict back to Claude Code, closing the local dialog. */
+async function sendVerdictToClaude(msg: VerdictMessage): Promise<void> {
+  assertValidBehavior(msg.behavior);
+  await server.notification({
+    method: "notifications/claude/channel/permission",
+    params: { request_id: msg.request_id, behavior: msg.behavior },
+  });
+  log("INFO", `sent verdict for request_id=${msg.request_id}: ${msg.behavior}`);
+}
+
 function handleFromBridge(msg: Message): void {
   log("INFO", `received from Bridge: type=${msg.type}`);
   if (msg.type === "inbound") {
     forwardInbound(msg).catch((err) => {
       log("ERROR", `failed to deliver inbound notification: ${(err as Error).message}`);
     });
+  } else if (msg.type === "verdict") {
+    sendVerdictToClaude(msg).catch((err) => {
+      log("ERROR", `failed to deliver verdict: ${(err as Error).message}`);
+    });
   }
-  // hello_ack / ack / verdict: nothing to do with these yet in Phase 1.
+  // hello_ack / ack: nothing to do with these.
 }
+
+/**
+ * §6.3's receive-side: Claude Code emits this notification (not a request - there is no reply
+ * expected inline) when a gated tool call raises a local permission prompt. Forwarded to the
+ * Bridge over the pipe verbatim; `permission_request` is already priority-queued by
+ * `pipe-client.ts`'s `isPriority()` if the pipe happens to be disconnected.
+ */
+server.fallbackNotificationHandler = async (notification) => {
+  if (notification.method !== "notifications/claude/channel/permission_request") {
+    log("WARN", `unhandled notification from Claude Code: ${notification.method}`);
+    return;
+  }
+  const params = notification.params as
+    | { request_id?: unknown; tool_name?: unknown; description?: unknown; input_preview?: unknown }
+    | undefined;
+  if (
+    typeof params?.request_id !== "string" ||
+    typeof params.tool_name !== "string" ||
+    typeof params.description !== "string" ||
+    typeof params.input_preview !== "string"
+  ) {
+    log("ERROR", `malformed permission_request notification: ${JSON.stringify(notification)}`);
+    return;
+  }
+  const msg: PermissionRequestMessage = {
+    v: PROTOCOL_VERSION,
+    type: "permission_request",
+    slug,
+    request_id: params.request_id,
+    tool_name: params.tool_name,
+    description: params.description,
+    input_preview: params.input_preview,
+  };
+  log("INFO", `forwarding permission_request ${params.request_id} (${params.tool_name}) to Bridge`);
+  pipe.send(msg);
+};
 
 // AIBRIDGE_PIPE_PATH overrides the default pipe path - used by integration tests to run several
 // isolated Bridge/channel-server pairs concurrently without colliding on \\.\pipe\aibridge.
