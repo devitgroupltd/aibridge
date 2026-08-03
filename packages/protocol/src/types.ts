@@ -114,14 +114,41 @@ export interface HookEventMessage extends EnvelopeBase {
   payload: Record<string, unknown>;
 }
 
-export interface HookAskMessage extends EnvelopeBase {
-  type: "ask";
-  questions: unknown[];
+/**
+ * §6.4's shape, live-verified 2026-08-03 against a real `AskUserQuestion` `PreToolUse` call:
+ * `tool_input.questions[]` carries `question`, an optional `header`, `options` (always
+ * `{ label, description }` objects, never bare strings), and `multiSelect` - multi-select
+ * questions aren't specially handled yet (every option still renders as its own single-choice
+ * button), a known gap rather than an invented one. `request_id` is the tool's own
+ * `tool_use_id`, present on this event unlike `PermissionRequest`'s (§6.5) - used here as a
+ * stable key across hook-client reconnects (§2.5) rather than something the Bridge invents.
+ */
+export interface AskQuestionOption {
+  label: string;
+  description?: string;
 }
 
+export interface AskQuestion {
+  question: string;
+  header?: string;
+  options: AskQuestionOption[];
+  multiSelect?: boolean;
+}
+
+export interface HookAskMessage extends EnvelopeBase {
+  type: "ask";
+  request_id: string;
+  questions: AskQuestion[];
+}
+
+/**
+ * §6.4: `answers` is keyed by each question's own `question` text (live-verified accepted shape
+ * for `hookSpecificOutput.updatedInput.answers`); `cancel` is the 3540s Bridge-side ceiling
+ * (§6.4) - "no answer in an hour, cancelling the question" - never both set.
+ */
 export interface HookAnswerMessage extends EnvelopeBase {
   type: "answer";
-  answers?: unknown;
+  answers?: Record<string, string>;
   cancel?: true;
 }
 

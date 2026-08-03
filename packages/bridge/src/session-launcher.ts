@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import * as pty from "node-pty";
@@ -57,23 +57,38 @@ function resolveBunExecutable(): string {
   return first;
 }
 
+/** Newest mtime among the hook client's own `.ts` sources - a plain existence check (this
+ * function's first version) let a stale compiled binary silently keep running old behaviour after
+ * a source edit, caught live 2026-08-03 when Phase 4's new `--ask` flag had no effect at all
+ * because `dist/aibridge-hook.exe` still predated it. */
+function newestSourceMtimeMs(srcDir: string): number {
+  let newest = 0;
+  for (const name of readdirSync(srcDir)) {
+    if (!name.endsWith(".ts")) continue;
+    const mtimeMs = statSync(path.join(srcDir, name)).mtimeMs;
+    if (mtimeMs > newest) newest = mtimeMs;
+  }
+  return newest;
+}
+
 /**
  * §9's "startup latency is load-bearing" applies only to the hook client, not the channel server:
  * a hook fires synchronously once per tool call even though the event itself is `async`, so this
  * one has to be a compiled binary rather than run from source under `bun run` the way the channel
  * server is a few lines below. Built lazily on first launch and cached on disk, not per-launch -
- * `bun build --compile` costs real seconds, and the binary only needs rebuilding when its own
- * source changes, which a `dist/` check-then-build covers without needing a separate build step
- * wired into CI for Phase 3's scope.
+ * `bun build --compile` costs real seconds - and rebuilt whenever any of its own `.ts` sources is
+ * newer than the existing binary, not just when the binary is missing outright.
  */
 let cachedHookClientPath: string | undefined;
 
 function resolveHookClientBinary(): string {
   if (cachedHookClientPath) return cachedHookClientPath;
   const packageDir = path.resolve(import.meta.dirname, "../../hook-client");
+  const srcDir = path.join(packageDir, "src");
   const exeName = process.platform === "win32" ? "aibridge-hook.exe" : "aibridge-hook";
   const exePath = path.join(packageDir, "dist", exeName);
-  if (!existsSync(exePath)) {
+  const stale = !existsSync(exePath) || statSync(exePath).mtimeMs < newestSourceMtimeMs(srcDir);
+  if (stale) {
     execFileSync(resolveBunExecutable(), ["build", "--compile", "src/index.ts", "--outfile", path.join("dist", "aibridge-hook")], {
       cwd: packageDir,
     });

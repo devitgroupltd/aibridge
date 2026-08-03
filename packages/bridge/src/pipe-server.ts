@@ -3,6 +3,7 @@ import { DEFAULT_PIPE_PATH, encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } fro
 import type {
   ChannelMetaFields,
   HelloAck,
+  HookAskMessage,
   HookEventMessage,
   InboundMessage,
   Message,
@@ -11,6 +12,8 @@ import type {
   VerdictBehavior,
   VerdictMessage,
 } from "@aibridge/protocol";
+import { buildAskKeyboard, renderAskCard } from "./ask-callback.ts";
+import { AskRegistry, type PendingAsk } from "./ask-registry.ts";
 import { buildPermissionKeyboard, renderPermissionCard } from "./permission-callback.ts";
 import { PermissionRegistry, type PendingPermissionRequest } from "./permission-registry.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
@@ -51,10 +54,20 @@ export interface PipeServerHandle {
   /** Resolves (and removes) a pending permission request by id - undefined for unknown or expired
    * ids (§9 scenarios 6-7), never throws. */
   resolvePermission(requestId: string): PendingPermissionRequest | undefined;
-  /** Edits a permission card in place once resolved, stripping its keyboard (§6.5). */
+  /** Edits a permission card in place once resolved, stripping its keyboard (§6.5). Reused
+   * verbatim for ask cards too - the edit itself has nothing permission-specific about it. */
   finalizePermissionMessage(messageId: number, text: string): Promise<void>;
   /** The registry itself, exposed for the expiry sweep (§6.5: strip + mark "expired" past 30min). */
   permissionRegistry: PermissionRegistry;
+  /** §6.4: records a button tap against a pending question - null for an unknown id/index or a
+   * question already answered (a stale or duplicate tap, same discipline as `resolvePermission`). */
+  answerAsk(id: string, questionIndex: number, optionIndex: number): { entry: PendingAsk; label: string; allAnswered: boolean } | null;
+  /** Sends the full `answers` map back to the blocked hook and forgets this ask. Returns whether
+   * a live connection was found to send it on (the hook may have already timed out locally). */
+  completeAsk(id: string): boolean;
+  /** Sends `{ cancel: true }` back to the blocked hook (§6.4's 3540s ceiling) and forgets this ask. */
+  cancelAsk(id: string): boolean;
+  askRegistry: AskRegistry;
 }
 
 /**
@@ -67,6 +80,11 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
   const log = opts.log ?? (() => {});
   const connectionsBySlug = new Map<string, net.Socket>();
   const permissionRegistry = new PermissionRegistry();
+  const askRegistry = new AskRegistry();
+  // Keyed by `request_id` (the tool's own `tool_use_id`, §6.4) rather than slug - a blocked ask
+  // holds its own connection open for up to an hour, entirely separate from the channel server's
+  // connection for the same slug.
+  const askSocketsById = new Map<string, net.Socket>();
 
   async function handleReply(msg: ReplyMessage): Promise<void> {
     try {
@@ -118,6 +136,41 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     }
   }
 
+  /**
+   * §6.4: posts one card per question and registers the ask, keyed by `request_id` (the tool's
+   * own `tool_use_id`) rather than a Bridge-invented id. A reconnect of the same blocked hook
+   * invocation (§2.5 - the hook client re-sends `hello`+`ask` on every reconnect attempt) arrives
+   * as a second `ask` with the same `request_id`; that case just rebinds the socket rather than
+   * reposting the question, since the operator would otherwise see duplicate cards for one ask.
+   */
+  async function handleAsk(msg: HookAskMessage, socket: net.Socket): Promise<void> {
+    const existing = askRegistry.get(msg.request_id);
+    if (existing) {
+      askSocketsById.set(msg.request_id, socket);
+      return;
+    }
+
+    const route = opts.routing.get(msg.slug);
+    if (!route) {
+      log("WARN", `ask for unknown slug "${msg.slug}" - dropped`);
+      return;
+    }
+
+    try {
+      const questions: PendingAsk["questions"] = [];
+      for (const q of msg.questions) {
+        const sent = await opts.controlBot.sendMessage(opts.chatId, route.topicId, renderAskCard(msg.slug, q.question, q.header), {
+          inline_keyboard: buildAskKeyboard(msg.request_id, questions.length, q.options),
+        });
+        questions.push({ question: q.question, header: q.header, options: q.options, topicId: route.topicId, messageId: sent.message_id });
+      }
+      askRegistry.add({ id: msg.request_id, slug: msg.slug, questions });
+      askSocketsById.set(msg.request_id, socket);
+    } catch (err) {
+      log("ERROR", `failed to post question for slug "${msg.slug}": ${(err as Error).message}`);
+    }
+  }
+
   function handleHello(msg: Extract<Message, { type: "hello" }>, socket: net.Socket): void {
     if (msg.role !== "channel") {
       // §5.1: the hook client's hello carries no session_id (only pid + which event it's for),
@@ -155,6 +208,9 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       case "event":
         opts.onHookEvent?.(msg);
         return;
+      case "ask":
+        void handleAsk(msg, socket);
+        return;
       default:
         log("WARN", `ignoring unrecognised message type "${(msg as { type?: unknown }).type}"`);
     }
@@ -183,6 +239,13 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     socket.on("close", () => {
       for (const [slug, s] of connectionsBySlug) {
         if (s === socket) connectionsBySlug.delete(slug);
+      }
+      // Not removed from `askRegistry` here - only the socket goes away. The hook client
+      // reconnects and re-sends the same `ask` (§2.5), which rebinds a fresh socket in
+      // `handleAsk` above; the pending question itself is only ever cleared by an answer, a
+      // cancel, or the expiry sweep.
+      for (const [id, s] of askSocketsById) {
+        if (s === socket) askSocketsById.delete(id);
       }
     });
   });
@@ -226,5 +289,43 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     await opts.controlBot.editMessageText(opts.chatId, messageId, text, { inline_keyboard: [] });
   }
 
-  return { server, sendInbound, sendVerdict, resolvePermission, finalizePermissionMessage, permissionRegistry };
+  function answerAsk(id: string, questionIndex: number, optionIndex: number): { entry: PendingAsk; label: string; allAnswered: boolean } | null {
+    return askRegistry.answer(id, questionIndex, optionIndex);
+  }
+
+  function completeAsk(id: string): boolean {
+    const entry = askRegistry.get(id);
+    if (!entry) return false;
+    const answers = askRegistry.buildAnswers(entry);
+    const socket = askSocketsById.get(id);
+    askRegistry.remove(id);
+    askSocketsById.delete(id);
+    if (!socket) return false;
+    socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "answer", slug: entry.slug, answers }));
+    return true;
+  }
+
+  function cancelAsk(id: string): boolean {
+    const entry = askRegistry.get(id);
+    if (!entry) return false;
+    const socket = askSocketsById.get(id);
+    askRegistry.remove(id);
+    askSocketsById.delete(id);
+    if (!socket) return false;
+    socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "answer", slug: entry.slug, cancel: true }));
+    return true;
+  }
+
+  return {
+    server,
+    sendInbound,
+    sendVerdict,
+    resolvePermission,
+    finalizePermissionMessage,
+    permissionRegistry,
+    answerAsk,
+    completeAsk,
+    cancelAsk,
+    askRegistry,
+  };
 }

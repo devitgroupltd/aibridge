@@ -2,6 +2,7 @@ import http from "node:http";
 import path from "node:path";
 import type { ChannelMetaFields, HookEventMessage } from "@aibridge/protocol";
 import { renderChannelTag } from "@aibridge/protocol";
+import { resolveAskCallback, renderAskAnsweredCard, renderAskCancelledCard } from "./ask-callback.ts";
 import { loadConfig } from "./config.ts";
 import { buildCmdShimText, buildCommandKeyboard, isBuiltinPassthroughCommand, listRepoCommands, resolveCommandAction } from "./commands.ts";
 import { STATE_DIR } from "./config.ts";
@@ -154,6 +155,19 @@ async function main(): Promise<void> {
         .finalizePermissionMessage(entry.messageId, `⌛ expired: ${entry.toolName} (no answer in time)`)
         .catch((err) => log("WARN", `failed to mark permission request as expired: ${(err as Error).message}`));
     }
+
+    // §6.4: past the 3540s ceiling, cancel rather than let the hook's own 3600s timeout expire
+    // silently - the operator sees an explicit "cancelled" card and Claude sees a `deny` it can
+    // recover from, never a wrong answer auto-picked on its behalf.
+    for (const entry of pipeHandle.askRegistry.expired()) {
+      pipeHandle.cancelAsk(entry.id);
+      for (const q of entry.questions) {
+        if (q.answerLabel !== undefined) continue;
+        pipeHandle
+          .finalizePermissionMessage(q.messageId, renderAskCancelledCard(entry.slug, q.question, q.header))
+          .catch((err) => log("WARN", `failed to mark question as cancelled: ${(err as Error).message}`));
+      }
+    }
   }, 60_000);
 
   if (process.env.AIBRIDGE_SKIP_LAUNCH !== "1") {
@@ -288,6 +302,24 @@ async function main(): Promise<void> {
           .answerCallbackQuery(callbackQuery.id)
           .catch((err) => log("WARN", `answerCallbackQuery failed: ${(err as Error).message}`));
         if (callbackQuery.message?.message_thread_id !== config.phase1.topicId) return;
+
+        // §6.4's per-question keyboard - checked first since "ask:" never collides with the
+        // other namespaces ("perm:", "run:", etc.).
+        const askAction = callbackQuery.data ? resolveAskCallback(callbackQuery.data) : null;
+        if (askAction) {
+          const result = pipeHandle.answerAsk(askAction.id, askAction.questionIndex, askAction.optionIndex);
+          if (!result) return; // unknown id, bad index, or already answered - a stale/duplicate tap
+          const q = result.entry.questions[askAction.questionIndex];
+          if (q) {
+            pipeHandle
+              .finalizePermissionMessage(q.messageId, renderAskAnsweredCard(result.entry.slug, q.question, q.header, result.label))
+              .catch((err) => log("WARN", `failed to finalize question message: ${(err as Error).message}`));
+          }
+          if (result.allAnswered) {
+            pipeHandle.completeAsk(askAction.id);
+          }
+          return;
+        }
 
         // §6.3's approve/deny/always keyboard - checked before the /help-style command keyboard
         // since the two callback_data namespaces ("perm:" vs "run:") never collide.

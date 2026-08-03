@@ -1,7 +1,7 @@
 ---
-version: 0.19.0
+version: 0.20.0
 status: solid
-last_modified_utc: 2026-08-03T14:45:00Z
+last_modified_utc: 2026-08-03T15:20:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,35 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.20.0 (2026-08-03): Phase 4 (questions) implemented and live-verified end to end. A fresh
+    Stage 0 spike (same discipline as Phase 3's) captured the real AskUserQuestion PreToolUse
+    payload (tool_input.questions[].{question, header, options[].{label, description},
+    multiSelect}, plus a real tool_use_id - present here unlike PermissionRequest's, §6.5) and,
+    critically, the real accepted stdout shapes: hookSpecificOutput.{permissionDecision:'allow',
+    updatedInput:{questions, answers}} made Claude proceed with no terminal picker at all, and
+    {permissionDecision:'deny', permissionDecisionReason} produced an explicit 'cancelled, want me
+    to ask again?' with no option auto-selected - both verified field-for-field against the real
+    Claude Code binary before hook-client's ask path was written to match. Built: hook-client's
+    --ask flag (the CLI argument, not the payload, is what tells one PreToolUse hook invocation to
+    block for an answer while the async catch-all firing on the identical stdin just logs the feed
+    line - both entries fire on the same AskUserQuestion call), ask-once.ts (reconnect-with-backoff
+    blocking wait, capped at a local 3550s backstop behind the Bridge's own 3540s cancel),
+    ask-message.ts (payload/output shapes); Bridge's ask-registry.ts (pending-question tracking
+    keyed by tool_use_id - stable across the hook client's reconnects, unlike a Bridge-invented id
+    - supporting multi-question asks and a per-question answered/cancelled state) and
+    ask-callback.ts (ask:<id>:<q>:<opt> callback_data, one Telegram card per question per §6.4);
+    settings.ts grew a second, synchronous PreToolUse entry matched to AskUserQuestion with
+    timeout:3600. Found and fixed along the way: session-launcher.ts's hook-client binary cache
+    only checked whether dist/aibridge-hook.exe existed, never whether it was older than its own
+    sources - caught live when the new --ask flag had silently no effect because the compiled
+    binary still predated it; fixed to compare mtimes and rebuild on any source change, not just on
+    a missing binary. Live-verified against the real Telegram group and the real Claude Code
+    binary: a genuine AskUserQuestion call blocked with no terminal picker, posted a real question
+    card from the control bot, and tapping 'Staging' both finalized the card in place (checkmark,
+    keyboard stripped) and made Claude proceed with 'Staging selected...' - the full round trip,
+    not a simulated one. The 3540s cancel path itself was only verified via the Stage 0 spike and
+    unit tests (scenarios 22/23), not a real hour-long wait. 208 tests passing, tsc clean across
+    all packages."
   - "0.19.0 (2026-08-03): Phase 3 (activity feed) implemented and live-verified. Stage 0's own
     spike (a throwaway logging hook client wired into the live spike session) captured real
     payload shapes for SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/PostToolUseFailure/
@@ -3057,9 +3086,29 @@ item 3 is moot until §7.6.
 
 ### Phase 4 - questions
 
-- `AskUserQuestion` blocking `PreToolUse` hook; option keyboards; `updatedInput`/`answers` return.
-- The per-hook `timeout` and the cancel-on-timeout path (§6.4).
-- **Exit:** scenarios 22 and 23 pass, and a real `AskUserQuestion` is answered from the phone.
+~~**Done 2026-08-03.**~~ Implemented and live-verified end to end.
+
+- ~~`AskUserQuestion` blocking `PreToolUse` hook; option keyboards; `updatedInput`/`answers`
+  return.~~ **Done** - `hook-client`'s `--ask` flag distinguishes the blocking invocation from the
+  async catch-all firing on the same payload; `ask-once.ts`/`ask-message.ts` (hook-client) and
+  `ask-registry.ts`/`ask-callback.ts` (Bridge) implement the round trip, one Telegram card per
+  question, keyed by the tool's own `tool_use_id` rather than a Bridge-invented id.
+- ~~The per-hook `timeout` and the cancel-on-timeout path (§6.4).~~ **Done** - `timeout: 3600` on
+  the `AskUserQuestion`-matched hook entry, Bridge-side cancel at 3540s (the periodic sweep already
+  used for §6.5's permission-expiry), hook-client's own 3550s local backstop behind that in case
+  the Bridge is unreachable for the whole hour. The 3540s path is unit-tested (scenario 23) and
+  spike-verified against the real stdout contract, not verified under a real hour-long wait.
+- **Live-verified 2026-08-03** against the real Telegram group and the real Claude Code binary: a
+  genuine `AskUserQuestion` call produced no terminal picker at all, posted a real question card
+  from the control bot, and tapping an option both finalized the card (checkmark, keyboard
+  stripped) and made Claude proceed with the chosen answer - the exact behaviour a terminal picker
+  tap would have produced, sourced from the phone instead.
+- **Found live, not anticipated:** the hook-client binary cache (`session-launcher.ts`, since
+  Phase 3) only checked whether the compiled binary existed, never whether it was stale - the new
+  `--ask` flag had no effect at all on first boot because the cached binary predated it. Fixed to
+  rebuild whenever any hook-client source file is newer than the binary.
+- **Exit:** scenarios 22 and 23 pass (unit-tested against real captured payloads/output shapes),
+  and a real `AskUserQuestion` was answered from the phone. **Phase 4 is complete.**
 
 ### Phase 5 - the fleet
 

@@ -3,7 +3,7 @@ import path from "node:path";
 
 interface HookEntry {
   matcher?: string;
-  hooks: [{ type: "command"; command: string; async: boolean }];
+  hooks: [{ type: "command"; command: string; async: boolean; timeout?: number }];
 }
 
 export interface PermissionSettings {
@@ -42,6 +42,20 @@ function buildHooks(hookClientPath: string): Record<string, HookEntry[]> {
   for (const event of HOOK_EVENTS) {
     entries[event] = [{ hooks: [{ type: "command", command: `"${hookClientPath}"`, async: true }] }];
   }
+  // §6.4: a second, synchronous PreToolUse entry matched to AskUserQuestion specifically - the
+  // async catch-all above still fires on the same call (for the feed's "asking: ..." line) but
+  // can't be the one that blocks, so the hook client distinguishes the two by the `--ask` flag
+  // baked into this command string, not by inspecting the payload (both entries get identical
+  // stdin). "timeout": 3600 is a real hour, not a ceiling to work around (§6.4) - live-verified
+  // 2026-08-03 that Claude Code accepts both the resulting `allow`+`updatedInput` and `deny`
+  // stdout shapes exactly as documented there.
+  entries.PreToolUse = [
+    ...(entries.PreToolUse ?? []),
+    {
+      matcher: "AskUserQuestion",
+      hooks: [{ type: "command", command: `"${hookClientPath}" --ask`, async: false, timeout: 3600 }],
+    },
+  ];
   return entries;
 }
 

@@ -109,6 +109,20 @@ describe("generateSettings with a hook client path", () => {
       expect(entry?.command).toContain(hookPath);
     }
   });
+
+  // §6.4: a second, synchronous PreToolUse entry matched to AskUserQuestion specifically, on top
+  // of (not instead of) the async catch-all above.
+  test("adds a synchronous AskUserQuestion-matched PreToolUse entry with an hour timeout", () => {
+    const entries = settings.hooks?.PreToolUse;
+    expect(entries).toHaveLength(2);
+    const askEntry = entries?.[1];
+    expect(askEntry?.matcher).toBe("AskUserQuestion");
+    const hook = askEntry?.hooks[0];
+    expect(hook?.async).toBe(false);
+    expect(hook?.timeout).toBe(3600);
+    expect(hook?.command).toContain(hookPath);
+    expect(hook?.command).toContain("--ask");
+  });
 });
 
 describe("writeSettingsFile / readSettingsFile", () => {
