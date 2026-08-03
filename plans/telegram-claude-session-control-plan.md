@@ -1,7 +1,7 @@
 ---
-version: 0.15.0
+version: 0.15.1
 status: solid
-last_modified_utc: 2026-08-03T10:38:15Z
+last_modified_utc: 2026-08-03T11:39:57Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,13 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.15.1 (2026-08-03): §4.2.2's cycle order is now VERIFIED, not inferred. Sent the raw \\x1b[Z
+    (Shift+Tab) keystroke four times against the live Phase 1 session via the dev-control port,
+    reading the resulting mode label off the status line after each press: manual -> 'accept edits
+    on' -> 'plan mode on' -> 'auto mode on' -> back to 'manual mode on'. Confirms the exact order
+    0.15.0 assumed from the picker's listed order, with no surprises - the fourth press wrapping
+    cleanly back to manual also confirms the cycle length used by buildModeKeystrokes's modulo
+    arithmetic. Promotes /mode from 'needs live confirmation before it ships' to ready for Phase 5"
   - "0.15.0 (2026-08-03): Added /mode <name>, the permission-mode counterpart to 0.14.0's /model. The
     picker (Manual/Edit automatically/Plan/Auto) has no typed slash command - it is reached only by
     Shift+Tab cycling at the prompt, already named in §10.0 as one of three keystroke primitives proven
@@ -159,6 +166,13 @@ changelog:
   - "0.3.0 (2026-08-02): Pass 2 - open questions and risks investigated against the docs and closed. CORRECTION: v0.2.0's central finding was wrong. A PreToolUse hook returning `allow` does NOT pre-empt the permission system; the docs state deny and ask rules are evaluated regardless of hook output. The fix is an `ask` rule in the generated per-session settings, so guard-git-write.ps1 needs no change and the AIBRIDGE_SESSION gate is withdrawn (§6.1.1). Adopted the OS-level Bash sandbox, which works on WSL2 and inverts the allowlist strategy (§6.7). Replaced the 540s AskUserQuestion auto-answer with the documented per-hook `timeout` field and the official updatedInput/answers shape (§6.4). Added a non-blocking PermissionRequest observer hook, which makes prompt reconciliation exact instead of heuristic (§6.5). Second bot token for feed traffic: Telegram limits are per bot, so P2 gets its own 20/min (§5.4). Launch dialogs are three, not one, and two are avoidable via user-level config (§2.4, §10.1). Added the usage/cost risk (§10.5). §9 grew to 30 scenarios"
   - "0.2.0 (2026-08-02): Pass 1 review - CRITICAL: guard-git-write.ps1 Layer 3 now auto-allows commit/push, which pre-empts the channel relay and would let a phone commit unapproved; added the AIBRIDGE_SESSION escalation gate (§6.1.1) and moved P-3 to a Phase 2 blocker. CRITICAL: editMessageText shares the sendMessage rate budget, so fixed 3s coalescing overruns the 20/min group limit at 2+ sessions; replaced with session-count-scaled intervals and a 12/min P2 reservation (§5.4). Expanded the bash-port parity requirements and pinned both implementations to test_claude_hook_guards (§7.3, scenarios 11-12). Renumbered §9 to 24 contiguous scenarios and corrected every cross-reference"
   - "0.1.0 (2026-08-02): Initial plan - Telegram-driven multi-session Claude Code control via a custom MCP channel server, hook-fed activity feed and inline-button permission relay, hosted on WSL2"
+v0151_touched_sections:
+  - section: "§4.2.2 /mode: the same primitive, plus a state-tracking problem /model doesn't have"
+    type: modified
+    summary: "Cycle order promoted from inferred to live-verified: four \\x1b[Z writes against the real Phase 1 session, reading the resulting mode label after each press"
+  - section: "§12 Phase 5 - the fleet"
+    type: modified
+    summary: "Updated the /mode bullet - cycle order is now live-verified, no longer a shipping blocker"
 v0150_touched_sections:
   - section: "§4.2 Commands (control topic)"
     type: modified
@@ -1037,14 +1051,16 @@ defaults to `manual` - so `manual` is the tracked starting value for every sessi
 after each `/mode` write (current index + presses, mod the cycle length). Two things follow from
 "optimistically": first, if the operator also cycles modes by hand at the keyboard between remote
 commands, the Bridge's tracked value drifts from reality with nothing to detect it - worth a `/ls`
-column once §5.7's telemetry exists, not blocking for Phase 5. Second, **the cycle order below is
-inferred from the picker's own listed order, not yet independently verified** the way the dev-channels
-and MCP-consent keystrokes were - it needs the same live confirmation before this ships, not a
-plan-time assumption promoted to fact:
+column once §5.7's telemetry exists, not blocking for Phase 5. Second, the cycle order below was
+inferred from the picker's own listed order and is now **verified**, the same way the dev-channels and
+MCP-consent keystrokes were: four `\x1b[Z` writes against the live Phase 1 session, reading the mode
+label off the status line after each one (2026-08-03) -
 
 ```
 manual -> acceptEdits -> plan -> auto -> (back to manual)
 ```
+
+- confirmed exactly, including the fourth press wrapping cleanly back to `manual`.
 
 `/mode auto`, sent from `manual`, is therefore three Shift+Tab writes, not one.
 
@@ -2844,8 +2860,7 @@ dependency rather than satisfying it (§6.5). P-3 is gone (§7.3) and item 3 is 
 - `/model <name>` (§4.2.1), reusing the dev-flag confirm keystroke's raw PTY write as a real feature
   instead of a debug-only affordance, so a running session's model can change mid-conversation.
 - `/mode <name>` (§4.2.2), the same primitive driving the Shift+Tab permission-mode cycle. The cycle
-  order it depends on must be live-confirmed against a real session before this ships, not carried
-  forward as the plan-time assumption it starts as.
+  order it depends on is live-verified (2026-08-03), not carried forward as a plan-time assumption.
 - **Exit:** scenarios 24-28, 32, 42 and 43 pass; four concurrent Sonnet sessions run for an hour without
   manual intervention, the weighted budget refuses a fifth, and the fleet's spend is visible in
   `/budget` throughout.
