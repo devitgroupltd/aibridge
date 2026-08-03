@@ -99,9 +99,19 @@ export interface HelloFromHook extends EnvelopeBase {
   event: string;
 }
 
+/**
+ * `§5.1`'s hook client: one process per hook firing, forwarding the raw payload Claude Code piped
+ * to its stdin. `hook_event_name` and `session_id` are pulled out because every handler needs them
+ * to route and normalise (`hook-events.ts`); the rest of the payload is forwarded verbatim in
+ * `payload` rather than re-typed per event, since `§6.5` already showed one assumed field
+ * (`tool_use_id` on `PermissionRequest`) turning out not to exist - the normalizer treats every
+ * field access as possibly absent rather than this type vouching for a specific shape.
+ */
 export interface HookEventMessage extends EnvelopeBase {
   type: "event";
-  event: unknown;
+  hook_event_name: string;
+  session_id: string;
+  payload: Record<string, unknown>;
 }
 
 export interface HookAskMessage extends EnvelopeBase {

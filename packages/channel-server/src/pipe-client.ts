@@ -1,8 +1,8 @@
 import net from "node:net";
-import { encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protocol";
+import { DEFAULT_PIPE_PATH, encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protocol";
 import type { HelloFromChannel, Message } from "@aibridge/protocol";
 
-export const DEFAULT_PIPE_PATH = "\\\\.\\pipe\\aibridge";
+export { DEFAULT_PIPE_PATH };
 const MAX_BACKOFF_MS = 5000;
 const INITIAL_BACKOFF_MS = 100;
 const MAX_QUEUE = 100;

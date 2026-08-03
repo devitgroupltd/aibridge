@@ -1,0 +1,15 @@
+{
+  "name": "@aibridge/hook-client",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build --compile src/index.ts --outfile dist/aibridge-hook"
+  },
+  "dependencies": {
+    "@aibridge/protocol": "workspace:*"
+  }
+}

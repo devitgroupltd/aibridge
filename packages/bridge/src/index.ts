@@ -1,13 +1,18 @@
 import http from "node:http";
 import path from "node:path";
-import type { ChannelMetaFields } from "@aibridge/protocol";
+import type { ChannelMetaFields, HookEventMessage } from "@aibridge/protocol";
 import { renderChannelTag } from "@aibridge/protocol";
 import { loadConfig } from "./config.ts";
 import { buildCmdShimText, buildCommandKeyboard, isBuiltinPassthroughCommand, listRepoCommands, resolveCommandAction } from "./commands.ts";
 import { STATE_DIR } from "./config.ts";
+import { FeedCoalescer } from "./feed-coalescer.ts";
+import { renderCard } from "./feed-renderer.ts";
+import { applyEvent, createFeedState, promptsInLastHour } from "./feed-state.ts";
+import { normalizeHookEvent } from "./hook-events.ts";
 import { resolvePermCallback } from "./permission-callback.ts";
 import { launchSession } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
+import { RateGovernor } from "./rate-governor.ts";
 import { deriveAlwaysRule, ruleAlreadyCovered } from "./rule-derivation.ts";
 import { Routing } from "./routing.ts";
 import {
@@ -73,15 +78,70 @@ async function main(): Promise<void> {
     log: (level, message) => log(level, message),
   });
 
+  // §5.1-§5.4: one turn-card state per session, one shared governor across both the feed bot's
+  // droppable P2 lane (§9 scenarios 14-18 are unit-tested against rate-governor.ts/
+  // feed-coalescer.ts directly) and a per-session-count-scaled coalescer that skips a render when
+  // the text hasn't actually changed. Reply/permission-card/answerCallbackQuery sends on the
+  // control bot are deliberately left as direct calls for this pass - Phase 1/2's own call volume
+  // is far below the 20/minute ceiling the governor exists to protect, and routing Phase 2's
+  // already live-verified permission relay through a queueing/retry layer is a real regression
+  // risk this pass isn't taking on for a budget concern that isn't yet observable. Wiring P0/P1
+  // through the same governor is a reasonable Phase 3 follow-up, not done here.
+  const feedStates = new Map<string, ReturnType<typeof createFeedState>>();
+  const feedMessageIds = new Map<string, number>();
+  const feedGovernor = new RateGovernor({ log });
+  const feedCoalescer = new FeedCoalescer({
+    activeSessionCount: () => routing.all().length,
+    onFlush: (slug, text) => {
+      feedGovernor.schedule("P2", async () => {
+        const route = routing.get(slug);
+        if (!route) return;
+        const existingMessageId = feedMessageIds.get(slug);
+        if (existingMessageId !== undefined && feedBot.editMessageText) {
+          await feedBot.editMessageText(config.supergroupChatId, existingMessageId, text, undefined, "HTML");
+        } else {
+          const sent = await feedBot.sendMessage(config.supergroupChatId, route.topicId, text, undefined, "HTML");
+          feedMessageIds.set(slug, sent.message_id);
+        }
+      });
+    },
+  });
+
+  // §10.4.1: this project's own choice of threshold, not a number the plan specifies - a
+  // conservative "worth a look" signal for whether the allowlist has grown too broad on a host
+  // with no sandbox, surfaced as a log line now and left for a Phase 5 fleet command to expose.
+  const PROMPTS_PER_HOUR_WARN_THRESHOLD = 20;
+
+  function handleHookEvent(msg: HookEventMessage): void {
+    const event = normalizeHookEvent(msg.hook_event_name, msg.payload);
+    if (!event) return;
+
+    const nowMs = Date.now();
+    const previous = feedStates.get(msg.slug) ?? createFeedState(msg.slug);
+    const next = applyEvent(previous, event, nowMs);
+    feedStates.set(msg.slug, next);
+
+    if (event.kind === "turn_start") {
+      const promptCount = promptsInLastHour(next, nowMs);
+      if (promptCount > PROMPTS_PER_HOUR_WARN_THRESHOLD) {
+        log("WARN", `session "${msg.slug}" started ${promptCount} turns in the last hour - check whether its allowlist has grown too broad (§10.4.1)`);
+      }
+    }
+
+    feedCoalescer.notify(msg.slug, renderCard(next, nowMs));
+  }
+
   // §10.1.2: inbound delivery no longer goes through the channel server (see the onUpdate
   // handler below), but the pipe server still owns outbound reply relay and stays the
-  // transport for Phase 2+ (permission_request/verdict), so it's still started unconditionally.
+  // transport for Phase 2+ (permission_request/verdict/event), so it's still started
+  // unconditionally.
   const pipeHandle = startPipeServer({
     routing,
     controlBot,
     chatId: config.supergroupChatId,
     thinkingPlaceholder,
     onReplySent: (topicId) => typingIndicator.stop(topicId),
+    onHookEvent: handleHookEvent,
     log,
   });
 

@@ -30,6 +30,13 @@
         "@modelcontextprotocol/sdk": "^1.30.0",
       },
     },
+    "packages/hook-client": {
+      "name": "@aibridge/hook-client",
+      "version": "0.0.0",
+      "dependencies": {
+        "@aibridge/protocol": "workspace:*",
+      },
+    },
     "packages/protocol": {
       "name": "@aibridge/protocol",
       "version": "0.0.0",
@@ -43,6 +50,8 @@
     "@aibridge/bridge": ["@aibridge/bridge@workspace:packages/bridge"],
 
     "@aibridge/channel-server": ["@aibridge/channel-server@workspace:packages/channel-server"],
+
+    "@aibridge/hook-client": ["@aibridge/hook-client@workspace:packages/hook-client"],
 
     "@aibridge/protocol": ["@aibridge/protocol@workspace:packages/protocol"],
 

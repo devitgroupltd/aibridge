@@ -1,7 +1,7 @@
 ---
-version: 0.18.0
+version: 0.19.0
 status: solid
-last_modified_utc: 2026-08-03T13:38:49Z
+last_modified_utc: 2026-08-03T14:45:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,32 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.19.0 (2026-08-03): Phase 3 (activity feed) implemented and live-verified. Stage 0's own
+    spike (a throwaway logging hook client wired into the live spike session) captured real
+    payload shapes for SessionStart/UserPromptSubmit/PreToolUse/PostToolUse/PostToolUseFailure/
+    PostToolBatch/Stop/SubagentStop/SessionEnd before hook-events.ts was written, the same
+    live-verification-before-building discipline §6.5/§10.0 already established - and it was
+    worth it: the common envelope held, but nothing beyond hook_event_name/session_id was assumed.
+    Built: packages/hook-client (a new compiled-binary package, bun build --compile, sending a
+    hello+event pair per firing over the pipe and always exiting 0); hook-events.ts (normalizer);
+    feed-state.ts (turn-card state machine plus the §10.4.1 prompts-per-hour metric, promoted from
+    Phase 6 as planned); feed-renderer.ts (§5.3's card layout, 8-line cap with overflow counter);
+    feed-escape.ts (HTML-entity + bidi/ZWJ stripping, since the card is sent with parse_mode HTML);
+    rate-governor.ts (the two-token, three-lane budget - P0/P1 share the control bot's bucket with
+    P0 always drained first, P2 on the feed bot's own bucket is droppable, 429s pause only the
+    affected bucket, non-429 P0/P1 failures retry at 1s/2s/4s then log ERROR); feed-coalescer.ts
+    (session-count-scaled flush interval, skips unchanged renders). Found and fixed along the way:
+    node --experimental-strip-types (what the Bridge actually runs under) does not support
+    TypeScript constructor parameter properties, unlike tsc/bun - a real gap between the type
+    checker and the runtime that only a live restart caught; and addAlwaysRule was silently
+    dropping the new hooks block from settings.json on every Always-tap, since it rebuilt the
+    settings object from only permissions - fixed to spread the rest of the object through.
+    Deliberately scoped out: P0/P1 sends still bypass the governor (documented risk trade-off, not
+    an oversight - see §12 Phase 3's own entry), and the §5.5 details button isn't wired to a
+    callback yet. Live-verified against the real Telegram group: a real turn's card updated in
+    place from a distinct feed-bot identity, and a concurrent Phase 2 permission prompt (a real git
+    commit) posted and was answered normally with the feed active. 189 tests passing across 5
+    packages, tsc clean."
   - "0.18.0 (2026-08-03): Added /effort <low|medium|high|xhigh|max> (§4.2.3), requested mid-session
     alongside /model and /mode. Live-verified against the same test-session used for every other
     keystroke primitive this plan measures, and it surfaced a real behavioural difference from
@@ -215,6 +241,16 @@ changelog:
   - "0.3.0 (2026-08-02): Pass 2 - open questions and risks investigated against the docs and closed. CORRECTION: v0.2.0's central finding was wrong. A PreToolUse hook returning `allow` does NOT pre-empt the permission system; the docs state deny and ask rules are evaluated regardless of hook output. The fix is an `ask` rule in the generated per-session settings, so guard-git-write.ps1 needs no change and the AIBRIDGE_SESSION gate is withdrawn (§6.1.1). Adopted the OS-level Bash sandbox, which works on WSL2 and inverts the allowlist strategy (§6.7). Replaced the 540s AskUserQuestion auto-answer with the documented per-hook `timeout` field and the official updatedInput/answers shape (§6.4). Added a non-blocking PermissionRequest observer hook, which makes prompt reconciliation exact instead of heuristic (§6.5). Second bot token for feed traffic: Telegram limits are per bot, so P2 gets its own 20/min (§5.4). Launch dialogs are three, not one, and two are avoidable via user-level config (§2.4, §10.1). Added the usage/cost risk (§10.5). §9 grew to 30 scenarios"
   - "0.2.0 (2026-08-02): Pass 1 review - CRITICAL: guard-git-write.ps1 Layer 3 now auto-allows commit/push, which pre-empts the channel relay and would let a phone commit unapproved; added the AIBRIDGE_SESSION escalation gate (§6.1.1) and moved P-3 to a Phase 2 blocker. CRITICAL: editMessageText shares the sendMessage rate budget, so fixed 3s coalescing overruns the 20/min group limit at 2+ sessions; replaced with session-count-scaled intervals and a 12/min P2 reservation (§5.4). Expanded the bash-port parity requirements and pinned both implementations to test_claude_hook_guards (§7.3, scenarios 11-12). Renumbered §9 to 24 contiguous scenarios and corrected every cross-reference"
   - "0.1.0 (2026-08-02): Initial plan - Telegram-driven multi-session Claude Code control via a custom MCP channel server, hook-fed activity feed and inline-button permission relay, hosted on WSL2"
+v0190_touched_sections:
+  - section: "§5 The activity feed"
+    type: modified
+    summary: "§5.1's event table live-verified via Stage 0's spike; §5.3/§5.4/§5.5 implemented as feed-state.ts/feed-renderer.ts/rate-governor.ts/feed-coalescer.ts, details button not yet wired to a callback"
+  - section: "§9 Test scenarios"
+    type: modified
+    summary: "Scenarios 14-21 implemented as real unit tests (rate-governor, feed-coalescer, feed-renderer, feed-escape, hook-events, feed-state)"
+  - section: "§12 Phase 3 - activity feed"
+    type: modified
+    summary: "Marked functionally complete; recorded the two deliberately deferred gaps (P0/P1 governor wiring, the details button) and the one exit-criterion half that needs Phase 5's /new to test (two concurrent sessions)"
 v0180_touched_sections:
   - section: "§4.2 Commands (control topic)"
     type: modified
@@ -2987,12 +3023,37 @@ item 3 is moot until §7.6.
 
 ### Phase 3 - activity feed
 
-- Compiled hook client; hook registration in the generated settings.
-- Turn card renderer; per-topic coalescing; the two-token priority governor; `details` button.
-- **The prompts-per-hour metric**, promoted here from Phase 6. On a host with no sandbox it is the only
-  instrument that says whether the allowlist has grown too broad (§10.4.1).
-- **Exit:** scenarios 14-21 pass, and a real tool-heavy turn stays inside the rate budget with two
-  sessions running.
+- ~~Compiled hook client; hook registration in the generated settings.~~ **Done** - `packages/hook-client`
+  (`bun build --compile`), forwarding every §5.1 event over the pipe with a `hello`+`event` pair per
+  firing; wired into `settings.ts`'s `hooks` block, all `async: true`.
+- ~~Turn card renderer; per-topic coalescing; the two-token priority governor; `details` button.~~
+  **Mostly done** - `hook-events.ts` (normalizer), `feed-state.ts` (turn-card state + prompts-per-hour),
+  `feed-renderer.ts` (§5.3's card layout, 8-line cap, HTML escaping via `feed-escape.ts`),
+  `rate-governor.ts` (P0/P1/P2 lanes, 429 handling, retry/backoff) and `feed-coalescer.ts`
+  (session-count-scaled flush interval) are all built and live-verified. The `details` button
+  (§5.5) is not wired yet - `renderDetails()` exists but nothing calls it - deferred rather than
+  invented against an unverified `callback_data` UX.
+- **The prompts-per-hour metric**, promoted here from Phase 6. Implemented as a rolling-hour counter in
+  `feed-state.ts`, logged at `WARN` past a threshold (20/hour - this implementation's own choice, not a
+  number the plan specifies) - exposing it via a fleet command is Phase 5 work.
+- **Deliberately deferred rather than done in this pass:** P0/P1 (reply, permission cards,
+  `answerCallbackQuery`) still call the control bot directly rather than through `rate-governor.ts`.
+  Phase 1/2's own call volume is far below the 20/minute ceiling the governor exists to protect, and
+  routing Phase 2's already live-verified permission relay through a new queueing/retry layer was
+  judged a real regression risk not worth taking for a budget concern that isn't yet observable.
+- **Live-verified 2026-08-03** against the real Telegram group: a real Read+Bash+subagent turn produced
+  a turn card from the feed bot (`om-aibridge-feed`, a distinct sender identity from the control bot,
+  confirming the two-token design), updating in place with correct icons and duration; a concurrently
+  raised Phase 2 permission prompt (a real `git commit`) posted and was answered normally while the
+  feed was active, confirming P0 isn't starved by P2 traffic in practice. Not independently verified:
+  the "two sessions running" half of the exit criterion below, since Phase 1 only launches one hardcoded
+  session - genuinely testable only once Phase 5's `/new` exists.
+- **Exit:** scenarios 14-21 pass (all as real unit tests - `rate-governor.test.ts`,
+  `feed-coalescer.test.ts`, `feed-renderer.test.ts`, `feed-escape.test.ts`, `hook-events.test.ts`,
+  `feed-state.test.ts`), and a real tool-heavy turn stays inside the rate budget - confirmed with one
+  session; the two-concurrent-sessions half of this exit criterion is carried forward to Phase 5.
+  **Phase 3 is functionally complete; the `details` button and P0/P1 governor wiring are the two
+  named gaps carried forward.**
 
 ### Phase 4 - questions
 

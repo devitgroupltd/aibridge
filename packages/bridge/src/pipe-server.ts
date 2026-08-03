@@ -1,8 +1,9 @@
 import net from "node:net";
-import { encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protocol";
+import { DEFAULT_PIPE_PATH, encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protocol";
 import type {
   ChannelMetaFields,
   HelloAck,
+  HookEventMessage,
   InboundMessage,
   Message,
   PermissionRequestMessage,
@@ -16,7 +17,7 @@ import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import type { Routing } from "./routing.ts";
 import type { SendMessageSource } from "./telegram.ts";
 
-export const DEFAULT_PIPE_PATH = "\\\\.\\pipe\\aibridge";
+export { DEFAULT_PIPE_PATH };
 
 type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
 
@@ -32,6 +33,10 @@ export interface PipeServerOptions {
   /** Fires after a `reply` is successfully delivered - the typing indicator's stop signal (§5's
    * feed doesn't exist yet, but "a reply landed" is already known here regardless). */
   onReplySent?: (topicId: string) => void;
+  /** §5.1: every hook firing forwards one `event` message here. The hook client is a one-shot
+   * process (a fresh connection per firing, no persistent registration to track), so this is the
+   * only wiring needed on this side - there is no per-hook `hello_ack` to send back. */
+  onHookEvent?: (msg: HookEventMessage) => void;
   log?: LogFn;
 }
 
@@ -115,7 +120,10 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
 
   function handleHello(msg: Extract<Message, { type: "hello" }>, socket: net.Socket): void {
     if (msg.role !== "channel") {
-      // Hook hello - Phase 3/4, not wired yet.
+      // §5.1: the hook client's hello carries no session_id (only pid + which event it's for),
+      // so there is nothing to register here - the event message on the same connection, handled
+      // below, is the one that actually carries anything routable.
+      log("INFO", `hook client connected for event "${msg.event}" (pid ${msg.pid})`);
       return;
     }
     connectionsBySlug.set(msg.slug, socket);
@@ -143,6 +151,9 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
         return;
       case "permission_request":
         void handlePermissionRequest(msg);
+        return;
+      case "event":
+        opts.onHookEvent?.(msg);
         return;
       default:
         log("WARN", `ignoring unrecognised message type "${(msg as { type?: unknown }).type}"`);

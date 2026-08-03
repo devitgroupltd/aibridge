@@ -75,6 +75,40 @@ describe("generateSettings", () => {
   test("pre-allows mcp__aibridge__reply so the relay's own reply tool doesn't self-prompt (§3.3)", () => {
     expect(settings.permissions.allow).toContain("mcp__aibridge__reply");
   });
+
+  test("omits the hooks block entirely when no hook client path is given", () => {
+    expect(settings.hooks).toBeUndefined();
+  });
+});
+
+describe("generateSettings with a hook client path", () => {
+  const hookPath = "C:\\data\\projects\\aibridge\\packages\\hook-client\\dist\\aibridge-hook.exe";
+  const settings = generateSettings(hookPath);
+
+  test("registers every §5.1 event, all declared async", () => {
+    const events = [
+      "SessionStart",
+      "UserPromptSubmit",
+      "PreToolUse",
+      "PostToolUse",
+      "PostToolUseFailure",
+      "PostToolBatch",
+      "SubagentStart",
+      "SubagentStop",
+      "PermissionRequest",
+      "PermissionDenied",
+      "Notification",
+      "Stop",
+      "StopFailure",
+      "SessionEnd",
+    ];
+    for (const event of events) {
+      const entry = settings.hooks?.[event]?.[0]?.hooks[0];
+      expect(entry?.type).toBe("command");
+      expect(entry?.async).toBe(true);
+      expect(entry?.command).toContain(hookPath);
+    }
+  });
 });
 
 describe("writeSettingsFile / readSettingsFile", () => {
@@ -118,5 +152,11 @@ describe("addAlwaysRule", () => {
     const before = settings.permissions.allow.length;
     addAlwaysRule(settings, "Bash(npm test *)");
     expect(settings.permissions.allow.length).toBe(before);
+  });
+
+  test("preserves the hooks block rather than dropping it - an Always tap must not silently kill the feed", () => {
+    const settings = generateSettings("C:\\path\\to\\aibridge-hook.exe");
+    const updated = addAlwaysRule(settings, "Bash(npm test *)");
+    expect(updated.hooks).toEqual(settings.hooks);
   });
 });

@@ -1,4 +1,5 @@
 import { execFileSync } from "node:child_process";
+import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import * as pty from "node-pty";
@@ -54,6 +55,31 @@ function resolveBunExecutable(): string {
   }
   cachedBunExePath = first;
   return first;
+}
+
+/**
+ * §9's "startup latency is load-bearing" applies only to the hook client, not the channel server:
+ * a hook fires synchronously once per tool call even though the event itself is `async`, so this
+ * one has to be a compiled binary rather than run from source under `bun run` the way the channel
+ * server is a few lines below. Built lazily on first launch and cached on disk, not per-launch -
+ * `bun build --compile` costs real seconds, and the binary only needs rebuilding when its own
+ * source changes, which a `dist/` check-then-build covers without needing a separate build step
+ * wired into CI for Phase 3's scope.
+ */
+let cachedHookClientPath: string | undefined;
+
+function resolveHookClientBinary(): string {
+  if (cachedHookClientPath) return cachedHookClientPath;
+  const packageDir = path.resolve(import.meta.dirname, "../../hook-client");
+  const exeName = process.platform === "win32" ? "aibridge-hook.exe" : "aibridge-hook";
+  const exePath = path.join(packageDir, "dist", exeName);
+  if (!existsSync(exePath)) {
+    execFileSync(resolveBunExecutable(), ["build", "--compile", "src/index.ts", "--outfile", path.join("dist", "aibridge-hook")], {
+      cwd: packageDir,
+    });
+  }
+  cachedHookClientPath = exePath;
+  return exePath;
 }
 
 type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
@@ -135,9 +161,11 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
       : `channel server already registered in ${worktreePath}\\.mcp.json`,
   );
 
-  // §6.2: written fresh on every launch, before the process is spawned - same ordering
-  // requirement as the .mcp.json/.claude.json registrations above.
-  const settingsPath = writeSettingsFile(opts.stateDir ?? STATE_DIR, opts.slug, generateSettings());
+  // §6.2/§5.1: written fresh on every launch, before the process is spawned - same ordering
+  // requirement as the .mcp.json/.claude.json registrations above. Resolving the hook client
+  // binary can trigger a one-time `bun build --compile`, so it happens before the settings file
+  // (and therefore the spawn) rather than racing it.
+  const settingsPath = writeSettingsFile(opts.stateDir ?? STATE_DIR, opts.slug, generateSettings(resolveHookClientBinary()));
   log("INFO", `wrote permission settings baseline to ${settingsPath}`);
 
   const ptyProcess = pty.spawn(

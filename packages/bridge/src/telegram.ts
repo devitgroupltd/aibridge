@@ -41,14 +41,24 @@ export interface SendMessageSource {
     messageThreadId: number | undefined,
     text: string,
     replyMarkup?: InlineKeyboardMarkup,
+    /** §5.3: only the feed card passes this - it renders `<code>`/`<b>` for the turn card, which
+     * is exactly why feed-escape.ts's HTML-entity escaping is load-bearing there rather than
+     * cosmetic. Every existing caller omits it and stays plain text, unaffected. */
+    parseMode?: "HTML",
   ): Promise<{ message_id: number }>;
   /**
    * Optional: only needed by callers that edit a previously-sent message (the thinking
-   * placeholder, and the permission relay stripping a resolved request's keyboard). Telegram
-   * only replaces/removes the existing keyboard when `reply_markup` is explicitly passed on the
-   * edit - omitting it leaves whatever keyboard the message already had.
+   * placeholder, the permission relay stripping a resolved request's keyboard, and the feed card).
+   * Telegram only replaces/removes the existing keyboard when `reply_markup` is explicitly passed
+   * on the edit - omitting it leaves whatever keyboard the message already had.
    */
-  editMessageText?(chatId: string | number, messageId: number, text: string, replyMarkup?: InlineKeyboardMarkup): Promise<void>;
+  editMessageText?(
+    chatId: string | number,
+    messageId: number,
+    text: string,
+    replyMarkup?: InlineKeyboardMarkup,
+    parseMode?: "HTML",
+  ): Promise<void>;
 }
 
 export interface SendChatActionSource {
@@ -99,6 +109,7 @@ export class TelegramClient implements UpdatesSource {
     messageThreadId: number | undefined,
     text: string,
     replyMarkup?: InlineKeyboardMarkup,
+    parseMode?: "HTML",
   ): Promise<{ message_id: number }> {
     const res = await fetch(this.url("sendMessage"), {
       method: "POST",
@@ -108,6 +119,7 @@ export class TelegramClient implements UpdatesSource {
         message_thread_id: messageThreadId,
         text,
         ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+        ...(parseMode ? { parse_mode: parseMode } : {}),
       }),
     });
     return parseTelegramResponse(res, "sendMessage");
@@ -141,6 +153,7 @@ export class TelegramClient implements UpdatesSource {
     messageId: number,
     text: string,
     replyMarkup?: InlineKeyboardMarkup,
+    parseMode?: "HTML",
   ): Promise<void> {
     const res = await fetch(this.url("editMessageText"), {
       method: "POST",
@@ -150,6 +163,7 @@ export class TelegramClient implements UpdatesSource {
         message_id: messageId,
         text,
         ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+        ...(parseMode ? { parse_mode: parseMode } : {}),
       }),
     });
     await parseTelegramResponse(res, "editMessageText");

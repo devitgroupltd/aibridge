@@ -1,12 +1,48 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
+interface HookEntry {
+  matcher?: string;
+  hooks: [{ type: "command"; command: string; async: boolean }];
+}
+
 export interface PermissionSettings {
   permissions: {
     deny: string[];
     ask: string[];
     allow: string[];
   };
+  hooks?: Record<string, HookEntry[]>;
+}
+
+/**
+ * §5.1's event table, live-verified shapes aside (hook-events.ts's own concern) - every one of
+ * these is declared `async` so firing them never adds latency to the agent loop; the
+ * `AskUserQuestion`-matched synchronous exception is Phase 4, not added here.
+ */
+const HOOK_EVENTS = [
+  "SessionStart",
+  "UserPromptSubmit",
+  "PreToolUse",
+  "PostToolUse",
+  "PostToolUseFailure",
+  "PostToolBatch",
+  "SubagentStart",
+  "SubagentStop",
+  "PermissionRequest",
+  "PermissionDenied",
+  "Notification",
+  "Stop",
+  "StopFailure",
+  "SessionEnd",
+] as const;
+
+function buildHooks(hookClientPath: string): Record<string, HookEntry[]> {
+  const entries: Record<string, HookEntry[]> = {};
+  for (const event of HOOK_EVENTS) {
+    entries[event] = [{ hooks: [{ type: "command", command: `"${hookClientPath}"`, async: true }] }];
+  }
+  return entries;
 }
 
 /**
@@ -15,9 +51,12 @@ export interface PermissionSettings {
  * the §7.6 sandbox migration), `~/`-anchored paths only (a single leading slash anchors at the
  * settings source, not the filesystem root), and `mcp__aibridge__reply` pre-allowed since the
  * channel server's own reply tool otherwise raises its own permission prompt on first use (§3.3).
+ * `hookClientPath` is optional so every existing caller/test that only cares about the permission
+ * baseline is unaffected - `session-launcher.ts` is the one real caller that passes it.
  */
-export function generateSettings(): PermissionSettings {
+export function generateSettings(hookClientPath?: string): PermissionSettings {
   return {
+    ...(hookClientPath ? { hooks: buildHooks(hookClientPath) } : {}),
     permissions: {
       deny: [
         "Bash(rm -rf /*)",
@@ -83,6 +122,7 @@ export function addAlwaysRule(settings: PermissionSettings, rule: string): Permi
     return settings;
   }
   return {
+    ...settings,
     permissions: { ...settings.permissions, allow: [...settings.permissions.allow, rule] },
   };
 }
