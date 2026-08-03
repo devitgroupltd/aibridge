@@ -5,6 +5,10 @@ dist/
 # aibridge's own runtime state, if ever run from inside this checkout
 .aibridge-state/
 
+# per-session git worktrees, nested here so VS Code's Git extension auto-discovers them
+# (see .vscode/settings.json) - each has its own .git file, never committed
+.worktrees/
+
 # secrets - bot tokens live in %APPDATA%\aibridge\.env / ~/.config/aibridge/.env, never here
 .env
 .env.*

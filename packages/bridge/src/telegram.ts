@@ -6,9 +6,25 @@ export interface TelegramMessage {
   from?: { id: number; username?: string; first_name?: string };
 }
 
+export interface TelegramCallbackQuery {
+  id: string;
+  data?: string;
+  message?: { chat: { id: number }; message_thread_id?: number };
+}
+
 export interface TelegramUpdate {
   update_id: number;
   message?: TelegramMessage;
+  callback_query?: TelegramCallbackQuery;
+}
+
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data: string;
+}
+
+export interface InlineKeyboardMarkup {
+  inline_keyboard: InlineKeyboardButton[][];
 }
 
 export interface UpdatesSource {
@@ -24,6 +40,7 @@ export interface SendMessageSource {
     chatId: string | number,
     messageThreadId: number | undefined,
     text: string,
+    replyMarkup?: InlineKeyboardMarkup,
   ): Promise<{ message_id: number }>;
   /** Optional: only needed by callers that edit a previously-sent message (the thinking placeholder). */
   editMessageText?(chatId: string | number, messageId: number, text: string): Promise<void>;
@@ -76,13 +93,29 @@ export class TelegramClient implements UpdatesSource {
     chatId: string | number,
     messageThreadId: number | undefined,
     text: string,
+    replyMarkup?: InlineKeyboardMarkup,
   ): Promise<{ message_id: number }> {
     const res = await fetch(this.url("sendMessage"), {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId, text }),
+      body: JSON.stringify({
+        chat_id: chatId,
+        message_thread_id: messageThreadId,
+        text,
+        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      }),
     });
     return parseTelegramResponse(res, "sendMessage");
+  }
+
+  /** Must be called for every `callback_query` update, or the tapped button spins forever on mobile. */
+  async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
+    const res = await fetch(this.url("answerCallbackQuery"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ callback_query_id: callbackQueryId, ...(text ? { text } : {}) }),
+    });
+    await parseTelegramResponse(res, "answerCallbackQuery");
   }
 
   async sendChatAction(

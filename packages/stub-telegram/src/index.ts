@@ -18,9 +18,16 @@ export interface StubMessage {
   from?: { id: number; username?: string; first_name?: string };
 }
 
+export interface StubCallbackQuery {
+  id: string;
+  data?: string;
+  message?: { chat: { id: number }; message_thread_id?: number };
+}
+
 export interface StubUpdate {
   update_id: number;
-  message: StubMessage;
+  message?: StubMessage;
+  callback_query?: StubCallbackQuery;
 }
 
 export interface SentMessage {
@@ -29,6 +36,7 @@ export interface SentMessage {
   message_thread_id?: number;
   text: string;
   message_id: number;
+  reply_markup?: unknown;
 }
 
 export interface PushUpdateInput {
@@ -38,12 +46,20 @@ export interface PushUpdateInput {
   from?: { id: number; username?: string; first_name?: string };
 }
 
+export interface PushCallbackQueryInput {
+  chatId: number;
+  data: string;
+  messageThreadId?: number;
+}
+
 interface TokenState {
   pendingUpdates: StubUpdate[];
   nextUpdateId: number;
   nextMessageId: number;
   nextTopicId: number;
+  nextCallbackQueryId: number;
   sent: SentMessage[];
+  answeredCallbackQueries: string[];
   waiters: Array<() => void>;
 }
 
@@ -58,7 +74,16 @@ export class StubTelegramServer {
   private stateFor(token: string): TokenState {
     let state = this.tokens.get(token);
     if (!state) {
-      state = { pendingUpdates: [], nextUpdateId: 1, nextMessageId: 1, nextTopicId: 2, sent: [], waiters: [] };
+      state = {
+        pendingUpdates: [],
+        nextUpdateId: 1,
+        nextMessageId: 1,
+        nextTopicId: 2,
+        nextCallbackQueryId: 1,
+        sent: [],
+        answeredCallbackQueries: [],
+        waiters: [],
+      };
       this.tokens.set(token, state);
     }
     return state;
@@ -82,9 +107,30 @@ export class StubTelegramServer {
     for (const resolve of waiters) resolve();
   }
 
+  /** Simulates an operator tapping an inline-keyboard button for `token`'s bot. */
+  pushCallbackQuery(token: string, input: PushCallbackQueryInput): void {
+    const state = this.stateFor(token);
+    const update: StubUpdate = {
+      update_id: state.nextUpdateId++,
+      callback_query: {
+        id: String(state.nextCallbackQueryId++),
+        data: input.data,
+        message: { chat: { id: input.chatId }, message_thread_id: input.messageThreadId },
+      },
+    };
+    state.pendingUpdates.push(update);
+    const waiters = state.waiters.splice(0);
+    for (const resolve of waiters) resolve();
+  }
+
   /** Everything sent via sendMessage/editMessageText for `token`, in call order. */
   getSent(token: string): SentMessage[] {
     return [...this.stateFor(token).sent];
+  }
+
+  /** `callback_query_id`s answered so far for `token`, in call order. */
+  getAnsweredCallbackQueries(token: string): string[] {
+    return [...this.stateFor(token).answeredCallbackQueries];
   }
 
   private async handleGetUpdates(state: TokenState, body: Record<string, unknown>): Promise<Response> {
@@ -116,6 +162,7 @@ export class StubTelegramServer {
       message_thread_id: body.message_thread_id === undefined ? undefined : Number(body.message_thread_id),
       text: String(body.text ?? ""),
       message_id: messageId,
+      reply_markup: body.reply_markup,
     });
     return jsonResponse({ ok: true, result: { message_id: messageId, chat: { id: Number(body.chat_id) }, text: body.text } });
   }
@@ -161,6 +208,7 @@ export class StubTelegramServer {
       case "createForumTopic":
         return this.handleCreateForumTopic(state, body);
       case "answerCallbackQuery":
+        state.answeredCallbackQueries.push(String(body.callback_query_id ?? ""));
         return jsonResponse({ ok: true, result: true });
       default:
         return jsonResponse({ ok: false, description: `unknown method ${method}` }, 404);

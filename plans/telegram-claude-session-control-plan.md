@@ -1,7 +1,7 @@
 ---
-version: 0.13.0
+version: 0.15.0
 status: solid
-last_modified_utc: 2026-08-03T11:50:00Z
+last_modified_utc: 2026-08-03T10:38:15Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,32 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.15.0 (2026-08-03): Added /mode <name>, the permission-mode counterpart to 0.14.0's /model. The
+    picker (Manual/Edit automatically/Plan/Auto) has no typed slash command - it is reached only by
+    Shift+Tab cycling at the prompt, already named in §10.0 as one of three keystroke primitives proven
+    live during the 2026-08-02/03 sitting. Reuses /model's raw-PTY-write mechanism (§4.2.1) but adds a
+    problem /model didn't have: Shift+Tab is relative ('next'), not absolute, so reaching a target mode
+    means knowing the current one and writing the right number of presses, with no ack over the
+    protocol to confirm it landed. Mitigated by tracking mode per session in the routing table, seeded
+    from manual (Phase 1's spawn default, confirmed live) and updated optimistically after each write -
+    with the honest caveat that manual cycling at the desk between remote commands drifts this state
+    with nothing to detect it. The cycle order (manual -> acceptEdits -> plan -> auto) is inferred from
+    the picker's own listed order and flagged as needing the same live confirmation the other two
+    keystroke primitives already got, not shipped as a plan-time assumption. New §4.2.2, test scenario
+    43, and a Phase 5 bullet next to /model's"
+  - "0.14.0 (2026-08-03): Added /model <name>, a gap noticed live: /new --opus|--haiku fixes a
+    session's model at launch (§4.2) but nothing let an operator change it mid-conversation once a
+    turn was already burning the wrong tier's tokens. Cannot be a /cmd-style shim - /model is a
+    CLI-native slash command with no backing markdown file, so wrapping it in a <channel> tag the
+    way ordinary inbound text is wrapped would just hand Claude a literal string, never reaching the
+    TUI's own command parser. Resolved by generalising §10.1's dev-control port (today a manual,
+    loopback-HTTP-only escape hatch for the dev-channels dialog) into a real feature: the Bridge
+    writes the raw keystroke '/model <name>\\r' straight to the session's PTY, bypassing
+    renderChannelTag entirely - exactly what an operator's own fingers would type at the terminal.
+    Since a model switch fires no hook and makes no reply call, the channel cannot observe it landed,
+    so the Bridge posts its own confirmation immediately after the write rather than waiting for an
+    ack that will never arrive. New §4.2.1, test scenario 42, and a Phase 5 bullet alongside the
+    per-session model routing it extends"
   - "0.13.0 (2026-08-03): Post-Phase-1 addition, not part of the original scenario list: an
     operator-visible 'Claude is working' signal for the gap between an inbound message landing and
     the reply tool call being confirmed (§9's reply-permission ask rule alone left that gap silent).
@@ -133,6 +159,32 @@ changelog:
   - "0.3.0 (2026-08-02): Pass 2 - open questions and risks investigated against the docs and closed. CORRECTION: v0.2.0's central finding was wrong. A PreToolUse hook returning `allow` does NOT pre-empt the permission system; the docs state deny and ask rules are evaluated regardless of hook output. The fix is an `ask` rule in the generated per-session settings, so guard-git-write.ps1 needs no change and the AIBRIDGE_SESSION gate is withdrawn (§6.1.1). Adopted the OS-level Bash sandbox, which works on WSL2 and inverts the allowlist strategy (§6.7). Replaced the 540s AskUserQuestion auto-answer with the documented per-hook `timeout` field and the official updatedInput/answers shape (§6.4). Added a non-blocking PermissionRequest observer hook, which makes prompt reconciliation exact instead of heuristic (§6.5). Second bot token for feed traffic: Telegram limits are per bot, so P2 gets its own 20/min (§5.4). Launch dialogs are three, not one, and two are avoidable via user-level config (§2.4, §10.1). Added the usage/cost risk (§10.5). §9 grew to 30 scenarios"
   - "0.2.0 (2026-08-02): Pass 1 review - CRITICAL: guard-git-write.ps1 Layer 3 now auto-allows commit/push, which pre-empts the channel relay and would let a phone commit unapproved; added the AIBRIDGE_SESSION escalation gate (§6.1.1) and moved P-3 to a Phase 2 blocker. CRITICAL: editMessageText shares the sendMessage rate budget, so fixed 3s coalescing overruns the 20/min group limit at 2+ sessions; replaced with session-count-scaled intervals and a 12/min P2 reservation (§5.4). Expanded the bash-port parity requirements and pinned both implementations to test_claude_hook_guards (§7.3, scenarios 11-12). Renumbered §9 to 24 contiguous scenarios and corrected every cross-reference"
   - "0.1.0 (2026-08-02): Initial plan - Telegram-driven multi-session Claude Code control via a custom MCP channel server, hook-fed activity feed and inline-button permission relay, hosted on WSL2"
+v0150_touched_sections:
+  - section: "§4.2 Commands (control topic)"
+    type: modified
+    summary: "Added the /mode <name> command row"
+  - section: "§4.2.2 /mode: the same primitive, plus a state-tracking problem /model doesn't have"
+    type: added
+    summary: "New subsection: Shift+Tab-based mode cycling, the relative-vs-absolute problem, routing-table state tracking, and the honestly-inferred (not yet verified) cycle order"
+  - section: "§9 Test scenarios"
+    type: added
+    summary: "Scenario 43: /mode computes the correct number of Shift+Tab writes from tracked state and updates it, table-driven over the cycle"
+  - section: "§12 Phase 5 - the fleet"
+    type: modified
+    summary: "Added a /mode bullet next to /model's, flagging the cycle order as needing live confirmation before shipping"
+v0140_touched_sections:
+  - section: "§4.2 Commands (control topic)"
+    type: modified
+    summary: "Added the /model <name> command row"
+  - section: "§4.2.1 /model: why this needs a keystroke, not a shim"
+    type: added
+    summary: "New subsection: why /model cannot use the /cmd shim mechanism, and the raw-PTY-write design that generalises §10.1's dev-control port into a real feature"
+  - section: "§9 Test scenarios"
+    type: added
+    summary: "Scenario 42: /model writes the raw keystroke directly to the PTY, bypassing renderChannelTag; an invalid model name is rejected before anything is written"
+  - section: "§12 Phase 5 - the fleet"
+    type: modified
+    summary: "Added a bullet for /model alongside the per-session model routing it extends, and added scenario 42 to the phase exit criteria"
 v0130_touched_sections:
   - section: "§12 Phase 1 - walking skeleton"
     type: modified
@@ -909,6 +961,8 @@ permission relay and feed renderer are all already scoped to a single Bridge pro
 | `/rm <slug>` | As `/kill`, plus remove the worktree and delete the topic |
 | `/attach <slug>` | Post the tail of the session's PTY ring buffer, plus the `claude --resume <session_id>` command for local pickup (§2.3) |
 | `/cmd <name> [args]` | Run a repo slash command by proxy. See below: this is a shim, not a passthrough |
+| `/model <sonnet\|opus\|haiku\|fable>` | Switch the current session's model live, mid-conversation. Session-scoped only, same convention as a bare `/kill` (§4.2.1) |
+| `/mode <manual\|acceptEdits\|plan\|auto>` | Switch the current session's permission mode live. Session-scoped only, same convention as a bare `/kill` (§4.2.2) |
 | `/pause <slug>` | Stop pushing feed updates for that topic (replies and prompts still flow) |
 
 Session-scoped commands live in the session's own topic, so `/kill` with no argument inside a session
@@ -933,6 +987,66 @@ through the `Skill` tool, so "run the ux-audit skill" already works from a phone
 
 The Bridge validates `<name>` against the files actually present under `.claude/commands/`, so a typo
 returns a list rather than a confusing instruction to read a file that does not exist.
+
+### 4.2.1 `/model`: why this needs a keystroke, not a shim
+
+`/new --opus|--haiku` (§4.2) fixes a session's model at launch, but there was no way to change it once
+running - the operator watched a `Ruminating…` turn burn Opus-rate tokens on something Haiku would have
+handled, with no lever except `/kill` and a fresh `/new`. `/model <name>` closes that.
+
+**It cannot be built as a `/cmd`-style shim.** `/cmd`'s trick works because a repo command *is* a
+markdown file Claude reads and follows by hand - there is no equivalent file for `/model`, `/effort`, or
+any other CLI-native slash command. Wrapping `/model opus` in a `<channel>` tag the way ordinary inbound
+text is wrapped (§4.2's "slash commands do not cross the channel boundary") would just hand Claude the
+literal string `<channel ...>/model opus</channel>` as conversational content - the TUI never sees a
+line starting with `/`, so nothing switches. `/model` only exists as something *typed at the prompt*,
+which means the Bridge has to type it.
+
+**Mechanism: the same raw-keystroke write Phase 1 already uses as a manual escape hatch, made a real
+feature.** §10.1's dev-control port exists today only so an operator can hand-answer the one-time
+dev-channels dialog; `/model <name>` is that same `ptyProcess.write(...)` call, generalised and put
+behind a validated command instead of a loopback HTTP debug endpoint. On receipt the Bridge writes the
+literal text directly to the session's PTY, bypassing `renderChannelTag` entirely, followed by `\r`:
+`/model opus\r`. This is exactly what an operator's own fingers would type at the terminal.
+
+**No ack comes back over the pipe.** A model switch does not fire a hook and produces no `reply` tool
+call - the channel genuinely cannot observe that it happened (the same split §2's "why the split matters
+for the feed" already names). So the Bridge posts its own confirmation immediately after the write
+("Switched test-session to opus") rather than waiting for evidence the switch landed; a bad `<name>` is
+rejected before it ever reaches the PTY; a good one it takes on faith, same as `/attach`'s PTY-tail is a
+best-effort read rather than a verified state.
+
+### 4.2.2 `/mode`: the same primitive, plus a state-tracking problem `/model` doesn't have
+
+The permission-mode picker (Manual / Edit automatically / Plan / Auto) has no typed slash command at
+all - it is reached only by **Shift+Tab cycling** at the prompt, already the plan's own words for it in
+§10.0: "the shift+tab manual-mode toggle" was one of the three keystroke primitives proven live during
+the 2026-08-02/03 sitting. So `/mode <name>` reuses exactly §4.2.1's write-to-the-PTY mechanism, sending
+the raw back-tab escape (`\x1b[Z`, standard xterm Shift+Tab) instead of a typed line.
+
+**The problem `/model` didn't have: cycling is relative, not absolute.** `/model opus\r` names its
+target directly. Shift+Tab only says "next" - reaching `plan` from `manual` means knowing where in the
+cycle the session currently sits and pressing the right number of times, and the protocol gives the
+Bridge no way to read that back (the same "no ack" gap §4.2.1 already names, compounded: a wrong guess
+here doesn't just fail silently, it silently lands on the *wrong mode*, which is worse for something
+gating tool execution than for a cosmetic label change).
+
+**Mitigation: the Bridge tracks mode per session in the routing table, seeded from a known baseline.**
+Phase 1 spawns every session with no `--permission-mode` flag, which this sitting confirmed live
+defaults to `manual` - so `manual` is the tracked starting value for every session, updated optimistically
+after each `/mode` write (current index + presses, mod the cycle length). Two things follow from
+"optimistically": first, if the operator also cycles modes by hand at the keyboard between remote
+commands, the Bridge's tracked value drifts from reality with nothing to detect it - worth a `/ls`
+column once §5.7's telemetry exists, not blocking for Phase 5. Second, **the cycle order below is
+inferred from the picker's own listed order, not yet independently verified** the way the dev-channels
+and MCP-consent keystrokes were - it needs the same live confirmation before this ships, not a
+plan-time assumption promoted to fact:
+
+```
+manual -> acceptEdits -> plan -> auto -> (back to manual)
+```
+
+`/mode auto`, sent from `manual`, is therefore three Shift+Tab writes, not one.
 
 ### 4.3 The routing table
 
@@ -2174,6 +2288,16 @@ mis-parsed verdict all produce a system that appears to work.
     a P0 send 3 times exhausts the retry budget (1s/2s/4s), logs at `ERROR`, and leaves the pending
     permission request live rather than marking it delivered; the same stub failing a P2 edit is not
     retried at all. Unit with a fake clock and a stub transport (§5.4).
+42. **`/model` writes the raw keystroke, not a channel message.** `/model opus` sent in a session's own
+    topic calls the PTY write directly with `/model opus\r` and never calls `renderChannelTag` - assert
+    against a stubbed PTY write, not the pipe. A name outside `sonnet|opus|haiku|fable` is rejected with
+    the valid list and nothing is written to the PTY. Unit (§4.2.1).
+43. **`/mode` computes the right number of Shift+Tab writes and tracks the result.** From a routing-table
+    state of `manual`, `/mode auto` writes `\x1b[Z` exactly three times (§4.2.2's cycle order) and updates
+    the tracked state to `auto`; a second `/mode auto` immediately after writes zero times, not three -
+    the tracked state, not a fresh assumption of `manual`, is the source of truth for the next call. A
+    name outside the four modes is rejected before anything is written. Unit against a stubbed PTY write
+    and a seeded routing-table row, table-driven over every (current, target) pair in the cycle.
 
 Scenarios 29 and 30 need a **stub Telegram Bot API server** (a local HTTP server implementing
 `getUpdates`, `sendMessage`, `editMessageText`, `createForumTopic` and `answerCallbackQuery`, for two
@@ -2717,7 +2841,12 @@ dependency rather than satisfying it (§6.5). P-3 is gone (§7.3) and item 3 is 
   the distinct "stopped on a usage limit" state (§10.5).
 - Per-session model routing: Sonnet default, `--opus` and `--haiku` overrides, and the weighted unit
   budget that admits them (§10.5).
-- **Exit:** scenarios 24-28 and 32 pass; four concurrent Sonnet sessions run for an hour without
+- `/model <name>` (§4.2.1), reusing the dev-flag confirm keystroke's raw PTY write as a real feature
+  instead of a debug-only affordance, so a running session's model can change mid-conversation.
+- `/mode <name>` (§4.2.2), the same primitive driving the Shift+Tab permission-mode cycle. The cycle
+  order it depends on must be live-confirmed against a real session before this ships, not carried
+  forward as the plan-time assumption it starts as.
+- **Exit:** scenarios 24-28, 32, 42 and 43 pass; four concurrent Sonnet sessions run for an hour without
   manual intervention, the weighted budget refuses a fifth, and the fleet's spend is visible in
   `/budget` throughout.
 

@@ -1,0 +1,15 @@
+{
+  // Session worktrees (packages/bridge/src/index.ts) are created nested at .worktrees/<slug>,
+  // not as a sibling directory - so VS Code's built-in Git extension can discover each one as
+  // its own Source Control provider just by scanning inside this opened folder. A sibling path
+  // could never be found this way (the scan only looks inside the opened folder), which is the
+  // whole reason for the nested convention (see SeoWrite's seowrite.code-workspace for the fuller
+  // version of this same setup, needed there because it's opened as a multi-root workspace).
+  //
+  // Depth 2, not the default of 1: a worktree's `.git` file lives at .worktrees/<slug>/.git,
+  // two levels below this folder. Bump this if session worktrees ever nest one level deeper.
+  "git.autoRepositoryDetection": true,
+  "git.repositoryScanMaxDepth": 2,
+  "git.openRepositoryInParentFolders": "never",
+  "scm.alwaysShowRepositories": true
+}

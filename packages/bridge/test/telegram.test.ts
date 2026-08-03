@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { startPolling, validateTokens } from "../src/telegram.ts";
+import { StubTelegramServer } from "@aibridge/stub-telegram";
+import { startPolling, TelegramClient, validateTokens } from "../src/telegram.ts";
 import type { GetMeSource, TelegramUpdate, UpdatesSource } from "../src/telegram.ts";
 
 function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -89,5 +90,53 @@ describe("startPolling", () => {
 
     expect(errors.length).toBeGreaterThanOrEqual(2);
     expect(received).toEqual([99]);
+  });
+
+  test("delivers callback_query updates alongside message updates", async () => {
+    const stub = new StubTelegramServer();
+    const { baseUrl } = stub.start(0);
+    try {
+      const token = "control-token";
+      const client = new TelegramClient(token, baseUrl);
+      await validateTokens(client, client);
+
+      const updates: TelegramUpdate[] = [];
+      const stop = startPolling(client, { timeoutSec: 1, retryDelayMs: 5, onUpdate: (u) => updates.push(u) });
+
+      stub.pushCallbackQuery(token, { chatId: -1, data: "run:builtin:compact", messageThreadId: 3 });
+      await waitFor(() => updates.length >= 1);
+      stop();
+
+      expect(updates[0]?.callback_query).toMatchObject({ data: "run:builtin:compact" });
+    } finally {
+      stub.stop();
+    }
+  });
+});
+
+describe("TelegramClient", () => {
+  test("answerCallbackQuery records the callback_query_id against the right token", async () => {
+    const stub = new StubTelegramServer();
+    const { baseUrl } = stub.start(0);
+    try {
+      const client = new TelegramClient("control-token", baseUrl);
+      await client.answerCallbackQuery("42");
+      expect(stub.getAnsweredCallbackQueries("control-token")).toEqual(["42"]);
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("sendMessage forwards an inline keyboard as reply_markup", async () => {
+    const stub = new StubTelegramServer();
+    const { baseUrl } = stub.start(0);
+    try {
+      const client = new TelegramClient("control-token", baseUrl);
+      const keyboard = { inline_keyboard: [[{ text: "/compact", callback_data: "run:builtin:compact" }]] };
+      await client.sendMessage(-1, 3, "Available commands:", keyboard);
+      expect(stub.getSent("control-token")[0]?.reply_markup).toEqual(keyboard);
+    } finally {
+      stub.stop();
+    }
   });
 });
