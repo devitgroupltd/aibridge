@@ -4,6 +4,7 @@ import { encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protoc
 import type { HelloFromChannel, Message, ReplyMessage } from "@aibridge/protocol";
 import { startPipeServer } from "../src/pipe-server.ts";
 import { Routing } from "../src/routing.ts";
+import { createThinkingPlaceholder } from "../src/thinking-placeholder.ts";
 import type { SendMessageSource } from "../src/telegram.ts";
 
 function pipePath(): string {
@@ -99,6 +100,134 @@ describe("startPipeServer", () => {
 
     await waitFor(() => calls.length >= 1);
     expect(calls[0]).toEqual({ chatId: "-1004470540564", threadId: 3, text: "hi from claude" });
+  });
+
+  test("onReplySent fires with the topic_id after a successful reply, and not on a failed one", async () => {
+    const path = pipePath();
+    const routing = new Routing();
+    routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+    const fired: string[] = [];
+    const controlBot: SendMessageSource = { sendMessage: async () => ({ message_id: 1 }) };
+
+    const handle = startPipeServer({
+      pipePath: path,
+      routing,
+      controlBot,
+      chatId: "-1",
+      onReplySent: (topicId) => fired.push(topicId),
+    });
+    servers.push(handle.server);
+    await waitFor(() => handle.server.listening);
+
+    const { socket } = connectClient(path);
+    await waitFor(() => socket.readyState === "open");
+    socket.write(
+      encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "hi" } satisfies ReplyMessage),
+    );
+
+    await waitFor(() => fired.length >= 1);
+    expect(fired).toEqual(["3"]);
+  });
+
+  test("onReplySent does not fire when the send itself fails", async () => {
+    const path = pipePath();
+    const routing = new Routing();
+    routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+    const fired: string[] = [];
+    const errors: string[] = [];
+    const controlBot: SendMessageSource = {
+      sendMessage: async () => {
+        throw new Error("network blip");
+      },
+    };
+
+    const handle = startPipeServer({
+      pipePath: path,
+      routing,
+      controlBot,
+      chatId: "-1",
+      onReplySent: (topicId) => fired.push(topicId),
+      log: (level, message) => {
+        if (level === "ERROR") errors.push(message);
+      },
+    });
+    servers.push(handle.server);
+    await waitFor(() => handle.server.listening);
+
+    const { socket } = connectClient(path);
+    await waitFor(() => socket.readyState === "open");
+    socket.write(
+      encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "hi" } satisfies ReplyMessage),
+    );
+
+    await waitFor(() => errors.length >= 1);
+    expect(fired).toEqual([]);
+  });
+
+  describe("thinking placeholder", () => {
+    test("a reply edits the pending placeholder instead of sending a second message", async () => {
+      const path = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const sent: Array<{ text: string }> = [];
+      const edited: Array<{ messageId: number; text: string }> = [];
+      const controlBot: SendMessageSource = {
+        sendMessage: async (_chatId, _threadId, text) => {
+          sent.push({ text });
+          return { message_id: 99 };
+        },
+        editMessageText: async (_chatId, messageId, text) => {
+          edited.push({ messageId, text });
+        },
+      };
+      const thinkingPlaceholder = createThinkingPlaceholder({ send: async () => 55 });
+      thinkingPlaceholder.start("3");
+
+      const handle = startPipeServer({ pipePath: path, routing, controlBot, chatId: "-1", thinkingPlaceholder });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket } = connectClient(path);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(
+        encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "the answer" } satisfies ReplyMessage),
+      );
+
+      await waitFor(() => edited.length >= 1);
+      expect(edited).toEqual([{ messageId: 55, text: "the answer" }]);
+      expect(sent).toEqual([]); // no second, separate message
+    });
+
+    test("falls back to sendMessage when no placeholder is pending for that topic", async () => {
+      const path = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const sent: Array<{ text: string }> = [];
+      const controlBot: SendMessageSource = {
+        sendMessage: async (_chatId, _threadId, text) => {
+          sent.push({ text });
+          return { message_id: 1 };
+        },
+        editMessageText: async () => {
+          throw new Error("should not be called - nothing pending");
+        },
+      };
+      const thinkingPlaceholder = createThinkingPlaceholder({ send: async () => 1 });
+      // No .start() call - nothing pending for topic "3".
+
+      const handle = startPipeServer({ pipePath: path, routing, controlBot, chatId: "-1", thinkingPlaceholder });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket } = connectClient(path);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(
+        encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "hi" } satisfies ReplyMessage),
+      );
+
+      await waitFor(() => sent.length >= 1);
+      expect(sent).toEqual([{ text: "hi" }]);
+    });
   });
 
   // §9 scenario 34: an unrecognised message type is logged and ignored, not a reason to drop the connection.

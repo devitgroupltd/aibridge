@@ -1,7 +1,7 @@
 ---
-version: 0.11.0
+version: 0.13.0
 status: solid
-last_modified_utc: 2026-08-03T07:10:00Z
+last_modified_utc: 2026-08-03T11:50:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,30 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.13.0 (2026-08-03): Post-Phase-1 addition, not part of the original scenario list: an
+    operator-visible 'Claude is working' signal for the gap between an inbound message landing and
+    the reply tool call being confirmed (§9's reply-permission ask rule alone left that gap silent).
+    First attempt was Telegram's native sendChatAction typing status; live testing surfaced a real
+    Telegram Desktop client bug (tdesktop#30452) where the indicator only renders in the topics
+    overview list, not inside the open topic the operator is actually watching - confirmed via a
+    direct sendChatAction call returning ok:true while nothing appeared in the open topic. Fixed by
+    adding a second, independent mechanism (thinking-placeholder.ts): a real '(thinking emoji)
+    Thinking...' message sent when a turn starts and edited in place into the reply text once it
+    lands via editMessageText, rather than a second message - real messages render identically on
+    every client. Both mechanisms are kept side by side (typing-indicator.ts for mobile, the
+    placeholder for desktop) since neither costs anything the other doesn't already pay. Also fixed
+    the typing indicator's own maxTicks safety cap, originally 24 ticks (96s), which was expiring
+    well before turns that took several minutes - raised to 450 (30 min), backstopped by the reply's
+    onReplySent as the real stop signal. Proven live end to end against the real Telegram group:
+    placeholder message appears, gets edited into the actual reply with no duplicate message, typing
+    indicator confirmed visible on both mobile and (once the placeholder message existed in the
+    topic) desktop. 35 tests and tsc --noEmit stayed green throughout"
+  - "0.12.0 (2026-08-03): PHASE 1 COMPLETE. Scenario 37 measured: killing the Bridge process alone
+    (Stop-Process, not a tree-kill) took the live claude.exe and its channel-server child down with
+    it - zero survivors. This collapses §4.5's reconciliation table's 'process alive' row to never
+    occurring in practice on this stack, makes claude --resume on a fresh PTY the only recovery path
+    (not one of several), and promotes the Job Object opt-out fallback from a contingency to a
+    concrete Phase 5 candidate. Both Phase 1 exit items (scenario 29, scenario 37) are now done"
   - "0.11.0 (2026-08-03): Stage 7 manual verification findings. HIGH: notifications/claude/channel
     confirmed broken upstream and independent of channelsEnabled - server.getClientCapabilities()
     returns undefined in this exact config, matching the consolidated tracker
@@ -109,6 +133,17 @@ changelog:
   - "0.3.0 (2026-08-02): Pass 2 - open questions and risks investigated against the docs and closed. CORRECTION: v0.2.0's central finding was wrong. A PreToolUse hook returning `allow` does NOT pre-empt the permission system; the docs state deny and ask rules are evaluated regardless of hook output. The fix is an `ask` rule in the generated per-session settings, so guard-git-write.ps1 needs no change and the AIBRIDGE_SESSION gate is withdrawn (§6.1.1). Adopted the OS-level Bash sandbox, which works on WSL2 and inverts the allowlist strategy (§6.7). Replaced the 540s AskUserQuestion auto-answer with the documented per-hook `timeout` field and the official updatedInput/answers shape (§6.4). Added a non-blocking PermissionRequest observer hook, which makes prompt reconciliation exact instead of heuristic (§6.5). Second bot token for feed traffic: Telegram limits are per bot, so P2 gets its own 20/min (§5.4). Launch dialogs are three, not one, and two are avoidable via user-level config (§2.4, §10.1). Added the usage/cost risk (§10.5). §9 grew to 30 scenarios"
   - "0.2.0 (2026-08-02): Pass 1 review - CRITICAL: guard-git-write.ps1 Layer 3 now auto-allows commit/push, which pre-empts the channel relay and would let a phone commit unapproved; added the AIBRIDGE_SESSION escalation gate (§6.1.1) and moved P-3 to a Phase 2 blocker. CRITICAL: editMessageText shares the sendMessage rate budget, so fixed 3s coalescing overruns the 20/min group limit at 2+ sessions; replaced with session-count-scaled intervals and a 12/min P2 reservation (§5.4). Expanded the bash-port parity requirements and pinned both implementations to test_claude_hook_guards (§7.3, scenarios 11-12). Renumbered §9 to 24 contiguous scenarios and corrected every cross-reference"
   - "0.1.0 (2026-08-02): Initial plan - Telegram-driven multi-session Claude Code control via a custom MCP channel server, hook-fed activity feed and inline-button permission relay, hosted on WSL2"
+v0130_touched_sections:
+  - section: "§12 Phase 1 - walking skeleton"
+    type: modified
+    summary: "Added a post-exit-criteria bullet documenting the operator-visible working indicator (typing action + message-based thinking placeholder), including the live-discovered Telegram Desktop typing-indicator bug and the fix"
+v0120_touched_sections:
+  - section: "§4.5 Restart recovery and orphan reconciliation"
+    type: modified
+    summary: "Scenario 37 measured live: sessions do not survive Bridge death on this stack (Stop-Process on the Bridge alone killed claude.exe and its channel-server child too). Struck the two bullets that assumed partial re-adoption / an open question, replaced with the measured consequence: claude --resume is the only recovery path, always, and the Job Object opt-out is now a concrete next step rather than a contingency"
+  - section: "§12 Phase 1 - walking skeleton"
+    type: modified
+    summary: "Marked complete: scenario 29 (proven live via PTY injection, v0.11.0) and scenario 37 (measured: sessions don't survive Bridge death) are both done"
 v0110_touched_sections:
   - section: "§10.1.2 notifications/claude/channel is broken upstream, independent of channelsEnabled - decision: stop using it for inbound"
     type: added
@@ -960,22 +995,58 @@ the Telegram topic list.
 | Process alive, no row | Orphan from a crashed Bridge mid-`/new`. Adopt into a fresh topic |
 | Row `state = awaiting_input` | The pending prompt is gone (§6.5). Post an explicit "the pending question was lost, please re-ask" rather than leaving a dead button |
 
-Two things get harder than they were under tmux, and both are consequences of §2.3 rather than
-oversights:
+**MEASURED 2026-08-03 (scenario 37, Stage 7).** Killed the Bridge process alone via PowerShell
+`Stop-Process -Id <bridge_pid> -Force` - explicitly *not* a tree-kill (`TaskStop`-equivalent), to
+isolate whether Windows kills children with their parent by default. It does not, in general - but
+this specific chain does: with a live session running (`claude.exe`, spawned via `node-pty`, itself
+having spawned the `bun.exe` channel server as its own registered-MCP-server child), killing only the
+Bridge's `node.exe` process left **zero** survivors. `Get-Process claude`/`Get-Process bun` immediately
+after showed neither PID anywhere on the system - not orphaned, not reparented, gone. This resolves the
+open question below in the direction the fallback was written for.
 
-- **Re-adoption is partial.** tmux was an independent process holding the terminal, so a restarted
-  supervisor could reattach to a live window and resume reading it. A PTY handle belongs to the process
-  that created it, so a restarted Bridge can see that the `claude` process is alive but **cannot read
-  its output or write to its stdin again**. The session keeps working and keeps talking through its
-  channel server and hooks, which is the path that actually matters, but the Bridge loses the PTY-level
-  view until the session ends. Row 1's re-adopt is therefore "adopt the session, not the terminal", and
-  `/attach` degrades to the `--resume` command alone for such sessions.
-- **Child survival across Bridge death is not assumed.** On Windows a child process is not killed with
-  its parent by default, but the ConPTY pseudoconsole host is a separate process in the chain and its
-  teardown behaviour on parent death is exactly the kind of thing that differs between Node versions
-  and Windows builds. **This must be measured in Phase 1, not assumed** (scenario 33). If sessions do
-  die with the Bridge, the fallback is to spawn each `claude` detached and in its own Job Object
-  configured *not* to kill on close, which is the documented way to opt out.
+This changes the reconciliation table above in a real way, not just a footnote:
+
+- **Row 1 ("process alive") does not occur in practice on this stack.** The distinction the two bullets
+  below used to draw - "the process survives but the Bridge loses the PTY view" vs. "the process might
+  not survive at all" - collapses, because the process does not survive. Every Bridge restart with a
+  live session forces **row 2** ("process gone"): `claude --resume <session_id>` on a fresh PTY is not
+  one recovery path among several, it is the *only* one, always, for every session that was running
+  when the Bridge died. The `/attach`-degrades-to-`--resume` framing below is moot for the same reason
+  - there is nothing PTY-level left to degrade from.
+- **Practical consequence for Phase 5's supervisor**: a Bridge crash or restart is not a "graceful
+  reconnect" event on this host, it is a "relaunch every live session from its last transcript" event.
+  `claude --resume` preserves conversation history (a durable transcript, independent of the PTY that
+  hosted it), so no work is lost, but every session pays the cold-start cost above (dev-channels
+  dialog, MCP consent, model/worktree re-resolution) on every Bridge restart, not just the first launch.
+  Worth factoring into how aggressively Phase 5 restarts the Bridge (e.g. on every deploy) versus how
+  disruptive that is to whoever is mid-conversation on Telegram at the time.
+- **The Job Object opt-out fallback below is now the concrete next step, not a contingency.** If
+  session survival across Bridge restarts is worth the engineering cost, spawning each `claude` detached
+  in its own Job Object configured not to kill on close (Windows' documented mechanism for exactly this)
+  is what would need building - not because the measurement was inconclusive, but because the measured
+  answer was "no, they don't survive" and that fallback is the only listed way to change that answer.
+
+What did *not* change: the underlying cause is still unconfirmed (Job Object inheritance from ConPTY's
+pseudoconsole host, `claude.exe` treating a closed stdin/stdout handle as a disconnect signal and
+exiting itself, or something else) - the measurement answers "does it survive" definitively, not "why
+not". Not chased further since the practical answer (build the Job Object opt-out, or accept the
+cold-start cost) doesn't depend on which mechanism it turns out to be.
+
+Two things get harder than they were under tmux, and both are consequences of §2.3 rather than
+oversights - the first is now superseded by the measurement above, kept for the historical reasoning:
+
+- ~~**Re-adoption is partial.**~~ **Superseded above: re-adoption doesn't happen at all, the process is
+  gone.** tmux was an independent process holding the terminal, so a restarted supervisor could
+  reattach to a live window and resume reading it. A PTY handle belongs to the process that created
+  it, so a restarted Bridge would only have been able to see the `claude` process alive but not read
+  its output or write to its stdin again - this reasoning was correct as far as it went, but assumed
+  the process itself would still be there to have this problem with.
+- ~~**Child survival across Bridge death is not assumed.**~~ **Measured above: it does not survive.**
+  On Windows a child process is not killed with its parent by default, but the ConPTY pseudoconsole
+  host is a separate process in the chain and its teardown behaviour on parent death turned out to
+  matter here. The fallback named at the time - spawn each `claude` detached and in its own Job Object
+  configured *not* to kill on close - is the documented way to opt out, and is now the concrete
+  next step if this behaviour needs to change (see above).
 
 ---
 
@@ -2583,10 +2654,24 @@ anything on top of it.
 - Channel server: `claude/channel`, `reply` tool, nothing else.
 - Manual launch: one `claude` on one Bridge-owned PTY, one hardcoded topic.
 - The stub Telegram server (§9), because everything after this depends on being testable.
-- Measure whether sessions survive Bridge death (scenario 37, §4.5), because the answer decides
-  whether spawning needs Job Object handling and it is cheaper to know now than at Phase 6.
-- **Exit:** scenario 29 passes. A message typed in the topic reaches Claude, and Claude's reply appears
-  in that topic.
+- ~~Measure whether sessions survive Bridge death (scenario 37, §4.5)~~ **Done 2026-08-03: they do
+  not.** Killing the Bridge alone (not a tree-kill) took `claude.exe` and its channel-server child down
+  with it - zero survivors, immediately. The Job Object opt-out named in §4.5 as a fallback is now a
+  concrete Phase 5 candidate, not a contingency; see §4.5 for the reconciliation-table consequences.
+- **Exit:** scenario 29 passes (also done, 2026-08-03: §10.1.2's PTY-injection path proven live against
+  the real Telegram group - a message typed in the topic reached Claude and a real reply appeared in
+  that topic). **Phase 1 is complete.**
+- **Added post-exit, 2026-08-03: an operator-visible "Claude is working" signal.** Not a scenario in
+  §9's list, but a cheap addition once §10.1.2's PTY injection meant the operator could send a message
+  and then wait with no feedback until the reply's permission prompt was confirmed. Two independent
+  mechanisms, kept side by side rather than one replacing the other: `sendChatAction("typing")` (renders
+  correctly on mobile clients, but Telegram Desktop has a confirmed client bug, tdesktop#30452, that only
+  shows it in the topics overview list rather than inside the open topic - discovered live when a direct
+  API call returned `ok:true` with nothing visible in the open topic on Desktop), and a real
+  "🤔 Thinking..." message sent on turn start and edited in place into the reply text via
+  `editMessageText` once it lands (real messages render identically everywhere, so this covers Desktop).
+  Proven live: placeholder appears, gets edited into the actual reply with no duplicate message, typing
+  action confirmed visible on both mobile and desktop.
 
 ### Phase 2 - permission relay
 

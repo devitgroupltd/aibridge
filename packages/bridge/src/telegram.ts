@@ -25,6 +25,12 @@ export interface SendMessageSource {
     messageThreadId: number | undefined,
     text: string,
   ): Promise<{ message_id: number }>;
+  /** Optional: only needed by callers that edit a previously-sent message (the thinking placeholder). */
+  editMessageText?(chatId: string | number, messageId: number, text: string): Promise<void>;
+}
+
+export interface SendChatActionSource {
+  sendChatAction(chatId: string | number, messageThreadId: number | undefined, action: string): Promise<void>;
 }
 
 async function parseTelegramResponse<T>(res: Response, method: string): Promise<T> {
@@ -77,6 +83,28 @@ export class TelegramClient implements UpdatesSource {
       body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId, text }),
     });
     return parseTelegramResponse(res, "sendMessage");
+  }
+
+  async sendChatAction(
+    chatId: string | number,
+    messageThreadId: number | undefined,
+    action: string,
+  ): Promise<void> {
+    const res = await fetch(this.url("sendChatAction"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId, action }),
+    });
+    await parseTelegramResponse(res, "sendChatAction");
+  }
+
+  async editMessageText(chatId: string | number, messageId: number, text: string): Promise<void> {
+    const res = await fetch(this.url("editMessageText"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId, text }),
+    });
+    await parseTelegramResponse(res, "editMessageText");
   }
 }
 

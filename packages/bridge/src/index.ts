@@ -7,6 +7,8 @@ import { launchSession } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
 import { Routing } from "./routing.ts";
 import { startPolling, TelegramClient, validateTokens } from "./telegram.ts";
+import { createThinkingPlaceholder } from "./thinking-placeholder.ts";
+import { createTypingIndicator } from "./typing-indicator.ts";
 
 type LogLevel = "INFO" | "WARN" | "ERROR";
 
@@ -31,6 +33,23 @@ async function main(): Promise<void> {
   const routing = new Routing();
   routing.add({ slug: config.phase1.slug, topicId: config.phase1.topicId, worktreePath });
 
+  // Two independent, cheap "Claude is working on this" signals, kept side by side rather than
+  // choosing one: `sendChatAction` renders correctly on mobile clients but Telegram Desktop has a
+  // known bug (tdesktop#30452) that only shows it in the topics overview, not inside the open
+  // topic - so the message-based placeholder covers desktop, and the reply landing is what stops
+  // (or, for the placeholder, edits away) both of them.
+  const typingIndicator = createTypingIndicator({
+    send: (topicId) => controlBot.sendChatAction(config.supergroupChatId, Number(topicId), "typing"),
+    log: (level, message) => log(level, message),
+  });
+  const thinkingPlaceholder = createThinkingPlaceholder({
+    send: async (topicId) => {
+      const sent = await controlBot.sendMessage(config.supergroupChatId, Number(topicId), "🤔 Thinking...");
+      return sent.message_id;
+    },
+    log: (level, message) => log(level, message),
+  });
+
   // §10.1.2: inbound delivery no longer goes through the channel server (see the onUpdate
   // handler below), but the pipe server still owns outbound reply relay and stays the
   // transport for Phase 2+ (permission_request/verdict), so it's still started unconditionally.
@@ -38,6 +57,8 @@ async function main(): Promise<void> {
     routing,
     controlBot,
     chatId: config.supergroupChatId,
+    thinkingPlaceholder,
+    onReplySent: (topicId) => typingIndicator.stop(topicId),
     log,
   });
 
@@ -113,6 +134,8 @@ async function main(): Promise<void> {
       // swallowing the embedded Enter (renderChannelTag's own doc comment).
       write(renderChannelTag(message.text, meta));
       write("\r");
+      typingIndicator.start(meta.topic_id);
+      thinkingPlaceholder.start(meta.topic_id);
     },
     onError: (err) => {
       log("WARN", `getUpdates failed, retrying: ${(err as Error).message}`);

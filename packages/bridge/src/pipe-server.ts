@@ -1,6 +1,7 @@
 import net from "node:net";
 import { encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protocol";
 import type { ChannelMetaFields, HelloAck, InboundMessage, Message, ReplyMessage } from "@aibridge/protocol";
+import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import type { Routing } from "./routing.ts";
 import type { SendMessageSource } from "./telegram.ts";
 
@@ -14,6 +15,12 @@ export interface PipeServerOptions {
   controlBot: SendMessageSource;
   /** The one supergroup chat every session's topics live in (§4.1). */
   chatId: string;
+  /** If a "🤔 Thinking..." placeholder is pending for this topic, the reply edits it in place
+   * instead of sending a second message (see `thinking-placeholder.ts`). */
+  thinkingPlaceholder?: ThinkingPlaceholder;
+  /** Fires after a `reply` is successfully delivered - the typing indicator's stop signal (§5's
+   * feed doesn't exist yet, but "a reply landed" is already known here regardless). */
+  onReplySent?: (topicId: string) => void;
   log?: LogFn;
 }
 
@@ -36,7 +43,13 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
 
   async function handleReply(msg: ReplyMessage): Promise<void> {
     try {
-      await opts.controlBot.sendMessage(opts.chatId, Number(msg.topic_id), msg.text);
+      const placeholderId = await opts.thinkingPlaceholder?.consume(msg.topic_id);
+      if (placeholderId !== undefined && opts.controlBot.editMessageText) {
+        await opts.controlBot.editMessageText(opts.chatId, placeholderId, msg.text);
+      } else {
+        await opts.controlBot.sendMessage(opts.chatId, Number(msg.topic_id), msg.text);
+      }
+      opts.onReplySent?.(msg.topic_id);
     } catch (err) {
       log("ERROR", `failed to deliver reply for slug "${msg.slug}": ${(err as Error).message}`);
     }
