@@ -1,7 +1,7 @@
 ---
-version: 0.9.0
-status: draft
-last_modified_utc: 2026-08-02T18:52:58Z
+version: 0.11.0
+status: solid
+last_modified_utc: 2026-08-03T07:10:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,37 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.11.0 (2026-08-03): Stage 7 manual verification findings. HIGH: notifications/claude/channel
+    confirmed broken upstream and independent of channelsEnabled - server.getClientCapabilities()
+    returns undefined in this exact config, matching the consolidated tracker
+    anthropics/claude-code#36431; §10.0's 'RESOLVED' framing is superseded (not deleted) by new §10.1.2,
+    which surveys community workarounds (all of which inject via tmux/PTY keystrokes rather than the
+    channel-notification path) and records the decision to switch Phase 1 inbound delivery to direct
+    PTY text injection while keeping the reply MCP tool for outbound. HIGH: corrected two false §2.4
+    claims found while diagnosing this live - registering the channel in ~/.claude.json alone does not
+    make --dangerously-load-development-channels resolve it (needs .mcp.json, which reintroduces the
+    per-/new consent dialog v0.10.0 thought it had avoided), and a registered MCP server's env does not
+    inherit from the ptyEnv() passed to the outer claude.exe process (AIBRIDGE_SLUG/AIBRIDGE_TOPIC must
+    be set directly on the server's own env key). MEDIUM: a bare `command: \"bun\"` in an MCP server
+    registration doesn't resolve for the same reason a bare `claude` didn't (§2.4 correction 4) -
+    resolve bun.exe's absolute path the same way. Same day, same session: the §10.1.2 PTY-injection
+    workaround was actually implemented (protocol renderChannelTag, Routing.setPtyWrite, index.ts
+    wiring) and PROVEN LIVE end to end against the real Telegram group - closing Stage 7's scenario 29.
+    One more live-only finding folded in: a single .write() carrying the tag text plus a trailing \\r
+    left it unsubmitted (bracketed-paste handling swallowing the embedded Enter); sending \\r as a
+    separate write fixed it. 43 tests and tsc --noEmit stayed green throughout"
+  - "0.10.0 (2026-08-02): Pass 2 review - HIGH: guard-git-write.ps1 was renumbered by an unrelated
+    concurrent edit to SeoWrite (Layer 3 -> Layer 6 for the auto-allow, Layers 1/2 -> Layers 3/4 for
+    the protected-branch/--no-verify hard blocks); rewrote all four live cross-references (§6.1.1,
+    §7.3) to name the layers by function with the current numbers kept only as a dated snapshot, so
+    the plan survives the hook being renumbered again. MEDIUM: added scenarios 40-41 proving the
+    sessions.state transition table and the non-429 retry/backoff policy added in pass 1, neither of
+    which had a test scenario. MEDIUM: gave the §8.2 pairing bootstrap code an explicit charset and a
+    10-minute single-use expiry, matching the rigor already given to the permission request_id.
+    MEDIUM: P-2 now validates both bot tokens with a getMe call at startup rather than surfacing a bad
+    token for the first time inside a live sendMessage. LOW: clarified that the §5.7 query_source
+    attribute distinguishes request origin (main/subagent/auxiliary), not billing pool, so it is
+    never the mechanism for verifying §10.5's subscription-vs-credit-pool split"
   - "0.9.0 (2026-08-02): Pass 1 review - HIGH: corrected Telegram's bot file-download limit from 50MB
     to the actual documented 20MB (§5.6). HIGH: added a retry/backoff policy for non-429 Telegram API
     failures, so a failed P0 permission-prompt send is never silently assumed delivered (§5.4).
@@ -78,6 +109,32 @@ changelog:
   - "0.3.0 (2026-08-02): Pass 2 - open questions and risks investigated against the docs and closed. CORRECTION: v0.2.0's central finding was wrong. A PreToolUse hook returning `allow` does NOT pre-empt the permission system; the docs state deny and ask rules are evaluated regardless of hook output. The fix is an `ask` rule in the generated per-session settings, so guard-git-write.ps1 needs no change and the AIBRIDGE_SESSION gate is withdrawn (§6.1.1). Adopted the OS-level Bash sandbox, which works on WSL2 and inverts the allowlist strategy (§6.7). Replaced the 540s AskUserQuestion auto-answer with the documented per-hook `timeout` field and the official updatedInput/answers shape (§6.4). Added a non-blocking PermissionRequest observer hook, which makes prompt reconciliation exact instead of heuristic (§6.5). Second bot token for feed traffic: Telegram limits are per bot, so P2 gets its own 20/min (§5.4). Launch dialogs are three, not one, and two are avoidable via user-level config (§2.4, §10.1). Added the usage/cost risk (§10.5). §9 grew to 30 scenarios"
   - "0.2.0 (2026-08-02): Pass 1 review - CRITICAL: guard-git-write.ps1 Layer 3 now auto-allows commit/push, which pre-empts the channel relay and would let a phone commit unapproved; added the AIBRIDGE_SESSION escalation gate (§6.1.1) and moved P-3 to a Phase 2 blocker. CRITICAL: editMessageText shares the sendMessage rate budget, so fixed 3s coalescing overruns the 20/min group limit at 2+ sessions; replaced with session-count-scaled intervals and a 12/min P2 reservation (§5.4). Expanded the bash-port parity requirements and pinned both implementations to test_claude_hook_guards (§7.3, scenarios 11-12). Renumbered §9 to 24 contiguous scenarios and corrected every cross-reference"
   - "0.1.0 (2026-08-02): Initial plan - Telegram-driven multi-session Claude Code control via a custom MCP channel server, hook-fed activity feed and inline-button permission relay, hosted on WSL2"
+v0110_touched_sections:
+  - section: "§10.1.2 notifications/claude/channel is broken upstream, independent of channelsEnabled - decision: stop using it for inbound"
+    type: added
+    summary: "New section superseding §10.0's RESOLVED framing. Documents the live 2026-08-03 repro (server.getClientCapabilities() returns undefined), cross-references the consolidated upstream tracker anthropics/claude-code#36431, surveys community bridge projects (all use tmux/PTY keystroke injection, none use the channel-notification path), and records the decision to switch Phase 1 inbound delivery to direct PTY text injection while keeping the reply MCP tool for outbound"
+  - section: "§2.4 Session launch: registration, identity and the three dialogs"
+    type: modified
+    summary: "Two corrections to claims that turned out false when tested live: (1) --dangerously-load-development-channels resolves server:<name> against the worktree's .mcp.json, not ~/.claude.json's per-project registration, so the per-/new consent dialog this plan thought it had avoided is unavoidable for a channel; (2) a registered MCP server's env does not inherit from the outer claude.exe process's env, so AIBRIDGE_SLUG/AIBRIDGE_TOPIC must be set directly on the server's own env key. Also added: a bare command: \"bun\" doesn't resolve, for the same reason a bare claude didn't (correction 4) - resolve bun.exe's absolute path the same way"
+v0100_touched_sections:
+  - section: "§6.1.1 Why a target repo's own guard hook does not defeat this"
+    type: modified
+    summary: "Layer-number cross-references to SeoWrite's guard-git-write.ps1 renamed to name layers by function (protected-branch hard block, --no-verify hard block, auto-allow) with current numbers kept only as a dated snapshot, after the hook was renumbered by an unrelated concurrent edit"
+  - section: "§7.3 A target repo's own guard hook needs no work from aibridge"
+    type: modified
+    summary: "Same layer-number drift fix as §6.1.1, applied to this section's worked-example paragraph"
+  - section: "§9 Testing"
+    type: modified
+    summary: "Added scenarios 40-41: sessions.state transitions match §4.3's table; non-429 send failures retry then fail loud rather than vanish"
+  - section: "§8.2 Controls"
+    type: modified
+    summary: "Pairing bootstrap code now has an explicit charset (matching the request_id alphabet) and a 10-minute single-use expiry"
+  - section: "§12 Phases"
+    type: modified
+    summary: "P-2 now validates both bot tokens with a getMe call at startup before the poller registers or any session launches"
+  - section: "§5.7 Telemetry: the third event path"
+    type: modified
+    summary: "Clarified that query_source distinguishes request origin, not billing pool, so it cannot verify §10.5's subscription-vs-credit-pool split"
 v090_touched_sections:
   - section: "§5.6 Attachments and compaction"
     type: modified
@@ -481,18 +538,53 @@ key is documented as one of the few read once at session start with restart sema
 no such ambiguity. On a Max 5x plan this default is the single largest lever on burn rate, so §10.5
 treats it as a budget decision rather than a quality one.
 
-**Registration.** The channel is an ordinary MCP server entry. It is registered **user-level in
-`~/.claude.json` with an absolute path**, not in a per-worktree `.mcp.json`. This is not a style
-preference: the docs state that a server appearing in a project's `.mcp.json` triggers a *"New MCP
-server found in this project"* consent dialog on first use, and every worktree is a new project
-directory, so a project-scoped registration would raise that dialog on **every** `/new`.
+**Registration - CORRECTED 2026-08-03, this was wrong.** v0.10.0 and earlier claimed the channel could
+be registered **user-level in `~/.claude.json`** to dodge the `.mcp.json` consent dialog. Measured live
+against **2.1.220** during Stage 7: a server registered only in `~/.claude.json`'s
+`projects[canonicalPath].mcpServers` produces Claude Code's own startup banner claiming
+`server:aibridge - no MCP server configured with that name` and the channel server is **never spawned at
+all** (confirmed by an empty debug log and no `hello` reaching the Bridge's pipe server). Registering the
+identical entry in the worktree's own **`.mcp.json`** instead, and accepting the resulting "New MCP
+server found in this project" consent dialog, is what actually makes `--dangerously-load-development-channels`
+resolve `server:aibridge` and spawn it. **`--dangerously-load-development-channels` resolves its
+`server:<name>` argument against `.mcp.json`, not against `~/.claude.json`'s per-project registration** -
+those are two different registries as far as this flag is concerned, even though both work fine for
+*ordinary* MCP tool use (confirmed: SeoWrite's `playwright`/`chrome-devtools` entries in `~/.claude.json`
+work with no `.mcp.json` at all). This means the per-`/new` consent dialog v0.10.0 tried to avoid is
+**unavoidable for a channel specifically**, not just an unproven risk - see §10.1.2 for why this stopped
+mattering once channels turned out to be broken regardless.
 
-**Session identity.** Nothing in the channel protocol tells a channel server which session spawned it.
-The `env` passed at spawn sets the variable in the session's environment, `claude` inherits it, and the
-MCP subprocess and every hook exec inherit it in turn. So `AIBRIDGE_SLUG` is the identity for all three
-components from birth, before `SessionStart` has fired. Note that this is *more* reliable than the
-tmux `-e` route it replaces, because there is no second process between the Bridge and `claude` that
-could fail to propagate it.
+**Session identity - CORRECTED 2026-08-03, this was wrong.** v0.10.0 and earlier claimed the MCP
+subprocess "inherits [`AIBRIDGE_SLUG`] in turn" from the env passed to `pty.spawn`. Measured live: it
+does not. Claude Code spawns a registered MCP server as its **own** child process, not as a child of the
+`claude.exe` PTY process, so it does not inherit whatever `ptyEnv()` set on the outer process just
+because `claude.exe` itself has those variables. Without an explicit `env` on the MCP server's own
+registration entry, the channel server throws on its own `AIBRIDGE_SLUG` guard before it ever opens the
+pipe - and before its own `log()` helper is even defined, so the crash produces **no debug-log line at
+all**, which is what made this so slow to isolate live. The fix is to put `AIBRIDGE_SLUG`/`AIBRIDGE_TOPIC`
+directly on the server entry's own `env` key:
+
+```json5
+// .mcp.json (per worktree - see the Registration correction above for why this, not ~/.claude.json)
+{
+  "mcpServers": {
+    "aibridge": {
+      "command": "C:\\...\\bun.exe",  // resolved via `where bun.exe` - see next paragraph
+      "args": ["run", "<abs path to channel-server/src/index.ts>"],
+      "env": { "AIBRIDGE_SLUG": "<slug>", "AIBRIDGE_TOPIC": "<topic_id>" }
+    }
+  }
+}
+```
+
+**A third, independent bug in the same code path: `command: "bun"` doesn't resolve.** Exactly the same
+failure mode §2.4 correction 4 already documents for a bare `claude`/`claude.cmd` - `where bun` matches
+nothing, only `where bun.exe` does - and Claude Code's own spawn of a registered MCP server hits the
+same resolution gap `node-pty`'s ConPTY agent does. The registration must use `bun.exe`'s absolute path,
+resolved once via `where bun.exe` exactly as `resolveClaudeExecutable()` already does for `claude.exe`.
+Symptom when this goes unnoticed: identical to the missing-env-var bug above (no debug-log line, no
+`hello` at the Bridge) - the two are easy to conflate and both had to be fixed before the channel server
+spawned successfully at all.
 
 **The dialogs.** There are up to **five** full-screen prompts between launch and a usable session. The
 first-run pair was discovered on 2026-08-02 and is not in any of the documentation:
@@ -502,7 +594,7 @@ first-run pair was discovered on 2026-08-02 and is not in any of the documentati
 | Theme picker | First ever run under a given config, before anything else | Pre-seed `theme` in `~/.claude.json`. Blocks *before* the banner, so a session that hits it produces no output at all |
 | Fullscreen renderer offer | Same, immediately after | Pre-seed the corresponding key. Decline it: it changes how output renders and the feed parses none of it anyway |
 | Development channels warning | `--dangerously-load-development-channels`, **every session** | Unavoidable. The Bridge writes the confirmation to the session's PTY after detecting it (§10.1) |
-| New MCP server consent | A server from a project `.mcp.json`, once per project | Avoided by registering user-level, as above |
+| New MCP server consent | A server from a project `.mcp.json`, once per project | **No longer avoidable for the channel** (correction above, 2026-08-03): `--dangerously-load-development-channels` needs `.mcp.json`, so this fires on every `/new`. The Bridge answers it the same way it answers the dev-channels warning |
 | Workspace trust | A directory Claude Code has not seen before, so every new worktree | Pre-accept via `hasTrustDialogAccepted` (below) |
 
 **Measured 2026-08-02, in a directory with its `~/.claude.json` `projects[]` entry deleted outright:**
@@ -1080,7 +1172,7 @@ What arrives, and why each piece matters:
 
 | Signal | Attributes used | Used for |
 |---|---|---|
-| `claude_code.cost.usage` | `session.id`, `model`, `query_source` | Per-session spend in `/ls`; the rolling 5-hour total in `/budget` |
+| `claude_code.cost.usage` | `session.id`, `model`, `query_source` | Per-session spend in `/ls`; the rolling 5-hour total in `/budget`. `query_source` distinguishes `main`/`subagent`/`auxiliary` request origin - it does not distinguish subscription-billed interactive usage from credit-pool-billed `-p`/SDK usage, so it is never the mechanism for verifying §10.5's billing-pool split, which is an architectural guarantee (a real PTY, §2.3/§7.1) rather than something telemetry confirms after the fact |
 | `claude_code.token.usage` | `session.id`, `model`, `type` (input / output / cacheRead / cacheCreation) | Distinguishing a session that is genuinely working from one re-reading its own context; a cacheRead-heavy session is cheap and a cacheCreation-heavy one is not |
 | `claude_code.api_error` (event) | `session.id` | The quota-stop detector. This is what turns a silently frozen topic into "stopped on a usage limit" |
 | `claude_code.session.count` | `session.id` | Cross-check against the routing table during reconciliation (§4.5) |
@@ -1121,8 +1213,10 @@ double prompts. The split:
 ### 6.1.1 Why a target repo's own guard hook does not defeat this
 
 **Worked example, not aibridge's own code:** SeoWrite, the first project registered against this
-design, carries `.claude/hooks/guard-git-write.ps1`, a `PreToolUse` hook whose Layer 3 (as of
-**2026-08-02**) returns `permissionDecision: 'allow'` for every `git commit` and `git push` off a
+design, carries `.claude/hooks/guard-git-write.ps1`, a `PreToolUse` hook whose final layer (Layer 6 as
+of **2026-08-02**, renumbered that same day from Layer 3 by an unrelated edit to the hook - its own
+layer numbers are not stable across the hook's edits, so treat any specific number here as a snapshot,
+not a citation) returns `permissionDecision: 'allow'` for every `git commit` and `git push` off a
 protected branch - a deliberate choice by that repo's owner, made after being prompted at essentially
 every step of a multi-PR session. aibridge does not ship this hook and has no opinion on whether a
 registered repo has one; the finding below is about how *any* such hook interacts with the settings
@@ -1178,8 +1272,8 @@ sandbox, so the caveat is inert today and becomes live at the §7.6 migration - 
 to write the rules content-scoped from the start rather than discovering this at Phase 6.
 
 SeoWrite's guard hook needs no work on Windows (§7.3), but where a target repo has one it remains
-load-bearing for a reason the `ask` rule cannot cover: its Layers 1 and 2 (protected-branch hard
-block, `--no-verify` refusal) are `exit 2` blocks. Those are the layers a phone cannot compensate for
+load-bearing for a reason the `ask` rule cannot cover: its protected-branch and `--no-verify` hard
+blocks (Layers 3 and 4 as of 2026-08-02) are `exit 2` blocks. Those are the layers a phone cannot compensate for
 - an `ask` rule turns a commit into a button, but nothing turns "you are on `main`" into a button. A
 registered repo with no such hook simply has no equivalent hard block, and that is a property of the
 repo, not of aibridge.
@@ -1240,8 +1334,8 @@ Four documented traps, each a silent-wrong of exactly the kind §9 exists to cat
   not.
 
 One more precedence note worth internalising: a hook that **exits 2** stops the call before permission
-rules are evaluated at all, so the guard's Layers 1 and 2 outrank every list above. That is the
-correct shape - a hard block should not be negotiable by settings.
+rules are evaluated at all, so the guard's protected-branch and `--no-verify` hard blocks outrank
+every list above. That is the correct shape - a hard block should not be negotiable by settings.
 
 ### 6.3 The relay round trip
 
@@ -1615,8 +1709,8 @@ problem to solve, not aibridge's.
 
 **Worked example: SeoWrite's `.claude/hooks/guard-git-write.ps1`.** SeoWrite (the first repo registered
 against this design) carries a guard hook that matters independently of the Telegram approval path:
-§6.1.1 moved approval onto an `ask` rule that needs no hook, but that hook's Layers 1 and 2 are `exit 2`
-hard blocks with no settings equivalent. An `ask` rule can turn a commit into a button; nothing turns
+§6.1.1 moved approval onto an `ask` rule that needs no hook, but that hook's protected-branch and
+`--no-verify` hard blocks are `exit 2` blocks with no settings equivalent. An `ask` rule can turn a commit into a button; nothing turns
 "HEAD is on `main`" or "this command carries `--no-verify`" into a button, and those are the two
 failures a remote operator is least able to catch by reading a prompt on a phone. Where a registered
 repo has a hook like this, it remains the strongest guarantee in the whole system; where it does not,
@@ -1798,7 +1892,7 @@ because that is precisely what the system is for.
 |---|---|
 | **Sender gating** | Allowlist on `message.from.id`, checked **before** anything is emitted. Never on `chat.id` or `message_thread_id`: in a group those differ, and gating on the room lets any group member inject. Non-allowlisted messages are dropped silently, never answered |
 | **Topic gating** | The topic must also exist in the routing table. Sender allowlist and topic binding are both required |
-| **Pairing bootstrap** | First contact returns a 6-character code; the operator runs `/pair <code>` from the local terminal. Modelled on the official plugin |
+| **Pairing bootstrap** | First contact returns a 6-character code drawn from the same `[a-km-z0-9]` alphabet as a permission `request_id` (§6.3) - no ambiguous characters on a phone screen - single-use and expiring after 10 minutes; the operator runs `/pair <code>` from the local terminal. Modelled on the official plugin |
 | **Untrusted relay text** | `description` and `input_preview` are attacker-influenced. Clients before v2.1.211 do not sanitize them at all. The Bridge escapes them for HTML parse mode, strips bidi overrides and zero-width characters, folds whitespace, truncates to 500 chars in the prompt, and **always renders them inside `<pre>`**. They never reach a parse mode that could forge a button or a fake "✅ approved by system" line |
 | **Callback authenticity** | Every `callback_query` is re-checked against the sender allowlist. Telegram callbacks carry the tapping user, and in a group that need not be the operator |
 | **Denylist is not overridable** | `permissions.deny` entries cannot be lifted by an `♾️ Always` tap. The button path can only add to `allow`, and `deny` wins in Claude Code's precedence |
@@ -1999,6 +2093,16 @@ mis-parsed verdict all produce a system that appears to work.
 39. **`meta` hygiene.** The emitted notification carries no `source` key, every key matches
     `[A-Za-z0-9_]+`, and a `seq` is present and monotonic per session. Unit over the notification
     builder, because all three failures are silent at runtime (§3.2).
+40. **`sessions.state` transitions match §4.3's table.** Each hook event drives the row to the
+    documented next state and no other: `SessionStart` -> `idle`, `UserPromptSubmit` on an `idle` row
+    -> `working`, a blocking `AskUserQuestion` or a relayed permission prompt -> `awaiting_input`, its
+    resolution -> back to `working`, `Stop`/`StopFailure` -> `idle`, `SessionEnd` -> `dead`. Table-driven
+    unit against a seeded row, asserting the one-step transition and rejecting any transition not in
+    the table (e.g. `dead` never re-entering `working` directly).
+41. **Non-429 send failures retry, then fail loud rather than vanish.** A stubbed transport that fails
+    a P0 send 3 times exhausts the retry budget (1s/2s/4s), logs at `ERROR`, and leaves the pending
+    permission request live rather than marking it delivered; the same stub failing a P2 edit is not
+    retried at all. Unit with a fake clock and a stub transport (§5.4).
 
 Scenarios 29 and 30 need a **stub Telegram Bot API server** (a local HTTP server implementing
 `getUpdates`, `sendMessage`, `editMessageText`, `createForumTopic` and `answerCallbackQuery`, for two
@@ -2135,6 +2239,133 @@ Mitigations:
 
 Note the asymmetry found on 2026-08-02: `permission_request` relay was delivered while inbound pushes
 were still being dropped. Do not use a working relay as evidence that inbound delivery is healthy.
+
+### 10.1.2 `notifications/claude/channel` is broken upstream, independent of `channelsEnabled` - decision: stop using it for inbound
+
+**This supersedes §10.0's "RESOLVED, proven end to end" framing.** That record stands as-is (kept
+per this plan's own convention of not rewriting history), but Stage 7 manual verification on
+**2026-08-03**, against the same pinned client **2.1.220**, with `channelsEnabled` freshly reconfirmed on
+via a live admin-console screenshot, with every §2.4 registration correction above applied (`.mcp.json`,
+`bun.exe` resolved, `AIBRIDGE_SLUG` on the server's own `env`), and with the channel server **confirmed
+connected** (`channel server for "test-session" connected` logged at the Bridge, `hello_ack` received) -
+sent two real Telegram messages end to end through the pipe, into `forwardInbound()`, through a
+`server.notification()` call that **resolved with no error**. Neither produced any reaction in the live
+session: no inbound line in the transcript, no `reply` tool call, nothing, after waiting well past the
+~8 second window §10.0's own proof run needed. This is not the `channelsEnabled` failure mode from
+§10.0/§10.1.1 - that one is silent in exactly the same way, but every variable §10.1.1 names as the cause
+was independently ruled out this time before concluding anything.
+
+**Direct confirmation, not inference.** The MCP SDK's `Server.getClientCapabilities()`, logged
+immediately after `server.connect(transport)` succeeds in this exact session, returned **`undefined`** -
+Claude Code never sent *any* client capabilities, let alone `experimental["claude/channel"]`. A working
+channel would show that key present.
+
+**This is a known, currently-open Anthropic bug, not a defect in this design or its implementation.**
+[anthropics/claude-code#36431](https://github.com/anthropics/claude-code/issues/36431) is the
+consolidated tracker (duplicates folded in: #45563, #36429, #36411, #36975, #64470, and others). Reports
+span from macOS to native Windows to WSL2, both `--channels` and `--dangerously-load-development-channels`,
+multiple channel plugins (Telegram, Discord) and hand-rolled test servers, and Claude Code versions from
+2.1.80 through at least 2.1.220 (this plan's pinned version) - including a `--bg` background-daemon
+repro (2.1.150) showing `/mcp` itself reporting `1 MCP server failed` while the transport-level handshake
+still completes. One commenter on the tracker independently found the exact same `getClientCapabilities()`
+smoking gun reported here, on a completely different host and channel plugin. A `getClientCapabilities()`
+data point posted 2026-ish in the thread suggested the capability negotiation might have been fixed for
+`--channels plugin:<id>` between host versions 2.1.158 and 2.1.170 on some platforms, but a later
+comment in the same thread reproduces it again on 2.1.145-2.1.158 with the *same* plugin version that
+supposedly fixed it elsewhere - so "fixed" is not a safe conclusion for any specific version, and this
+plan's own 2.1.220 repro (well past that window, using the raw `server:` dev-flag path rather than a
+marketplace plugin) confirms it is not fixed for this design's exact configuration. Outbound is
+unaffected: every report, including this plan's own, confirms the `reply` **tool call** works
+perfectly - only the notification-push direction is broken. This matches Claude Code's own docs
+distinguishing a "standard MCP server" (tool calls only, unaffected) from a "channel" (adds the pushed-
+event capability, broken) - see the comparison table in `/docs/en/remote-control`.
+
+**Anthropic's own documented alternative doesn't fit this design.** `code.claude.com/docs/en/remote-control`
+describes a first-party mechanism ("Remote Control") that pushes messages into a running session from
+claude.ai/the Claude mobile app - and it is *not* built on `notifications/claude/channel` at all; it is a
+separate, proprietary streaming protocol between the local `claude` process and Anthropic's own backend
+(the local process "registers with the Anthropic API and polls for work"), so it is not affected by this
+bug and not something a third-party MCP server can plug into. §11 already evaluated and rejected Remote
+Control as this design's zero-build alternative (no Telegram UI, no topic-per-session organisation, no
+custom buttons) - that conclusion still holds; Remote Control's immunity to this specific bug doesn't
+change the fact that it isn't the product being built.
+
+**Survey of how other projects solve the same problem (2026-08-03).** None of the community
+Telegram/Discord-to-Claude-Code bridges found rely on `notifications/claude/channel` for inbound
+delivery at all - which, in hindsight, is itself a signal about how load-bearing this bug is industry-
+wide:
+
+| Project | Inbound mechanism |
+|---|---|
+| [oscarsterling/claude-telegram-remote](https://github.com/oscarsterling/claude-telegram-remote) | Injects messages into the tmux session via keystrokes, "wrapped in Telegram channel tags so Claude treats it as a real message" - the same `<channel source=... topic_id=...>` wrapping this plan already uses, just delivered as typed input instead of a notification |
+| [jsayubi/ccgram](https://github.com/jsayubi/ccgram) | Keystroke injection across tmux, Ghostty (AppleScript), or a **headless `node-pty` PTY as a fallback** when neither is available - the same primitive this plan already uses for the dev-channels confirmation keystroke |
+| [alexei-led/ccgram](https://github.com/alexei-led/ccgram) | tmux `send-keys`, same pattern |
+| [hanxiao/claudecode-telegram](https://github.com/hanxiao/claudecode-telegram) | tmux `send-keys`, same pattern |
+| [prassanna-ravishankar/repowire](https://github.com/prassanna-ravishankar/repowire) | Its own local daemon mesh with an MCP tool surface (`ask_peer`, `notify_peer`) rather than the channel-notification push path - explicitly chosen, per its own maintainer commenting on this bug's tracker, because it "never touches the channel capability negotiation that's failing" |
+
+Two open Anthropic feature requests
+([#24947](https://github.com/anthropics/claude-code/issues/24947),
+[#53049](https://github.com/anthropics/claude-code/issues/53049)) ask for a first-class
+`claude inject`/message-injection API and remain unimplemented, which is further evidence this is a
+known gap rather than a corner nobody has hit yet.
+
+**Decision: Phase 1 switches inbound delivery from `notifications/claude/channel` to direct PTY text
+injection, keeping the `reply` MCP tool for outbound exactly as designed.** Concretely:
+
+- The Bridge, which already owns the PTY (§2.3) and already injects keystrokes for the dev-channels and
+  MCP-consent dialogs (§2.4), writes the inbound Telegram text directly to the PTY's stdin, wrapped in
+  the same `<channel source="aibridge" topic_id="..." msg_id="..." from="...">...</channel>` shape
+  `buildMeta` already produces for the (now-unused) notification path, followed by `\r` - i.e. exactly
+  what a human operator typing that text into the TUI and pressing Enter would send. This is the same
+  primitive already proven working three times this session (the dev-channels dialog, the MCP-consent
+  dialog, and the shift+tab manual-mode toggle).
+- The channel server keeps declaring `experimental: { "claude/channel": {} }` and the `reply` tool
+  exactly as built (§3.1-§3.3) - dropping the capability declaration buys nothing since tool calls were
+  never the broken part, and keeping it costs nothing beyond the dialogs above. What changes is that
+  `forwardInbound()` (§3.2) becomes dead code for Phase 1: the Bridge delivers inbound text to the PTY
+  directly instead of routing it through the channel server's `server.notification()` call. Revisit
+  removing the capability declaration and the dev-flag entirely once #36431 is fixed and this plan can
+  return to the originally-designed path, which is materially simpler (one fewer full-screen dialog,
+  and inbound delivery becomes push-based instead of PTY-text, which correctly restores the ability for
+  multiple queued messages to land as one system notification rather than one CLI turn each - see
+  §10.0's "16 events arrived batched" finding, which this workaround cannot reproduce).
+- This is a real behavioural change worth naming: each Telegram message becomes a normal queued user
+  turn in the transcript (visibly, with its own turn boundary) rather than an ambient system
+  notification Claude could act on unprompted mid-turn. Claude Code's own prompt queue already handles
+  typing while busy (queues, delivers in order), which is the same mechanism an operator relies on
+  typing at the desk, so this is not new risk - it is a return to exactly how a human drives the TUI,
+  which several of the surveyed projects call out as a feature ("Claude treats it as a real message")
+  rather than a compromise.
+- **Built and proven live the same day (2026-08-03), same Stage 7 session.** `packages/protocol`
+  gained `renderChannelTag(content, meta)` (validates via `buildMeta`, XML-escapes, appends `\r`);
+  `Routing` gained `setPtyWrite`/`getPtyWrite` so `index.ts` can reach the PTY by slug; the Telegram
+  `onUpdate` handler now calls `write(renderChannelTag(...))` instead of `pipe.sendInbound(...)`.
+  `pipe-server.ts`'s `sendInbound` and `channel-server`'s `forwardInbound`/notification path are
+  untouched and still covered by their existing tests - genuinely dead in this call site, not deleted,
+  per the "revisit once #36431 is fixed" note above. One real snag on the way to green, worth recording:
+  a `.write()` call carrying the whole tag *and* the trailing `\r` in one chunk left the text sitting
+  unsubmitted in the input box - plausibly the TUI's bracketed-paste handling (`\x1b[?2004h`, seen in
+  every startup banner) treating a large single write as pasted content and swallowing the embedded
+  Enter. Sending the `\r` as a **separate, subsequent** `.write()` call submitted it reliably; the dev
+  control server's existing `/write` endpoint made this trivial to isolate live. Full round trip
+  confirmed against the real "AI Bridge Control" group: `hi7` sent from the phone at 10:06, Claude
+  called `aibridge - reply(topic_id: "3", text: "hi! what do you need?")`, the permission prompt was
+  approved, and the reply landed in Telegram at 10:08 - the true end-to-end form of scenario 29, closing
+  Stage 7's core exit criterion. `bun test` (43 tests) and `tsc --noEmit` stayed green in both touched
+  packages throughout.
+- **The `\r`-as-separate-write fix is in production code**, not just recorded here:
+  `renderChannelTag` (protocol) deliberately omits the trailing `\r` now, with a doc comment
+  explaining why, and `index.ts`'s inbound handler calls `write(renderChannelTag(...))` then
+  `write("\r")` as two distinct writes.
+- Still open, not yet done: (a) the "New MCP server found" consent dialog `.mcp.json` registration
+  (the §2.4 correction above) now raises on every `/new` needs the same treatment correction 3 already
+  gives the dev-channels warning - i.e. it's Phase 5 supervisor work, not a new Phase 1 gap, and today
+  it was answered by hand through the dev control server exactly like the existing dev-channels
+  keystroke. (b) the §9 test scenario list needs a scenario for "inbound delivered via PTY injection,
+  not notification" replacing the assumption baked into the existing scenario 29 language. (c) file our
+  own comment on #36431 with this plan's specific repro (`getClientCapabilities()` returning `undefined`
+  for a raw `server:` dev-flag registration, not just marketplace plugins) - the existing thread's
+  evidence table is missing this exact configuration.
 
 ### 10.2 Feed volume exceeds the rate budget
 
@@ -2311,7 +2542,11 @@ Prerequisites, before Phase 1:
 - **P-2** Telegram supergroup with Topics enabled; **two** bots created; the control bot promoted to
   admin with `can_manage_topics`; the feed bot added as a member that can post; both tokens in
   `~/.config/aibridge/.env` mode 0600. Note that any admin holding `can_delete_messages` can delete topics
-  regardless of `can_manage_topics`, so keep the admin list to the operator and the control bot.
+  regardless of `can_manage_topics`, so keep the admin list to the operator and the control bot. The
+  Bridge validates both tokens with a `getMe` call **at startup**, before registering the `getUpdates`
+  poller or accepting any session launch, and refuses to start with a named error naming which token
+  failed - a bad or revoked token must never surface for the first time deep inside the first
+  `sendMessage` call.
 - **P-3** *(deleted for Phases 1-5.)* Was the `guard-git-write.sh` bash port. On a Windows host
   `guard-git-write.ps1` runs natively and unmodified, so this plan now touches **no existing repo
   code at all** (§7.3). The port returns as a §7.6 migration item, because a sandboxed WSL2 command

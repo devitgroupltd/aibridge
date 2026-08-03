@@ -33,9 +33,9 @@ starts, per §9 (the only place aibridge's own conventions are specified rather 
 - Test framework: `bun test`. Type gate: `tsc --noEmit`. Both are meant to run in CI per package.
 - Testing convention: unit-test any helper whose failure mode is **silent-wrong** (produces a
   plausible-looking but incorrect result) rather than a loud crash, plus every exit-code or protocol
-  contract another component branches on. §9 lists ~24 concrete scenarios this covers (protocol
-  contract, permission-rule derivation, rate-limit governors, reconciliation) — treat these as the
-  initial test plan, not just documentation.
+  contract another component branches on. §9 lists 41 concrete scenarios this covers (protocol
+  contract, permission-rule derivation, rate-limit governors, reconciliation, session-state
+  transitions, send-failure retries) — treat these as the initial test plan, not just documentation.
 
 ## Architecture
 
