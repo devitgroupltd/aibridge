@@ -52,6 +52,12 @@ export interface PushCallbackQueryInput {
   messageThreadId?: number;
 }
 
+interface StubTopic {
+  name: string;
+  closed: boolean;
+  deleted: boolean;
+}
+
 interface TokenState {
   pendingUpdates: StubUpdate[];
   nextUpdateId: number;
@@ -61,6 +67,7 @@ interface TokenState {
   sent: SentMessage[];
   answeredCallbackQueries: string[];
   waiters: Array<() => void>;
+  topics: Map<number, StubTopic>;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -83,6 +90,7 @@ export class StubTelegramServer {
         sent: [],
         answeredCallbackQueries: [],
         waiters: [],
+        topics: new Map(),
       };
       this.tokens.set(token, state);
     }
@@ -131,6 +139,12 @@ export class StubTelegramServer {
   /** `callback_query_id`s answered so far for `token`, in call order. */
   getAnsweredCallbackQueries(token: string): string[] {
     return [...this.stateFor(token).answeredCallbackQueries];
+  }
+
+  /** Current state of a forum topic (name, closed, deleted) for `token`'s bot - undefined if
+   * `createForumTopic` was never called for that id. */
+  getTopic(token: string, messageThreadId: number): StubTopic | undefined {
+    return this.stateFor(token).topics.get(messageThreadId);
   }
 
   private async handleGetUpdates(state: TokenState, body: Record<string, unknown>): Promise<Response> {
@@ -182,7 +196,29 @@ export class StubTelegramServer {
 
   private handleCreateForumTopic(state: TokenState, body: Record<string, unknown>): Response {
     const messageThreadId = state.nextTopicId++;
+    state.topics.set(messageThreadId, { name: String(body.name ?? ""), closed: false, deleted: false });
     return jsonResponse({ ok: true, result: { message_thread_id: messageThreadId, name: String(body.name ?? "") } });
+  }
+
+  private handleEditForumTopic(state: TokenState, body: Record<string, unknown>): Response {
+    const messageThreadId = Number(body.message_thread_id ?? 0);
+    const topic = state.topics.get(messageThreadId);
+    if (topic) topic.name = String(body.name ?? topic.name);
+    return jsonResponse({ ok: true, result: true });
+  }
+
+  private handleCloseForumTopic(state: TokenState, body: Record<string, unknown>): Response {
+    const messageThreadId = Number(body.message_thread_id ?? 0);
+    const topic = state.topics.get(messageThreadId);
+    if (topic) topic.closed = true;
+    return jsonResponse({ ok: true, result: true });
+  }
+
+  private handleDeleteForumTopic(state: TokenState, body: Record<string, unknown>): Response {
+    const messageThreadId = Number(body.message_thread_id ?? 0);
+    const topic = state.topics.get(messageThreadId);
+    if (topic) topic.deleted = true;
+    return jsonResponse({ ok: true, result: true });
   }
 
   private async handleRequest(req: Request): Promise<Response> {
@@ -208,6 +244,12 @@ export class StubTelegramServer {
         return this.handleEditMessageText(state, body);
       case "createForumTopic":
         return this.handleCreateForumTopic(state, body);
+      case "editForumTopic":
+        return this.handleEditForumTopic(state, body);
+      case "closeForumTopic":
+        return this.handleCloseForumTopic(state, body);
+      case "deleteForumTopic":
+        return this.handleDeleteForumTopic(state, body);
       case "answerCallbackQuery":
         state.answeredCallbackQueries.push(String(body.callback_query_id ?? ""));
         return jsonResponse({ ok: true, result: true });

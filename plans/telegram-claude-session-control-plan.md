@@ -1,7 +1,7 @@
 ---
-version: 0.20.0
+version: 0.21.0
 status: solid
-last_modified_utc: 2026-08-03T15:20:00Z
+last_modified_utc: 2026-08-03T19:45:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,55 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.21.0 (2026-08-03): Phase 5 (the fleet) started - the core lifecycle slice, not the whole
+    phase. Built: repos-registry.ts (§7.5's repos.toml, hand-rolled parser matching config.ts's own
+    convention rather than a TOML dependency); slug.ts (prompt -> sanitized, unique slug, §9
+    scenario 27); session-store.ts (§4.3's SQLite routing table, persisted at $STATE/aibridge.db,
+    with §4.3's exhaustive state-transition table enforced via isValidTransition - dead is terminal
+    until /rm); reconciliation.ts (the DB-observable half of §4.5's table as a pure, unit-tested
+    function - the two rows needing live process/topic enumeration, 'orphan process no row' and
+    'topic deleted in Telegram', are named gaps, not silently skipped); telegram.ts/stub-telegram
+    grew createForumTopic/editForumTopic/closeForumTopic/deleteForumTopic; fleet-commands.ts
+    (parse+render /new, /ls, /kill, /rm, /attach, /pause - the last four take an optional <slug> so
+    they work from the control topic or bare from inside a session's own topic, per §4.2); index.ts
+    rewritten from Phase 1-4's single hardcoded phase1.slug/topicId dispatch to routing by
+    message_thread_id, with topic 1 (or no thread id) as the control topic (§4.1). Per-session
+    --model routing (§10.5's default-Sonnet half, not yet the weighted-budget half) landed as part
+    of this, since /new --opus|--haiku needed session-launcher.ts to stop hardcoding --model sonnet.
+    Two real bugs found live, not just in review: (1) node-pty (Windows ConPTY) writes crash the
+    whole process with an unhandled 'Socket is closed' when the Bridge itself runs under Bun - a
+    write that succeeds against a perfectly healthy child process still throws asynchronously on
+    the next tick, reproduced with a minimal repro outside this codebase before touching
+    session-store.ts again. bun:sqlite forced the Bridge onto Bun to get this table at all, so
+    session-store.ts now picks node:sqlite vs. bun:sqlite at runtime via a synchronous
+    createRequire (not a static import, so `bun test` keeps working) - the Bridge itself stays on
+    plain Node (`node --experimental-strip-types`), only `bun test` uses the Bun binding. (2) /kill
+    and /rm left the typing indicator and the '🤔 Thinking...' placeholder running/sitting forever
+    for a topic that would never receive another reply - both are now stopped explicitly
+    (stopIndicatorsForTopic) rather than only on the normal reply-triggered path. Also: /ls and
+    /attach were sending Markdown-style triple-backtick code fences with no parse_mode set (rendered
+    as literal backticks, not a code block) - switched both to the same HTML <pre> convention the
+    feed card already uses (§5.3), with real column padding for /ls so it reads as an aligned table
+    rather than a wall of text - checked live against real Telegram Bot API docs first: no native
+    table entity exists for a plain sendMessage call (Bot API 10.1/10.2, June-July 2026, added a
+    genuine Rich Messages / RichBlockTable via a new sendRichMessage method, but adopting a
+    weeks-old API with unverified client-version rollout for a formatting nicety was judged not
+    worth the risk this pass - noted as a real, available upgrade, not implemented). Live-verified
+    end to end against the real Telegram group and real Claude Code binary: /new created a second
+    concurrent session (own worktree, own topic, own model) while the Phase 1 session kept running
+    - the two-concurrent-sessions half of Phase 3's exit criterion Phase 3 itself couldn't test;
+    /ls listed both, aligned; bare /pause toggled feed suppression from inside the session's own
+    topic; bare /kill closed the topic and stopped the process; /rm from the control topic removed
+    the worktree, deleted the topic and the routing-table row. 267 tests passing (up from 208),
+    tsc clean across all five packages. **Deliberately not done this pass** (left for a later Phase
+    5 sitting, not silently dropped): /new's launch pre-config ordering (scenario 28) is unit-tested
+    at the session-launcher level from Phase 1 but not re-asserted for the /new path specifically;
+    reconciliation.ts is unit-tested but not wired into Bridge startup (no auto-resume-on-restart
+    yet); awaiting_input state transitions are wired for permission/ask but /ls's state column
+    otherwise only reflects the hook-driven half of §4.3's table; /restart, the OTLP listener,
+    /budget, the burn-rate alarm and the weighted concurrency budget (§10.5's other half) are all
+    still open. Not yet re-tested: the 'four concurrent Sonnet sessions for an hour' half of this
+    phase's own exit criterion - only two concurrent sessions have been run live, briefly."
   - "0.20.0 (2026-08-03): Phase 4 (questions) implemented and live-verified end to end. A fresh
     Stage 0 spike (same discipline as Phase 3's) captured the real AskUserQuestion PreToolUse
     payload (tool_input.questions[].{question, header, options[].{label, description},
@@ -3112,15 +3161,30 @@ item 3 is moot until §7.6.
 
 ### Phase 5 - the fleet
 
-- `/new`, `/ls`, `/kill`, `/rm`, `/attach`, `/pause`.
-- Topic lifecycle including create, rename-once and delete.
-- Worktree provisioning per session; the SQLite routing table.
-- The supervisor: launch, health, restart, and the dev-flag confirm keystroke.
-- Package as a plugin so the allowlist path stays open (§10.1).
+- ~~`/new`, `/ls`, `/kill`, `/rm`, `/attach`, `/pause`.~~ **Done** (2026-08-03) and live-verified: two
+  concurrent sessions (Phase 1's hardcoded one plus a real `/new`), `/ls`'s aligned table, `/pause`
+  toggling feed suppression, `/kill` closing a topic and stopping the process, `/rm` removing the
+  worktree/topic/row. `/attach` is implemented and unit-tested (PTY ring-buffer tail plus a
+  `claude --resume` hint) but not yet exercised live against a real multi-line PTY tail.
+- ~~Topic lifecycle including create, rename-once and delete.~~ **Create and delete done** (via
+  `createForumTopic`/`deleteForumTopic`, live-verified). **Rename-once (§4.4) not done** - `/new`
+  still names the topic from the prompt at creation and never calls `editForumTopic` again once the
+  session's real title is known.
+- ~~Worktree provisioning per session; the SQLite routing table.~~ **Done** - `session-store.ts`
+  persists §4.3's schema at `$STATE/aibridge.db`, with §4.3's state-transition table enforced
+  (`isValidTransition`); the hook-driven half of the table (`SessionStart`/`UserPromptSubmit`/
+  `Stop`/`StopFailure`/`SessionEnd`) and the permission/ask half (`awaiting_input` <-> `working`) are
+  both wired. **Not done:** reconciliation (`reconciliation.ts`) is unit-tested against §4.5's table
+  but not called on Bridge startup - no auto-resume across a restart yet, so a Bridge restart still
+  orphans every live session exactly as it did before this table existed; only the *persistence*
+  (surviving in `/ls` as a `dead`-eligible row rather than vanishing) is new.
+- The supervisor: launch (done, reused from Phase 1), health and restart-on-crash - **not done**.
+- Package as a plugin so the allowlist path stays open (§10.1) - **not done**.
 - The OTLP listener and telemetry ingest (§5.7); `/ls` cost columns, `/budget`, the burn-rate alarm and
-  the distinct "stopped on a usage limit" state (§10.5).
-- Per-session model routing: Sonnet default, `--opus` and `--haiku` overrides, and the weighted unit
-  budget that admits them (§10.5).
+  the distinct "stopped on a usage limit" state (§10.5) - **not done**.
+- ~~Per-session model routing: Sonnet default, `--opus` and `--haiku` overrides~~ **Done** and
+  live-verified (`/new --opus <repo> <prompt>` launches with `--model opus`). **The weighted unit
+  budget that admits them (§10.5) is not done** - there is currently no concurrency cap at all.
 - ~~`/model <name>` (§4.2.1), reusing the dev-flag confirm keystroke's raw PTY write as a real feature
   instead of a debug-only affordance, so a running session's model can change mid-conversation.~~
   **Done** - implemented earlier; gained a bare-`/model` button keyboard on 2026-08-03.
@@ -3136,7 +3200,14 @@ item 3 is moot until §7.6.
   to stop being destructive to whatever conversation was mid-turn - do not backport to Phase 1.
 - **Exit:** scenarios 24-28, 32, 42, 43 and 44 pass; four concurrent Sonnet sessions run for an hour
   without manual intervention, the weighted budget refuses a fifth, and the fleet's spend is visible in
-  `/budget` throughout.
+  `/budget` throughout. **Not yet met** - this pass shipped the fleet's core lifecycle (§4.2's six
+  commands, the persisted routing table, per-session model routing) and live-verified two concurrent
+  sessions, not four for an hour; scenarios 27 and 40 are unit-tested (`slug.test.ts`,
+  `session-store.test.ts`), scenario 24 is unit-tested (`reconciliation.test.ts`) but not wired into a
+  real restart, and scenarios 28/32/42-44 and the weighted budget are untouched this pass. Remaining
+  for a later Phase 5 sitting: wire `reconciliation.ts` into Bridge startup, `/restart`, rename-once,
+  the supervisor's health/restart-on-crash duty, the OTLP listener/`/budget`/burn-rate alarm, the
+  weighted concurrency cap, and plugin packaging.
 
 ### Phase 6 - hardening, and the WSL2 migration
 

@@ -65,6 +65,15 @@ export interface SendChatActionSource {
   sendChatAction(chatId: string | number, messageThreadId: number | undefined, action: string): Promise<void>;
 }
 
+/** §4.4/§7.5's topic lifecycle: create at `/new`, rename once on the first real title, close on
+ * `/kill`/`/pause`, delete on `/rm`. */
+export interface ForumTopicSource {
+  createForumTopic(chatId: string | number, name: string): Promise<{ message_thread_id: number }>;
+  editForumTopic(chatId: string | number, messageThreadId: number, name: string): Promise<void>;
+  closeForumTopic(chatId: string | number, messageThreadId: number): Promise<void>;
+  deleteForumTopic(chatId: string | number, messageThreadId: number): Promise<void>;
+}
+
 async function parseTelegramResponse<T>(res: Response, method: string): Promise<T> {
   const body = (await res.json()) as { ok: boolean; result?: T; description?: string };
   if (!body.ok) {
@@ -167,6 +176,42 @@ export class TelegramClient implements UpdatesSource {
       }),
     });
     await parseTelegramResponse(res, "editMessageText");
+  }
+
+  async createForumTopic(chatId: string | number, name: string): Promise<{ message_thread_id: number }> {
+    const res = await fetch(this.url("createForumTopic"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, name }),
+    });
+    return parseTelegramResponse(res, "createForumTopic");
+  }
+
+  async editForumTopic(chatId: string | number, messageThreadId: number, name: string): Promise<void> {
+    const res = await fetch(this.url("editForumTopic"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId, name }),
+    });
+    await parseTelegramResponse(res, "editForumTopic");
+  }
+
+  async closeForumTopic(chatId: string | number, messageThreadId: number): Promise<void> {
+    const res = await fetch(this.url("closeForumTopic"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId }),
+    });
+    await parseTelegramResponse(res, "closeForumTopic");
+  }
+
+  async deleteForumTopic(chatId: string | number, messageThreadId: number): Promise<void> {
+    const res = await fetch(this.url("deleteForumTopic"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId }),
+    });
+    await parseTelegramResponse(res, "deleteForumTopic");
   }
 }
 

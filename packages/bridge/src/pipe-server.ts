@@ -40,6 +40,9 @@ export interface PipeServerOptions {
    * process (a fresh connection per firing, no persistent registration to track), so this is the
    * only wiring needed on this side - there is no per-hook `hello_ack` to send back. */
   onHookEvent?: (msg: HookEventMessage) => void;
+  /** §4.3: a freshly-posted permission/question card moves the session's tracked state to
+   * `awaiting_input`. Not fired on an ask reconnect rebind (the question was already pending). */
+  onAwaitingInput?: (slug: string) => void;
   log?: LogFn;
 }
 
@@ -131,6 +134,7 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
         topicId: route.topicId,
         messageId: sent.message_id,
       });
+      opts.onAwaitingInput?.(msg.slug);
     } catch (err) {
       log("ERROR", `failed to post permission request for slug "${msg.slug}": ${(err as Error).message}`);
     }
@@ -166,6 +170,7 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       }
       askRegistry.add({ id: msg.request_id, slug: msg.slug, questions });
       askSocketsById.set(msg.request_id, socket);
+      opts.onAwaitingInput?.(msg.slug);
     } catch (err) {
       log("ERROR", `failed to post question for slug "${msg.slug}": ${(err as Error).message}`);
     }

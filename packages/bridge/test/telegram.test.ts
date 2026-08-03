@@ -139,4 +139,25 @@ describe("TelegramClient", () => {
       stub.stop();
     }
   });
+
+  test("§4.2's topic lifecycle: createForumTopic, editForumTopic (rename-once), closeForumTopic (/kill), deleteForumTopic (/rm)", async () => {
+    const stub = new StubTelegramServer();
+    const { baseUrl } = stub.start(0);
+    try {
+      const client = new TelegramClient("control-token", baseUrl);
+      const { message_thread_id } = await client.createForumTopic(-1, "fix the login bug");
+      expect(stub.getTopic("control-token", message_thread_id)).toMatchObject({ name: "fix the login bug", closed: false, deleted: false });
+
+      await client.editForumTopic(-1, message_thread_id, "renamed title");
+      expect(stub.getTopic("control-token", message_thread_id)?.name).toBe("renamed title");
+
+      await client.closeForumTopic(-1, message_thread_id);
+      expect(stub.getTopic("control-token", message_thread_id)?.closed).toBe(true);
+
+      await client.deleteForumTopic(-1, message_thread_id);
+      expect(stub.getTopic("control-token", message_thread_id)?.deleted).toBe(true);
+    } finally {
+      stub.stop();
+    }
+  });
 });

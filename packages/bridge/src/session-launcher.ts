@@ -116,6 +116,9 @@ export interface SessionLaunchOptions {
    */
   mirrorPtyToConsole?: boolean;
   log?: LogFn;
+  /** §10.5's per-session model routing: Sonnet unless `/new --opus`/`--haiku`/`--fable` overrides
+   * it at launch. Defaults to "sonnet" (§4.2's own default), not left to `claude`'s own default. */
+  model?: string;
 }
 
 export interface LaunchedSession {
@@ -185,7 +188,7 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
 
   const ptyProcess = pty.spawn(
     resolveClaudeExecutable(),
-    ["--dangerously-load-development-channels", "server:aibridge", "--model", "sonnet", "--settings", settingsPath],
+    ["--dangerously-load-development-channels", "server:aibridge", "--model", opts.model ?? "sonnet", "--settings", settingsPath],
     {
       name: "xterm-256color",
       cols: 120,
