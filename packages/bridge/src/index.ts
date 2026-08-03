@@ -10,7 +10,21 @@ import { launchSession } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
 import { deriveAlwaysRule, ruleAlreadyCovered } from "./rule-derivation.ts";
 import { Routing } from "./routing.ts";
-import { buildModeKeystrokes, isSessionCommandAttempt, MODELS, MODES, parseSessionCommand } from "./session-commands.ts";
+import {
+  buildEffortKeyboard,
+  buildModeKeyboard,
+  buildModeKeystrokes,
+  buildModelKeyboard,
+  EFFORTS,
+  isSessionCommandAttempt,
+  MODELS,
+  MODES,
+  parseSessionCommand,
+  resolveEffortCallback,
+  resolveModeCallback,
+  resolveModelCallback,
+} from "./session-commands.ts";
+import type { Mode } from "./session-commands.ts";
 import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
 import { startPolling, TelegramClient, validateTokens } from "./telegram.ts";
 import { createThinkingPlaceholder } from "./thinking-placeholder.ts";
@@ -141,6 +155,24 @@ async function main(): Promise<void> {
     write("\r");
   }
 
+  // /effort, unlike /model, opens a "Change effort level? 1. Yes, switch  2. No, go back"
+  // confirmation dialog with "Yes" pre-selected - live-verified 2026-08-03 against the same
+  // test-session used for Phase 1/2's own spikes. A second Enter selects it, but sending both \r's
+  // in the same tick arrives before the dialog has rendered and is dropped, leaving the dialog open
+  // and the level unchanged (also confirmed live) - same class of PTY-timing hazard as the
+  // known single-write text+\r issue, one layer removed. A short delay before the confirming \r
+  // fixes it.
+  function sendEffortCommand(effort: string): void {
+    const write = routing.getPtyWrite(config.phase1.slug);
+    if (!write) {
+      log("WARN", `no live session for slug "${config.phase1.slug}" - command dropped`);
+      return;
+    }
+    write(`/effort ${effort}`);
+    write("\r");
+    setTimeout(() => write("\r"), 200);
+  }
+
   // A normal inbound turn: wrapped in the <channel> tag Claude Code would have rendered itself,
   // for text Claude should read and act on rather than a literal TUI keystroke.
   function sendChannelText(content: string, msgId: string, from: string): void {
@@ -161,6 +193,31 @@ async function main(): Promise<void> {
     controlBot
       .sendMessage(config.supergroupChatId, config.phase1.topicId, text)
       .catch((err: unknown) => log("WARN", `failed to send command confirmation: ${(err as Error).message}`));
+  }
+
+  // Shared by the typed `/model foo` / `/mode bar` / `/effort baz` path and the button-tap path
+  // (bare /model, /mode or /effort followed by a keyboard selection) - same switch, two triggers.
+  function applyModelSwitch(model: string): void {
+    sendRaw(`/model ${model}`);
+    confirmSessionCommand(`Switched ${config.phase1.slug} to ${model}`);
+  }
+
+  function applyModeSwitch(mode: Mode): void {
+    const current = routing.getMode(config.phase1.slug);
+    const keystrokes = buildModeKeystrokes(current, mode);
+    // Already at the target mode: no keystroke to send, and sendRaw("") would still submit a
+    // spurious blank Enter at the prompt.
+    if (keystrokes.length > 0) {
+      const write = routing.getPtyWrite(config.phase1.slug);
+      write?.(keystrokes);
+    }
+    routing.setMode(config.phase1.slug, mode);
+    confirmSessionCommand(`Switched ${config.phase1.slug} to ${mode} mode`);
+  }
+
+  function applyEffortSwitch(effort: string): void {
+    sendEffortCommand(effort);
+    confirmSessionCommand(`Switched ${config.phase1.slug} to ${effort} effort`);
   }
 
   startPolling(controlBot, {
@@ -203,6 +260,24 @@ async function main(): Promise<void> {
           return;
         }
 
+        const model = callbackQuery.data ? resolveModelCallback(callbackQuery.data) : null;
+        if (model) {
+          applyModelSwitch(model);
+          return;
+        }
+
+        const mode = callbackQuery.data ? resolveModeCallback(callbackQuery.data) : null;
+        if (mode) {
+          applyModeSwitch(mode);
+          return;
+        }
+
+        const effort = callbackQuery.data ? resolveEffortCallback(callbackQuery.data) : null;
+        if (effort) {
+          applyEffortSwitch(effort);
+          return;
+        }
+
         const action = callbackQuery.data ? resolveCommandAction(callbackQuery.data, listRepoCommands(worktreePath)) : null;
         if (!action) return;
         if (action.kind === "builtin") {
@@ -231,29 +306,42 @@ async function main(): Promise<void> {
         return;
       }
 
+      // A bare /model, /mode or /effort (no argument to act on) surfaces a button per option
+      // instead of falling through to the ordinary inbound-message path, where it would just
+      // arrive as plain chat text and get answered conversationally rather than switching
+      // anything (confirmed live for /effort).
+      const bareCommandKeyboards: Record<string, { prompt: string; keyboard: () => ReturnType<typeof buildEffortKeyboard> }> = {
+        "/model": { prompt: "Choose a model:", keyboard: buildModelKeyboard },
+        "/mode": { prompt: "Choose a permission mode:", keyboard: buildModeKeyboard },
+        "/effort": { prompt: "Choose an effort level:", keyboard: buildEffortKeyboard },
+      };
+      const bareCommand = bareCommandKeyboards[text];
+      if (bareCommand) {
+        controlBot
+          .sendMessage(config.supergroupChatId, message.message_thread_id, bareCommand.prompt, {
+            inline_keyboard: bareCommand.keyboard(),
+          })
+          .catch((err) => log("WARN", `sendMessage (${text} list) failed: ${(err as Error).message}`));
+        return;
+      }
+
       // §4.2.1/§4.2.2: neither /model nor /mode fires a hook or a reply call, so the Bridge
       // confirms them itself rather than waiting for an ack that will never arrive.
       const attempt = parseSessionCommand(text);
       if (attempt) {
         if (attempt.kind === "model") {
-          sendRaw(`/model ${attempt.model}`);
-          confirmSessionCommand(`Switched ${config.phase1.slug} to ${attempt.model}`);
+          applyModelSwitch(attempt.model);
+        } else if (attempt.kind === "effort") {
+          applyEffortSwitch(attempt.effort);
         } else {
-          const current = routing.getMode(config.phase1.slug);
-          const keystrokes = buildModeKeystrokes(current, attempt.mode);
-          // Already at the target mode: no keystroke to send, and sendRaw("") would still submit
-          // a spurious blank Enter at the prompt.
-          if (keystrokes.length > 0) {
-            const write = routing.getPtyWrite(config.phase1.slug);
-            write?.(keystrokes);
-          }
-          routing.setMode(config.phase1.slug, attempt.mode);
-          confirmSessionCommand(`Switched ${config.phase1.slug} to ${attempt.mode} mode`);
+          applyModeSwitch(attempt.mode);
         }
         return;
       }
       if (isSessionCommandAttempt(text)) {
-        confirmSessionCommand(`Unrecognised /model or /mode argument. Models: ${MODELS.join(", ")}. Modes: ${MODES.join(", ")}.`);
+        confirmSessionCommand(
+          `Unrecognised /model, /mode or /effort argument. Models: ${MODELS.join(", ")}. Modes: ${MODES.join(", ")}. Effort: ${EFFORTS.join(", ")}.`,
+        );
         return;
       }
 

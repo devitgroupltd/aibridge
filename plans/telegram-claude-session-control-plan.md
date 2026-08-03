@@ -1,7 +1,7 @@
 ---
-version: 0.17.0
+version: 0.18.0
 status: solid
-last_modified_utc: 2026-08-03T12:33:15Z
+last_modified_utc: 2026-08-03T13:38:49Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,20 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.18.0 (2026-08-03): Added /effort <low|medium|high|xhigh|max> (§4.2.3), requested mid-session
+    alongside /model and /mode. Live-verified against the same test-session used for every other
+    keystroke primitive this plan measures, and it surfaced a real behavioural difference from
+    /model: /effort opens a 'Change effort level?' confirmation dialog that needs a second \\r to
+    accept, and sending both \\r's in the same synchronous tick drops the second one (the dialog
+    hadn't rendered yet) - fixed with a 200ms delay before the confirming \\r, the same class of
+    PTY-timing hazard §10.1.2 already names for single-write text+\\r, one step further down the
+    same interaction. Also added: a bare /model, /mode or /effort (no argument) now shows a button
+    per option instead of silently falling through as ordinary chat text - discovered live that a
+    bare /effort doesn't match the command parser at all and gets answered conversationally by
+    Claude instead of switching anything. Implemented as a generic buildLevelKeyboard/
+    resolveLevelCallback pair in session-commands.ts under model:/mode:/effort: callback_data
+    namespaces, reusing the same tap-resolve-apply path Phase 2's perm: keyboard established. 118
+    tests passing, tsc clean across all packages."
   - "0.17.0 (2026-08-03): Phase 2 (permission relay) implemented and live-verified end to end - the
     plan's one open risk here (§3.1/§6.3's claude/channel/permission capability, never
     live-verified before now, unlike every other keystroke/protocol primitive this plan already
@@ -201,6 +215,16 @@ changelog:
   - "0.3.0 (2026-08-02): Pass 2 - open questions and risks investigated against the docs and closed. CORRECTION: v0.2.0's central finding was wrong. A PreToolUse hook returning `allow` does NOT pre-empt the permission system; the docs state deny and ask rules are evaluated regardless of hook output. The fix is an `ask` rule in the generated per-session settings, so guard-git-write.ps1 needs no change and the AIBRIDGE_SESSION gate is withdrawn (§6.1.1). Adopted the OS-level Bash sandbox, which works on WSL2 and inverts the allowlist strategy (§6.7). Replaced the 540s AskUserQuestion auto-answer with the documented per-hook `timeout` field and the official updatedInput/answers shape (§6.4). Added a non-blocking PermissionRequest observer hook, which makes prompt reconciliation exact instead of heuristic (§6.5). Second bot token for feed traffic: Telegram limits are per bot, so P2 gets its own 20/min (§5.4). Launch dialogs are three, not one, and two are avoidable via user-level config (§2.4, §10.1). Added the usage/cost risk (§10.5). §9 grew to 30 scenarios"
   - "0.2.0 (2026-08-02): Pass 1 review - CRITICAL: guard-git-write.ps1 Layer 3 now auto-allows commit/push, which pre-empts the channel relay and would let a phone commit unapproved; added the AIBRIDGE_SESSION escalation gate (§6.1.1) and moved P-3 to a Phase 2 blocker. CRITICAL: editMessageText shares the sendMessage rate budget, so fixed 3s coalescing overruns the 20/min group limit at 2+ sessions; replaced with session-count-scaled intervals and a 12/min P2 reservation (§5.4). Expanded the bash-port parity requirements and pinned both implementations to test_claude_hook_guards (§7.3, scenarios 11-12). Renumbered §9 to 24 contiguous scenarios and corrected every cross-reference"
   - "0.1.0 (2026-08-02): Initial plan - Telegram-driven multi-session Claude Code control via a custom MCP channel server, hook-fed activity feed and inline-button permission relay, hosted on WSL2"
+v0180_touched_sections:
+  - section: "§4.2 Commands (control topic)"
+    type: modified
+    summary: "Added the /effort <low|medium|high|xhigh|max> command row"
+  - section: "§4.2.3 /effort: same primitive as /model, plus a confirmation dialog neither of the other two has"
+    type: added
+    summary: "New subsection: the live-verified confirmation dialog, the same-tick-\\r timing hazard and its 200ms-delay fix, and the bare-/model|/mode|/effort button keyboard added for all three commands"
+  - section: "§12 Phase 5 - the fleet"
+    type: modified
+    summary: "Marked /model, /mode and /effort done; /effort added and live-verified in this pass"
 v0170_touched_sections:
   - section: "§3.1 Capability declaration"
     type: modified
@@ -1035,6 +1059,7 @@ permission relay and feed renderer are all already scoped to a single Bridge pro
 | `/cmd <name> [args]` | Run a repo slash command by proxy. See below: this is a shim, not a passthrough |
 | `/model <sonnet\|opus\|haiku\|fable>` | Switch the current session's model live, mid-conversation. Session-scoped only, same convention as a bare `/kill` (§4.2.1) |
 | `/mode <manual\|acceptEdits\|plan\|auto>` | Switch the current session's permission mode live. Session-scoped only, same convention as a bare `/kill` (§4.2.2) |
+| `/effort <low\|medium\|high\|xhigh\|max>` | Switch the current session's reasoning effort live, mid-conversation. Session-scoped only (§4.2.3) |
 | `/pause <slug>` | Stop pushing feed updates for that topic (replies and prompts still flow) |
 | `/restart` | Fleet-scoped, control topic only. Self-respawns the Bridge process to pick up a code change. Kills every live session with it (§4.5); Phase 5 scope, see §4.5.1 |
 
@@ -1122,6 +1147,31 @@ manual -> acceptEdits -> plan -> auto -> (back to manual)
 - confirmed exactly, including the fourth press wrapping cleanly back to `manual`.
 
 `/mode auto`, sent from `manual`, is therefore three Shift+Tab writes, not one.
+
+### 4.2.3 `/effort`: same primitive as `/model`, plus a confirmation dialog neither of the other two has
+
+`/effort <low|medium|high|xhigh|max>` reuses §4.2.1's write-to-the-PTY mechanism (a direct-argument
+command, not a relative cycle like `/mode`) - but live-verifying it (2026-08-03, same test-session used
+for Phase 2's own spikes) surfaced a real difference from `/model`: `/effort <level>` opens a "Change
+effort level? 1. Yes, switch  2. No, go back" confirmation dialog with "Yes" pre-selected, rather than
+applying immediately. `/model` and `/mode` never do this.
+
+**A second `\r` is required, and it cannot be sent in the same tick as the first.** Writing
+`/effort high\r\r` as three back-to-back synchronous writes left the dialog open and the level
+unchanged - confirmed live, the same class of PTY-timing hazard §10.1.2 already names for a single
+write carrying text plus a trailing `\r` (the terminal hadn't rendered the dialog yet when the second
+`\r` arrived, so it was dropped), just one step further down the same interaction. The fix is a short
+delay (200ms) before the confirming `\r`. One asymmetry worth naming: if the session is already at the
+requested level, no dialog appears at all and the delayed `\r` lands on an empty prompt instead - this
+was also verified live to be a harmless no-op, not a spurious blank turn.
+
+**Bare `/model`, `/mode` or `/effort` (no argument) now shows a button per option** rather than falling
+through to the ordinary inbound-message path - discovered live that a bare `/effort` with no target to
+act on doesn't match the command parser at all, so it silently became a plain chat message and Claude
+answered it conversationally ("`/effort` isn't a recognized built-in slash command...") instead of
+anything switching. The button list closes that gap for all three commands, not just `/effort`, reusing
+the same tap -> resolve -> apply path scenario 30's `perm:` keyboard already established, under a
+`model:`/`mode:`/`effort:` callback_data namespace.
 
 ### 4.3 The routing table
 
@@ -2961,10 +3011,16 @@ item 3 is moot until §7.6.
   the distinct "stopped on a usage limit" state (§10.5).
 - Per-session model routing: Sonnet default, `--opus` and `--haiku` overrides, and the weighted unit
   budget that admits them (§10.5).
-- `/model <name>` (§4.2.1), reusing the dev-flag confirm keystroke's raw PTY write as a real feature
-  instead of a debug-only affordance, so a running session's model can change mid-conversation.
-- `/mode <name>` (§4.2.2), the same primitive driving the Shift+Tab permission-mode cycle. The cycle
-  order it depends on is live-verified (2026-08-03), not carried forward as a plan-time assumption.
+- ~~`/model <name>` (§4.2.1), reusing the dev-flag confirm keystroke's raw PTY write as a real feature
+  instead of a debug-only affordance, so a running session's model can change mid-conversation.~~
+  **Done** - implemented earlier; gained a bare-`/model` button keyboard on 2026-08-03.
+- ~~`/mode <name>` (§4.2.2), the same primitive driving the Shift+Tab permission-mode cycle. The cycle
+  order it depends on is live-verified (2026-08-03), not carried forward as a plan-time assumption.~~
+  **Done** - implemented earlier; gained a bare-`/mode` button keyboard on 2026-08-03, live-verified
+  (a tap correctly drove the Shift+Tab cycle: manual -> acceptEdits).
+- `/effort <name>` (§4.2.3) - **Done** (2026-08-03), added and live-verified in the same sitting,
+  including the confirmation-dialog second `\r` (with its required delay) and a bare-`/effort` button
+  keyboard.
 - `/restart` (§4.5.1): the self-respawn primitive the supervisor's own automatic restart-on-crash duty
   already needs, made reachable as a fleet command. Depends on this phase's own session-id persistence
   to stop being destructive to whatever conversation was mid-turn - do not backport to Phase 1.

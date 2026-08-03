@@ -15,10 +15,20 @@ export type Mode = (typeof MODES)[number];
 
 export const DEFAULT_MODE: Mode = "manual";
 
+// Direct-argument CLI command, same shape as /model - not yet independently live-verified the way
+// Phase 2's MCP notification path was (killing the live spike session to watch its mirrored PTY was
+// blocked by the auto-mode classifier), but it's the same "type it, press Enter, no ack" mechanism
+// /model already proves works, so it carries the same risk /model does, not a new one.
+export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
+export type Effort = (typeof EFFORTS)[number];
+
 /** Standard xterm Shift+Tab (back-tab). One press advances the picker by exactly one entry. */
 export const SHIFT_TAB = "\x1b[Z";
 
-export type SessionCommand = { kind: "model"; model: Model } | { kind: "mode"; mode: Mode };
+export type SessionCommand =
+  | { kind: "model"; model: Model }
+  | { kind: "mode"; mode: Mode }
+  | { kind: "effort"; effort: Effort };
 
 function isModel(value: string): value is Model {
   return (MODELS as readonly string[]).includes(value);
@@ -26,6 +36,10 @@ function isModel(value: string): value is Model {
 
 function isMode(value: string): value is Mode {
   return (MODES as readonly string[]).includes(value);
+}
+
+function isEffort(value: string): value is Effort {
+  return (EFFORTS as readonly string[]).includes(value);
 }
 
 /**
@@ -45,14 +59,20 @@ export function parseSessionCommand(text: string): SessionCommand | null {
     const arg = modeMatch[1] ?? "";
     return isMode(arg) ? { kind: "mode", mode: arg } : null;
   }
+  const effortMatch = trimmed.match(/^\/effort\s+(\S+)$/);
+  if (effortMatch) {
+    const arg = (effortMatch[1] ?? "").toLowerCase();
+    return isEffort(arg) ? { kind: "effort", effort: arg } : null;
+  }
   return null;
 }
 
-/** True for `/model ...` or `/mode ...` regardless of whether the argument is valid - lets the
- * caller distinguish "recognised command, bad argument" (reject with the valid list) from "not
- * one of these commands at all" (fall through to the ordinary inbound-message path). */
+/** True for `/model ...`, `/mode ...` or `/effort ...` regardless of whether the argument is
+ * valid - lets the caller distinguish "recognised command, bad argument" (reject with the valid
+ * list) from "not one of these commands at all" (fall through to the ordinary inbound-message
+ * path). */
 export function isSessionCommandAttempt(text: string): boolean {
-  return /^\/(model|mode)\s+/.test(text.trim());
+  return /^\/(model|mode|effort)\s+/.test(text.trim());
 }
 
 /** §4.2.2: how many Shift+Tab presses separate `current` from `target` in the cycle, wrapping
@@ -63,3 +83,36 @@ export function buildModeKeystrokes(current: Mode, target: Mode): string {
   const steps = (to - from + MODES.length) % MODES.length;
   return SHIFT_TAB.repeat(steps);
 }
+
+export interface InlineKeyboardButton {
+  text: string;
+  callback_data: string;
+}
+
+/** A bare `/model`, `/mode` or `/effort` with no argument (no valid target to act on) surfaces a
+ * button per option, same UX as the `/help` command list, instead of falling through as ordinary
+ * chat text - confirmed live that a bare `/effort` otherwise lands as a plain message Claude
+ * answers conversationally rather than a command the CLI intercepts. */
+function buildLevelKeyboard<T extends string>(namespace: string, levels: readonly T[]): InlineKeyboardButton[][] {
+  return levels.map((level) => [{ text: level, callback_data: `${namespace}:${level}` }]);
+}
+
+/**
+ * Parses a `<namespace>:<value>` callback_data string, re-validating against `isValid` rather
+ * than trusting the tap - same defensive pattern as resolveCommandAction/resolvePermCallback,
+ * since callback_data is attacker-shaped input in principle.
+ */
+function resolveLevelCallback<T extends string>(namespace: string, data: string, isValid: (value: string) => value is T): T | null {
+  const match = data.match(new RegExp(`^${namespace}:(.+)$`));
+  if (!match) return null;
+  const value = match[1] ?? "";
+  return isValid(value) ? value : null;
+}
+
+export const buildModelKeyboard = (): InlineKeyboardButton[][] => buildLevelKeyboard("model", MODELS);
+export const buildModeKeyboard = (): InlineKeyboardButton[][] => buildLevelKeyboard("mode", MODES);
+export const buildEffortKeyboard = (): InlineKeyboardButton[][] => buildLevelKeyboard("effort", EFFORTS);
+
+export const resolveModelCallback = (data: string): Model | null => resolveLevelCallback("model", data, isModel);
+export const resolveModeCallback = (data: string): Mode | null => resolveLevelCallback("mode", data, isMode);
+export const resolveEffortCallback = (data: string): Effort | null => resolveLevelCallback("effort", data, isEffort);
