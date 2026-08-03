@@ -1,7 +1,7 @@
 ---
-version: 0.15.1
+version: 0.16.0
 status: solid
-last_modified_utc: 2026-08-03T11:39:57Z
+last_modified_utc: 2026-08-03T11:49:45Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,20 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.16.0 (2026-08-03): Added /restart, a gap noticed live: the fleet's own session, after
+    implementing a feature to the Bridge, said unprompted 'this needs a Bridge restart to take
+    effect - I can't hot-reload the process I'm running under', and there was no way to trigger that
+    from Telegram. Mechanism is a self-respawn (spawn a detached successor with the running
+    process's own process.argv, then exit) rather than an external supervisor - deliberately not a
+    new code path, just an operator-triggered instance of the exact restart event §4.5/scenario 37
+    already measures and reconciles. Stated plainly rather than glossed: because Phase 1 has no
+    persisted session_id for the successor to pass to claude --resume, /restart today kills every
+    live session and relaunches fresh, losing conversation history, not resuming it - the same
+    cold-start cost §4.5 already flags for the supervisor's own automatic restarts. Non-destructive
+    only once Phase 5's session-id persistence lands, so /restart is scoped to Phase 5, not
+    backported to Phase 1 despite being noticed there. New §4.5.1, a fleet-scoped (not
+    session-scoped) command row in §4.2, test scenario 44, and a Phase 5 bullet. Not implemented in
+    code - design only, pending Phase 5's routing table"
   - "0.15.1 (2026-08-03): §4.2.2's cycle order is now VERIFIED, not inferred. Sent the raw \\x1b[Z
     (Shift+Tab) keystroke four times against the live Phase 1 session via the dev-control port,
     reading the resulting mode label off the status line after each press: manual -> 'accept edits
@@ -166,6 +180,19 @@ changelog:
   - "0.3.0 (2026-08-02): Pass 2 - open questions and risks investigated against the docs and closed. CORRECTION: v0.2.0's central finding was wrong. A PreToolUse hook returning `allow` does NOT pre-empt the permission system; the docs state deny and ask rules are evaluated regardless of hook output. The fix is an `ask` rule in the generated per-session settings, so guard-git-write.ps1 needs no change and the AIBRIDGE_SESSION gate is withdrawn (§6.1.1). Adopted the OS-level Bash sandbox, which works on WSL2 and inverts the allowlist strategy (§6.7). Replaced the 540s AskUserQuestion auto-answer with the documented per-hook `timeout` field and the official updatedInput/answers shape (§6.4). Added a non-blocking PermissionRequest observer hook, which makes prompt reconciliation exact instead of heuristic (§6.5). Second bot token for feed traffic: Telegram limits are per bot, so P2 gets its own 20/min (§5.4). Launch dialogs are three, not one, and two are avoidable via user-level config (§2.4, §10.1). Added the usage/cost risk (§10.5). §9 grew to 30 scenarios"
   - "0.2.0 (2026-08-02): Pass 1 review - CRITICAL: guard-git-write.ps1 Layer 3 now auto-allows commit/push, which pre-empts the channel relay and would let a phone commit unapproved; added the AIBRIDGE_SESSION escalation gate (§6.1.1) and moved P-3 to a Phase 2 blocker. CRITICAL: editMessageText shares the sendMessage rate budget, so fixed 3s coalescing overruns the 20/min group limit at 2+ sessions; replaced with session-count-scaled intervals and a 12/min P2 reservation (§5.4). Expanded the bash-port parity requirements and pinned both implementations to test_claude_hook_guards (§7.3, scenarios 11-12). Renumbered §9 to 24 contiguous scenarios and corrected every cross-reference"
   - "0.1.0 (2026-08-02): Initial plan - Telegram-driven multi-session Claude Code control via a custom MCP channel server, hook-fed activity feed and inline-button permission relay, hosted on WSL2"
+v0160_touched_sections:
+  - section: "§4.2 Commands (control topic)"
+    type: modified
+    summary: "Added the /restart command row, marked fleet-scoped rather than session-scoped"
+  - section: "§4.5.1 /restart: an operator-triggered version of the same event"
+    type: added
+    summary: "New subsection: self-respawn mechanism, why it's not a new code path, and the honest Phase 1 caveat that it currently loses conversation history rather than resuming it"
+  - section: "§9 Test scenarios"
+    type: added
+    summary: "Scenario 44: /restart is fleet-scoped (rejected from a session topic) and spawns a detached successor before exiting, not a real process kill in the unit test"
+  - section: "§12 Phase 5 - the fleet"
+    type: modified
+    summary: "Added a /restart bullet, scoped to Phase 5 because it depends on this phase's session-id persistence to stop being destructive"
 v0151_touched_sections:
   - section: "§4.2.2 /mode: the same primitive, plus a state-tracking problem /model doesn't have"
     type: modified
@@ -978,6 +1005,7 @@ permission relay and feed renderer are all already scoped to a single Bridge pro
 | `/model <sonnet\|opus\|haiku\|fable>` | Switch the current session's model live, mid-conversation. Session-scoped only, same convention as a bare `/kill` (§4.2.1) |
 | `/mode <manual\|acceptEdits\|plan\|auto>` | Switch the current session's permission mode live. Session-scoped only, same convention as a bare `/kill` (§4.2.2) |
 | `/pause <slug>` | Stop pushing feed updates for that topic (replies and prompts still flow) |
+| `/restart` | Fleet-scoped, control topic only. Self-respawns the Bridge process to pick up a code change. Kills every live session with it (§4.5); Phase 5 scope, see §4.5.1 |
 
 Session-scoped commands live in the session's own topic, so `/kill` with no argument inside a session
 topic kills that session. Any non-command text in a session topic is an inbound message to that session.
@@ -1177,6 +1205,31 @@ oversights - the first is now superseded by the measurement above, kept for the 
   matter here. The fallback named at the time - spawn each `claude` detached and in its own Job Object
   configured *not* to kill on close - is the documented way to opt out, and is now the concrete
   next step if this behaviour needs to change (see above).
+
+### 4.5.1 `/restart`: an operator-triggered version of the same event
+
+A gap noticed live (2026-08-03): a code change to the Bridge itself needs a process restart to take
+effect - it cannot hot-reload the process it is running under (this exact sentence is what the fleet's
+own live session said, unprompted, after implementing a feature to itself) - and there was no way to
+trigger that from Telegram, only from the desk. `/restart`, sent in the **control topic** (fleet-scoped,
+not session-scoped, unlike `/model`/`/mode`), closes that gap.
+
+**Mechanism: self-respawn, not an external supervisor.** The Bridge spawns a detached successor with
+its own `process.argv` (`spawn(process.execPath, process.argv.slice(1), { detached: true, stdio:
+"ignore" }).unref()`), posts a confirmation, then exits. This deliberately triggers nothing new:
+`/restart` is not a special code path, it is an operator-initiated instance of exactly the event §4.5
+above already measured (scenario 37) and reconciles for. No extra design is owed to it beyond making it
+reachable from a command instead of only from a crash or a manual `Stop-Process`.
+
+**The honest Phase 1 caveat, stated plainly rather than glossed:** §4.5's measurement means `/restart`
+kills every live session along with the Bridge, and Phase 1 has no persisted `session_id` (that is
+Phase 5's SQLite routing table, §12) for the successor to pass to `claude --resume`. So today, `/restart`
+does not hot-reload a session's *conversation* - it relaunches fresh, and whatever was mid-turn is gone,
+not resumed. This is the same "cold-start cost on every restart" tradeoff §4.5 already flags for the
+supervisor's own automatic restarts; `/restart` just makes the operator able to pay that cost
+deliberately, on their own schedule, instead of only when something crashes. It becomes non-destructive
+once Phase 5's session-id persistence lands, and not before - **`/restart` is therefore Phase 5 scope**,
+not a Phase 1 retrofit, same as the supervisor duty it's a manual trigger for.
 
 ---
 
@@ -2314,6 +2367,11 @@ mis-parsed verdict all produce a system that appears to work.
     the tracked state, not a fresh assumption of `manual`, is the source of truth for the next call. A
     name outside the four modes is rejected before anything is written. Unit against a stubbed PTY write
     and a seeded routing-table row, table-driven over every (current, target) pair in the cycle.
+44. **`/restart` spawns a detached successor before exiting, and only from the control topic.** A
+    session-topic `/restart` is rejected (fleet-scoped, not session-scoped, unlike `/model`/`/mode`); a
+    control-topic `/restart` calls `spawn` with `detached: true` and the running process's own
+    `process.argv`, then calls `process.exit` - assert the spawn call's arguments and that exit is
+    called after it, not a real process kill (§4.5.1). Unit against a stubbed `spawn`.
 
 Scenarios 29 and 30 need a **stub Telegram Bot API server** (a local HTTP server implementing
 `getUpdates`, `sendMessage`, `editMessageText`, `createForumTopic` and `answerCallbackQuery`, for two
@@ -2861,8 +2919,11 @@ dependency rather than satisfying it (§6.5). P-3 is gone (§7.3) and item 3 is 
   instead of a debug-only affordance, so a running session's model can change mid-conversation.
 - `/mode <name>` (§4.2.2), the same primitive driving the Shift+Tab permission-mode cycle. The cycle
   order it depends on is live-verified (2026-08-03), not carried forward as a plan-time assumption.
-- **Exit:** scenarios 24-28, 32, 42 and 43 pass; four concurrent Sonnet sessions run for an hour without
-  manual intervention, the weighted budget refuses a fifth, and the fleet's spend is visible in
+- `/restart` (§4.5.1): the self-respawn primitive the supervisor's own automatic restart-on-crash duty
+  already needs, made reachable as a fleet command. Depends on this phase's own session-id persistence
+  to stop being destructive to whatever conversation was mid-turn - do not backport to Phase 1.
+- **Exit:** scenarios 24-28, 32, 42, 43 and 44 pass; four concurrent Sonnet sessions run for an hour
+  without manual intervention, the weighted budget refuses a fifth, and the fleet's spend is visible in
   `/budget` throughout.
 
 ### Phase 6 - hardening, and the WSL2 migration
