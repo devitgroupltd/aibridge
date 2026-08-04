@@ -13,16 +13,19 @@ import { FeedCoalescer } from "./feed-coalescer.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
-import { parseFleetCommand, renderAttach, renderBudget, renderLsTable, renderSettings } from "./fleet-commands.ts";
+import { parseFleetCommand, renderAttach, renderBudget, renderHelp, renderLsTable, renderSettings } from "./fleet-commands.ts";
 import { renderCard } from "./feed-renderer.ts";
 import { applyEvent, createFeedState, promptsInLastHour } from "./feed-state.ts";
 import { normalizeHookEvent } from "./hook-events.ts";
 import { CostTracker, FIVE_HOURS_MS, ONE_WEEK_MS } from "./cost-tracker.ts";
 import { checkConcurrencyCap, currentUnits, WEIGHTED_CAP } from "./concurrency-cap.ts";
+import { findOrphanProcesses } from "./orphan-scan.ts";
 import { startOtlpListener } from "./otlp-listener.ts";
 import { resolvePermCallback } from "./permission-callback.ts";
 import { sweepExpiredPermissions } from "./permission-registry.ts";
+import { listClaudeProcesses } from "./process-scan.ts";
 import { reconcile } from "./reconciliation.ts";
+import { isTopicDeleted } from "./topic-probe.ts";
 import { loadReposRegistry, type RepoEntry, type ReposRegistry } from "./repos-registry.ts";
 import { launchSession, resolveBunExecutable, stripAnsi } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
@@ -507,16 +510,56 @@ async function main(): Promise<void> {
     }
   }
 
+  /** §4.5's "row exists, topic deleted in Telegram" row: probed live (there's no `getForumTopic`
+   * to just ask - see `topic-probe.ts`) before spending a resume attempt on a topic nothing can be
+   * posted to. Marks the row `dead` and notifies the control topic instead of the (gone) session
+   * topic - a `resumeSession` for a deleted topic would itself fail to post its own confirmation,
+   * silently, which is worse than skipping it outright. */
+  async function reapRowsWithDeletedTopics(rows: readonly SessionRow[]): Promise<SessionRow[]> {
+    const survivors: SessionRow[] = [];
+    for (const row of rows) {
+      const deleted = await isTopicDeleted(controlBot, config.supergroupChatId, row.topicId);
+      if (deleted) {
+        sessionStore.setState(row.slug, "dead", nowIso());
+        log("WARN", `session "${row.slug}"'s Telegram topic was deleted while the Bridge was down (§4.5) - marked dead, worktree preserved at ${row.worktreePath}`);
+        confirmSessionCommand(undefined, `Session "${row.slug}" was marked dead: its Telegram topic no longer exists. Worktree preserved at ${row.worktreePath}.`);
+      } else {
+        survivors.push(row);
+      }
+    }
+    return survivors;
+  }
+
+  /** §4.5's "process alive, no row" orphan row: a `claude` process this Bridge instance never
+   * launched (or lost track of) that's still holding onto a worktree. Detected, logged and
+   * surfaced to the control topic for manual review only - an unrecognized live process is never
+   * auto-killed (deciding to kill something is the operator's call, not a startup heuristic's). */
+  async function reportOrphanProcesses(): Promise<void> {
+    const processes = await listClaudeProcesses();
+    if (processes.length === 0) return;
+    const orphans = findOrphanProcesses(processes, sessionStore.all());
+    if (orphans.length === 0) return;
+    const pidList = orphans.map((o) => o.pid).join(", ");
+    log("WARN", `found ${orphans.length} orphaned claude process(es) with no matching session row (§4.5): pid(s) ${pidList}`);
+    confirmSessionCommand(
+      undefined,
+      `Found ${orphans.length} orphaned claude process(es) not tracked by any session row: pid(s) ${pidList}. Not killed automatically - review and end manually if unwanted.`,
+    );
+  }
+
   async function runStartupReconciliation(): Promise<void> {
+    await reportOrphanProcesses();
     const rows = sessionStore.all().filter((r) => r.slug !== config.phase1.slug && r.state !== "dead");
     if (rows.length === 0) return;
-    const actions = reconcile(rows, isPidAlive);
+    const live = await reapRowsWithDeletedTopics(rows);
+    if (live.length === 0) return;
+    const actions = reconcile(live, isPidAlive);
     for (const action of actions) {
       if (action.kind === "readopt") {
         log("WARN", `session "${action.slug}"'s process is still alive after a Bridge restart, but the PTY handle is gone (§4.5) - resuming on a fresh PTY anyway`);
       }
     }
-    for (const row of rows) {
+    for (const row of live) {
       log("INFO", `reconciling session "${row.slug}" after a Bridge restart`);
       await resumeSession(row);
     }
@@ -1311,10 +1354,13 @@ async function main(): Promise<void> {
         return;
       }
 
-      if (text === "/help" || text === "/commands") {
+      // "?" bare (no slash) is only treated as a help request from the control topic - inside a
+      // session topic it's plausible real content meant for Claude (e.g. "?" as a shorthand
+      // question), so only the unambiguous slash forms are recognised there.
+      if (text === "/help" || text === "/commands" || text === "/?" || text === "/h" || (text === "?" && isControl)) {
         const repoCommands = route ? listRepoCommands(route.worktreePath) : [];
         controlBot
-          .sendMessage(config.supergroupChatId, threadId, "Available commands:", {
+          .sendMessage(config.supergroupChatId, threadId, renderHelp(), {
             inline_keyboard: buildCommandKeyboard(repoCommands),
           })
           .catch((err) => log("WARN", `sendMessage (command list) failed: ${(err as Error).message}`));

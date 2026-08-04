@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseFleetCommand, renderAttach, renderBudget, renderLsTable, renderSettings } from "../src/fleet-commands.ts";
+import { parseFleetCommand, renderAttach, renderBudget, renderHelp, renderLsTable, renderSettings } from "../src/fleet-commands.ts";
 import type { SessionRow } from "../src/session-store.ts";
 
 describe("parseFleetCommand", () => {
@@ -92,6 +92,18 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/model opus")).toBeNull();
     expect(parseFleetCommand("hello")).toBeNull();
     expect(parseFleetCommand("/lsx")).toBeNull();
+  });
+});
+
+describe("renderHelp", () => {
+  test("lists every fleet-scoped and session-scoped command", () => {
+    const text = renderHelp();
+    for (const cmd of ["/new", "/ls", "/kill", "/rm", "/attach", "/pause", "/usage", "/budget", "/restart", "/settings", "/autostart"]) {
+      expect(text).toContain(cmd);
+    }
+    expect(text).toContain("/model <");
+    expect(text).toContain("/mode <");
+    expect(text).toContain("/effort <");
   });
 });
 

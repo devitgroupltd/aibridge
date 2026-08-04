@@ -1,7 +1,7 @@
 ---
-version: 0.32.0
+version: 0.33.0
 status: solid
-last_modified_utc: 2026-08-04T16:00:00Z
+last_modified_utc: 2026-08-04T17:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,36 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.33.0 (2026-08-04): Closed out three of 0.32.0's open items. (1) Live-verified `/autostart`
+    for real, not just against a hand-written fixture: ran the actual `schtasks /Create` ->
+    `/Query` -> `/Delete` round trip on the operator's own box using `buildCreateArgs`/
+    `buildQueryArgs`/`buildDeleteArgs`'s real output, confirmed the real `/Query` field names
+    (`Status`/`Last Run Time`/`Last Result`) and the unregistered-task error text both match
+    `parseQueryOutput` exactly, then deleted the test task - no residue left. (2) `/help`/
+    `/commands` was found to be incomplete (only ever listed `/compact`/`/clear` and repo
+    `.claude/commands/*.md` shortcuts, never the fleet or session commands) - added
+    `renderHelp()` in `fleet-commands.ts` to print the full command list as text alongside the
+    existing button keyboard, plus `/?`, `/h`, and bare `?` (control-topic only, since a bare `?`
+    inside a session topic is plausible real content meant for Claude) as aliases. (3) Built
+    the two §4.5 reconciliation rows 0.32.0 left open, wired into `index.ts`'s real startup path
+    rather than left as a documented gap: `topic-probe.ts`'s `isTopicDeleted()` (there is no
+    `getForumTopic` in the Bot API to just ask, so this probes with a non-intrusive
+    `sendChatAction(\"typing\")` and treats only Telegram's exact \"message thread not found\"
+    error as a deleted verdict - anything else, e.g. a rate limit, is inconclusive and the row is
+    left alone, since a false 'deleted' verdict kills a still-healthy session) reaps rows whose
+    topic was deleted while the Bridge was down, marking them dead and notifying the control
+    topic instead of the now-nonexistent session topic; `orphan-scan.ts`'s `findOrphanProcesses()`
+    plus `process-scan.ts`'s `listClaudeProcesses()` (shells out to `Get-CimInstance
+    Win32_Process` - Windows has no `ps -o command` equivalent that exposes the full command
+    line) find `claude.exe` processes carrying `--dangerously-load-development-channels` with no
+    matching session row and surface them to the control topic for manual review - never
+    auto-killed, since deciding to kill an unrecognized live process is the operator's call, not
+    a startup heuristic's. Live-verified the orphan scan against this box's own real `claude.exe`
+    processes (found 3, correctly flagged 0 as orphans since none carry the launch flag - this
+    session's own VS Code-launched processes are correctly left alone). `bun test` (320 pass) and
+    `tsc --noEmit` clean across all five packages. Still open: the Task Scheduler item's
+    README-and-recovery-doc half, §7.4's stale-inbound handling and monotonic-clock swap, and
+    quiet mode's 50%-drop threshold."
   - "0.32.0 (2026-08-04): Started Phase 6a with the Task Scheduler item, reshaped as an operator
     request rather than a static XML/README artifact: the user asked for a way to manage Bridge
     settings (autostart, config) without introducing a second UI stack. Considered and rejected a
@@ -1703,8 +1733,8 @@ the Telegram topic list.
 |---|---|
 | Row exists, process alive | Re-adopt. Post "bridge restarted, session still running" to the topic. **The PTY handle is gone even though the process is not** - see below |
 | Row exists, process gone | Attempt `claude --resume <session_id>` on a fresh PTY. On failure, mark `dead` and post a notice with the worktree path so work is not lost |
-| Row exists, topic deleted in Telegram | Mark `dead`, terminate the process, leave the worktree. Log |
-| Process alive, no row | Orphan from a crashed Bridge mid-`/new`. Adopt into a fresh topic |
+| Row exists, topic deleted in Telegram | Mark `dead`, leave the worktree. Notify the control topic (the session's own topic no longer exists to post into). Log |
+| Process alive, no row | Orphan from a crashed Bridge mid-`/new`. Report to the control topic for manual review. Log |
 | Row `state = awaiting_input` | The pending prompt is gone (§6.5). Post an explicit "the pending question was lost, please re-ask" rather than leaving a dead button |
 
 **MEASURED 2026-08-03 (scenario 37, Stage 7).** Killed the Bridge process alone via PowerShell
@@ -1732,6 +1762,16 @@ This changes the reconciliation table above in a real way, not just a footnote:
   dialog, MCP consent, model/worktree re-resolution) on every Bridge restart, not just the first launch.
   Worth factoring into how aggressively Phase 5 restarts the Bridge (e.g. on every deploy) versus how
   disruptive that is to whoever is mid-conversation on Telegram at the time.
+- **Rows 3 and 4, as implemented (0.33.0), lean on the same measurement rather than re-verifying it
+  per row.** "Topic deleted" no longer says "terminate the process" - the process is already gone by
+  the time reconciliation runs, per the measurement above, so there is nothing left to terminate; the
+  row is simply marked `dead`. "Process alive, no row" no longer auto-adopts into a fresh topic -
+  deciding what session a stray process actually was, and whether restarting it is even wanted, is the
+  operator's call, so it's reported to the control topic instead. Both choices mean a process that
+  *did* somehow survive (the recycled-pid case row 1's own `readopt` action is kept defensive for) is
+  never blindly `kill()`-ed by pid alone - `orphan-scan.ts` deliberately treats a `dead` row's pid as
+  no longer "known", so a genuinely-surviving process re-surfaces on the next scan instead of being
+  silently trusted forever just because its row says `dead`.
 - **The Job Object opt-out fallback below is now the concrete next step, not a contingency.** If
   session survival across Bridge restarts is worth the engineering cost, spawning each `claude` detached
   in its own Job Object configured not to kill on close (Windows' documented mechanism for exactly this)
@@ -3636,10 +3676,16 @@ unattended running defensible, and **should not be skipped just because Phases 1
 
 **6a, on Windows:**
 
-- The full §4.5 reconciliation matrix, including the partial-re-adoption case.
+- ~~The full §4.5 reconciliation matrix, including the partial-re-adoption case.~~ **Done (0.33.0).**
+  `topic-probe.ts`/`orphan-scan.ts`/`process-scan.ts` cover the two rows that needed live process/topic
+  enumeration, wired into `index.ts`'s real startup path alongside the existing DB-observable rows in
+  `reconciliation.ts`. The "partial-re-adoption" case (row 1, "process alive") is confirmed not to occur
+  on this stack (§4.5's 2026-08-03 measurement) - `readopt` is kept only as defensive handling for a
+  recycled pid, per that section's own note.
+- The Task Scheduler task itself (`autostart.ts`, `/autostart`) is built and live-verified (0.32.0/
+  0.33.0); the README half (setup, recovery, VPS escape hatch) is still open.
 - Stale-inbound handling and monotonic timers (§7.4), verified across a real modern-standby suspend.
 - Quiet mode.
-- The Task Scheduler task and a README covering setup, recovery and the VPS escape hatch.
 - **Exit:** scenarios 24 and 37 pass under a real restart - kill the Bridge mid-turn with a permission
   prompt open, restart it, and the system converges to a correct state with no dead buttons.
 

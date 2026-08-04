@@ -1,7 +1,7 @@
 import { escapeForFeed } from "./feed-escape.ts";
 import type { RepoEntry } from "./repos-registry.ts";
 import type { Model } from "./session-commands.ts";
-import { MODELS } from "./session-commands.ts";
+import { EFFORTS, MODELS, MODES } from "./session-commands.ts";
 import type { SessionRow } from "./session-store.ts";
 
 /**
@@ -200,6 +200,35 @@ export function renderSettings(repos: readonly RepoEntry[], concurrency: { curre
   }
   lines.push("", `Concurrency: ${concurrency.current} / ${concurrency.cap} weighted units (§10.5)`);
   return escapeForFeed(lines.join("\n"));
+}
+
+/** `/help`/`/commands`: the fleet- and session-scoped command list itself, plain text (no
+ * `parse_mode`, unlike the other render functions here - the `/help` call site sends it alongside
+ * the existing built-in/repo-command button keyboard, not in place of it) - surfaced because the
+ * button keyboard only ever covered `/compact`/`/clear` and repo-defined `.claude/commands/*.md`
+ * shortcuts, never the fleet/session commands themselves. */
+export function renderHelp(): string {
+  return [
+    "Fleet commands (control topic; also /help, /?, /h, or bare ? here):",
+    "  /new [--model] <repo> <prompt> - start a new session",
+    "  /ls - list sessions",
+    "  /kill [<slug>|--all] - stop a session (or all, confirm-gated)",
+    "  /rm [<slug>|--dead|--prefix <text>|--all] - remove a dead session row",
+    "  /attach [<slug>] - show a session's PTY tail",
+    "  /pause [<slug>] - pause a session",
+    "  /usage [<slug>] - token/cost usage",
+    "  /budget - fleet spend (5h/7d)",
+    "  /restart - restart the Bridge daemon",
+    "  /settings - registered repos + concurrency budget",
+    "  /autostart [status|install|uninstall] - manage the logon Task Scheduler entry",
+    "",
+    "Session commands (inside a session's own topic):",
+    `  /model <${MODELS.join("|")}>`,
+    `  /mode <${MODES.join("|")}>`,
+    `  /effort <${EFFORTS.join("|")}>`,
+    "",
+    "Built-in passthrough and repo commands are below:",
+  ].join("\n");
 }
 
 /** §4.2's `/attach`: the PTY tail plus the local pickup command - both best-effort, same "takes it
