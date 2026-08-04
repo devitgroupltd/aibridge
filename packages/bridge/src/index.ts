@@ -891,7 +891,6 @@ async function main(): Promise<void> {
       confirmSessionCommand(topicId, kind === "kill" ? "No live sessions to kill." : "No sessions to remove.");
       return;
     }
-    if (topicId === undefined) return;
     const id = randomUUID().slice(0, 8);
     const slugs = targets.map((r) => r.slug);
     try {

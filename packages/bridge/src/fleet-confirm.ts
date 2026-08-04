@@ -6,7 +6,7 @@ export interface PendingFleetConfirm {
   id: string;
   kind: FleetConfirmKind;
   slugs: string[];
-  topicId: number;
+  topicId: number | undefined;
   messageId: number;
   createdAt: number;
 }

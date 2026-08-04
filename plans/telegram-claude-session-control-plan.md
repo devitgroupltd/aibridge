@@ -1,7 +1,7 @@
 ---
-version: 0.28.0
+version: 0.29.0
 status: solid
-last_modified_utc: 2026-08-04T11:26:00Z
+last_modified_utc: 2026-08-04T11:52:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,24 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.29.0 (2026-08-04): Live-verified 0.26.0's `/kill --all`/`/rm --all` confirm flow for the
+    first time - it had shipped and been deployed but never actually exercised against a real
+    Telegram button tap. Found a real bug doing so: `postFleetConfirm` had `if (topicId ===
+    undefined) return;`, silently dropping the confirm card whenever the command was sent from the
+    control topic itself - but `isControlTopic` treats `threadId === undefined` as *the* control
+    topic (Telegram's real 'General' topic carries no `message_thread_id` at all), which every
+    other command handler (`confirmSessionCommand`, `handleLsCommand`) already passes through to
+    `sendMessage` unchanged. So the one command meant to be typed from General was the one command
+    that silently no-op'd there. Removed the guard; `PendingFleetConfirm.topicId` widened to
+    `number | undefined` to match. Live-verified end to end against two real sessions and a real
+    button tap via `scripts/telegram-automation/` (new `tap-button.js`, `inspect-last-message.js`):
+    `/kill --all` posts the card, Yes tap kills both and edits the card to 'Killed 2 sessions: ...',
+    confirmed dead via `/ls`; `/rm --all` posts its own card, a Cancel tap edits to 'Cancelled -
+    nothing was changed.' leaving the rows intact (confirmed via `/ls`), and a second `/rm --all`
+    with a Yes tap removes both, confirmed via `/ls` showing 'No sessions.'. This is the same
+    'restart, then actually check' discipline 0.27.0 applied to the endurance run, now applied to
+    this feature - it had looked done because it typechecked and unit-tested, not because anyone had
+    tapped the button."
   - "0.28.0 (2026-08-04): Fixed 0.27.0's `sendChannelText` bug - the trailing `\r` after an inbound
     prompt injection could silently fail to submit, wedging a session forever with the
     'Thinking...' placeholder lying about it. Added a settle-then-verify retry: after the write's
@@ -3506,7 +3524,11 @@ item 3 is moot until §7.6.
   flag. A 5-minute TTL, not the 30-minute permission-prompt one, since this is an operator confirming
   their own just-typed command rather than waiting on Claude. Deliberately scoped down from covering
   every destructive command (including single-slug `/kill`/`/rm`) per explicit operator direction -
-  only the two genuinely fleet-wide forms get the button.
+  only the two genuinely fleet-wide forms get the button. **Live-verified (2026-08-04, see 0.29.0)**
+  against a real button tap after finding and fixing a real bug: the confirm card silently never
+  posted when the command was typed from the control topic itself, because `postFleetConfirm`
+  refused an `undefined` topic id that every sibling command handler already treats as "the control
+  topic" and handles fine.
 - ~~The four-concurrent-Sonnet-sessions-for-an-hour endurance run.~~ **Attempted (2026-08-04),
   claimed done, then found wrong within the hour - see the 0.27.0 changelog entry.** `/new` launched
   three sessions alongside the pre-existing `test-session`; `/ls`/`/budget` looked clean for the full
