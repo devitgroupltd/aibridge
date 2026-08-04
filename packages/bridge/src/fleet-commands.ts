@@ -308,6 +308,8 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "effort", description: `Set effort: /effort <${EFFORTS.join("|")}>` },
     { command: "commands", description: "List this project's .claude/commands: /commands [<term>]" },
     { command: "skills", description: "List this project's .claude/skills: /skills [<term>]" },
+    { command: "compact", description: "Compact the session's conversation" },
+    { command: "clear", description: "Clear the session's conversation" },
   ];
 }
 

@@ -1517,10 +1517,20 @@ async function main(): Promise<void> {
           }
           return;
         }
+        // A bare `/<name>` is checked against both skills and repo commands (in that order) -
+        // `/cmd`/`/commands` stays available as an explicit disambiguator for the rare case a
+        // skill and a command share a name, but for everything else typing `/deep-check` should
+        // just work without the operator needing to know which category it's in.
         const skillInvoke = parseSkillInvocation(text);
-        if (skillInvoke && listRepoSkills(route.worktreePath).includes(skillInvoke.name)) {
-          sendChannelText(currentSlug, threadId, buildSkillShimText(skillInvoke.name, skillInvoke.args), String(message.message_id), from);
-          return;
+        if (skillInvoke) {
+          if (listRepoSkills(route.worktreePath).includes(skillInvoke.name)) {
+            sendChannelText(currentSlug, threadId, buildSkillShimText(skillInvoke.name, skillInvoke.args), String(message.message_id), from);
+            return;
+          }
+          if (listRepoCommands(route.worktreePath).includes(skillInvoke.name)) {
+            sendChannelText(currentSlug, threadId, buildCmdShimText(skillInvoke.name, skillInvoke.args), String(message.message_id), from);
+            return;
+          }
         }
       }
 
