@@ -1,7 +1,7 @@
 ---
-version: 0.31.0
+version: 0.32.0
 status: solid
-last_modified_utc: 2026-08-04T15:00:00Z
+last_modified_utc: 2026-08-04T16:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,27 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.32.0 (2026-08-04): Started Phase 6a with the Task Scheduler item, reshaped as an operator
+    request rather than a static XML/README artifact: the user asked for a way to manage Bridge
+    settings (autostart, config) without introducing a second UI stack. Considered and rejected a
+    separate Python/C# admin app - it would add a second runtime to install/patch on the same
+    Windows box for zero benefit `schtasks.exe`/`Register-ScheduledTask` via `child_process` doesn't
+    already give from inside the existing Bun process, and the project's own §9 rule is one stack
+    (Bun/TypeScript). Instead extended the existing control-topic command surface: new
+    `packages/bridge/src/autostart.ts` (pure arg-building for `schtasks /Create /SC ONLOGON /RL
+    LIMITED` - a *current-user*, non-admin logon-trigger task, matching §7.2's own 'check \"highest
+    privileges\" only if it proves necessary' - plus `/Query`/`/Delete` args and output parsing, unit
+    tested against a captured-shape `/FO LIST /V` sample per §9's silent-wrong-parse discipline) and
+    two new commands in `fleet-commands.ts`/`index.ts`: `/settings` (read-only: registered repos from
+    `repos.toml`, current/cap weighted concurrency) and `/autostart status\|install\|uninstall`
+    (wraps `schtasks.exe`, control-topic only, same gating as `/budget`/`/restart`). Confirmed
+    `Register-ScheduledTask`'s OS-level `Bun.cron()` wrapper (Bun 1.3.12+) does not fit here - it's
+    cron-schedule-based, not a logon-trigger - so `schtasks`/`child_process` remains the right tool
+    for this specific trigger type. `bun test` (347 pass) and `tsc --noEmit` clean across all five
+    packages. The Task Scheduler item's README-and-recovery-doc half, plus the other three Phase 6a
+    items (the full §4.5 reconciliation matrix's orphan/topic-deleted rows and their wiring into
+    `index.ts`'s startup path, §7.4's stale-inbound handling and monotonic-clock swap, and quiet
+    mode's 50%-drop threshold) remain open."
   - "0.31.0 (2026-08-04): Redid the Phase 5 endurance run per 0.30.0's own prescription - four
     concurrent Sonnet sessions (`using-only-read-and-git`, `using-only-read-and-grep`,
     `using-only-grep-no-write`, `using-only-read-grep-and`), each given an independent real
@@ -1512,6 +1533,8 @@ permission relay and feed renderer are all already scoped to a single Bridge pro
 | `/effort <low\|medium\|high\|xhigh\|max>` | Switch the current session's reasoning effort live, mid-conversation. Session-scoped only (§4.2.3) |
 | `/pause <slug>` | Stop pushing feed updates for that topic (replies and prompts still flow) |
 | `/restart` | Fleet-scoped, control topic only. Self-respawns the Bridge process to pick up a code change. Kills every live session with it (§4.5); Phase 5 scope, see §4.5.1 |
+| `/settings` | Fleet-scoped, control topic only. Read-only card: registered repos from `repos.toml` and the current/cap weighted concurrency budget (§10.5). Phase 6a scope |
+| `/autostart [status\|install\|uninstall]` | Fleet-scoped, control topic only. Manages the §7.2 Task Scheduler entry via `schtasks.exe` - `install` registers a logon-trigger task under the operator's own account (no admin rights needed); no argument defaults to `status`. Phase 6a scope |
 
 Session-scoped commands live in the session's own topic, so `/kill` with no argument inside a session
 topic kills that session. Any non-command text in a session topic is an inbound message to that session.

@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import http from "node:http";
 import path from "node:path";
@@ -6,24 +6,25 @@ import type * as pty from "node-pty";
 import type { ChannelMetaFields, HookEventMessage } from "@aibridge/protocol";
 import { renderChannelTag } from "@aibridge/protocol";
 import { resolveAskCallback, renderAskAnsweredCard, renderAskCancelledCard } from "./ask-callback.ts";
+import { buildCreateArgs, buildDeleteArgs, buildQueryArgs, parseQueryOutput, renderAutostartStatus, TASK_NAME } from "./autostart.ts";
 import { buildCmdShimText, buildCommandKeyboard, isBuiltinPassthroughCommand, listRepoCommands, resolveCommandAction } from "./commands.ts";
 import { loadConfig, STATE_DIR } from "./config.ts";
 import { FeedCoalescer } from "./feed-coalescer.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
-import { parseFleetCommand, renderAttach, renderBudget, renderLsTable } from "./fleet-commands.ts";
+import { parseFleetCommand, renderAttach, renderBudget, renderLsTable, renderSettings } from "./fleet-commands.ts";
 import { renderCard } from "./feed-renderer.ts";
 import { applyEvent, createFeedState, promptsInLastHour } from "./feed-state.ts";
 import { normalizeHookEvent } from "./hook-events.ts";
 import { CostTracker, FIVE_HOURS_MS, ONE_WEEK_MS } from "./cost-tracker.ts";
-import { checkConcurrencyCap, WEIGHTED_CAP } from "./concurrency-cap.ts";
+import { checkConcurrencyCap, currentUnits, WEIGHTED_CAP } from "./concurrency-cap.ts";
 import { startOtlpListener } from "./otlp-listener.ts";
 import { resolvePermCallback } from "./permission-callback.ts";
 import { sweepExpiredPermissions } from "./permission-registry.ts";
 import { reconcile } from "./reconciliation.ts";
-import { loadReposRegistry, type ReposRegistry } from "./repos-registry.ts";
-import { launchSession, stripAnsi } from "./session-launcher.ts";
+import { loadReposRegistry, type RepoEntry, type ReposRegistry } from "./repos-registry.ts";
+import { launchSession, resolveBunExecutable, stripAnsi } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
 import { RateGovernor } from "./rate-governor.ts";
 import { deriveAlwaysRule, ruleAlreadyCovered } from "./rule-derivation.ts";
@@ -1075,6 +1076,65 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  /** `/settings`: control-topic only, same reasoning as `/budget` - repos.toml and the weighted
+   * concurrency budget are fleet-wide, not scoped to any one session's topic. */
+  function handleSettingsCommand(topicId: number | undefined): void {
+    if (!isControlTopic(topicId)) {
+      confirmSessionCommand(topicId, "/settings only works from the control topic.");
+      return;
+    }
+    const repos: RepoEntry[] = reposRegistry
+      ? reposRegistry.names().map((name) => reposRegistry?.get(name)).filter((r): r is RepoEntry => r !== undefined)
+      : [];
+    controlBot
+      .sendMessage(config.supergroupChatId, topicId, renderSettings(repos, { current: currentUnits(sessionStore.all()), cap: WEIGHTED_CAP }))
+      .catch((err) => log("WARN", `sendMessage (/settings) failed: ${(err as Error).message}`));
+  }
+
+  /** Wraps `schtasks.exe` (built into Windows, no extra dependency) - `/Query` against an
+   * unregistered task exits non-zero, which is a valid "not registered" answer, not a transport
+   * failure, so this always resolves rather than rejecting; callers that care about install/delete
+   * failing check `failed` themselves. */
+  function runSchtasks(args: string[]): Promise<{ stdout: string; stderr: string; failed: boolean }> {
+    return new Promise((resolve) => {
+      execFile("schtasks", args, { windowsHide: true }, (err, stdout, stderr) => {
+        resolve({ stdout: stdout ?? "", stderr: stderr ?? "", failed: err !== null });
+      });
+    });
+  }
+
+  /** `/autostart status|install|uninstall`: §7.2's Task Scheduler entry, made reachable from
+   * Telegram instead of only from the desk. `install` registers a logon-trigger task under this
+   * account's own token (`/RL LIMITED`), which needs no admin rights. */
+  async function handleAutostartCommand(cmd: Extract<FleetCommand, { kind: "autostart" }>, topicId: number | undefined): Promise<void> {
+    if (!isControlTopic(topicId)) {
+      confirmSessionCommand(topicId, "/autostart only works from the control topic.");
+      return;
+    }
+    try {
+      if (cmd.action === "status") {
+        const { stdout, stderr } = await runSchtasks(buildQueryArgs());
+        await controlBot.sendMessage(config.supergroupChatId, topicId, renderAutostartStatus(parseQueryOutput(stdout, stderr)));
+        return;
+      }
+      if (cmd.action === "install") {
+        const entryScript = path.join(import.meta.dirname, "index.ts");
+        const result = await runSchtasks(buildCreateArgs(resolveBunExecutable(), entryScript));
+        if (result.failed) throw new Error(result.stderr.trim() || "schtasks /Create failed");
+        confirmSessionCommand(
+          topicId,
+          `Registered "${TASK_NAME}" as a logon-trigger scheduled task (§7.2) - starts the Bridge at next log-on, current-user scope, no admin rights needed.`,
+        );
+        return;
+      }
+      const result = await runSchtasks(buildDeleteArgs());
+      if (result.failed) throw new Error(result.stderr.trim() || "schtasks /Delete failed");
+      confirmSessionCommand(topicId, `Removed the "${TASK_NAME}" scheduled task.`);
+    } catch (err) {
+      confirmSessionCommand(topicId, `/autostart ${cmd.action} failed: ${(err as Error).message}`);
+    }
+  }
+
   const offsetPath = path.join(STATE_DIR, "telegram-offset.json");
   startPolling(controlBot, {
     initialOffset: loadOffset(offsetPath),
@@ -1237,6 +1297,14 @@ async function main(): Promise<void> {
         }
         if (fleetCmd.kind === "restart") {
           void handleRestartCommand(threadId);
+          return;
+        }
+        if (fleetCmd.kind === "settings") {
+          handleSettingsCommand(threadId);
+          return;
+        }
+        if (fleetCmd.kind === "autostart") {
+          void handleAutostartCommand(fleetCmd, threadId);
           return;
         }
         handlePauseCommand(fleetCmd, threadId, currentSlug);

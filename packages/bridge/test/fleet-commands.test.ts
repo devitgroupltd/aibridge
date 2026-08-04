@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseFleetCommand, renderAttach, renderBudget, renderLsTable } from "../src/fleet-commands.ts";
+import { parseFleetCommand, renderAttach, renderBudget, renderLsTable, renderSettings } from "../src/fleet-commands.ts";
 import type { SessionRow } from "../src/session-store.ts";
 
 describe("parseFleetCommand", () => {
@@ -71,10 +71,47 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/restart")).toEqual({ kind: "restart" });
   });
 
+  test("/settings takes no argument", () => {
+    expect(parseFleetCommand("/settings")).toEqual({ kind: "settings" });
+  });
+
+  test("/autostart with no argument defaults to status", () => {
+    expect(parseFleetCommand("/autostart")).toEqual({ kind: "autostart", action: "status" });
+  });
+
+  test("/autostart install and /autostart uninstall", () => {
+    expect(parseFleetCommand("/autostart install")).toEqual({ kind: "autostart", action: "install" });
+    expect(parseFleetCommand("/autostart uninstall")).toEqual({ kind: "autostart", action: "uninstall" });
+  });
+
+  test("/autostart with an unrecognised argument is invalid, not a different command", () => {
+    expect(parseFleetCommand("/autostart bogus")).toBeNull();
+  });
+
   test("returns null for anything that isn't one of these commands", () => {
     expect(parseFleetCommand("/model opus")).toBeNull();
     expect(parseFleetCommand("hello")).toBeNull();
     expect(parseFleetCommand("/lsx")).toBeNull();
+  });
+});
+
+describe("renderSettings", () => {
+  test("lists registered repos and the weighted concurrency budget", () => {
+    const text = renderSettings(
+      [
+        { name: "seowrite", path: "c:\\data\\projects\\seowrite", base: "main", model: "sonnet" },
+        { name: "aibridge", path: "c:\\data\\projects\\aibridge", base: "main" },
+      ],
+      { current: 1.5, cap: 4 },
+    );
+    expect(text).toContain("Registered repos (2):");
+    expect(text).toContain("seowrite -&gt; c:\\data\\projects\\seowrite (default model: sonnet)");
+    expect(text).toContain("aibridge -&gt; c:\\data\\projects\\aibridge");
+    expect(text).toContain("Concurrency: 1.5 / 4 weighted units");
+  });
+
+  test("an empty registry says so instead of an empty list", () => {
+    expect(renderSettings([], { current: 0, cap: 4 })).toContain("(none - add one to repos.toml, §7.5)");
   });
 });
 

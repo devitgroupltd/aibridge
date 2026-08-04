@@ -43,7 +43,7 @@ function resolveClaudeExecutable(): string {
  */
 let cachedBunExePath: string | undefined;
 
-function resolveBunExecutable(): string {
+export function resolveBunExecutable(): string {
   if (cachedBunExePath) return cachedBunExePath;
   const output = execFileSync("where", ["bun.exe"], { encoding: "utf8" });
   const first = output

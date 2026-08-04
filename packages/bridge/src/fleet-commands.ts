@@ -1,4 +1,5 @@
 import { escapeForFeed } from "./feed-escape.ts";
+import type { RepoEntry } from "./repos-registry.ts";
 import type { Model } from "./session-commands.ts";
 import { MODELS } from "./session-commands.ts";
 import type { SessionRow } from "./session-store.ts";
@@ -29,7 +30,9 @@ export type FleetCommand =
   | { kind: "pause"; slug?: string }
   | { kind: "usage"; slug?: string }
   | { kind: "budget" }
-  | { kind: "restart" };
+  | { kind: "restart" }
+  | { kind: "settings" }
+  | { kind: "autostart"; action: "status" | "install" | "uninstall" };
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
 
@@ -75,12 +78,21 @@ function parseRm(rest: string): FleetCommand {
   return { kind: "rm", slug: trimmed.length > 0 ? trimmed : undefined };
 }
 
+/** `/autostart` with no argument defaults to `status`; anything besides `status`/`install`/
+ * `uninstall` is a malformed argument, not a different command. */
+function parseAutostart(rest: string): FleetCommand | null {
+  const trimmed = rest.trim();
+  const action = trimmed.length === 0 ? "status" : trimmed;
+  if (action !== "status" && action !== "install" && action !== "uninstall") return null;
+  return { kind: "autostart", action };
+}
+
 /** Returns null for anything that isn't one of these commands. A recognised command with a
  * malformed argument (e.g. `/new` with no repo) also returns null - same "not for us" vs.
  * "for us, but invalid" split as `session-commands.ts`'s parser. */
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart)\b(.*)$/s);
+  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|settings|autostart)\b(.*)$/s);
   if (!match) return null;
   const [, cmd, rest] = match as [string, string, string];
   switch (cmd) {
@@ -92,6 +104,10 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return { kind: "budget" };
     case "restart":
       return { kind: "restart" };
+    case "settings":
+      return { kind: "settings" };
+    case "autostart":
+      return parseAutostart(rest);
     case "rm":
       return parseRm(rest);
     case "kill":
@@ -167,6 +183,22 @@ export function renderBudget(fleetFiveHour: number, fleetWeekly: number, perSess
       lines.push(`  ${slug}: ${formatUsd(cost)}`);
     }
   }
+  return escapeForFeed(lines.join("\n"));
+}
+
+/** `/settings`: a read-only card for the machine-level config an operator can't see from `/ls`
+ * (registered repos, the weighted concurrency budget) - control-topic only, same reasoning as
+ * `/budget` (there's no single session to scope this to). */
+export function renderSettings(repos: readonly RepoEntry[], concurrency: { current: number; cap: number }): string {
+  const lines = ["Bridge settings:", "", `Registered repos (${repos.length}):`];
+  if (repos.length === 0) {
+    lines.push("  (none - add one to repos.toml, §7.5)");
+  } else {
+    for (const r of repos) {
+      lines.push(`  ${r.name} -> ${r.path}${r.model ? ` (default model: ${r.model})` : ""}`);
+    }
+  }
+  lines.push("", `Concurrency: ${concurrency.current} / ${concurrency.cap} weighted units (§10.5)`);
   return escapeForFeed(lines.join("\n"));
 }
 
