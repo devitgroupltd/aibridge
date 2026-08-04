@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { PermissionRegistry } from "../src/permission-registry.ts";
+import { PermissionRegistry, sweepExpiredPermissions } from "../src/permission-registry.ts";
 
 function entry(overrides: Partial<Parameters<PermissionRegistry["add"]>[0]> = {}) {
   return {
@@ -74,5 +74,61 @@ describe("PermissionRegistry", () => {
     now = 1500;
     expect(registry.expired().map((e) => e.requestId).sort()).toEqual(["aaaaa", "bbbbb"]);
     expect(registry.get("aaaaa")).toBeDefined(); // expired() does not consume entries
+  });
+
+  // Found live 2026-08-04: the expiry sweep edited the Telegram card to "expired" but never sent
+  // a deny verdict, leaving the channel server's blocked permission call - and the Claude process
+  // behind it - waiting forever. Four concurrent endurance-run sessions each wedged this way.
+  test("sweepExpiredPermissions sends a deny verdict and removes the entry, not just the card edit", () => {
+    let now = 0;
+    const registry = new PermissionRegistry({ now: () => now, ttlMs: 1000 });
+    registry.add(entry({ requestId: "aaaaa", slug: "session-a" }));
+    registry.add(entry({ requestId: "bbbbb", slug: "session-b" }));
+
+    const verdicts: Array<{ slug: string; requestId: string; behavior: string }> = [];
+    const finalized: Array<{ messageId: number; text: string }> = [];
+
+    now = 1500;
+    sweepExpiredPermissions(
+      registry,
+      (slug, requestId, behavior) => verdicts.push({ slug, requestId, behavior }),
+      async (messageId, text) => {
+        finalized.push({ messageId, text });
+      },
+      () => {
+        throw new Error("finalizeMessage should not reject in this test");
+      },
+    );
+
+    expect(verdicts.sort((a, b) => a.requestId.localeCompare(b.requestId))).toEqual([
+      { slug: "session-a", requestId: "aaaaa", behavior: "deny" },
+      { slug: "session-b", requestId: "bbbbb", behavior: "deny" },
+    ]);
+    expect(finalized.map((f) => f.text)).toEqual([
+      "⌛ expired: Bash (no answer in time)",
+      "⌛ expired: Bash (no answer in time)",
+    ]);
+    expect(registry.get("aaaaa")).toBeUndefined();
+    expect(registry.get("bbbbb")).toBeUndefined();
+  });
+
+  test("sweepExpiredPermissions is a no-op when nothing is expired", () => {
+    let now = 0;
+    const registry = new PermissionRegistry({ now: () => now, ttlMs: 1000 });
+    registry.add(entry({ requestId: "aaaaa" }));
+
+    let verdictSent = false;
+    now = 500;
+    sweepExpiredPermissions(
+      registry,
+      () => {
+        verdictSent = true;
+      },
+      async () => {},
+      () => {},
+    );
+
+    expect(verdictSent).toBe(false);
+    expect(registry.get("aaaaa")).toBeDefined();
   });
 });

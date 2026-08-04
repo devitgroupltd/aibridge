@@ -67,3 +67,23 @@ export class PermissionRegistry {
     this.pending.delete(requestId);
   }
 }
+
+/**
+ * §6.5's periodic expiry sweep. Sends the same `deny` verdict a tapped "Deny" button would
+ * (§6.3) before editing the Telegram card - without it, the channel server's blocked permission
+ * call (and the Claude process behind it) waits forever even though the card correctly shows
+ * "expired" (found live 2026-08-04: four concurrent endurance-run sessions each wedged
+ * permanently on an unanswered Write/Bash prompt, none ever unblocked).
+ */
+export function sweepExpiredPermissions(
+  registry: PermissionRegistry,
+  sendVerdict: (slug: string, requestId: string, behavior: "deny") => void,
+  finalizeMessage: (messageId: number, text: string) => Promise<void>,
+  onFinalizeError: (err: Error) => void,
+): void {
+  for (const entry of registry.expired()) {
+    registry.remove(entry.requestId);
+    sendVerdict(entry.slug, entry.requestId, "deny");
+    finalizeMessage(entry.messageId, `⌛ expired: ${entry.toolName} (no answer in time)`).catch(onFinalizeError);
+  }
+}

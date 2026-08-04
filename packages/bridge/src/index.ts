@@ -20,6 +20,7 @@ import { CostTracker, FIVE_HOURS_MS, ONE_WEEK_MS } from "./cost-tracker.ts";
 import { checkConcurrencyCap, WEIGHTED_CAP } from "./concurrency-cap.ts";
 import { startOtlpListener } from "./otlp-listener.ts";
 import { resolvePermCallback } from "./permission-callback.ts";
+import { sweepExpiredPermissions } from "./permission-registry.ts";
 import { reconcile } from "./reconciliation.ts";
 import { loadReposRegistry, type ReposRegistry } from "./repos-registry.ts";
 import { launchSession, stripAnsi } from "./session-launcher.ts";
@@ -400,15 +401,16 @@ async function main(): Promise<void> {
     log,
   });
 
-  // §6.5: strip the keyboard and mark "expired" on any pending permission request past its TTL -
-  // a stale button left live would look tappable but silently do nothing.
+  // §6.5: strip the keyboard, mark "expired", and deny (see sweepExpiredPermissions) on any
+  // pending permission request past its TTL - a stale button left live would look tappable but
+  // silently do nothing.
   setInterval(() => {
-    for (const entry of pipeHandle.permissionRegistry.expired()) {
-      pipeHandle.permissionRegistry.remove(entry.requestId);
-      pipeHandle
-        .finalizePermissionMessage(entry.messageId, `⌛ expired: ${entry.toolName} (no answer in time)`)
-        .catch((err) => log("WARN", `failed to mark permission request as expired: ${(err as Error).message}`));
-    }
+    sweepExpiredPermissions(
+      pipeHandle.permissionRegistry,
+      pipeHandle.sendVerdict,
+      pipeHandle.finalizePermissionMessage,
+      (err) => log("WARN", `failed to mark permission request as expired: ${err.message}`),
+    );
 
     // §6.4: past the 3540s ceiling, cancel rather than let the hook's own 3600s timeout expire
     // silently - the operator sees an explicit "cancelled" card and Claude sees a `deny` it can

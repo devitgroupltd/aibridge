@@ -1,7 +1,7 @@
 ---
-version: 0.29.0
+version: 0.30.0
 status: solid
-last_modified_utc: 2026-08-04T11:52:00Z
+last_modified_utc: 2026-08-04T13:45:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,32 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.30.0 (2026-08-04): Attempted the Phase 5 endurance run (four concurrent Sonnet sessions,
+    each given an independent real task requiring a `Write` or a `bun`/`bunx` `Bash` call not in
+    the default `settings.json` allowlist) and found every single one permanently wedged after an
+    hour, not merely idle - each session's transcript ends mid-turn on the gated tool_use with no
+    tool_result ever following, and the session's own Telegram topic showed 'expired: Write/Bash
+    (no answer in time)' because the operator (this run) never opened the per-session topics to
+    tap the permission card, only the control topic. Root cause: `index.ts`'s §6.5 expiry sweep
+    edited the Telegram card to 'expired' but never sent a `deny` verdict over the pipe the way a
+    tapped 'Deny' button does (`sendVerdict(slug, requestId, 'deny')`) - contrast the sibling
+    `askRegistry` sweep two blocks below it, which does call `cancelAsk` to actually unblock the
+    waiting hook client. So the channel server's blocked `claude/channel/permission` call, and the
+    Claude process behind it, waited forever even though the card correctly said 'expired' - a
+    silent-wrong failure exactly of the kind §9 exists to catch, only surfaced because this was a
+    genuine unattended hour, not a fast unit test with an injected clock. Fixed by extracting the
+    sweep into `permission-registry.ts`'s new `sweepExpiredPermissions()` (registry, sendVerdict,
+    finalizeMessage, onError) so it has real unit coverage - two new tests confirm a `deny` verdict
+    is sent per expired entry and that a non-expired entry sends nothing. `bun test` (299 pass) and
+    `tsc --noEmit` clean. Bridge restarted on the fix; the four wedged sessions were killed/removed
+    (unrecoverable - the fix only prevents new wedges, it can't unblock an already-orphaned pipe
+    verdict target from before the restart). **Phase 5's endurance exit criterion is still not
+    met** - this run proved the four-concurrent-session *fleet* stays healthy for over an hour
+    (Bridge itself never crashed, `/ls` and the log stayed clean throughout), but none of the four
+    sessions produced verified real task output, so a redo is still needed, this time either using
+    only pre-allowlisted tools (`Read`/`Grep`/`git status|diff|log|branch|show`/`ls`/`cat`/`rg`/
+    `mcp__aibridge__reply`) so no permission prompt is needed at all, or by actively tapping each
+    session's own permission prompts during the run."
   - "0.29.0 (2026-08-04): Live-verified 0.26.0's `/kill --all`/`/rm --all` confirm flow for the
     first time - it had shipped and been deployed but never actually exercised against a real
     Telegram button tap. Found a real bug doing so: `postFleetConfirm` had `if (topicId ===
