@@ -37,6 +37,35 @@ starts, per §9 (the only place aibridge's own conventions are specified rather 
   contract, permission-rule derivation, rate-limit governors, reconciliation, session-state
   transitions, send-failure retries) — treat these as the initial test plan, not just documentation.
 
+## Live-verifying against the real Telegram client
+
+Before telling the user something "can't be verified without a real bot/browser" or "would need you
+to check Telegram yourself" — check **`scripts/telegram-automation/`** first. It is a Playwright rig
+that drives the actual Telegram Web K client as the logged-in operator (`chromium.launchPersistentContext`
+against a real, already-authenticated profile — `status.txt` in that folder reads `logged_in` when a
+session exists). It is dev/QA tooling for aibridge, not aibridge itself (same "not aibridge's own code"
+boundary as `scripts/dev-bridge.sh`).
+
+- `login.js` — one-time interactive login (run manually, scan the QR code). Skip this if `status.txt`
+  already says `logged_in`.
+- `client.js` — shared helpers (`connect`, `openGroup`, `openTopic`, `sendMessage`, `getMessageTexts`,
+  `getMessageCount`) every other script imports. Read this first for the DOM selectors it already
+  fought through (documented inline: composer disambiguation, ripple-overlay click interception, stale
+  message-matching pitfalls).
+- `send-command.js "<cmd>"` — sends a real control-topic command and prints what comes back.
+- `check-topic.js "<substring>" [count]` — reads the last N messages from a session's own topic.
+- `list-topics.js`, `inspect-last-message.js`, `inspect-topic.js`, `tap-button.js`,
+  `tap-topic-button.js` — narrower inspection/interaction helpers; read before writing a new one-off
+  script, most needs are already covered.
+- For anything not covered by an existing script (e.g. checking Telegram's native command-autocomplete
+  popup), write a small one-off script in this folder that reuses `client.js` rather than declaring the
+  check impossible — a real, already-logged-in browser profile is sitting right there.
+- Only one browser may run against the persisted profile at a time (`launchPersistentContext` refuses
+  a second concurrent instance) — don't run two of these scripts simultaneously.
+- The Bridge itself only picks up new code on restart (`bun run bridge:restart` /
+  `scripts/dev-bridge.sh restart`) — if a live check doesn't show an expected change, restart the
+  daemon before concluding the feature is broken; it's easy to be live-checking a stale process.
+
 ## Architecture
 
 Three long-lived-differently components, one per process lifetime requirement (§2.1):
