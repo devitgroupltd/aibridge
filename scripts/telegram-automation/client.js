@@ -25,7 +25,10 @@ async function openGroup(page, groupName = "AI Bridge Control") {
 }
 
 async function openTopic(page, topicNameSubstring) {
-  await page.locator(".chatlist-chat", { hasText: topicNameSubstring }).first().click();
+  // `force: true` - confirmed live 2026-08-04 that the topics-slider bar's own ripple overlay
+  // (`.topics-slider .c-ripple`) sits on top of the sidebar list and intercepts a plain click,
+  // timing out after 30s even though the target row is visible/enabled/stable the whole time.
+  await page.locator(".chatlist-chat", { hasText: topicNameSubstring }).first().click({ force: true });
   await page.waitForTimeout(1500);
 }
 

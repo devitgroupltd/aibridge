@@ -146,6 +146,13 @@ async function main(): Promise<void> {
   const BURN_RATE_ALARM_COOLDOWN_MS = 60 * 60 * 1000;
   let lastBurnAlarmMs = 0;
 
+  // `sendChannelText`'s lost-Enter detector (found 2026-08-04) - real activity (spinner frames etc.)
+  // redraws well within a couple of seconds, confirmed live, so this is generous rather than tight.
+  const SUBMIT_CONFIRM_WINDOW_MS = Number(process.env.AIBRIDGE_SUBMIT_CONFIRM_WINDOW_MS ?? 2500);
+  // How long the write's own echo takes to land, confirmed live to be well under 500ms - the
+  // baseline for the check above is taken after this, not at the moment of the write itself.
+  const ECHO_SETTLE_MS = Number(process.env.AIBRIDGE_ECHO_SETTLE_MS ?? 500);
+
   function maybeFireBurnRateAlarm(nowMs: number): void {
     if (nowMs - lastBurnAlarmMs < BURN_RATE_ALARM_COOLDOWN_MS) return;
     const fleetFiveHour = costTracker.fleetSpendSince(FIVE_HOURS_MS, nowMs);
@@ -192,6 +199,11 @@ async function main(): Promise<void> {
 
   const ptyProcessBySlug = new Map<string, pty.IPty>();
   const channelServerEntryPath = path.resolve(import.meta.dirname, "../../channel-server/src/index.ts");
+  // `sendChannelText`'s own lost-Enter detector (found 2026-08-04, see the 0.27.0 changelog entry):
+  // the last time each session's PTY produced *any* output, so a write that never gets a single
+  // further onData event within the check window is treated as "the trailing \r never submitted"
+  // rather than silently trusted.
+  const lastPtyActivityBySlug = new Map<string, number>();
   // `/kill --all` and `/rm --all` (§4.2, added 2026-08-04) - the only fleet commands that can act
   // on every live session at once, so they go through the same confirm-button pattern as a
   // permission prompt instead of executing on the same message (fleet-confirm.ts).
@@ -545,6 +557,40 @@ async function main(): Promise<void> {
     setTimeout(() => write("\r"), 200);
   }
 
+  /**
+   * Retries the trailing `\r` once if the PTY produces no output at all within the window - found
+   * live 2026-08-04 (see the 0.27.0 changelog entry): the content+`\r` writes can land with the
+   * Enter never actually submitting, silently wedging the session with no further output ever and
+   * no error anywhere. `session.ready`/`waitForChannelConnected` close the *startup* race but not
+   * this one. A genuinely working turn produces PTY output (spinner frames etc.) well within this
+   * window - confirmed live, real activity redraws every few hundred ms - so "nothing at all" for
+   * the full window is a reliable "the Enter didn't land" signal, not a false positive on a slow
+   * turn. Resends only the `\r`, never the content, so a `\r` that *did* land doesn't get the
+   * prompt injected twice. If the retry also produces nothing, gives up loudly instead of leaving
+   * the "Thinking..." placeholder lying forever with no explanation.
+   */
+  function confirmSubmitted(slug: string, topicId: number, write: (text: string) => void, attempt = 1): void {
+    // The write's own echo (the typed text reappearing) is itself real, non-empty PTY output - so
+    // the baseline has to be taken *after* that echo has landed, not at the moment of the write,
+    // or the echo alone always looks like "it worked" regardless of whether Claude ever submitted
+    // it. `ECHO_SETTLE_MS` is comfortably longer than the echo has ever taken to land live.
+    setTimeout(() => {
+      const baseline = lastPtyActivityBySlug.get(slug) ?? 0;
+      setTimeout(() => {
+        const lastActivity = lastPtyActivityBySlug.get(slug) ?? 0;
+        if (lastActivity > baseline) return; // real activity happened after the echo settled
+        if (attempt >= 2) {
+          log("ERROR", `session "${slug}" produced no output after ${attempt} attempts to submit an inbound message - likely wedged`);
+          confirmSessionCommand(topicId, `⚠️ "${slug}" isn't responding to its last message - it may be wedged. Try /kill then /new again, or check /attach.`);
+          return;
+        }
+        log("WARN", `session "${slug}" produced no output ${SUBMIT_CONFIRM_WINDOW_MS}ms after an inbound message - retrying the Enter`);
+        write("\r");
+        confirmSubmitted(slug, topicId, write, attempt + 1);
+      }, SUBMIT_CONFIRM_WINDOW_MS);
+    }, ECHO_SETTLE_MS);
+  }
+
   // A normal inbound turn: wrapped in the <channel> tag Claude Code would have rendered itself,
   // for text Claude should read and act on rather than a literal TUI keystroke.
   function sendChannelText(slug: string, topicId: number, content: string, msgId: string, from: string): void {
@@ -559,6 +605,7 @@ async function main(): Promise<void> {
     write("\r");
     typingIndicator.start(meta.topic_id);
     thinkingPlaceholder.start(meta.topic_id);
+    confirmSubmitted(slug, topicId, write);
   }
 
   function confirmSessionCommand(topicId: number | undefined, text: string, parseMode?: "HTML"): void {
@@ -573,6 +620,11 @@ async function main(): Promise<void> {
   function wireSession(slug: string, ptyProcess: pty.IPty, topicId: number): void {
     routing.setPtyWrite(slug, (text) => ptyProcess.write(text));
     ptyProcess.onData((data) => {
+      // An onData event alone is too loose a signal - confirmed live 2026-08-04 that a wedged
+      // session still periodically emits ANSI-only chunks (cursor blink, resize repaint) with no
+      // visible text at all, which defeated the first version of this check entirely. Only content
+      // that survives `stripAnsi` counts as real activity.
+      if (stripAnsi(data).length > 0) lastPtyActivityBySlug.set(slug, Date.now());
       routing.appendOutput(slug, data);
       const usageState = usageWaiters.get(slug);
       if (usageState) {
