@@ -5,12 +5,16 @@ import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprot
 import { assertValidBehavior, buildMeta, PROTOCOL_VERSION } from "@aibridge/protocol";
 import type { InboundMessage, Message, PermissionRequestMessage, ReplyMessage, VerdictMessage } from "@aibridge/protocol";
 import { PipeClient } from "./pipe-client.ts";
+import { resolveSlug } from "./resolve-slug.ts";
 
-// This component only ever exists because the Bridge spawned it with AIBRIDGE_SLUG set (§2.4) -
-// there is no meaningful way to run it standalone, so a missing var is a loud, immediate failure.
-const slug = process.env.AIBRIDGE_SLUG;
+// This component only exists spawned either by the Bridge (§2.4) or by the aibridge-telegram
+// plugin (§10.1) - there is no meaningful way to run it standalone, so a missing var is a loud,
+// immediate failure. See resolve-slug.ts for why there are two valid sources.
+const slug = resolveSlug(process.env);
 if (!slug) {
-  throw new Error("AIBRIDGE_SLUG is not set - this channel server must be spawned by the Bridge");
+  throw new Error(
+    "could not determine this session's slug - neither AIBRIDGE_SLUG nor CLAUDE_PROJECT_DIR is set; this channel server must be spawned by the Bridge or the aibridge-telegram plugin",
+  );
 }
 
 // stdout is the MCP transport (StdioServerTransport); all logging goes to stderr (§9). Claude

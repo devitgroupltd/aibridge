@@ -1,0 +1,15 @@
+{
+  "name": "devitgroup-plugins",
+  "description": "DevIT Group's internal Claude Code plugins - currently just aibridge's channel server (§10.1).",
+  "owner": {
+    "name": "DevIT Group",
+    "email": "team@devitgroup.co.uk"
+  },
+  "plugins": [
+    {
+      "name": "aibridge-telegram",
+      "source": "./plugins/aibridge-telegram",
+      "description": "aibridge's claude/channel MCP server, packaged so the dev-flag/allowlist escape hatch in §10.1 stays open."
+    }
+  ]
+}

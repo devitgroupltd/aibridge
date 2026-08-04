@@ -1,7 +1,7 @@
 ---
-version: 0.24.0
+version: 0.25.0
 status: solid
-last_modified_utc: 2026-08-04T08:45:00Z
+last_modified_utc: 2026-08-04T09:05:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,41 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.25.0 (2026-08-04): §10.1's plugin packaging - the last item blocking Phase 5's exit criterion
+    besides the four-session endurance run. Verified the plugin/marketplace schema against Anthropic's
+    published docs directly (fetched `plugins-reference`, `channels-reference`, `channels` and
+    `plugin-marketplaces` pages live) rather than trusting a research agent's report at face value -
+    this project's standing rule against building on an assumed protocol shape applies just as much to
+    an agent's summary of docs as to an unverified payload. New `.claude-plugin/marketplace.json` at
+    the repo root (marketplace name `devitgroup-plugins`, matching §10.1's own worked example) lists one
+    plugin, `plugins/aibridge-telegram/`, whose `plugin.json` declares the existing channel server as
+    an MCP server plus a `channels` entry binding it - the exact mechanism the docs call 'package as a
+    plugin' for the `--channels plugin:<name>@<marketplace>`/`allowedChannelPlugins` escape hatch. The
+    one real design problem: `plugin.json` is a single static file shared across every worktree, so it
+    can't carry a per-session `AIBRIDGE_SLUG` the way session-launcher.ts's own `.mcp.json` write does
+    today. Fixed by extracting slug resolution into new `resolve-slug.ts` (unit-tested): it now falls
+    back to the basename of `CLAUDE_PROJECT_DIR` - which the docs confirm Claude Code exports to every
+    plugin MCP subprocess, and which is always the slug (`worktreePath = path.join(worktreesRoot,
+    slug)`) - when `AIBRIDGE_SLUG` isn't set. New `scripts/build-plugin.sh` bundles
+    `packages/channel-server` into a single dependency-free `plugins/aibridge-telegram/server/index.js`
+    via `bun build --target bun` - committed pre-built (unlike the hook client's compiled binary, a
+    marketplace install just copies files out of a repo checkout, it doesn't run a build step on the
+    installing machine). Live-verified end to end, not just schema-validated: `claude plugin validate .`
+    passed clean on both the marketplace and the plugin directory; `claude plugin marketplace add ./`
+    and `claude plugin install aibridge-telegram@devitgroup-plugins` both succeeded against the real
+    local checkout; and a real `claude --dangerously-load-development-channels
+    plugin:aibridge-telegram@devitgroup-plugins -p \"...\"` run in a throwaway project directory (piped
+    to a throwaway stub pipe server, not the production Bridge) produced a real `hello` message on the
+    pipe with the slug correctly derived from `CLAUDE_PROJECT_DIR` - confirming the plugin-spawned MCP
+    server receives that variable exactly as documented. Scoped deliberately to the artifact only:
+    session-launcher.ts's live launch path still uses `--dangerously-load-development-channels
+    server:aibridge` plus the per-worktree `.mcp.json` write, unchanged - switching the fleet's default
+    launch path to `plugin:aibridge-telegram@devitgroup-plugins` is a separate decision (it removes the
+    'New MCP server found' consent-dialog path this project already depends on and hasn't been
+    exercised against a real multi-turn session with hooks/settings/permission-relay together, only a
+    non-interactive `-p` smoke test) and was not made without asking first. The marketplace and plugin
+    are left registered/installed on this machine (user scope) rather than torn down, since staying
+    registered is the actual point of '§10.1: package as a plugin so the allowlist path stays open.'"
   - "0.24.0 (2026-08-04): §5.7's telemetry listener, §10.5's weighted concurrency cap, `/budget`, and
     quota-stop detection - the last of Phase 5's unbuilt items besides plugin packaging. Started with
     a live spike (this project's standing discipline, §10.0/§6.5): a throwaway `claude -p` run with
@@ -3347,7 +3382,17 @@ item 3 is moot until §7.6.
   (2026-08-04) - a PTY's `onExit` triggers the identical `claude --resume` path a Bridge restart
   gets, distinguishing a real crash from a deliberate `/kill`/`/rm` by whether the slug still points
   at that exact PTY object at the time the (async) exit fires.
-- Package as a plugin so the allowlist path stays open (§10.1) - **not done**.
+- ~~Package as a plugin so the allowlist path stays open (§10.1).~~ **Artifact done** (2026-08-04):
+  `.claude-plugin/marketplace.json` (`devitgroup-plugins`) plus `plugins/aibridge-telegram/`, a plugin
+  binding the existing channel server as an MCP-based channel, with `resolve-slug.ts` deriving the
+  per-session slug from `CLAUDE_PROJECT_DIR` since a plugin's `mcpServers`/`env` block is static and
+  can't carry a per-worktree `AIBRIDGE_SLUG` the way `session-launcher.ts`'s own `.mcp.json` write
+  does. `claude plugin validate`, a real local `marketplace add`/`install`, and a real
+  `--dangerously-load-development-channels plugin:aibridge-telegram@devitgroup-plugins` launch against
+  a throwaway stub pipe all succeeded live - see the 0.25.0 changelog entry. **Cutover not done**: the
+  fleet's actual launch path (`session-launcher.ts`) still uses `server:aibridge` + `.mcp.json`,
+  unchanged - switching it to the plugin form is a separate decision, deliberately not made without
+  asking.
 - ~~The OTLP listener and telemetry ingest (§5.7); `/ls` cost columns, `/budget`, the burn-rate alarm
   and the distinct "stopped on a usage limit" state (§10.5).~~ **Done** (2026-08-04) - see the 0.24.0
   changelog entry for the live-spike-driven design deviation (cost sourced from `/v1/logs`'
@@ -3385,15 +3430,18 @@ item 3 is moot until §7.6.
 - **Exit:** scenarios 24-28, 32, 42, 43 and 44 pass; four concurrent Sonnet sessions run for an hour
   without manual intervention, the weighted budget refuses a fifth, and the fleet's spend is visible in
   `/budget` throughout. **Still not met, but down to one gap.** Startup reconciliation, `/restart`,
-  rename-once, the supervisor's crash-restart duty, `/budget`, the weighted concurrency cap and the
-  quota-stop state are all built and at least unit-tested, most live-verified (scenario 24's live half,
-  not just its unit test; `/budget`/`/ls`'s cost column confirmed live against real tracked spend on
-  2026-08-04). Three concurrent sessions have survived a real restart via genuine `claude --resume`
-  with real session_ids; four for a full hour has still not been attempted, and the concurrency cap /
-  quota-stop paths haven't been live-exercised against a real four-session fleet or a real rate limit.
-  Plugin packaging remains entirely unbuilt. **The only work left for a future Phase 5 sitting: the
-  four-concurrent-sessions-for-an-hour endurance run and plugin packaging** - everything else on this
-  list now has real code behind it.
+  rename-once, the supervisor's crash-restart duty, `/budget`, the weighted concurrency cap, the
+  quota-stop state and the plugin-packaging artifact are all built and at least unit-tested, most
+  live-verified (scenario 24's live half, not just its unit test; `/budget`/`/ls`'s cost column
+  confirmed live against real tracked spend on 2026-08-04; the plugin marketplace/install/launch chain
+  confirmed live on 2026-08-04 too). Three concurrent sessions have survived a real restart via genuine
+  `claude --resume` with real session_ids; four for a full hour has still not been attempted, and the
+  concurrency cap / quota-stop paths haven't been live-exercised against a real four-session fleet or a
+  real rate limit. **The only work left for a future Phase 5 sitting: the
+  four-concurrent-sessions-for-an-hour endurance run** - everything else on this list now has real code
+  behind it. Whether to cut the fleet's actual launch path over from
+  `--dangerously-load-development-channels server:aibridge` to the plugin form is a separate decision,
+  deliberately left open rather than made unasked (see the 0.25.0 changelog entry).
 
 ### Phase 6 - hardening, and the WSL2 migration
 

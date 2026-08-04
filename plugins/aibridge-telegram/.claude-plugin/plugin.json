@@ -1,0 +1,20 @@
+{
+  "name": "aibridge-telegram",
+  "description": "aibridge's claude/channel MCP server - relays a session's reply tool and permission prompts to the Bridge over the local named pipe, which forwards them to Telegram (§2.2, §10.1).",
+  "version": "0.1.0",
+  "author": {
+    "name": "DevIT Group",
+    "email": "team@devitgroup.co.uk"
+  },
+  "mcpServers": {
+    "aibridge": {
+      "command": "bun",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/server/index.js"]
+    }
+  },
+  "channels": [
+    {
+      "server": "aibridge"
+    }
+  ]
+}
