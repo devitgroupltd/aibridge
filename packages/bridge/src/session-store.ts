@@ -39,7 +39,7 @@ function loadDatabaseCtor(): DatabaseCtor {
   }
   return (req("node:sqlite") as { DatabaseSync: DatabaseCtor }).DatabaseSync;
 }
-export type SessionState = "starting" | "idle" | "working" | "awaiting_input" | "dead";
+export type SessionState = "starting" | "idle" | "working" | "awaiting_input" | "quota_stopped" | "dead";
 
 export interface SessionRow {
   slug: string;
@@ -103,9 +103,14 @@ function fromSql(row: SessionRowSql): SessionRow {
  */
 const ALLOWED_TRANSITIONS: Record<SessionState, SessionState[]> = {
   starting: ["idle", "dead"],
-  idle: ["working", "dead"],
-  working: ["awaiting_input", "idle", "dead"],
-  awaiting_input: ["working", "dead"],
+  idle: ["working", "quota_stopped", "dead"],
+  working: ["awaiting_input", "idle", "quota_stopped", "dead"],
+  awaiting_input: ["working", "quota_stopped", "dead"],
+  // §10.5 point 3: a quota stop can hit mid-turn from either signal (the OTLP `api_error` log event
+  // or a `StopFailure` hook carrying a rate-limit error) - recoverable back to `working` once the
+  // window resets and the operator (or a retried turn) picks the session back up, same as any other
+  // `awaiting_input`-style pause rather than a dead end.
+  quota_stopped: ["working", "idle", "dead"],
   dead: [], // terminal until /rm removes the row entirely
 };
 
@@ -187,6 +192,14 @@ export class SessionStore {
 
   getByTopicId(topicId: number): SessionRow | undefined {
     const row = this.db.prepare("SELECT * FROM sessions WHERE topic_id = $topic_id").get({ $topic_id: topicId }) as unknown as SessionRowSql | undefined;
+    return row ? fromSql(row) : undefined;
+  }
+
+  /** Joins an OTLP event's `session.id` (§5.7) back to a slug - `session_id` is unique but nullable
+   * (unset until the first hook fires), so a lookup before that point is a legitimate miss, not an
+   * error. */
+  getBySessionId(sessionId: string): SessionRow | undefined {
+    const row = this.db.prepare("SELECT * FROM sessions WHERE session_id = $session_id").get({ $session_id: sessionId }) as unknown as SessionRowSql | undefined;
     return row ? fromSql(row) : undefined;
   }
 

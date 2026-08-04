@@ -123,6 +123,10 @@ export interface SessionLaunchOptions {
    * `claude --resume <id>` on a fresh PTY instead of starting a new one. The worktree is reused
    * as-is (`ensureWorktree` is a no-op when the directory already exists). */
   resumeSessionId?: string;
+  /** §5.7: where this session's OTLP export should point - defaults to `settings.ts`'s own `4318`
+   * default. Overridable so integration tests can point a launched session at a throwaway listener
+   * instead of the Bridge's real one. */
+  otlpPort?: number;
 }
 
 export interface LaunchedSession {
@@ -276,7 +280,7 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   // requirement as the .mcp.json/.claude.json registrations above. Resolving the hook client
   // binary can trigger a one-time `bun build --compile`, so it happens before the settings file
   // (and therefore the spawn) rather than racing it.
-  const settingsPath = writeSettingsFile(opts.stateDir ?? STATE_DIR, opts.slug, generateSettings(resolveHookClientBinary()));
+  const settingsPath = writeSettingsFile(opts.stateDir ?? STATE_DIR, opts.slug, generateSettings(resolveHookClientBinary(), opts.otlpPort));
   log("INFO", `wrote permission settings baseline to ${settingsPath}`);
 
   const ptyProcess = pty.spawn(

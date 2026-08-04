@@ -1,7 +1,7 @@
 ---
-version: 0.23.0
+version: 0.24.0
 status: solid
-last_modified_utc: 2026-08-04T07:44:00Z
+last_modified_utc: 2026-08-04T08:45:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,45 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.24.0 (2026-08-04): §5.7's telemetry listener, §10.5's weighted concurrency cap, `/budget`, and
+    quota-stop detection - the last of Phase 5's unbuilt items besides plugin packaging. Started with
+    a live spike (this project's standing discipline, §10.0/§6.5): a throwaway `claude -p` run with
+    `CLAUDE_CODE_ENABLE_TELEMETRY=1` pointed at a capture-only HTTP listener. Two findings changed the
+    design from what §5.7 originally specified. First, `OTEL_EXPORTER_OTLP_PROTOCOL=http/json` is
+    honoured and produces plain JSON - no protobuf decoder needed on the Bridge side, so this ships
+    with `http/json`, not the plan's originally-written `http/protobuf`. Second, and more
+    substantially: `/v1/metrics`' `claude_code.cost.usage` (the plan's assumed cost source) exports
+    DELTA-temporality per-interval amounts, needing cross-export accumulation with edge cases around
+    process restarts - but `/v1/logs` carries a `claude_code.api_request` record per actual API call
+    that already has a complete `cost_usd`, `session.id`, `model` and all four token-type counts as
+    flat attributes. New `otlp-listener.ts` parses that log record exclusively and drains/200s
+    `/v1/metrics` unparsed - a deliberate, evidence-based deviation from §5.7's original design, not an
+    oversight. `claude_code.api_error` (the quota-stop signal) was **not** independently observed in
+    the spike - forcing a real rate limit wasn't practical to stage - so it's parsed defensively
+    (whatever attributes arrive get passed through) and flagged as unverified in the module's own doc
+    comment, same honesty convention as `/mode`'s cycle order. New `cost-tracker.ts` (pure, unit-tested)
+    is a plain per-`session_id` running sum of `api_request` deltas - `/ls` gained a COST column
+    (lifetime spend per session) and new `/budget` (control-topic only, like `/ls`) reports fleet-wide
+    rolling 5h/7d spend plus a per-session 5h breakdown. New `concurrency-cap.ts` implements §10.5
+    point 1's weighted budget (Opus=2, Sonnet=1, Haiku=0.5, cap=4 units) - `/new` now refuses
+    over-budget before ever creating a topic or worktree, reporting the fleet's current allocation in
+    the refusal; Fable (added to `/new` after §10.5's table was written) is weighted the same as Haiku
+    as a reasonable default, not a verified figure. Quota-stop detection (§10.5 point 3) fires from
+    either signal - the OTLP `api_error` event or a `StopFailure` hook whose own error text matches
+    `rate.?limit|usage limit|quota` - and marks the session with a new `quota_stopped` state (added to
+    `session-store.ts`'s transition table, reachable from idle/working/awaiting_input and recoverable
+    back to working/idle) plus a one-time '⚠️ stopped on a usage limit' post to the session's topic, so
+    a genuine quota stop no longer looks identical to a silently wedged session from a phone. New
+    burn-rate alarm posts once to the control topic when rolling 5h fleet spend crosses a configurable
+    threshold (`AIBRIDGE_BURN_RATE_THRESHOLD_USD`, default $10), with a 1-hour cooldown so it can't fire
+    on every subsequent call once tripped. Live-verified end to end: restarted the dev Bridge (binding
+    the new listener on `127.0.0.1:4318`), sent a real prompt into the live test session, and confirmed
+    via the real Telegram group that `/ls` showed a nonzero `$0.10` COST column and `/budget` reported
+    the matching fleet 5h/7d total with the per-session breakdown - both driven by real telemetry, not
+    a stub. The concurrency cap and quota-stop paths are unit-tested but not live-exercised (spinning
+    four-plus real sessions or forcing a genuine rate limit wasn't practical this sitting) - flagged
+    rather than glossed over. Phase 5's exit criterion is now unmet only on plugin packaging and the
+    'four concurrent sessions for an hour' live endurance run."
   - "0.23.0 (2026-08-04): New `/usage` fleet command, prompted by the operator asking to see Claude's
     own account-level usage bars from inside Telegram - distinct from anything in this plan's own
     `/budget` idea (never built; that would be Bridge tracking its own OTLP-derived spend, not
@@ -3309,11 +3348,19 @@ item 3 is moot until §7.6.
   gets, distinguishing a real crash from a deliberate `/kill`/`/rm` by whether the slug still points
   at that exact PTY object at the time the (async) exit fires.
 - Package as a plugin so the allowlist path stays open (§10.1) - **not done**.
-- The OTLP listener and telemetry ingest (§5.7); `/ls` cost columns, `/budget`, the burn-rate alarm and
-  the distinct "stopped on a usage limit" state (§10.5) - **not done**.
+- ~~The OTLP listener and telemetry ingest (§5.7); `/ls` cost columns, `/budget`, the burn-rate alarm
+  and the distinct "stopped on a usage limit" state (§10.5).~~ **Done** (2026-08-04) - see the 0.24.0
+  changelog entry for the live-spike-driven design deviation (cost sourced from `/v1/logs`'
+  `claude_code.api_request`, not `/v1/metrics`' delta-temporality `cost.usage`; `http/json`, not
+  `http/protobuf`). Live-verified end to end against the real Telegram group with a genuine tracked
+  spend; the `quota_stopped` state itself is unit-tested but never live-triggered (no real rate limit
+  was forced this sitting).
 - ~~Per-session model routing: Sonnet default, `--opus` and `--haiku` overrides~~ **Done** and
-  live-verified (`/new --opus <repo> <prompt>` launches with `--model opus`). **The weighted unit
-  budget that admits them (§10.5) is not done** - there is currently no concurrency cap at all.
+  live-verified (`/new --opus <repo> <prompt>` launches with `--model opus`). ~~The weighted unit
+  budget that admits them (§10.5) is not done~~ **done** (2026-08-04): `concurrency-cap.ts` refuses
+  `/new` before any topic/worktree is created once the fleet is at 4 weighted units, reporting the
+  current allocation in the refusal - unit-tested against §10.5's own worked examples, not yet
+  live-exercised against four real concurrent sessions.
 - ~~`/model <name>` (§4.2.1), reusing the dev-flag confirm keystroke's raw PTY write as a real feature
   instead of a debug-only affordance, so a running session's model can change mid-conversation.~~
   **Done** - implemented earlier; gained a bare-`/model` button keyboard on 2026-08-03.
@@ -3337,13 +3384,16 @@ item 3 is moot until §7.6.
   live-verified removing nine at once while correctly leaving three live sessions untouched.
 - **Exit:** scenarios 24-28, 32, 42, 43 and 44 pass; four concurrent Sonnet sessions run for an hour
   without manual intervention, the weighted budget refuses a fifth, and the fleet's spend is visible in
-  `/budget` throughout. **Still not met, but much closer** - this pass closed every item the 0.21.0
-  sitting deferred except plugin packaging and the OTLP/`/budget`/weighted-concurrency half: startup
-  reconciliation, `/restart`, rename-once, and the supervisor's crash-restart duty are all done and
-  live-verified (scenario 24's live half, not just its unit test). Three concurrent sessions have
-  survived a real restart via genuine `claude --resume` with real session_ids; four for a full hour
-  has still not been attempted. `/budget`, the weighted concurrency cap, and plugin packaging remain
-  entirely unbuilt - the only work left for a future Phase 5 sitting to close this phase out.
+  `/budget` throughout. **Still not met, but down to one gap.** Startup reconciliation, `/restart`,
+  rename-once, the supervisor's crash-restart duty, `/budget`, the weighted concurrency cap and the
+  quota-stop state are all built and at least unit-tested, most live-verified (scenario 24's live half,
+  not just its unit test; `/budget`/`/ls`'s cost column confirmed live against real tracked spend on
+  2026-08-04). Three concurrent sessions have survived a real restart via genuine `claude --resume`
+  with real session_ids; four for a full hour has still not been attempted, and the concurrency cap /
+  quota-stop paths haven't been live-exercised against a real four-session fleet or a real rate limit.
+  Plugin packaging remains entirely unbuilt. **The only work left for a future Phase 5 sitting: the
+  four-concurrent-sessions-for-an-hour endurance run and plugin packaging** - everything else on this
+  list now has real code behind it.
 
 ### Phase 6 - hardening, and the WSL2 migration
 

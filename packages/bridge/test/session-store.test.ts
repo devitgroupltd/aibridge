@@ -43,6 +43,20 @@ describe("isValidTransition (§4.3's state table)", () => {
     expect(isValidTransition("starting", "working")).toBe(false);
     expect(isValidTransition("idle", "awaiting_input")).toBe(false);
   });
+
+  test("quota_stopped (§10.5 point 3, added 2026-08-04) is reachable from idle, working and awaiting_input, and recoverable back to working/idle", () => {
+    expect(isValidTransition("idle", "quota_stopped")).toBe(true);
+    expect(isValidTransition("working", "quota_stopped")).toBe(true);
+    expect(isValidTransition("awaiting_input", "quota_stopped")).toBe(true);
+    expect(isValidTransition("quota_stopped", "working")).toBe(true);
+    expect(isValidTransition("quota_stopped", "idle")).toBe(true);
+    expect(isValidTransition("quota_stopped", "dead")).toBe(true);
+  });
+
+  test("quota_stopped is not reachable from starting, and does not resurrect a dead session", () => {
+    expect(isValidTransition("starting", "quota_stopped")).toBe(false);
+    expect(isValidTransition("dead", "quota_stopped")).toBe(false);
+  });
 });
 
 describe("SessionStore", () => {
@@ -115,5 +129,13 @@ describe("SessionStore", () => {
     const store = new SessionStore(":memory:");
     store.insert(row({ slug: "a", topicId: 2 }));
     expect(() => store.insert(row({ slug: "b", topicId: 2 }))).toThrow();
+  });
+
+  test("getBySessionId joins an OTLP session.id back to its row", () => {
+    const store = new SessionStore(":memory:");
+    store.insert(row());
+    store.setSessionId("fix-bug", "sess-123");
+    expect(store.getBySessionId("sess-123")?.slug).toBe("fix-bug");
+    expect(store.getBySessionId("no-such-session")).toBeUndefined();
   });
 });

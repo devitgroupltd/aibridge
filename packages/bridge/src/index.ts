@@ -9,10 +9,13 @@ import { buildCmdShimText, buildCommandKeyboard, isBuiltinPassthroughCommand, li
 import { loadConfig, STATE_DIR } from "./config.ts";
 import { FeedCoalescer } from "./feed-coalescer.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
-import { parseFleetCommand, renderAttach, renderLsTable } from "./fleet-commands.ts";
+import { parseFleetCommand, renderAttach, renderBudget, renderLsTable } from "./fleet-commands.ts";
 import { renderCard } from "./feed-renderer.ts";
 import { applyEvent, createFeedState, promptsInLastHour } from "./feed-state.ts";
 import { normalizeHookEvent } from "./hook-events.ts";
+import { CostTracker, FIVE_HOURS_MS, ONE_WEEK_MS } from "./cost-tracker.ts";
+import { checkConcurrencyCap, WEIGHTED_CAP } from "./concurrency-cap.ts";
+import { startOtlpListener } from "./otlp-listener.ts";
 import { resolvePermCallback } from "./permission-callback.ts";
 import { reconcile } from "./reconciliation.ts";
 import { loadReposRegistry, type ReposRegistry } from "./repos-registry.ts";
@@ -106,6 +109,75 @@ async function main(): Promise<void> {
     });
   }
 
+  // §5.7/§10.5 (added 2026-08-04): cost tracking is strictly read-only input, same guarantee as the
+  // rest of telemetry - a listener failure degrades /ls and /budget and nothing else. Port is
+  // overridable for symmetry with the other AIBRIDGE_* dev overrides, though nothing in the test
+  // suite currently spawns a full Bridge process that would need it.
+  const otlpPort = Number(process.env.AIBRIDGE_OTLP_PORT ?? 4318);
+  const costTracker = new CostTracker();
+
+  function slugForSessionId(sessionId: string): string | undefined {
+    return sessionStore.getBySessionId(sessionId)?.slug;
+  }
+
+  /** §10.5 point 3: marks a session `quota_stopped` and posts a one-time notice, from either signal
+   * - the OTLP `api_error` log event or a `StopFailure` hook carrying a rate-limit error (wired
+   * below in `handleHookEvent`). Idempotent: a session already `quota_stopped` (or `dead`) is left
+   * alone rather than re-posting on every subsequent error in the same stopped window. */
+  function markQuotaStopped(slug: string): void {
+    const row = sessionStore.get(slug);
+    if (!row || row.state === "quota_stopped" || row.state === "dead") return;
+    if (!isValidTransition(row.state, "quota_stopped")) return;
+    sessionStore.setState(slug, "quota_stopped", nowIso());
+    controlBot
+      .sendMessage(config.supergroupChatId, row.topicId, `⚠️ "${slug}" stopped on a usage limit (§10.5) - this looks frozen but isn't wedged; it should resume once the window resets.`)
+      .catch((err) => log("WARN", `failed to post quota-stop notice for "${slug}": ${(err as Error).message}`));
+  }
+
+  // §10.5 point 2's burn-rate alarm - this project's own choice of threshold, not a number the plan
+  // specifies (same convention as §10.4.1's prompts-per-hour warning), overridable for a laptop that
+  // wants a tighter or looser guardrail. `lastBurnAlarmMs` cooldown keeps a session that's genuinely
+  // burning through quota from posting on every single API call once it crosses the line - "an alarm
+  // that fires constantly is an alarm nobody reads" (§10.5).
+  const BURN_RATE_THRESHOLD_USD = Number(process.env.AIBRIDGE_BURN_RATE_THRESHOLD_USD ?? 10);
+  const BURN_RATE_ALARM_COOLDOWN_MS = 60 * 60 * 1000;
+  let lastBurnAlarmMs = 0;
+
+  function maybeFireBurnRateAlarm(nowMs: number): void {
+    if (nowMs - lastBurnAlarmMs < BURN_RATE_ALARM_COOLDOWN_MS) return;
+    const fleetFiveHour = costTracker.fleetSpendSince(FIVE_HOURS_MS, nowMs);
+    if (fleetFiveHour < BURN_RATE_THRESHOLD_USD) return;
+    lastBurnAlarmMs = nowMs;
+    const breakdown = sessionStore
+      .all()
+      .filter((r) => r.sessionId)
+      .map((r) => ({ slug: r.slug, spend: costTracker.spendSince(r.sessionId as string, FIVE_HOURS_MS, nowMs) }))
+      .filter((r) => r.spend > 0)
+      .sort((a, b) => b.spend - a.spend)
+      .map((r) => `  ${r.slug}: $${r.spend.toFixed(2)}`)
+      .join("\n");
+    controlBot
+      .sendMessage(
+        config.supergroupChatId,
+        undefined,
+        `⚠️ Burn-rate alarm: fleet has spent $${fleetFiveHour.toFixed(2)} in the last 5h (threshold $${BURN_RATE_THRESHOLD_USD.toFixed(2)}).\n${breakdown}`,
+      )
+      .catch((err) => log("WARN", `failed to post burn-rate alarm: ${(err as Error).message}`));
+  }
+
+  startOtlpListener({
+    port: otlpPort,
+    log,
+    onApiRequest: (event) => {
+      costTracker.record(event.sessionId, event.atMs, event.costUsd);
+      maybeFireBurnRateAlarm(event.atMs);
+    },
+    onApiError: (event) => {
+      const slug = slugForSessionId(event.sessionId);
+      if (slug) markQuotaStopped(slug);
+    },
+  });
+
   // §7.5: an unregistered/missing repos.toml disables /new rather than crashing the whole Bridge -
   // every other session (including the Phase 1 hardcoded one) works fine without it.
   let reposRegistry: ReposRegistry | undefined;
@@ -192,6 +264,13 @@ async function main(): Promise<void> {
 
     const event = normalizeHookEvent(msg.hook_event_name, msg.payload);
     if (!event) return;
+
+    // §10.5 point 3's second quota-stop signal - a `StopFailure` hook whose own error text names a
+    // rate limit/usage limit, independent of whether the OTLP `api_error` event (unverified shape,
+    // see otlp-listener.ts) ever arrives for the same failure.
+    if (event.kind === "turn_end" && !event.success && /rate.?limit|usage limit|quota/i.test(event.error)) {
+      markQuotaStopped(msg.slug);
+    }
 
     const nowMs = Date.now();
     const previous = feedStates.get(msg.slug) ?? createFeedState(msg.slug);
@@ -334,6 +413,7 @@ async function main(): Promise<void> {
       channelServerEntryPath,
       worktreesRoot: phase1WorktreesRoot,
       mirrorPtyToConsole: process.env.AIBRIDGE_DEV_MIRROR_PTY === "1",
+      otlpPort,
       log,
     });
 
@@ -545,6 +625,7 @@ async function main(): Promise<void> {
         worktreesRoot: path.dirname(row.worktreePath),
         model: row.model,
         resumeSessionId: row.sessionId,
+        otlpPort,
         log,
       });
       wireSession(slug, session.ptyProcess, topicId);
@@ -595,6 +676,17 @@ async function main(): Promise<void> {
     }
     const model = cmd.model ?? repo.model ?? "sonnet";
 
+    // §10.5 point 1: refuse before ever creating a topic/worktree, so a rejected /new leaves no
+    // debris the way a launch failure further down deliberately cleans up after itself.
+    const capCheck = checkConcurrencyCap(sessionStore.all(), model);
+    if (!capCheck.ok) {
+      confirmSessionCommand(
+        controlTopicId,
+        `Refused: the fleet is already at ${capCheck.current}/${WEIGHTED_CAP} weighted units - adding a ${model} session would bring it to ${capCheck.wouldBe}. Kill or /rm a session first.`,
+      );
+      return;
+    }
+
     const base = slugFromPrompt(cmd.prompt);
     const slug = uniqueSlug(base, sessionStore.slugs());
 
@@ -615,6 +707,7 @@ async function main(): Promise<void> {
         channelServerEntryPath,
         worktreesRoot: fleetWorktreesRoot,
         model,
+        otlpPort,
         log,
       });
     } catch (err) {
@@ -665,9 +758,30 @@ async function main(): Promise<void> {
   }
 
   function handleLsCommand(topicId: number | undefined): void {
+    const rows = sessionStore.all();
+    const costBySlug = new Map<string, number>();
+    for (const row of rows) {
+      if (row.sessionId) costBySlug.set(row.slug, costTracker.lifetimeSpend(row.sessionId));
+    }
     controlBot
-      .sendMessage(config.supergroupChatId, topicId, renderLsTable(sessionStore.all(), Date.now()), undefined, "HTML")
+      .sendMessage(config.supergroupChatId, topicId, renderLsTable(rows, Date.now(), costBySlug), undefined, "HTML")
       .catch((err) => log("WARN", `sendMessage (/ls) failed: ${(err as Error).message}`));
+  }
+
+  /** §10.5 point 2's `/budget`: fleet-wide rolling 5h/7d spend plus a per-session 5h breakdown -
+   * control-topic only, same as `/ls` (no single session to scope this to). */
+  function handleBudgetCommand(topicId: number | undefined): void {
+    const nowMs = Date.now();
+    costTracker.prune(nowMs);
+    const fleetFiveHour = costTracker.fleetSpendSince(FIVE_HOURS_MS, nowMs);
+    const fleetWeekly = costTracker.fleetSpendSince(ONE_WEEK_MS, nowMs);
+    const perSessionFiveHour = new Map<string, number>();
+    for (const row of sessionStore.all()) {
+      if (row.sessionId) perSessionFiveHour.set(row.slug, costTracker.spendSince(row.sessionId, FIVE_HOURS_MS, nowMs));
+    }
+    controlBot
+      .sendMessage(config.supergroupChatId, topicId, renderBudget(fleetFiveHour, fleetWeekly, perSessionFiveHour))
+      .catch((err) => log("WARN", `sendMessage (/budget) failed: ${(err as Error).message}`));
   }
 
   /** §4.2's `/kill`/`/rm`: no `reply` will ever land for this topic again, so the two "Claude is
@@ -958,6 +1072,14 @@ async function main(): Promise<void> {
         }
         if (fleetCmd.kind === "ls") {
           handleLsCommand(threadId);
+          return;
+        }
+        if (fleetCmd.kind === "budget") {
+          if (!isControl) {
+            confirmSessionCommand(threadId, "/budget only works from the control topic.");
+            return;
+          }
+          handleBudgetCommand(threadId);
           return;
         }
         if (fleetCmd.kind === "kill") {

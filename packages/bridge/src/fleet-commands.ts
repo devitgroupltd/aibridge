@@ -4,10 +4,10 @@ import { MODELS } from "./session-commands.ts";
 import type { SessionRow } from "./session-store.ts";
 
 /**
- * §4.2's fleet-scoped commands. `/new`/`/ls` are control-topic only (no target to act on besides
- * the fleet itself); `/kill`/`/rm`/`/attach`/`/pause`/`/usage` take an optional `<slug>` so they can
- * be sent from the control topic *or* bare from inside the session's own topic (§4.2: "`/kill` with
- * no argument inside a session topic kills that session").
+ * §4.2's fleet-scoped commands. `/new`/`/ls`/`/budget` are control-topic only (no target to act on
+ * besides the fleet itself); `/kill`/`/rm`/`/attach`/`/pause`/`/usage` take an optional `<slug>` so
+ * they can be sent from the control topic *or* bare from inside the session's own topic (§4.2:
+ * "`/kill` with no argument inside a session topic kills that session").
  */
 /**
  * `/rm`'s bulk forms (added 2026-08-04, live testing produced dozens of `dead` rows within a
@@ -25,6 +25,7 @@ export type FleetCommand =
   | { kind: "attach"; slug?: string }
   | { kind: "pause"; slug?: string }
   | { kind: "usage"; slug?: string }
+  | { kind: "budget" }
   | { kind: "restart" };
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
@@ -66,7 +67,7 @@ function parseRm(rest: string): FleetCommand {
  * "for us, but invalid" split as `session-commands.ts`'s parser. */
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|restart)\b(.*)$/s);
+  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart)\b(.*)$/s);
   if (!match) return null;
   const [, cmd, rest] = match as [string, string, string];
   switch (cmd) {
@@ -74,6 +75,8 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return parseNew(rest);
     case "ls":
       return { kind: "ls" };
+    case "budget":
+      return { kind: "budget" };
     case "restart":
       return { kind: "restart" };
     case "rm":
@@ -109,18 +112,48 @@ function padColumns(rows: readonly string[][]): string[][] {
   return rows.map((row) => row.map((cell, i) => cell.padEnd(widths[i] ?? 0)));
 }
 
-/** §4.2's `/ls`: slug, state, worktree, branch, age, model - session cost/tokens (§5.7) deferred.
- * Rendered as an HTML `<pre>` block (call sites must pass `parseMode: "HTML"`) so the columns line
- * up as a monospace table instead of Telegram's default proportional font. */
-export function renderLsTable(rows: readonly SessionRow[], nowMs: number): string {
+function formatUsd(amount: number): string {
+  return `$${amount.toFixed(2)}`;
+}
+
+/** §4.2's `/ls`: slug, state, worktree, branch, age, model, and (§5.7, added 2026-08-04) lifetime
+ * cost per session, sourced from `cost-tracker.ts` and keyed by `session_id` - `costBySlug` is
+ * optional so every existing caller/test that only cares about the lifecycle columns is unaffected,
+ * and a session with no `session_id` yet (or simply no recorded spend) shows `$0.00` rather than a
+ * blank cell. Rendered as an HTML `<pre>` block (call sites must pass `parseMode: "HTML"`) so the
+ * columns line up as a monospace table instead of Telegram's default proportional font. */
+export function renderLsTable(rows: readonly SessionRow[], nowMs: number, costBySlug?: ReadonlyMap<string, number>): string {
   if (rows.length === 0) return "No sessions.";
-  const header = ["SLUG", "STATE", "MODEL", "BRANCH", "AGE"];
-  const body = rows.map((r) => [r.slug, r.paused ? `${r.state} (paused)` : r.state, r.model, r.branch, ageLabel(r.createdUtc, nowMs)]);
+  const header = ["SLUG", "STATE", "MODEL", "BRANCH", "AGE", "COST"];
+  const body = rows.map((r) => [
+    r.slug,
+    r.paused ? `${r.state} (paused)` : r.state,
+    r.model,
+    r.branch,
+    ageLabel(r.createdUtc, nowMs),
+    formatUsd(costBySlug?.get(r.slug) ?? 0),
+  ]);
   const [paddedHeader, ...paddedBody] = padColumns([header, ...body]);
   const headerLine = (paddedHeader as string[]).join("  ");
   const separator = "-".repeat(headerLine.length);
   const lines = [headerLine, separator, ...paddedBody.map((row) => row.join("  "))];
   return `<pre>${escapeForFeed(lines.join("\n"))}</pre>`;
+}
+
+/** §10.5 point 2's `/budget`: rolling 5-hour and weekly fleet spend, plus a per-session breakdown
+ * sorted highest-spend-first so the session actually driving the number is the first thing visible.
+ * `perSessionFiveHour` only lists sessions with nonzero 5h spend - a fleet of mostly-idle sessions
+ * shouldn't produce a wall of `$0.00` rows. */
+export function renderBudget(fleetFiveHour: number, fleetWeekly: number, perSessionFiveHour: ReadonlyMap<string, number>): string {
+  const lines = [`Fleet spend - last 5h: ${formatUsd(fleetFiveHour)} · last 7d: ${formatUsd(fleetWeekly)}`];
+  const nonzero = [...perSessionFiveHour.entries()].filter(([, cost]) => cost > 0).sort((a, b) => b[1] - a[1]);
+  if (nonzero.length > 0) {
+    lines.push("", "Last 5h by session:");
+    for (const [slug, cost] of nonzero) {
+      lines.push(`  ${slug}: ${formatUsd(cost)}`);
+    }
+  }
+  return escapeForFeed(lines.join("\n"));
 }
 
 /** §4.2's `/attach`: the PTY tail plus the local pickup command - both best-effort, same "takes it

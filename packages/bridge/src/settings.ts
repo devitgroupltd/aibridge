@@ -13,6 +13,7 @@ export interface PermissionSettings {
     allow: string[];
   };
   hooks?: Record<string, HookEntry[]>;
+  env?: Record<string, string>;
 }
 
 /**
@@ -60,17 +61,37 @@ function buildHooks(hookClientPath: string): Record<string, HookEntry[]> {
 }
 
 /**
+ * §5.7's telemetry env block - `http/json`, not the plan's originally-written `http/protobuf` (see
+ * `otlp-listener.ts`'s own doc comment for why: confirmed live 2026-08-04 that Claude Code honours
+ * the env var and sends plain JSON, which needs no protobuf decoder on the Bridge side). Deliberately
+ * omits `OTEL_LOG_USER_PROMPTS` and the tool-content variables (§5.7's "two deliberate restraints") -
+ * prompts/tool output would put source code and secrets into a second store for no operational gain.
+ */
+function buildTelemetryEnv(otlpPort: number): Record<string, string> {
+  return {
+    CLAUDE_CODE_ENABLE_TELEMETRY: "1",
+    OTEL_METRICS_EXPORTER: "otlp",
+    OTEL_LOGS_EXPORTER: "otlp",
+    OTEL_EXPORTER_OTLP_PROTOCOL: "http/json",
+    OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${otlpPort}`,
+    OTEL_METRIC_EXPORT_INTERVAL: "15000",
+  };
+}
+
+/**
  * §6.2's per-session settings baseline, verbatim. Content-scoped from the start (§6.1.1: a bare
  * `Bash` ask rule is skipped for sandboxed commands, so writing it broad now avoids a rewrite at
  * the §7.6 sandbox migration), `~/`-anchored paths only (a single leading slash anchors at the
  * settings source, not the filesystem root), and `mcp__aibridge__reply` pre-allowed since the
  * channel server's own reply tool otherwise raises its own permission prompt on first use (§3.3).
  * `hookClientPath` is optional so every existing caller/test that only cares about the permission
- * baseline is unaffected - `session-launcher.ts` is the one real caller that passes it.
+ * baseline is unaffected - `session-launcher.ts` is the one real caller that passes it. `otlpPort`
+ * defaults to §5.7's `4318` - overridable for tests that run their own throwaway listener.
  */
-export function generateSettings(hookClientPath?: string): PermissionSettings {
+export function generateSettings(hookClientPath?: string, otlpPort = 4318): PermissionSettings {
   return {
     ...(hookClientPath ? { hooks: buildHooks(hookClientPath) } : {}),
+    env: buildTelemetryEnv(otlpPort),
     permissions: {
       deny: [
         "Bash(rm -rf /*)",

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { parseFleetCommand, renderAttach, renderLsTable } from "../src/fleet-commands.ts";
+import { parseFleetCommand, renderAttach, renderBudget, renderLsTable } from "../src/fleet-commands.ts";
 import type { SessionRow } from "../src/session-store.ts";
 
 describe("parseFleetCommand", () => {
@@ -41,6 +41,10 @@ describe("parseFleetCommand", () => {
   test("/usage with and without a slug", () => {
     expect(parseFleetCommand("/usage fix-bug")).toEqual({ kind: "usage", slug: "fix-bug" });
     expect(parseFleetCommand("/usage")).toEqual({ kind: "usage", slug: undefined });
+  });
+
+  test("/budget takes no argument", () => {
+    expect(parseFleetCommand("/budget")).toEqual({ kind: "budget" });
   });
 
   test("/rm --dead requests the bulk dead-row filter", () => {
@@ -115,6 +119,34 @@ describe("renderLsTable", () => {
     const text = renderLsTable([row({ branch: "claude/<b>x</b>" })], Date.parse("2026-08-03T00:10:00.000Z"));
     expect(text).not.toContain("<b>x</b>");
     expect(text).toContain("&lt;b&gt;x&lt;/b&gt;");
+  });
+
+  test("§5.7's cost column shows a session's lifetime spend, formatted as USD", () => {
+    const text = renderLsTable([row()], Date.parse("2026-08-03T00:10:00.000Z"), new Map([["fix-bug", 1.5]]));
+    expect(text).toContain("$1.50");
+  });
+
+  test("a session missing from the cost map (no session_id yet, or no recorded spend) shows $0.00", () => {
+    const text = renderLsTable([row()], Date.parse("2026-08-03T00:10:00.000Z"));
+    expect(text).toContain("$0.00");
+  });
+});
+
+describe("renderBudget", () => {
+  test("shows fleet 5h/7d totals and a sorted, nonzero-only per-session breakdown", () => {
+    const text = renderBudget(3.5, 12.25, new Map([["a", 1], ["b", 2.5], ["c", 0]]));
+    expect(text).toContain("$3.50");
+    expect(text).toContain("$12.25");
+    const bLine = text.indexOf("b: $2.50");
+    const aLine = text.indexOf("a: $1.00");
+    expect(bLine).toBeGreaterThan(-1);
+    expect(aLine).toBeGreaterThan(bLine);
+    expect(text).not.toContain("c: $0.00");
+  });
+
+  test("an all-idle fleet omits the per-session breakdown section entirely", () => {
+    const text = renderBudget(0, 0, new Map([["a", 0]]));
+    expect(text).not.toContain("by session");
   });
 });
 
