@@ -1,7 +1,7 @@
 ---
-version: 0.25.0
+version: 0.26.0
 status: solid
-last_modified_utc: 2026-08-04T09:05:00Z
+last_modified_utc: 2026-08-04T10:50:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,27 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.26.0 (2026-08-04): Phase 5's exit criterion is now fully met, live. The
+    four-concurrent-Sonnet-sessions-for-an-hour endurance run passed: `test-session` (pre-existing)
+    plus three `/new`-launched sessions ran unattended for over an hour (1h2m at the final check, up
+    from 0.21.0's 'three ran briefly' and 0.24.0's 'not practical this sitting'), with zero manual
+    intervention, the Bridge's pid unchanged throughout (no crash/restart), and `/budget` stable. The
+    weighted-concurrency-cap live-exercise gap closed as a side effect, not a separate test: a genuine
+    5th `/new` against the real 4-session fleet was correctly refused ('already at 4/4 weighted
+    units'). Verification ran through a new committed tool rather than a throwaway script -
+    `scripts/telegram-automation/` (`client.js`/`login.js`/`send-command.js`/`check-topic.js`), a
+    Playwright-driven real Telegram Web session promoted from an earlier sitting's scratchpad, same
+    dev/QA-tooling boundary as `scripts/dev-bridge.sh`. Its persisted Chromium profile (a live
+    logged-in session, i.e. a credential) is gitignored; each machine runs its own one-time
+    `login.js`. Also added: `/kill --all` and `/rm --all` (§4.2) - the two fleet commands that can
+    act on every session at once - gated behind a Yes/No inline-keyboard confirm (new
+    `fleet-confirm.ts`) rather than executing on the same message, matching the existing
+    permission-approval button pattern (§6.3) rather than a typed `--confirm` flag. A 5-minute TTL,
+    not the 30-minute permission-prompt one: this is an operator confirming their own just-typed
+    command, not waiting on Claude, so a forgotten stale button should go cold fast. Deliberately
+    scoped down from a broader 'confirm every destructive command' option: single-slug `/kill`/`/rm`
+    and the existing `--dead`/`--prefix` bulk `/rm` forms are untouched, per explicit operator
+    direction - only the two genuinely fleet-wide forms get the button."
   - "0.25.0 (2026-08-04): §10.1's plugin packaging - the last item blocking Phase 5's exit criterion
     besides the four-session endurance run. Verified the plugin/marketplace schema against Anthropic's
     published docs directly (fetched `plugins-reference`, `channels-reference`, `channels` and
@@ -3427,21 +3448,35 @@ item 3 is moot until §7.6.
   turn into an accidental mass-`/kill` of a live session. Added because this phase's own live testing
   routinely piles up many dead rows with no way to clear them but one `/rm <slug>` at a time -
   live-verified removing nine at once while correctly leaving three live sessions untouched.
-- **Exit:** scenarios 24-28, 32, 42, 43 and 44 pass; four concurrent Sonnet sessions run for an hour
-  without manual intervention, the weighted budget refuses a fifth, and the fleet's spend is visible in
-  `/budget` throughout. **Still not met, but down to one gap.** Startup reconciliation, `/restart`,
-  rename-once, the supervisor's crash-restart duty, `/budget`, the weighted concurrency cap, the
-  quota-stop state and the plugin-packaging artifact are all built and at least unit-tested, most
+- `/kill --all` and `/rm --all` (added 2026-08-04, not originally in §4.2): unlike their `dead`-only
+  siblings above, these can act on live sessions too - so instead of executing on the same message,
+  both post a Yes/No inline-keyboard confirm card (`fleet-confirm.ts`) and only act once tapped,
+  matching the existing permission-approval button pattern (§6.3) rather than a typed `--confirm`
+  flag. A 5-minute TTL, not the 30-minute permission-prompt one, since this is an operator confirming
+  their own just-typed command rather than waiting on Claude. Deliberately scoped down from covering
+  every destructive command (including single-slug `/kill`/`/rm`) per explicit operator direction -
+  only the two genuinely fleet-wide forms get the button.
+- ~~The four-concurrent-Sonnet-sessions-for-an-hour endurance run.~~ **Done** (2026-08-04): `/new`
+  launched three sessions alongside the pre-existing `test-session` (four total, all Sonnet); a
+  genuine 5th `/new` against that real fleet was correctly refused by the weighted cap
+  ('already at 4/4 weighted units'), and the four ran unattended for over an hour (1h2m at the final
+  check) with the Bridge's pid unchanged throughout (no crash/restart) and `/budget` stable. Verified
+  via `scripts/telegram-automation/`'s real Telegram Web session (see the 0.26.0 changelog entry), not
+  a stub.
+- **Exit: fully met.** Scenarios 24-28, 32, 42, 43 and 44 pass; four concurrent Sonnet sessions ran
+  for over an hour without manual intervention (2026-08-04, above), the weighted budget refused a
+  fifth against that same real fleet, and the fleet's spend was visible in `/budget` throughout.
+  Startup reconciliation, `/restart`, rename-once, the supervisor's crash-restart duty, `/budget`, the
+  weighted concurrency cap, the quota-stop state and the plugin-packaging artifact are all built and
   live-verified (scenario 24's live half, not just its unit test; `/budget`/`/ls`'s cost column
-  confirmed live against real tracked spend on 2026-08-04; the plugin marketplace/install/launch chain
-  confirmed live on 2026-08-04 too). Three concurrent sessions have survived a real restart via genuine
-  `claude --resume` with real session_ids; four for a full hour has still not been attempted, and the
-  concurrency cap / quota-stop paths haven't been live-exercised against a real four-session fleet or a
-  real rate limit. **The only work left for a future Phase 5 sitting: the
-  four-concurrent-sessions-for-an-hour endurance run** - everything else on this list now has real code
-  behind it. Whether to cut the fleet's actual launch path over from
-  `--dangerously-load-development-channels server:aibridge` to the plugin form is a separate decision,
-  deliberately left open rather than made unasked (see the 0.25.0 changelog entry).
+  confirmed live against real tracked spend; the plugin marketplace/install/launch chain confirmed
+  live; the concurrency cap now confirmed live against a real four-session fleet, not just its unit
+  test). The one item never fully live-exercised: the quota-stop path has not been triggered by a
+  genuine rate limit (still unit-tested only) - not a Phase 5 blocker, since it requires an
+  externally-imposed condition rather than anything the operator can force on demand. Whether to cut
+  the fleet's actual launch path over from `--dangerously-load-development-channels server:aibridge`
+  to the plugin form remains a separate decision, deliberately left open rather than made unasked (see
+  the 0.25.0 changelog entry).
 
 ### Phase 6 - hardening, and the WSL2 migration
 

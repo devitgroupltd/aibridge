@@ -59,6 +59,14 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/rm --prefix")).toEqual({ kind: "rm", slug: "--prefix" });
   });
 
+  test("/kill --all requests the fleet-wide confirm flow", () => {
+    expect(parseFleetCommand("/kill --all")).toEqual({ kind: "kill", all: true });
+  });
+
+  test("/rm --all requests the bulk all-row filter", () => {
+    expect(parseFleetCommand("/rm --all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
+  });
+
   test("/restart takes no argument", () => {
     expect(parseFleetCommand("/restart")).toEqual({ kind: "restart" });
   });

@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import http from "node:http";
 import path from "node:path";
 import type * as pty from "node-pty";
@@ -8,6 +9,8 @@ import { resolveAskCallback, renderAskAnsweredCard, renderAskCancelledCard } fro
 import { buildCmdShimText, buildCommandKeyboard, isBuiltinPassthroughCommand, listRepoCommands, resolveCommandAction } from "./commands.ts";
 import { loadConfig, STATE_DIR } from "./config.ts";
 import { FeedCoalescer } from "./feed-coalescer.ts";
+import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
+import type { PendingFleetConfirm } from "./fleet-confirm.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import { parseFleetCommand, renderAttach, renderBudget, renderLsTable } from "./fleet-commands.ts";
 import { renderCard } from "./feed-renderer.ts";
@@ -189,6 +192,10 @@ async function main(): Promise<void> {
 
   const ptyProcessBySlug = new Map<string, pty.IPty>();
   const channelServerEntryPath = path.resolve(import.meta.dirname, "../../channel-server/src/index.ts");
+  // `/kill --all` and `/rm --all` (§4.2, added 2026-08-04) - the only fleet commands that can act
+  // on every live session at once, so they go through the same confirm-button pattern as a
+  // permission prompt instead of executing on the same message (fleet-confirm.ts).
+  const fleetConfirmRegistry = new FleetConfirmRegistry();
 
   function maybeSetState(slug: string, target: SessionState): void {
     const row = sessionStore.get(slug);
@@ -807,15 +814,10 @@ async function main(): Promise<void> {
     return { slug };
   }
 
-  async function handleKillCommand(cmd: Extract<FleetCommand, { kind: "kill" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
-    const resolved = resolveTargetSlug(cmd.slug, currentSlug);
-    if ("error" in resolved) {
-      confirmSessionCommand(topicId, resolved.error);
-      return;
-    }
-    const { slug } = resolved;
-    const row = sessionStore.get(slug) as NonNullable<ReturnType<typeof sessionStore.get>>;
-
+  /** The actual teardown `/kill` does for one row - shared by the single-slug form and the
+   * `--all` confirm-button flow below, so the two can't drift. */
+  async function killSessionRow(row: SessionRow): Promise<void> {
+    const { slug } = row;
     ptyProcessBySlug.get(slug)?.kill();
     ptyProcessBySlug.delete(slug);
     routing.clearPtyWrite(slug);
@@ -827,6 +829,65 @@ async function main(): Promise<void> {
     } catch (err) {
       log("WARN", `closeForumTopic failed for "${slug}": ${(err as Error).message}`);
     }
+  }
+
+  /** Posts the Yes/No confirm card for `/kill --all`/`/rm --all` and registers it in
+   * `fleetConfirmRegistry` - shared since the two commands differ only in wording and which
+   * teardown function eventually runs. Returns without posting if there's nothing to act on. */
+  async function postFleetConfirm(kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[], promptText: string): Promise<void> {
+    if (targets.length === 0) {
+      confirmSessionCommand(topicId, kind === "kill" ? "No live sessions to kill." : "No sessions to remove.");
+      return;
+    }
+    if (topicId === undefined) return;
+    const id = randomUUID().slice(0, 8);
+    const slugs = targets.map((r) => r.slug);
+    try {
+      const sent = await controlBot.sendMessage(config.supergroupChatId, topicId, `${promptText}\n${slugs.join(", ")}`, {
+        inline_keyboard: buildFleetConfirmKeyboard(kind, id),
+      });
+      fleetConfirmRegistry.add({ id, kind, slugs, topicId, messageId: sent.message_id });
+    } catch (err) {
+      log("WARN", `failed to post /${kind} --all confirmation: ${(err as Error).message}`);
+    }
+  }
+
+  async function finalizeFleetConfirmMessage(pending: PendingFleetConfirm, text: string): Promise<void> {
+    if (!controlBot.editMessageText) return;
+    try {
+      await controlBot.editMessageText(config.supergroupChatId, pending.messageId, text, { inline_keyboard: [] });
+    } catch (err) {
+      log("WARN", `failed to finalize fleet-confirm message: ${(err as Error).message}`);
+    }
+  }
+
+  /** Runs after a `/kill --all`/`/rm --all` confirm tap - re-looks-up rows by slug rather than
+   * trusting a snapshot from when the confirm card was posted, since a session can die or get
+   * removed independently in the minutes between posting and the tap. */
+  async function executeFleetConfirm(pending: PendingFleetConfirm): Promise<void> {
+    const rows = pending.slugs.map((s) => sessionStore.get(s)).filter((r): r is SessionRow => r !== undefined);
+    for (const row of rows) {
+      await (pending.kind === "kill" ? killSessionRow(row) : removeSessionRow(row));
+    }
+    const verb = pending.kind === "kill" ? "Killed" : "Removed";
+    await finalizeFleetConfirmMessage(pending, rows.length === 0 ? "Nothing left to act on." : `${verb} ${rows.length} session${rows.length === 1 ? "" : "s"}: ${rows.map((r) => r.slug).join(", ")}`);
+  }
+
+  async function handleKillCommand(cmd: Extract<FleetCommand, { kind: "kill" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
+    if (cmd.all) {
+      const targets = sessionStore.all().filter((r) => r.state !== "dead");
+      await postFleetConfirm("kill", topicId, targets, `Kill ${targets.length} live session${targets.length === 1 ? "" : "s"}?`);
+      return;
+    }
+
+    const resolved = resolveTargetSlug(cmd.slug, currentSlug);
+    if ("error" in resolved) {
+      confirmSessionCommand(topicId, resolved.error);
+      return;
+    }
+    const { slug } = resolved;
+    const row = sessionStore.get(slug) as NonNullable<ReturnType<typeof sessionStore.get>>;
+    await killSessionRow(row);
     confirmSessionCommand(topicId, `Killed "${slug}". Worktree left in place - \`/rm ${slug}\` to remove it.`);
   }
 
@@ -859,6 +920,15 @@ async function main(): Promise<void> {
   }
 
   async function handleRmCommand(cmd: Extract<FleetCommand, { kind: "rm" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
+    // `--all` (added 2026-08-04) is the deliberate exception to the dead-only rule below - it can
+    // remove live sessions too, so it goes through the same confirm-button flow as `/kill --all`
+    // rather than executing on the same message (fleet-commands.ts's RmBulkFilter note).
+    if (cmd.bulk?.mode === "all") {
+      const targets = sessionStore.all();
+      await postFleetConfirm("rm", topicId, targets, `Remove ALL ${targets.length} session${targets.length === 1 ? "" : "s"} - worktrees and topics deleted, live ones killed first?`);
+      return;
+    }
+
     // §4.2's bulk cleanup (added 2026-08-04): always scoped to `dead` rows, regardless of which
     // filter matched, since a bulk command is exactly the kind of action a mistyped prefix
     // shouldn't be able to turn into an accidental mass-`/kill` of live sessions.
@@ -1015,6 +1085,20 @@ async function main(): Promise<void> {
           pipeHandle
             .finalizePermissionMessage(pending.messageId, confirmText)
             .catch((err) => log("WARN", `failed to finalize permission message: ${(err as Error).message}`));
+          return;
+        }
+
+        // `/kill --all`/`/rm --all`'s own confirm keyboard (fleet-confirm.ts) - a fresh "fc:"
+        // namespace, checked alongside "perm:" since both gate a destructive action behind a tap.
+        const fleetConfirmAction = callbackQuery.data ? resolveFleetConfirmCallback(callbackQuery.data) : null;
+        if (fleetConfirmAction) {
+          const pending = fleetConfirmRegistry.resolve(fleetConfirmAction.id);
+          if (!pending || pending.kind !== fleetConfirmAction.kind) return;
+          if (!fleetConfirmAction.confirmed) {
+            void finalizeFleetConfirmMessage(pending, "Cancelled - nothing was changed.");
+            return;
+          }
+          void executeFleetConfirm(pending);
           return;
         }
 

@@ -11,16 +11,19 @@ import type { SessionRow } from "./session-store.ts";
  */
 /**
  * `/rm`'s bulk forms (added 2026-08-04, live testing produced dozens of `dead` rows within a
- * single sitting with no way to clear them except one `/rm <slug>` at a time). Scoped to `dead`
- * rows only, always - a bulk command is exactly the kind of action a fat-fingered pattern
- * shouldn't be able to turn into an accidental mass-`/kill` of live sessions.
+ * single sitting with no way to clear them except one `/rm <slug>` at a time). `--dead`/`--prefix`
+ * are scoped to `dead` rows only, always - a bulk command is exactly the kind of action a
+ * fat-fingered pattern shouldn't be able to turn into an accidental mass-`/kill` of live sessions.
+ * `--all` (added 2026-08-04) is the deliberate exception - it can remove live sessions too, which
+ * is why `index.ts` routes it through the `/kill --all` confirm-button flow (fleet-confirm.ts)
+ * instead of executing on the same message, unlike its `dead`-only siblings here.
  */
-export type RmBulkFilter = { mode: "dead" } | { mode: "prefix"; prefix: string };
+export type RmBulkFilter = { mode: "dead" } | { mode: "prefix"; prefix: string } | { mode: "all" };
 
 export type FleetCommand =
   | { kind: "new"; repo: string; prompt: string; model?: Model }
   | { kind: "ls" }
-  | { kind: "kill"; slug?: string }
+  | { kind: "kill"; slug?: string; all?: boolean }
   | { kind: "rm"; slug?: string; bulk?: RmBulkFilter }
   | { kind: "attach"; slug?: string }
   | { kind: "pause"; slug?: string }
@@ -46,17 +49,27 @@ function parseNew(rest: string): FleetCommand | null {
   return { kind: "new", repo, prompt, model };
 }
 
-function parseSlugArg(kind: "kill" | "attach" | "pause" | "usage", rest: string): FleetCommand {
+function parseSlugArg(kind: "attach" | "pause" | "usage", rest: string): FleetCommand {
   const slug = rest.trim();
   return { kind, slug: slug.length > 0 ? slug : undefined };
 }
 
+/** `/kill --all` requests fleet-confirm-gated (`index.ts`, fleet-confirm.ts) termination of every
+ * live session. Anything else falls through to the ordinary single-slug form. */
+function parseKill(rest: string): FleetCommand {
+  const trimmed = rest.trim();
+  if (trimmed === "--all") return { kind: "kill", all: true };
+  return { kind: "kill", slug: trimmed.length > 0 ? trimmed : undefined };
+}
+
 /** `/rm --dead` removes every `dead`-state row; `/rm --prefix <text>` removes every `dead`-state
  * row whose slug starts with `<text>` (still `dead`-only, for the same reason `--dead` is - see
- * `RmBulkFilter`'s own note). Anything else falls through to the ordinary single-slug form. */
+ * `RmBulkFilter`'s own note); `/rm --all` requests fleet-confirm-gated removal of every session
+ * regardless of state. Anything else falls through to the ordinary single-slug form. */
 function parseRm(rest: string): FleetCommand {
   const trimmed = rest.trim();
   if (trimmed === "--dead") return { kind: "rm", bulk: { mode: "dead" } };
+  if (trimmed === "--all") return { kind: "rm", bulk: { mode: "all" } };
   const prefixMatch = trimmed.match(/^--prefix\s+(\S+)$/);
   if (prefixMatch?.[1]) return { kind: "rm", bulk: { mode: "prefix", prefix: prefixMatch[1] } };
   return { kind: "rm", slug: trimmed.length > 0 ? trimmed : undefined };
@@ -82,6 +95,7 @@ export function parseFleetCommand(text: string): FleetCommand | null {
     case "rm":
       return parseRm(rest);
     case "kill":
+      return parseKill(rest);
     case "attach":
     case "pause":
     case "usage":
