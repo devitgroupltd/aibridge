@@ -1,7 +1,7 @@
 ---
-version: 0.22.0
+version: 0.23.0
 status: solid
-last_modified_utc: 2026-08-04T07:10:00Z
+last_modified_utc: 2026-08-04T07:44:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,38 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.23.0 (2026-08-04): New `/usage` fleet command, prompted by the operator asking to see Claude's
+    own account-level usage bars from inside Telegram - distinct from anything in this plan's own
+    `/budget` idea (never built; that would be Bridge tracking its own OTLP-derived spend, not
+    Anthropic's account meter). `/usage` is not a documented Claude Code feature, so it was found and
+    verified the same way this project always verifies an unconfirmed surface (§10.0, §6.5): live
+    injection via the dev-control-port's per-slug `/write` endpoint into a real session's PTY, reading
+    the raw captured render back out. Confirmed live against v2.1.221: `/usage` is a local TUI overlay
+    (Settings/Status/Config/Usage/Stats tabs) that never reaches the model, so writing it into a
+    session's PTY can't pollute that session's conversation - the same property `/model`/`/mode`/
+    `/effort` already rely on. It renders in two passes: an immediate frame with 'Current session' and
+    'Current week (all models)' bars, then an async 'Scanning local sessions…' refresh a second or two
+    later that adds 'Current week (Fable)' (only present on plans with Fable access) and settles on a
+    'd to day · w to week' hint - confirmed live to be the last thing the overlay draws. New
+    `usage-panel.ts`'s `formatUsagePanel()` parses the stripped-ANSI text for those three bars'
+    percentages and reset times; unit-tested against the two real captured frames rather than invented
+    JSON, same discipline as `hook-events.ts`. One real finding from that live capture that shaped the
+    parser: the refresh is a genuine terminal cursor-positioned patch of just the bar/percentage
+    characters with no heading nearby in the raw byte stream, so a flat post-`stripAnsi` regex can't
+    tell 'this is the same field, updated' from 'this is unrelated text' - the session/weekly numbers
+    end up pinned to the first frame's (very slightly stale, matching the panel's own 'Approximate'
+    caveat) values, while Fable's line, drawn fresh in full since it didn't exist before the refresh,
+    always matches cleanly. `index.ts`'s `requestUsagePanel(slug)` writes `/usage\r` into the target
+    session's own PTY, accumulates its output in a per-slug waiter (mirroring `waitForChannelConnected`
+    §4.5's event-driven pattern, not a fixed delay - this plan's own 2026-08-04 lesson from the
+    dev-channels first-write race), resolves on the 'd to day' settle marker, and always sends Esc
+    before resolving so the session's PTY returns to its normal idle prompt instead of being left
+    showing the overlay (confirmed live: '⎿ Settings dialog dismissed', prompt immediately reusable for
+    the next command). Falls back to formatting whatever was captured on a 10s timeout rather than
+    discarding it, matching `/attach`'s own 'best-effort tail, not a durable guarantee' convention.
+    `/usage [<slug>]` is session-scoped like `/attach`/`/pause` - control-topic callers must name a
+    slug, in-topic callers can send it bare. Live-verified end to end via the Playwright/Telegram-Web
+    harness: reply landed in well under 2 seconds and included the Fable line."
   - "0.22.0 (2026-08-04): Phase 5's remainder from 0.21.0's own deferred list, plus two more real
     bugs found only by running it live. Built: reconciliation.ts wired into Bridge startup for
     real (runStartupReconciliation, gated the same as the Phase 1 launch) - every non-dead,

@@ -16,7 +16,7 @@ import { normalizeHookEvent } from "./hook-events.ts";
 import { resolvePermCallback } from "./permission-callback.ts";
 import { reconcile } from "./reconciliation.ts";
 import { loadReposRegistry, type ReposRegistry } from "./repos-registry.ts";
-import { launchSession } from "./session-launcher.ts";
+import { launchSession, stripAnsi } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
 import { RateGovernor } from "./rate-governor.ts";
 import { deriveAlwaysRule, ruleAlreadyCovered } from "./rule-derivation.ts";
@@ -37,6 +37,7 @@ import {
 } from "./session-commands.ts";
 import type { Mode } from "./session-commands.ts";
 import { stateForHookEvent } from "./session-state-transitions.ts";
+import { formatUsagePanel } from "./usage-panel.ts";
 import { isValidTransition, SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
 import { slugFromPrompt, uniqueSlug } from "./slug.ts";
 import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
@@ -228,6 +229,46 @@ async function main(): Promise<void> {
         clearTimeout(timeout);
         resolve();
       });
+    });
+  }
+
+  // `/usage` (§4.2, added 2026-08-04): a slug can have at most one pending capture at a time - a
+  // second `/usage` for the same slug while one is already in flight would garble both buffers, so
+  // `requestUsagePanel` below overwrites rather than queuing, same "last request wins" simplicity as
+  // the channel-connected waiter above.
+  const usageWaiters = new Map<string, { buffer: string; check: () => void }>();
+
+  /** Writes `/usage` into `slug`'s own PTY (a local TUI overlay - never reaches the model, so it
+   * can't pollute the conversation) and resolves once Claude Code's async "scanning local sessions"
+   * refresh has settled (the "d to day · w to week" hint is the last thing that overlay renders -
+   * confirmed live 2026-08-04, see `usage-panel.ts`). Falls back to whatever's been captured so far
+   * on timeout rather than discarding it - the first frame alone already has real numbers, same
+   * "best-effort" convention `/attach`'s ring buffer already uses. Always closes the overlay with
+   * Esc before resolving, so the session isn't left showing it over the normal prompt. */
+  function requestUsagePanel(slug: string, timeoutMs = 10_000): Promise<string> {
+    return new Promise((resolve) => {
+      const write = routing.getPtyWrite(slug);
+      if (!write) {
+        resolve(`No live PTY for "${slug}" to query.`);
+        return;
+      }
+      const finish = (state: { buffer: string }) => {
+        clearTimeout(timeout);
+        usageWaiters.delete(slug);
+        write("\x1b");
+        resolve(formatUsagePanel(stripAnsi(state.buffer)));
+      };
+      const timeout = setTimeout(() => {
+        const state = usageWaiters.get(slug);
+        if (state) finish(state);
+      }, timeoutMs);
+      usageWaiters.set(slug, {
+        buffer: "",
+        check() {
+          if (/d to day/i.test(stripAnsi(this.buffer))) finish(this);
+        },
+      });
+      write("/usage\r");
     });
   }
 
@@ -444,7 +485,14 @@ async function main(): Promise<void> {
    * the Phase 1 launch, `/new`, and every `resumeSession` relaunch so the three don't drift. */
   function wireSession(slug: string, ptyProcess: pty.IPty, topicId: number): void {
     routing.setPtyWrite(slug, (text) => ptyProcess.write(text));
-    ptyProcess.onData((data) => routing.appendOutput(slug, data));
+    ptyProcess.onData((data) => {
+      routing.appendOutput(slug, data);
+      const usageState = usageWaiters.get(slug);
+      if (usageState) {
+        usageState.buffer += data;
+        usageState.check();
+      }
+    });
     ptyProcessBySlug.set(slug, ptyProcess);
     ptyProcess.onExit(({ exitCode }) => {
       void handleUnexpectedExit(slug, ptyProcess, topicId, exitCode);
@@ -739,6 +787,19 @@ async function main(): Promise<void> {
     confirmSessionCommand(topicId, renderAttach(row, tail), "HTML");
   }
 
+  /** `/usage` (§4.2, added 2026-08-04): asks `slug`'s own session to open Claude Code's own `/usage`
+   * overlay (account-level Anthropic usage, distinct from anything Bridge tracks itself) and relays
+   * the parsed Session/Weekly/Weekly-Fable percentages back into Telegram. */
+  async function handleUsageCommand(cmd: Extract<FleetCommand, { kind: "usage" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
+    const resolved = resolveTargetSlug(cmd.slug, currentSlug);
+    if ("error" in resolved) {
+      confirmSessionCommand(topicId, resolved.error);
+      return;
+    }
+    const summary = await requestUsagePanel(resolved.slug);
+    confirmSessionCommand(topicId, summary);
+  }
+
   function handlePauseCommand(cmd: Extract<FleetCommand, { kind: "pause" }>, topicId: number | undefined, currentSlug: string | undefined): void {
     const resolved = resolveTargetSlug(cmd.slug, currentSlug);
     if ("error" in resolved) {
@@ -909,6 +970,10 @@ async function main(): Promise<void> {
         }
         if (fleetCmd.kind === "attach") {
           handleAttachCommand(fleetCmd, threadId, currentSlug);
+          return;
+        }
+        if (fleetCmd.kind === "usage") {
+          void handleUsageCommand(fleetCmd, threadId, currentSlug);
           return;
         }
         if (fleetCmd.kind === "restart") {

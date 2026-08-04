@@ -5,9 +5,9 @@ import type { SessionRow } from "./session-store.ts";
 
 /**
  * §4.2's fleet-scoped commands. `/new`/`/ls` are control-topic only (no target to act on besides
- * the fleet itself); `/kill`/`/rm`/`/attach`/`/pause` take an optional `<slug>` so they can be sent
- * from the control topic *or* bare from inside the session's own topic (§4.2: "`/kill` with no
- * argument inside a session topic kills that session").
+ * the fleet itself); `/kill`/`/rm`/`/attach`/`/pause`/`/usage` take an optional `<slug>` so they can
+ * be sent from the control topic *or* bare from inside the session's own topic (§4.2: "`/kill` with
+ * no argument inside a session topic kills that session").
  */
 /**
  * `/rm`'s bulk forms (added 2026-08-04, live testing produced dozens of `dead` rows within a
@@ -24,6 +24,7 @@ export type FleetCommand =
   | { kind: "rm"; slug?: string; bulk?: RmBulkFilter }
   | { kind: "attach"; slug?: string }
   | { kind: "pause"; slug?: string }
+  | { kind: "usage"; slug?: string }
   | { kind: "restart" };
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
@@ -44,7 +45,7 @@ function parseNew(rest: string): FleetCommand | null {
   return { kind: "new", repo, prompt, model };
 }
 
-function parseSlugArg(kind: "kill" | "attach" | "pause", rest: string): FleetCommand {
+function parseSlugArg(kind: "kill" | "attach" | "pause" | "usage", rest: string): FleetCommand {
   const slug = rest.trim();
   return { kind, slug: slug.length > 0 ? slug : undefined };
 }
@@ -65,7 +66,7 @@ function parseRm(rest: string): FleetCommand {
  * "for us, but invalid" split as `session-commands.ts`'s parser. */
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|restart)\b(.*)$/s);
+  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|restart)\b(.*)$/s);
   if (!match) return null;
   const [, cmd, rest] = match as [string, string, string];
   switch (cmd) {
@@ -80,6 +81,7 @@ export function parseFleetCommand(text: string): FleetCommand | null {
     case "kill":
     case "attach":
     case "pause":
+    case "usage":
       return parseSlugArg(cmd, rest);
     default:
       return null;

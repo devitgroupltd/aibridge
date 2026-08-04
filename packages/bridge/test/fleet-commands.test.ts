@@ -38,6 +38,11 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/pause fix-bug")).toEqual({ kind: "pause", slug: "fix-bug" });
   });
 
+  test("/usage with and without a slug", () => {
+    expect(parseFleetCommand("/usage fix-bug")).toEqual({ kind: "usage", slug: "fix-bug" });
+    expect(parseFleetCommand("/usage")).toEqual({ kind: "usage", slug: undefined });
+  });
+
   test("/rm --dead requests the bulk dead-row filter", () => {
     expect(parseFleetCommand("/rm --dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
   });
