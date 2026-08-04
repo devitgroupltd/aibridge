@@ -1,6 +1,93 @@
 import { describe, expect, test } from "bun:test";
-import { parseFleetCommand, renderAttach, renderBudget, renderHelp, renderLsTable, renderSettings } from "../src/fleet-commands.ts";
+import {
+  isHelpCommand,
+  parseCommandsQuery,
+  parseFleetCommand,
+  parseSkillsQuery,
+  renderAttach,
+  renderBudget,
+  renderHelp,
+  renderLsTable,
+  renderSettings,
+  stripBotMention,
+} from "../src/fleet-commands.ts";
 import type { SessionRow } from "../src/session-store.ts";
+
+describe("isHelpCommand", () => {
+  test("recognises /help, /?, /h", () => {
+    for (const text of ["/help", "/?", "/h"]) {
+      expect(isHelpCommand(text, true)).toBe(true);
+    }
+  });
+
+  test("bare ? is help only from the control topic", () => {
+    expect(isHelpCommand("?", true)).toBe(true);
+    expect(isHelpCommand("?", false)).toBe(false);
+  });
+
+  test("/commands is no longer a /help alias - repurposed 2026-08-04", () => {
+    expect(isHelpCommand("/commands", true)).toBe(false);
+  });
+
+  test("returns false for anything else, including a term (help never takes one)", () => {
+    expect(isHelpCommand("/help deep", true)).toBe(false);
+    expect(isHelpCommand("/ls", true)).toBe(false);
+    expect(isHelpCommand("hello", true)).toBe(false);
+  });
+});
+
+describe("parseCommandsQuery", () => {
+  test("recognises a bare /commands with no term", () => {
+    expect(parseCommandsQuery("/commands")).toEqual({ term: "" });
+  });
+
+  test("captures a trailing search term, trimmed", () => {
+    expect(parseCommandsQuery("/commands   deep-check  ")).toEqual({ term: "deep-check" });
+  });
+
+  test("returns null for anything else", () => {
+    expect(parseCommandsQuery("/skills")).toBeNull();
+    expect(parseCommandsQuery("/help")).toBeNull();
+    expect(parseCommandsQuery("hello")).toBeNull();
+  });
+});
+
+describe("parseSkillsQuery", () => {
+  test("recognises a bare /skills with no term", () => {
+    expect(parseSkillsQuery("/skills")).toEqual({ term: "" });
+  });
+
+  test("captures a trailing search term, trimmed", () => {
+    expect(parseSkillsQuery("/skills   plan  ")).toEqual({ term: "plan" });
+  });
+
+  test("returns null for anything else", () => {
+    expect(parseSkillsQuery("/commands")).toBeNull();
+    expect(parseSkillsQuery("hello")).toBeNull();
+  });
+});
+
+describe("stripBotMention", () => {
+  test("strips a bare command's bot-username suffix", () => {
+    expect(stripBotMention("/help@om_aibridge_control_bot")).toBe("/help");
+  });
+
+  test("strips the suffix and preserves the argument text after it", () => {
+    expect(stripBotMention("/kill@om_aibridge_control_bot my-slug")).toBe("/kill my-slug");
+  });
+
+  test("leaves a plain command with no mention untouched", () => {
+    expect(stripBotMention("/kill my-slug")).toBe("/kill my-slug");
+  });
+
+  test("leaves non-command text untouched, including a genuine @mention", () => {
+    expect(stripBotMention("hey @someone, can you check this?")).toBe("hey @someone, can you check this?");
+  });
+
+  test("only strips a mention immediately after the leading command, not one later in the text", () => {
+    expect(stripBotMention("/new seowrite ask @alice to review")).toBe("/new seowrite ask @alice to review");
+  });
+});
 
 describe("parseFleetCommand", () => {
   test("/new <repo> <prompt> with no model flag", () => {

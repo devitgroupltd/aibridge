@@ -87,6 +87,55 @@ function parseAutostart(rest: string): FleetCommand | null {
   return { kind: "autostart", action };
 }
 
+/**
+ * Telegram's own "/" autocomplete popup inserts "@<botusername>" right after the command name in
+ * a group chat (confirmed live 2026-08-04 - see CLAUDE.md's live-verification note), so a tapped
+ * suggestion arrives as e.g. `/kill@om_aibridge_control_bot slug` rather than `/kill slug`. Every
+ * command match in this codebase (`parseFleetCommand`, `parseSessionCommand`, the `/help` exact
+ * checks, `isBuiltinPassthroughCommand`) assumes a bare `/command` - without stripping the mention
+ * first, a tapped suggestion would silently match nothing and fall through as plain chat text
+ * instead of running the command. Only a mention directly following the leading `/word` with no
+ * intervening space is stripped, matching exactly what Telegram inserts - a genuine `@name`
+ * anywhere else in a real message (e.g. actual conversational text) is left untouched.
+ */
+export function stripBotMention(text: string): string {
+  return text.replace(/^(\/[A-Za-z0-9_]+)@[A-Za-z0-9_]+\b/, "$1");
+}
+
+/**
+ * `/help`/`/?`/`/h` (plus bare `?`, control-topic only - ambiguous with real chat text inside a
+ * session topic): the fixed fleet+session command reference, never filtered. `/commands`
+ * (formerly a `/help` alias, repurposed 2026-08-04 - see `parseCommandsQuery`) and `/skills` are
+ * the ones that take a search term, since they're the ones whose item count actually scales with
+ * the project.
+ */
+export function isHelpCommand(text: string, isControl: boolean): boolean {
+  const trimmed = text.trim();
+  if (trimmed === "?") return isControl;
+  return trimmed === "/help" || trimmed === "/?" || trimmed === "/h";
+}
+
+/**
+ * `/commands [<term>]` - lists the session's own `.claude/commands/**\/*.md`, optionally filtered.
+ * Repurposed 2026-08-04 from a bare `/help` alias: once real projects showed up with 40+ repo
+ * commands (seowrite, confirmed live) a flat per-item button list couldn't scale, and per Telegram
+ * bot UX convention the fix for "too many items for buttons" is search-as-you-type browsing via a
+ * dedicated command, not deeper pagination. Returns null for anything that isn't this command,
+ * distinct from `{ term: "" }` (recognised, no filter given - list everything).
+ */
+export function parseCommandsQuery(text: string): { term: string } | null {
+  const match = text.trim().match(/^\/commands(?:\s+(.+))?$/);
+  if (!match) return null;
+  return { term: (match[1] ?? "").trim() };
+}
+
+/** `/skills [<term>]` - same idea as `parseCommandsQuery`, for `.claude/skills/*`. */
+export function parseSkillsQuery(text: string): { term: string } | null {
+  const match = text.trim().match(/^\/skills(?:\s+(.+))?$/);
+  if (!match) return null;
+  return { term: (match[1] ?? "").trim() };
+}
+
 /** Returns null for anything that isn't one of these commands. A recognised command with a
  * malformed argument (e.g. `/new` with no repo) also returns null - same "not for us" vs.
  * "for us, but invalid" split as `session-commands.ts`'s parser. */
@@ -202,11 +251,11 @@ export function renderSettings(repos: readonly RepoEntry[], concurrency: { curre
   return escapeForFeed(lines.join("\n"));
 }
 
-/** `/help`/`/commands`: the fleet- and session-scoped command list itself, plain text (no
- * `parse_mode`, unlike the other render functions here - the `/help` call site sends it alongside
- * the existing built-in/repo-command button keyboard, not in place of it) - surfaced because the
- * button keyboard only ever covered `/compact`/`/clear` and repo-defined `.claude/commands/*.md`
- * shortcuts, never the fleet/session commands themselves. */
+/** `/help`: the fixed fleet- and session-scoped command reference, plain text (no `parse_mode`,
+ * unlike the other render functions here - the `/help` call site sends it alongside the
+ * built-in/category button keyboard, not in place of it). `/commands`/`/skills` are the
+ * per-project, item-count-scoped lists (see `commands.ts`'s `renderCommandsListText`/
+ * `renderSkillsListText`) - this only covers what's fixed regardless of project. */
 export function renderHelp(): string {
   return [
     "Fleet commands (control topic; also /help, /?, /h, or bare ? here):",
@@ -226,8 +275,10 @@ export function renderHelp(): string {
     `  /model <${MODELS.join("|")}>`,
     `  /mode <${MODES.join("|")}>`,
     `  /effort <${EFFORTS.join("|")}>`,
+    "  /commands [<term>] - list this project's .claude/commands",
+    "  /skills [<term>] - list this project's .claude/skills",
     "",
-    "Built-in passthrough and repo commands are below:",
+    "Built-in passthrough is below - tap a button, or type /compact or /clear directly:",
   ].join("\n");
 }
 
@@ -255,6 +306,8 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "model", description: `Set model: /model <${MODELS.join("|")}>` },
     { command: "mode", description: `Set mode: /mode <${MODES.join("|")}>` },
     { command: "effort", description: `Set effort: /effort <${EFFORTS.join("|")}>` },
+    { command: "commands", description: "List this project's .claude/commands: /commands [<term>]" },
+    { command: "skills", description: "List this project's .claude/skills: /skills [<term>]" },
   ];
 }
 

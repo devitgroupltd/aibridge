@@ -7,13 +7,37 @@ import type { ChannelMetaFields, HookEventMessage } from "@aibridge/protocol";
 import { renderChannelTag } from "@aibridge/protocol";
 import { resolveAskCallback, renderAskAnsweredCard, renderAskCancelledCard } from "./ask-callback.ts";
 import { buildCreateArgs, buildDeleteArgs, buildQueryArgs, parseQueryOutput, renderAutostartStatus, TASK_NAME } from "./autostart.ts";
-import { buildCmdShimText, buildCommandKeyboard, isBuiltinPassthroughCommand, listRepoCommands, resolveCommandAction } from "./commands.ts";
+import {
+  buildCmdShimText,
+  buildCommandKeyboard,
+  buildSkillShimText,
+  isBuiltinPassthroughCommand,
+  listRepoCommands,
+  listRepoSkills,
+  parseCmdInvocation,
+  parseSkillInvocation,
+  renderCommandsListText,
+  renderSkillsListText,
+  resolveCommandAction,
+} from "./commands.ts";
 import { loadConfig, STATE_DIR } from "./config.ts";
 import { FeedCoalescer } from "./feed-coalescer.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
-import { botCommandList, parseFleetCommand, renderAttach, renderBudget, renderHelp, renderLsTable, renderSettings } from "./fleet-commands.ts";
+import {
+  botCommandList,
+  isHelpCommand,
+  parseCommandsQuery,
+  parseFleetCommand,
+  parseSkillsQuery,
+  renderAttach,
+  renderBudget,
+  renderHelp,
+  renderLsTable,
+  renderSettings,
+  stripBotMention,
+} from "./fleet-commands.ts";
 import { renderCard } from "./feed-renderer.ts";
 import { applyEvent, createFeedState, promptsInLastHour } from "./feed-state.ts";
 import { normalizeHookEvent } from "./hook-events.ts";
@@ -743,6 +767,13 @@ async function main(): Promise<void> {
       });
       wireSession(slug, session.ptyProcess, topicId);
       sessionStore.setPtyPid(slug, session.ptyProcess.pid ?? 0);
+      // Without this, `routing.getByTopicId(topicId)` stays undefined for this session forever
+      // after this restart (only the phase1 slot and freshly-`/new`'d sessions ever call
+      // `routing.add` otherwise) - every message in its topic then silently drops at the
+      // `!isControl && !route` guard, with no error and no log line. Confirmed live 2026-08-04:
+      // a resumed session answered /ls (control topic, doesn't need routing) but never replied to
+      // anything sent in its own topic - not the command being wrong, the route being missing.
+      routing.add({ slug, topicId, worktreePath: row.worktreePath });
       confirmSessionCommand(topicId, `Session "${slug}" resumed.`);
     } catch (err) {
       sessionStore.setState(slug, "dead", nowIso());
@@ -1284,13 +1315,21 @@ async function main(): Promise<void> {
           return;
         }
 
-        const action = callbackQuery.data ? resolveCommandAction(callbackQuery.data, currentRoute ? listRepoCommands(currentRoute.worktreePath) : []) : null;
-        if (!action || !currentSlug || threadId === undefined) return;
-        if (action.kind === "builtin") {
-          sendRaw(currentSlug, `/${action.name}`);
-        } else {
-          sendChannelText(currentSlug, threadId, buildCmdShimText(action.name, ""), `cb-${callbackQuery.id}`, "telegram-button");
+        const action = callbackQuery.data ? resolveCommandAction(callbackQuery.data) : null;
+        if (!action || threadId === undefined) return;
+        // "Commands (N)"/"Skills (N)" - answered directly, like /help/`/commands`/`/skills`
+        // themselves; this is "list them as text," not something to forward into the PTY/channel.
+        if (action.kind === "show_commands") {
+          const text = renderCommandsListText(currentRoute ? listRepoCommands(currentRoute.worktreePath) : []);
+          controlBot.sendMessage(config.supergroupChatId, threadId, text).catch((err) => log("WARN", `sendMessage (show commands) failed: ${(err as Error).message}`));
+          return;
         }
+        if (action.kind === "show_skills") {
+          const text = renderSkillsListText(currentRoute ? listRepoSkills(currentRoute.worktreePath) : []);
+          controlBot.sendMessage(config.supergroupChatId, threadId, text).catch((err) => log("WARN", `sendMessage (show skills) failed: ${(err as Error).message}`));
+          return;
+        }
+        if (currentSlug) sendRaw(currentSlug, `/${action.name}`);
         return;
       }
 
@@ -1305,7 +1344,9 @@ async function main(): Promise<void> {
       // Neither the control topic nor a topic this Bridge recognises as a session - ignore.
       if (!isControl && !route) return;
 
-      const text = message.text.trim();
+      // Strip a Telegram-inserted "@botusername" before any command parsing below - see
+      // stripBotMention's doc comment for why this has to happen exactly once, here.
+      const text = stripBotMention(message.text.trim());
       const from = message.from?.username ?? message.from?.first_name ?? "unknown";
 
       const fleetCmd = parseFleetCommand(text);
@@ -1365,13 +1406,36 @@ async function main(): Promise<void> {
       // "?" bare (no slash) is only treated as a help request from the control topic - inside a
       // session topic it's plausible real content meant for Claude (e.g. "?" as a shorthand
       // question), so only the unambiguous slash forms are recognised there.
-      if (text === "/help" || text === "/commands" || text === "/?" || text === "/h" || (text === "?" && isControl)) {
+      if (isHelpCommand(text, isControl)) {
         const repoCommands = route ? listRepoCommands(route.worktreePath) : [];
+        const repoSkills = route ? listRepoSkills(route.worktreePath) : [];
         controlBot
           .sendMessage(config.supergroupChatId, threadId, renderHelp(), {
-            inline_keyboard: buildCommandKeyboard(repoCommands),
+            inline_keyboard: buildCommandKeyboard(repoCommands, repoSkills),
           })
           .catch((err) => log("WARN", `sendMessage (command list) failed: ${(err as Error).message}`));
+        return;
+      }
+
+      // `/commands [<term>]`/`/skills [<term>]` - the per-project, item-count-scoped lists (see
+      // commands.ts's doc comments on `buildCommandKeyboard` for why these replaced per-item
+      // buttons: seowrite, confirmed live 2026-08-04, has 43 repo commands and 66 skills, and a
+      // flat button-per-item keyboard can't scale to that). Session-scoped only - control topic
+      // has no worktree to read commands/skills from.
+      const commandsQuery = parseCommandsQuery(text);
+      if (commandsQuery) {
+        const text_ = route
+          ? renderCommandsListText(listRepoCommands(route.worktreePath), commandsQuery.term)
+          : "Repo commands are session-scoped - send /commands inside a session's own topic.";
+        controlBot.sendMessage(config.supergroupChatId, threadId, text_).catch((err) => log("WARN", `sendMessage (/commands) failed: ${(err as Error).message}`));
+        return;
+      }
+      const skillsQuery = parseSkillsQuery(text);
+      if (skillsQuery) {
+        const text_ = route
+          ? renderSkillsListText(listRepoSkills(route.worktreePath), skillsQuery.term)
+          : "Repo skills are session-scoped - send /skills inside a session's own topic.";
+        controlBot.sendMessage(config.supergroupChatId, threadId, text_).catch((err) => log("WARN", `sendMessage (/skills) failed: ${(err as Error).message}`));
         return;
       }
 
@@ -1436,6 +1500,28 @@ async function main(): Promise<void> {
       if (sessionStore.get(currentSlug)?.state === "dead") {
         confirmSessionCommand(threadId, "This session has ended.");
         return;
+      }
+
+      // Manual typing equivalent of the old per-item buttons (removed 2026-08-04 - see
+      // commands.ts's `buildCommandKeyboard` doc comment): `/cmd <name>`/`/commands <name>`
+      // invokes a repo command by name, `/<name>` invokes a repo skill by name if - and only if -
+      // `<name>` matches a real skill; anything else falls through untouched rather than treating
+      // every leading "/" as an error, since ordinary chat text can start with "/" too.
+      if (route) {
+        const cmdInvoke = parseCmdInvocation(text);
+        if (cmdInvoke) {
+          if (listRepoCommands(route.worktreePath).includes(cmdInvoke.name)) {
+            sendChannelText(currentSlug, threadId, buildCmdShimText(cmdInvoke.name, cmdInvoke.args), String(message.message_id), from);
+          } else {
+            confirmSessionCommand(threadId, `No repo command named "${cmdInvoke.name}" in this project. Try /commands to list them.`);
+          }
+          return;
+        }
+        const skillInvoke = parseSkillInvocation(text);
+        if (skillInvoke && listRepoSkills(route.worktreePath).includes(skillInvoke.name)) {
+          sendChannelText(currentSlug, threadId, buildSkillShimText(skillInvoke.name, skillInvoke.args), String(message.message_id), from);
+          return;
+        }
       }
 
       // §10.1.2: notifications/claude/channel is confirmed broken upstream (getClientCapabilities()
