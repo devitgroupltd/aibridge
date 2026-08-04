@@ -9,13 +9,22 @@ import type { SessionRow } from "./session-store.ts";
  * from the control topic *or* bare from inside the session's own topic (§4.2: "`/kill` with no
  * argument inside a session topic kills that session").
  */
+/**
+ * `/rm`'s bulk forms (added 2026-08-04, live testing produced dozens of `dead` rows within a
+ * single sitting with no way to clear them except one `/rm <slug>` at a time). Scoped to `dead`
+ * rows only, always - a bulk command is exactly the kind of action a fat-fingered pattern
+ * shouldn't be able to turn into an accidental mass-`/kill` of live sessions.
+ */
+export type RmBulkFilter = { mode: "dead" } | { mode: "prefix"; prefix: string };
+
 export type FleetCommand =
   | { kind: "new"; repo: string; prompt: string; model?: Model }
   | { kind: "ls" }
   | { kind: "kill"; slug?: string }
-  | { kind: "rm"; slug?: string }
+  | { kind: "rm"; slug?: string; bulk?: RmBulkFilter }
   | { kind: "attach"; slug?: string }
-  | { kind: "pause"; slug?: string };
+  | { kind: "pause"; slug?: string }
+  | { kind: "restart" };
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
 
@@ -35,9 +44,20 @@ function parseNew(rest: string): FleetCommand | null {
   return { kind: "new", repo, prompt, model };
 }
 
-function parseSlugArg(kind: "kill" | "rm" | "attach" | "pause", rest: string): FleetCommand {
+function parseSlugArg(kind: "kill" | "attach" | "pause", rest: string): FleetCommand {
   const slug = rest.trim();
   return { kind, slug: slug.length > 0 ? slug : undefined };
+}
+
+/** `/rm --dead` removes every `dead`-state row; `/rm --prefix <text>` removes every `dead`-state
+ * row whose slug starts with `<text>` (still `dead`-only, for the same reason `--dead` is - see
+ * `RmBulkFilter`'s own note). Anything else falls through to the ordinary single-slug form. */
+function parseRm(rest: string): FleetCommand {
+  const trimmed = rest.trim();
+  if (trimmed === "--dead") return { kind: "rm", bulk: { mode: "dead" } };
+  const prefixMatch = trimmed.match(/^--prefix\s+(\S+)$/);
+  if (prefixMatch?.[1]) return { kind: "rm", bulk: { mode: "prefix", prefix: prefixMatch[1] } };
+  return { kind: "rm", slug: trimmed.length > 0 ? trimmed : undefined };
 }
 
 /** Returns null for anything that isn't one of these commands. A recognised command with a
@@ -45,7 +65,7 @@ function parseSlugArg(kind: "kill" | "rm" | "attach" | "pause", rest: string): F
  * "for us, but invalid" split as `session-commands.ts`'s parser. */
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause)\b(.*)$/s);
+  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|restart)\b(.*)$/s);
   if (!match) return null;
   const [, cmd, rest] = match as [string, string, string];
   switch (cmd) {
@@ -53,8 +73,11 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return parseNew(rest);
     case "ls":
       return { kind: "ls" };
-    case "kill":
+    case "restart":
+      return { kind: "restart" };
     case "rm":
+      return parseRm(rest);
+    case "kill":
     case "attach":
     case "pause":
       return parseSlugArg(cmd, rest);

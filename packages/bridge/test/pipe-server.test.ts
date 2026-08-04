@@ -77,6 +77,30 @@ describe("startPipeServer", () => {
     expect(received[0]).toMatchObject({ session_state: "unknown", topic_id: -1 });
   });
 
+  test("onChannelConnected fires with the slug once the channel server's hello arrives", async () => {
+    const path = pipePath();
+    const routing = new Routing();
+    routing.add({ slug: "test-session", topicId: 3, worktreePath: "c:\\data\\worktrees\\test-session" });
+
+    const connected: string[] = [];
+    const handle = startPipeServer({
+      pipePath: path,
+      routing,
+      controlBot: noopControlBot,
+      chatId: "-1",
+      onChannelConnected: (slug) => connected.push(slug),
+    });
+    servers.push(handle.server);
+    await waitFor(() => handle.server.listening);
+
+    const { socket } = connectClient(path);
+    await waitFor(() => socket.readyState === "open");
+    socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "hello", role: "channel", slug: "test-session", pid: 123 } satisfies HelloFromChannel));
+
+    await waitFor(() => connected.length >= 1);
+    expect(connected).toEqual(["test-session"]);
+  });
+
   test("reply is forwarded to the control bot in the session's chat/topic", async () => {
     const path = pipePath();
     const routing = new Routing();

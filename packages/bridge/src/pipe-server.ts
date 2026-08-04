@@ -34,8 +34,10 @@ export interface PipeServerOptions {
    * instead of sending a second message (see `thinking-placeholder.ts`). */
   thinkingPlaceholder?: ThinkingPlaceholder;
   /** Fires after a `reply` is successfully delivered - the typing indicator's stop signal (§5's
-   * feed doesn't exist yet, but "a reply landed" is already known here regardless). */
-  onReplySent?: (topicId: string) => void;
+   * feed doesn't exist yet, but "a reply landed" is already known here regardless). The reply text
+   * is passed through too so a caller can drive §4.4's rename-once off the session's first reply
+   * without this module needing to know anything about topics or the routing table. */
+  onReplySent?: (topicId: string, text: string) => void;
   /** §5.1: every hook firing forwards one `event` message here. The hook client is a one-shot
    * process (a fresh connection per firing, no persistent registration to track), so this is the
    * only wiring needed on this side - there is no per-hook `hello_ack` to send back. */
@@ -43,6 +45,12 @@ export interface PipeServerOptions {
   /** §4.3: a freshly-posted permission/question card moves the session's tracked state to
    * `awaiting_input`. Not fired on an ask reconnect rebind (the question was already pending). */
   onAwaitingInput?: (slug: string) => void;
+  /** Fires once the channel server (Claude Code's own MCP client for this session) registers
+   * itself via `hello` - the deterministic signal that its MCP handshake has actually completed,
+   * used by `index.ts` to know when it's finally safe to write a session's first inbound message
+   * without racing that handshake (confirmed live 2026-08-04: a fixed delay guessed at this was
+   * unreliable - this event is what replaced it). */
+  onChannelConnected?: (slug: string) => void;
   log?: LogFn;
 }
 
@@ -97,7 +105,7 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       } else {
         await opts.controlBot.sendMessage(opts.chatId, Number(msg.topic_id), msg.text);
       }
-      opts.onReplySent?.(msg.topic_id);
+      opts.onReplySent?.(msg.topic_id, msg.text);
     } catch (err) {
       log("ERROR", `failed to deliver reply for slug "${msg.slug}": ${(err as Error).message}`);
     }
@@ -186,6 +194,7 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     }
     connectionsBySlug.set(msg.slug, socket);
     log("INFO", `channel server for "${msg.slug}" connected (pid ${msg.pid})`);
+    opts.onChannelConnected?.(msg.slug);
 
     const route = opts.routing.get(msg.slug);
     const ack: HelloAck = {

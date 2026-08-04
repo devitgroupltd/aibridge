@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import http from "node:http";
 import path from "node:path";
 import type * as pty from "node-pty";
@@ -13,6 +14,7 @@ import { renderCard } from "./feed-renderer.ts";
 import { applyEvent, createFeedState, promptsInLastHour } from "./feed-state.ts";
 import { normalizeHookEvent } from "./hook-events.ts";
 import { resolvePermCallback } from "./permission-callback.ts";
+import { reconcile } from "./reconciliation.ts";
 import { loadReposRegistry, type ReposRegistry } from "./repos-registry.ts";
 import { launchSession } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
@@ -35,10 +37,11 @@ import {
 } from "./session-commands.ts";
 import type { Mode } from "./session-commands.ts";
 import { stateForHookEvent } from "./session-state-transitions.ts";
-import { isValidTransition, SessionStore, type SessionState } from "./session-store.ts";
+import { isValidTransition, SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
 import { slugFromPrompt, uniqueSlug } from "./slug.ts";
 import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
 import { startPolling, TelegramClient, validateTokens } from "./telegram.ts";
+import { loadOffset, saveOffset } from "./telegram-offset.ts";
 import { createThinkingPlaceholder } from "./thinking-placeholder.ts";
 import { createTypingIndicator } from "./typing-indicator.ts";
 import { removeWorktree } from "./worktree.ts";
@@ -96,6 +99,7 @@ async function main(): Promise<void> {
       state: "starting",
       turnCardMsg: null,
       paused: false,
+      renamed: false,
       createdUtc: nowIso(),
       lastEventUtc: nowIso(),
     });
@@ -111,6 +115,7 @@ async function main(): Promise<void> {
   }
 
   const ptyProcessBySlug = new Map<string, pty.IPty>();
+  const channelServerEntryPath = path.resolve(import.meta.dirname, "../../channel-server/src/index.ts");
 
   function maybeSetState(slug: string, target: SessionState): void {
     const row = sessionStore.get(slug);
@@ -169,6 +174,16 @@ async function main(): Promise<void> {
   const PROMPTS_PER_HOUR_WARN_THRESHOLD = 20;
 
   function handleHookEvent(msg: HookEventMessage): void {
+    // §4.5's resume path needs a real session_id to hand to `claude --resume` - every hook event
+    // carries one (§5.1), so this is the only place it's ever known, and it's cheap to keep fresh
+    // in case a session's own id ever changes mid-run (e.g. after its own internal --resume).
+    // Missing live 2026-08-03 until now: `sessionId` sat `null` forever, so the very first restart
+    // recovery attempt had nothing to resume with.
+    const row = sessionStore.get(msg.slug);
+    if (row && row.sessionId !== msg.session_id) {
+      sessionStore.setSessionId(msg.slug, msg.session_id);
+    }
+
     // §4.3's state table, the hook-driven half (the permission/ask half is wired via
     // onAwaitingInput/maybeSetState below) - a stale/duplicate event is a silent no-op, not an error.
     const targetState = stateForHookEvent(msg.hook_event_name);
@@ -192,6 +207,30 @@ async function main(): Promise<void> {
     feedCoalescer.notify(msg.slug, renderCard(next, nowMs));
   }
 
+  // The deterministic half of `/new`'s first-write race (§4.5's dev-channels dialog is the other
+  // half, handled in `session-launcher.ts`): a slug can have at most one pending waiter at a time,
+  // since nothing writes a session's first message before it's even launched.
+  const channelConnectedWaiters = new Map<string, () => void>();
+
+  /** Resolves once the channel server for `slug` has completed its MCP handshake with this Claude
+   * Code process, or after `timeoutMs` if it never does (a misconfigured `.mcp.json`, say) - a
+   * caller that needs this settled before writing must not wedge forever over a signal that never
+   * arrives. Replaces a guessed fixed delay after the dev-channels dialog (confirmed live
+   * 2026-08-04 to be unreliable) with the real event that delay was standing in for. */
+  function waitForChannelConnected(slug: string, timeoutMs = 15_000): Promise<void> {
+    return new Promise((resolve) => {
+      const timeout = setTimeout(() => {
+        channelConnectedWaiters.delete(slug);
+        log("WARN", `timed out waiting for the channel server to connect for "${slug}" - proceeding anyway`);
+        resolve();
+      }, timeoutMs);
+      channelConnectedWaiters.set(slug, () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+  }
+
   // §10.1.2: inbound delivery no longer goes through the channel server (see the onUpdate
   // handler below), but the pipe server still owns outbound reply relay and stays the
   // transport for Phase 2+ (permission_request/verdict/event), so it's still started
@@ -201,9 +240,24 @@ async function main(): Promise<void> {
     controlBot,
     chatId: config.supergroupChatId,
     thinkingPlaceholder,
-    onReplySent: (topicId) => typingIndicator.stop(topicId),
+    onReplySent: (topicId, text) => {
+      typingIndicator.stop(topicId);
+      // §4.4's rename-once: the first real reply upgrades the topic off its provisional
+      // `/new`-prompt title, capped so a later reply never renames it again.
+      const row = sessionStore.getByTopicId(Number(topicId));
+      if (row && !row.renamed) {
+        sessionStore.setRenamed(row.slug);
+        controlBot
+          .editForumTopic(config.supergroupChatId, Number(topicId), text.slice(0, 128) || row.slug)
+          .catch((err: unknown) => log("WARN", `editForumTopic (rename-once) failed for "${row.slug}": ${(err as Error).message}`));
+      }
+    },
     onHookEvent: handleHookEvent,
     onAwaitingInput: (slug) => maybeSetState(slug, "awaiting_input"),
+    onChannelConnected: (slug) => {
+      channelConnectedWaiters.get(slug)?.();
+      channelConnectedWaiters.delete(slug);
+    },
     log,
   });
 
@@ -232,7 +286,6 @@ async function main(): Promise<void> {
   }, 60_000);
 
   if (process.env.AIBRIDGE_SKIP_LAUNCH !== "1") {
-    const channelServerEntryPath = path.resolve(import.meta.dirname, "../../channel-server/src/index.ts");
     const session = launchSession({
       slug: config.phase1.slug,
       topicId: config.phase1.topicId,
@@ -243,9 +296,7 @@ async function main(): Promise<void> {
       log,
     });
 
-    routing.setPtyWrite(config.phase1.slug, (text) => session.ptyProcess.write(text));
-    session.ptyProcess.onData((data) => routing.appendOutput(config.phase1.slug, data));
-    ptyProcessBySlug.set(config.phase1.slug, session.ptyProcess);
+    wireSession(config.phase1.slug, session.ptyProcess, config.phase1.topicId);
 
     // Stage 7 manual-verification-only affordance: this process's own stdin isn't a real TTY
     // when the Bridge itself is launched non-interactively, so mirrorPtyToConsole's stdin pipe
@@ -260,7 +311,17 @@ async function main(): Promise<void> {
           req.on("data", (chunk) => (body += chunk));
           req.on("end", () => {
             try {
-              session.ptyProcess.write(body);
+              // ?slug= targets any tracked session, not just the Phase 1 hardcoded one - added
+              // 2026-08-04 purely as a live-debugging affordance, to send a raw keystroke to a
+              // fleet session with no other manual-launch wiring.
+              const slug = url.searchParams.get("slug");
+              const target = slug ? ptyProcessBySlug.get(slug) : session.ptyProcess;
+              if (!target) {
+                res.statusCode = 404;
+                res.end(`no live session for slug "${slug}"\n`);
+                return;
+              }
+              target.write(body);
               res.end("ok\n");
             } catch (err) {
               // node-pty's write() can throw synchronously once the underlying ConPTY socket has
@@ -282,6 +343,44 @@ async function main(): Promise<void> {
     }
   } else {
     log("INFO", "AIBRIDGE_SKIP_LAUNCH=1 - not spawning a claude session");
+  }
+
+  /**
+   * §4.5's reconciliation, wired for real: on this stack (measured 2026-08-03) a live session's
+   * process never survives the Bridge dying, so `readopt` (row 1 - "process alive") is defensive
+   * only, kept for the untested-in-practice recycled-pid case §4.5 calls out - it still relaunches
+   * fresh rather than pretending an orphaned handle is usable. Every other non-`dead` row always
+   * lands on `resume`. Scoped to every slug except the hardcoded Phase 1 one, which the block above
+   * already launches fresh unconditionally rather than resuming - a known simplification, not an
+   * oversight (Phase 1's own session predates this table and isn't itself Phase 5 scope).
+   */
+  function isPidAlive(pid: number): boolean {
+    if (!pid) return false;
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async function runStartupReconciliation(): Promise<void> {
+    const rows = sessionStore.all().filter((r) => r.slug !== config.phase1.slug && r.state !== "dead");
+    if (rows.length === 0) return;
+    const actions = reconcile(rows, isPidAlive);
+    for (const action of actions) {
+      if (action.kind === "readopt") {
+        log("WARN", `session "${action.slug}"'s process is still alive after a Bridge restart, but the PTY handle is gone (§4.5) - resuming on a fresh PTY anyway`);
+      }
+    }
+    for (const row of rows) {
+      log("INFO", `reconciling session "${row.slug}" after a Bridge restart`);
+      await resumeSession(row);
+    }
+  }
+
+  if (process.env.AIBRIDGE_SKIP_LAUNCH !== "1") {
+    await runStartupReconciliation();
   }
 
   let seq = 0;
@@ -340,6 +439,75 @@ async function main(): Promise<void> {
       .catch((err: unknown) => log("WARN", `failed to send command confirmation: ${(err as Error).message}`));
   }
 
+  /** Wires up a freshly-spawned (or resumed) session's PTY: the routing table's write/output-tail
+   * plumbing, the `ptyProcessBySlug` liveness map, and the supervisor's crash detector. Shared by
+   * the Phase 1 launch, `/new`, and every `resumeSession` relaunch so the three don't drift. */
+  function wireSession(slug: string, ptyProcess: pty.IPty, topicId: number): void {
+    routing.setPtyWrite(slug, (text) => ptyProcess.write(text));
+    ptyProcess.onData((data) => routing.appendOutput(slug, data));
+    ptyProcessBySlug.set(slug, ptyProcess);
+    ptyProcess.onExit(({ exitCode }) => {
+      void handleUnexpectedExit(slug, ptyProcess, topicId, exitCode);
+    });
+  }
+
+  /**
+   * The supervisor's health/restart-on-crash duty (§12 Phase 5). Fires on *any* PTY exit,
+   * deliberate or not - the `ptyProcessBySlug.get(slug) !== ptyProcess` check is what tells the two
+   * apart: `/kill`/`/rm` both delete the map entry before calling `.kill()`, so by the time this
+   * (asynchronous) exit handler runs for that call, the entry is already gone or already points at
+   * a newer PTY, and this is a silent no-op. Anything else is a real crash, and gets the same
+   * `claude --resume` treatment §4.5 already gives a Bridge restart.
+   */
+  async function handleUnexpectedExit(slug: string, ptyProcess: pty.IPty, topicId: number, exitCode: number): Promise<void> {
+    if (ptyProcessBySlug.get(slug) !== ptyProcess) return;
+    ptyProcessBySlug.delete(slug);
+    routing.clearPtyWrite(slug);
+    const row = sessionStore.get(slug);
+    if (!row || row.state === "dead") return;
+    log("WARN", `session "${slug}" exited unexpectedly (code ${exitCode}) - attempting an automatic resume`);
+    confirmSessionCommand(topicId, `⚠️ Session "${slug}" exited unexpectedly. Attempting to resume it automatically...`);
+    await resumeSession(row);
+  }
+
+  /**
+   * Shared by both restart-recovery paths - a Bridge restart (`runStartupReconciliation`) and a
+   * live crash (`handleUnexpectedExit`) - since both need exactly the same thing: relaunch via
+   * `claude --resume <session_id>` on a fresh PTY, rewire it, and tell the topic what happened.
+   * §4.5's "row exists, `state = awaiting_input`" case is handled first since the pending prompt
+   * is gone either way and needs its own notice, distinct from the resume notice.
+   */
+  async function resumeSession(row: SessionRow): Promise<void> {
+    const { slug, topicId } = row;
+    if (row.state === "awaiting_input") {
+      sessionStore.setState(slug, "working", nowIso());
+      confirmSessionCommand(topicId, "The pending question was lost - please re-ask.");
+    }
+    if (!row.sessionId) {
+      sessionStore.setState(slug, "dead", nowIso());
+      confirmSessionCommand(topicId, `Session "${slug}" could not be resumed (no session id was recorded yet). Worktree preserved at ${row.worktreePath}.`);
+      return;
+    }
+    try {
+      const session = launchSession({
+        slug,
+        topicId,
+        repoPath: row.repoPath,
+        channelServerEntryPath,
+        worktreesRoot: path.dirname(row.worktreePath),
+        model: row.model,
+        resumeSessionId: row.sessionId,
+        log,
+      });
+      wireSession(slug, session.ptyProcess, topicId);
+      sessionStore.setPtyPid(slug, session.ptyProcess.pid ?? 0);
+      confirmSessionCommand(topicId, `Session "${slug}" resumed.`);
+    } catch (err) {
+      sessionStore.setState(slug, "dead", nowIso());
+      confirmSessionCommand(topicId, `Failed to resume "${slug}": ${(err as Error).message}. Worktree preserved at ${row.worktreePath}.`);
+    }
+  }
+
   // Shared by the typed `/model foo` / `/mode bar` / `/effort baz` path and the button-tap path
   // (bare /model, /mode or /effort followed by a keyboard selection) - same switch, two triggers.
   function applyModelSwitch(slug: string, topicId: number, model: string): void {
@@ -390,7 +558,6 @@ async function main(): Promise<void> {
       return;
     }
 
-    const channelServerEntryPath = path.resolve(import.meta.dirname, "../../channel-server/src/index.ts");
     let session: ReturnType<typeof launchSession>;
     try {
       session = launchSession({
@@ -403,14 +570,21 @@ async function main(): Promise<void> {
         log,
       });
     } catch (err) {
+      // A launch failure this late still leaves the topic already created above (Telegram has no
+      // atomic "create topic + do the rest" call) - deleted here rather than left as an orphan with
+      // no session row and therefore no slug for `/rm` to ever find, confirmed live 2026-08-03 when
+      // a branch-name collision left exactly this kind of debris behind.
+      try {
+        await controlBot.deleteForumTopic(config.supergroupChatId, topic.message_thread_id);
+      } catch (deleteErr) {
+        log("WARN", `failed to clean up topic for "${slug}" after a failed launch: ${(deleteErr as Error).message}`);
+      }
       confirmSessionCommand(controlTopicId, `Failed to launch session "${slug}": ${(err as Error).message}`);
       return;
     }
 
     routing.add({ slug, topicId: topic.message_thread_id, worktreePath: session.worktreePath });
-    routing.setPtyWrite(slug, (text) => session.ptyProcess.write(text));
-    session.ptyProcess.onData((data) => routing.appendOutput(slug, data));
-    ptyProcessBySlug.set(slug, session.ptyProcess);
+    wireSession(slug, session.ptyProcess, topic.message_thread_id);
 
     sessionStore.insert({
       slug,
@@ -424,12 +598,22 @@ async function main(): Promise<void> {
       state: "starting",
       turnCardMsg: null,
       paused: false,
+      renamed: false,
       createdUtc: nowIso(),
       lastEventUtc: nowIso(),
     });
 
-    sendChannelText(slug, topic.message_thread_id, cmd.prompt, "new-1", "telegram");
     confirmSessionCommand(controlTopicId, `Created "${slug}" (${model}) in a new topic.`);
+
+    // Two independent gates, both real events rather than guessed delays: the dev-channels dialog
+    // must be confirmed (`session.ready` - otherwise the write lands on the still-open dialog and
+    // corrupts it, confirmed live 2026-08-04), and the channel server's own MCP handshake must have
+    // completed (`waitForChannelConnected` - otherwise the write's trailing Enter can be silently
+    // lost even with the dialog long since confirmed, also confirmed live 2026-08-04). `/new`'s
+    // initial prompt is the only write this codebase ever makes to a session this early.
+    await session.ready;
+    await waitForChannelConnected(slug);
+    sendChannelText(slug, topic.message_thread_id, cmd.prompt, "new-1", "telegram");
   }
 
   function handleLsCommand(topicId: number | undefined): void {
@@ -484,15 +668,10 @@ async function main(): Promise<void> {
     confirmSessionCommand(topicId, `Killed "${slug}". Worktree left in place - \`/rm ${slug}\` to remove it.`);
   }
 
-  async function handleRmCommand(cmd: Extract<FleetCommand, { kind: "rm" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
-    const resolved = resolveTargetSlug(cmd.slug, currentSlug);
-    if ("error" in resolved) {
-      confirmSessionCommand(topicId, resolved.error);
-      return;
-    }
-    const { slug } = resolved;
-    const row = sessionStore.get(slug) as NonNullable<ReturnType<typeof sessionStore.get>>;
-
+  /** The actual teardown `/rm` does for one row - shared by the single-slug form and the bulk
+   * `--dead`/`--prefix` forms below, so the two can't drift. */
+  async function removeSessionRow(row: SessionRow): Promise<void> {
+    const { slug } = row;
     if (row.state !== "dead") {
       ptyProcessBySlug.get(slug)?.kill();
     }
@@ -515,6 +694,36 @@ async function main(): Promise<void> {
     routing.remove(slug);
     feedStates.delete(slug);
     feedMessageIds.delete(slug);
+  }
+
+  async function handleRmCommand(cmd: Extract<FleetCommand, { kind: "rm" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
+    // §4.2's bulk cleanup (added 2026-08-04): always scoped to `dead` rows, regardless of which
+    // filter matched, since a bulk command is exactly the kind of action a mistyped prefix
+    // shouldn't be able to turn into an accidental mass-`/kill` of live sessions.
+    if (cmd.bulk) {
+      const targets = sessionStore
+        .all()
+        .filter((r) => r.state === "dead")
+        .filter((r) => (cmd.bulk?.mode === "prefix" ? r.slug.startsWith(cmd.bulk.prefix) : true));
+      if (targets.length === 0) {
+        confirmSessionCommand(topicId, "No dead sessions matched - nothing removed.");
+        return;
+      }
+      for (const row of targets) {
+        await removeSessionRow(row);
+      }
+      confirmSessionCommand(topicId, `Removed ${targets.length} dead session${targets.length === 1 ? "" : "s"}: ${targets.map((r) => r.slug).join(", ")}`);
+      return;
+    }
+
+    const resolved = resolveTargetSlug(cmd.slug, currentSlug);
+    if ("error" in resolved) {
+      confirmSessionCommand(topicId, resolved.error);
+      return;
+    }
+    const { slug } = resolved;
+    const row = sessionStore.get(slug) as NonNullable<ReturnType<typeof sessionStore.get>>;
+    await removeSessionRow(row);
     confirmSessionCommand(topicId, `Removed "${slug}" - worktree and topic deleted.`);
   }
 
@@ -543,7 +752,35 @@ async function main(): Promise<void> {
     confirmSessionCommand(topicId, `${next ? "Paused" : "Resumed"} feed updates for "${slug}".`);
   }
 
+  /**
+   * §4.5.1's `/restart`: self-respawn, not an external supervisor. Every live session dies with
+   * this process (§4.5's measurement) and comes back via `resumeSession`'s `claude --resume` path
+   * once the successor's own startup reconciliation runs - the same cold-start cost as any other
+   * Bridge restart, just operator-triggered instead of waiting for a crash.
+   */
+  async function handleRestartCommand(topicId: number | undefined): Promise<void> {
+    if (!isControlTopic(topicId)) {
+      confirmSessionCommand(topicId, "/restart only works from the control topic.");
+      return;
+    }
+    try {
+      await controlBot.sendMessage(
+        config.supergroupChatId,
+        topicId,
+        "Restarting the Bridge now (§4.5.1) - live sessions will relaunch via claude --resume once it's back up.",
+      );
+    } catch (err) {
+      log("WARN", `failed to send /restart confirmation: ${(err as Error).message}`);
+    }
+    log("INFO", "/restart requested - spawning a detached successor and exiting");
+    spawn(process.execPath, process.argv.slice(1), { detached: true, stdio: "ignore" }).unref();
+    process.exit(0);
+  }
+
+  const offsetPath = path.join(STATE_DIR, "telegram-offset.json");
   startPolling(controlBot, {
+    initialOffset: loadOffset(offsetPath),
+    onOffsetChange: (offset) => saveOffset(offsetPath, offset, (err) => log("WARN", `failed to persist Telegram offset: ${(err as Error).message}`)),
     onUpdate: (update) => {
       const callbackQuery = update.callback_query;
       if (callbackQuery) {
@@ -672,6 +909,10 @@ async function main(): Promise<void> {
         }
         if (fleetCmd.kind === "attach") {
           handleAttachCommand(fleetCmd, threadId, currentSlug);
+          return;
+        }
+        if (fleetCmd.kind === "restart") {
+          void handleRestartCommand(threadId);
           return;
         }
         handlePauseCommand(fleetCmd, threadId, currentSlug);

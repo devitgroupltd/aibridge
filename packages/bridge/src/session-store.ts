@@ -53,6 +53,9 @@ export interface SessionRow {
   state: SessionState;
   turnCardMsg: number | null;
   paused: boolean;
+  /** §4.4's rename-once cap: flips true the first time the topic is renamed off its provisional
+   * `/new`-prompt title, so a later Bridge restart or a second reply doesn't re-trigger it. */
+  renamed: boolean;
   createdUtc: string;
   lastEventUtc: string;
 }
@@ -69,6 +72,7 @@ interface SessionRowSql {
   state: string;
   turn_card_msg: number | null;
   paused: number;
+  renamed: number;
   created_utc: string;
   last_event_utc: string;
 }
@@ -86,6 +90,7 @@ function fromSql(row: SessionRowSql): SessionRow {
     state: row.state as SessionState,
     turnCardMsg: row.turn_card_msg,
     paused: row.paused !== 0,
+    renamed: row.renamed !== 0,
     createdUtc: row.created_utc,
     lastEventUtc: row.last_event_utc,
   };
@@ -128,18 +133,34 @@ export class SessionStore {
         state          TEXT NOT NULL,
         turn_card_msg  INTEGER,
         paused         INTEGER NOT NULL DEFAULT 0,
+        renamed        INTEGER NOT NULL DEFAULT 0,
         created_utc    TEXT NOT NULL,
         last_event_utc TEXT NOT NULL
       );
     `);
+    this.migrate();
+  }
+
+  /**
+   * `CREATE TABLE IF NOT EXISTS` only helps a brand-new `$STATE/aibridge.db` - an existing one from
+   * before a column was added (confirmed live 2026-08-03: `renamed` landing after this table had
+   * already been created by an earlier Bridge run) keeps its old schema forever and throws "table
+   * sessions has no column named X" on the next insert. `ALTER TABLE ... ADD COLUMN` is the SQLite
+   * way to catch it up, guarded by `PRAGMA table_info` so it only runs once per missing column.
+   */
+  private migrate(): void {
+    const columns = new Set((this.db.prepare("PRAGMA table_info(sessions)").all() as unknown as { name: string }[]).map((c) => c.name));
+    if (!columns.has("renamed")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN renamed INTEGER NOT NULL DEFAULT 0;");
+    }
   }
 
   insert(row: SessionRow): void {
     this.db
       .prepare(
         `INSERT INTO sessions
-         (slug, topic_id, session_id, worktree_path, branch, repo_path, model, pty_pid, state, turn_card_msg, paused, created_utc, last_event_utc)
-         VALUES ($slug, $topic_id, $session_id, $worktree_path, $branch, $repo_path, $model, $pty_pid, $state, $turn_card_msg, $paused, $created_utc, $last_event_utc)`,
+         (slug, topic_id, session_id, worktree_path, branch, repo_path, model, pty_pid, state, turn_card_msg, paused, renamed, created_utc, last_event_utc)
+         VALUES ($slug, $topic_id, $session_id, $worktree_path, $branch, $repo_path, $model, $pty_pid, $state, $turn_card_msg, $paused, $renamed, $created_utc, $last_event_utc)`,
       )
       .run({
         $slug: row.slug,
@@ -153,6 +174,7 @@ export class SessionStore {
         $state: row.state,
         $turn_card_msg: row.turnCardMsg,
         $paused: row.paused ? 1 : 0,
+        $renamed: row.renamed ? 1 : 0,
         $created_utc: row.createdUtc,
         $last_event_utc: row.lastEventUtc,
       });
@@ -205,6 +227,10 @@ export class SessionStore {
 
   setPaused(slug: string, paused: boolean): void {
     this.db.prepare("UPDATE sessions SET paused = $paused WHERE slug = $slug").run({ $paused: paused ? 1 : 0, $slug: slug });
+  }
+
+  setRenamed(slug: string): void {
+    this.db.prepare("UPDATE sessions SET renamed = 1 WHERE slug = $slug").run({ $slug: slug });
   }
 
   setPtyPid(slug: string, ptyPid: number): void {

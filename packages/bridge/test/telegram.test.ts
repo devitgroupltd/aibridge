@@ -64,6 +64,46 @@ describe("startPolling", () => {
     expect(seenOffsets[0]).toBe(0);
   });
 
+  test("resumes from initialOffset instead of 0", async () => {
+    const seenOffsets: number[] = [];
+    const source: UpdatesSource = {
+      getUpdates: async (offset) => {
+        seenOffsets.push(offset);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return [];
+      },
+    };
+    const stop = startPolling(source, { initialOffset: 42, onUpdate: () => {}, retryDelayMs: 5 });
+    await waitFor(() => seenOffsets.length >= 1);
+    stop();
+    expect(seenOffsets[0]).toBe(42);
+  });
+
+  test("onOffsetChange fires with the new offset before onUpdate, for every update", async () => {
+    // §4.5.1: a restart triggered from inside onUpdate (e.g. /restart) must not race ahead of the
+    // offset actually being persisted - this is the ordering that closes that race.
+    const batches: TelegramUpdate[][] = [[{ update_id: 5 }], []];
+    const source: UpdatesSource = {
+      getUpdates: async () => {
+        const batch = batches.shift();
+        if (batch === undefined) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return [];
+        }
+        return batch;
+      },
+    };
+    const order: string[] = [];
+    const stop = startPolling(source, {
+      onOffsetChange: (offset) => order.push(`offset:${offset}`),
+      onUpdate: (u) => order.push(`update:${u.update_id}`),
+      retryDelayMs: 5,
+    });
+    await waitFor(() => order.length >= 2);
+    stop();
+    expect(order).toEqual(["offset:6", "update:5"]);
+  });
+
   test("a failed getUpdates call retries rather than crashing the loop", async () => {
     // Same microtask-starvation care as above: once past the induced failures, subsequent calls
     // must pace themselves like a real long-poll rather than resolving instantly forever.

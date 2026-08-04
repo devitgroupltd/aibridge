@@ -38,6 +38,22 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/pause fix-bug")).toEqual({ kind: "pause", slug: "fix-bug" });
   });
 
+  test("/rm --dead requests the bulk dead-row filter", () => {
+    expect(parseFleetCommand("/rm --dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
+  });
+
+  test("/rm --prefix <text> requests the bulk prefix filter", () => {
+    expect(parseFleetCommand("/rm --prefix say-hello")).toEqual({ kind: "rm", bulk: { mode: "prefix", prefix: "say-hello" } });
+  });
+
+  test("/rm --prefix with no argument falls through to the ordinary single-slug form", () => {
+    expect(parseFleetCommand("/rm --prefix")).toEqual({ kind: "rm", slug: "--prefix" });
+  });
+
+  test("/restart takes no argument", () => {
+    expect(parseFleetCommand("/restart")).toEqual({ kind: "restart" });
+  });
+
   test("returns null for anything that isn't one of these commands", () => {
     expect(parseFleetCommand("/model opus")).toBeNull();
     expect(parseFleetCommand("hello")).toBeNull();
@@ -58,6 +74,7 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     state: "idle",
     turnCardMsg: null,
     paused: false,
+    renamed: false,
     createdUtc: "2026-08-03T00:00:00.000Z",
     lastEventUtc: "2026-08-03T00:00:00.000Z",
     ...overrides,

@@ -44,4 +44,16 @@ describe("ensureWorktree", () => {
     ensureWorktree(repoDir, worktreePath, "claude/test-session-1");
     expect(() => ensureWorktree(repoDir, worktreePath, "claude/test-session-1")).not.toThrow();
   });
+
+  test("a stale branch left behind by a crashed/removed earlier attempt at the same slug does not block a retry", () => {
+    const worktreePath = path.join(worktreesDir, "test-session");
+    ensureWorktree(repoDir, worktreePath, "claude/test-session-1");
+    rmSync(worktreePath, { recursive: true, force: true });
+    execFileSync("git", ["worktree", "prune"], { cwd: repoDir, stdio: "pipe" });
+
+    // The worktree directory is gone but the branch survived (exactly what removeWorktree/a crash
+    // leaves behind) - a fresh attempt at the same slug must still succeed.
+    expect(() => ensureWorktree(repoDir, worktreePath, "claude/test-session-1")).not.toThrow();
+    expect(existsSync(worktreePath)).toBe(true);
+  });
 });

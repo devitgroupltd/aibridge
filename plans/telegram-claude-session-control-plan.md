@@ -1,7 +1,7 @@
 ---
-version: 0.21.0
+version: 0.22.0
 status: solid
-last_modified_utc: 2026-08-03T19:45:00Z
+last_modified_utc: 2026-08-04T07:10:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,98 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.22.0 (2026-08-04): Phase 5's remainder from 0.21.0's own deferred list, plus two more real
+    bugs found only by running it live. Built: reconciliation.ts wired into Bridge startup for
+    real (runStartupReconciliation, gated the same as the Phase 1 launch) - every non-dead,
+    non-Phase-1 row is now resumed via `claude --resume <session_id>` on a fresh PTY on every
+    restart, matching §4.5's 2026-08-03 measurement that a session's process never survives the
+    Bridge dying on this stack, so 'resume' (not 'readopt') is the only real path regardless of
+    what reconcile() itself returns; an `awaiting_input` row gets an explicit 'the pending
+    question was lost' notice first, per §4.5's table. `/restart` (§4.5.1): self-respawn via
+    `spawn(process.execPath, process.argv.slice(1), {detached:true})` then `process.exit(0)`,
+    control-topic only. Rename-once (§4.4): the session's first real `reply` upgrades the topic off
+    its provisional `/new`-prompt title (a new `renamed` column, migrated onto an existing
+    `aibridge.db` via `ALTER TABLE ... ADD COLUMN` guarded by `PRAGMA table_info` - `CREATE TABLE IF
+    NOT EXISTS` alone doesn't retrofit a column onto a table an earlier Bridge run already created,
+    confirmed live the hard way: the very first `/new` after this shipped crashed the whole Bridge
+    with 'table sessions has no column named renamed'). The supervisor's health/restart-on-crash
+    duty: every PTY's `onExit` is wired through a shared `wireSession`/`handleUnexpectedExit` pair -
+    a deliberate `/kill`/`/rm` is distinguished from a real crash by whether the slug still points
+    at *that* PTY object in `ptyProcessBySlug` at the time the (async) exit fires, and a real crash
+    gets the identical `claude --resume` treatment a Bridge restart gets, immediately rather than
+    waiting for one. `/rm --dead` and `/rm --prefix <text>` (both `dead`-scoped only, never touching
+    a live session regardless of what matches) for bulk cleanup, added specifically because this
+    pass's own live testing had piled up nine dead test-session rows with no way to clear them but
+    one `/rm <slug>` at a time - live-verified removing all nine at once while correctly leaving
+    three live sessions untouched.
+    Four more real bugs, found only by actually running `/new` against a brand-new worktree
+    repeatedly rather than the already-warm Phase 1 one every prior sitting had reused: (1) every
+    `/new`-launched session sat stuck forever at the un-confirmed `--dangerously-load-development-channels`
+    dialog, because the one-time manual confirm affordance (`mirrorPtyToConsole`/the dev-control-port)
+    was wired to the Phase 1 hardcoded session only - `session-launcher.ts` now watches the PTY's own
+    (ANSI-stripped, since the TUI colours 'development' and 'channels' as two separate spans with a
+    literal space between them, breaking a plain substring match) output for the dialog's banner and
+    auto-confirms with a bare Enter, the same way for every session. (2) a second, previously-
+    undiscovered-in-code (though already-documented-as-unavoidable in a `claude-config.ts` comment
+    from an earlier sitting) dialog, 'New MCP server found in this project', fires ahead of the
+    dev-channels one on a worktree's genuinely first-ever launch and needed the same auto-confirm
+    treatment; both are now one state machine in `session-launcher.ts` (`autoConfirmDevChannelsDialog`)
+    that confirms each in sequence and exposes a `LaunchedSession.ready` promise resolving once the
+    unconditional dev-channels one is done. (3) `ready` resolving there still wasn't sufficient -
+    `/new`'s initial prompt, written the moment `ready` resolved, could still silently lose its
+    trailing Enter (the session then sits with the prompt visibly typed but never submitted, no error
+    anywhere) because the channel server's own MCP handshake hadn't finished, and that handshake has
+    no signal at all in the PTY text stream to watch for. A fixed delay was tried first and tested
+    unreliable across repeated live attempts (per the operator's own objection to guessing a number at
+    all) - replaced with a real event instead: `pipe-server.ts` gained `onChannelConnected`, fired
+    from the existing channel-server `hello` handler, and `/new` now awaits both `session.ready` and
+    a new `waitForChannelConnected(slug)` before writing anything. (4) `sessionId` was never actually
+    being written to a session's row at all - every hook event carries one (§5.1) but nothing called
+    `sessionStore.setSessionId`, so `sessionId` stayed `null` forever and the very first restart-
+    recovery attempt (and this sitting's own first resume test) had nothing to resume with; now set
+    from `handleHookEvent` whenever it differs from what's stored.
+    Two smaller live-discovered robustness gaps, fixed alongside: a git branch surviving a
+    crashed or `/rm`'d worktree (`git worktree remove` doesn't delete the branch) blocked a retry at
+    the same slug with 'a branch named ... already exists' - `ensureWorktree` now detects that
+    specific error and deletes-then-retries; a `/new` that fails after `createForumTopic` but before
+    a session row exists left an orphaned topic with no slug for `/rm` to ever find - the topic is
+    now deleted on that failure path instead of left behind. `startPolling`'s `getUpdates` offset was
+    also found live to be a real correctness bug independent of anything else this pass touched: it
+    was purely in-memory, reset to 0 on every process start, and Telegram only forgets an update once
+    a *later* `getUpdates` call passes a higher offset - a process that dies (crash or `/restart`)
+    right after handling an update, before making that next call, never actually told Telegram it was
+    seen, so a successor replayed it (confirmed live: `/restart` posted its own confirmation twice,
+    once from each of two successive processes). Now persisted to `$STATE/telegram-offset.json`,
+    written synchronously via a new `onOffsetChange` hook on `startPolling` *before* `onUpdate` runs
+    for that update, not after, so the persistence happens ahead of anything that update's own
+    handling might trigger. A `scripts/dev-bridge.sh` start/stop/restart/status/logs helper was added
+    for local iteration (not shipped product code, kept at the repo root like `setup-windows.ps1`) -
+    added after repeatedly forgetting `AIBRIDGE_DEV_CONTROL_PORT` across manual restarts mid-sitting.
+    Live-verified end to end, including the previously-untested full round trip: a brand-new `/new`
+    session now auto-confirms both dialogs, submits its prompt, and gets a real reply with zero
+    manual intervention (verified via a Playwright-driven secondary Telegram account, not just
+    screenshots - see the note on that below); killing the Bridge mid-conversation and restarting it
+    resumed three genuinely-live sessions via `claude --resume` with real captured session_ids and
+    zero 'No conversation found' errors; `/restart` self-respawns and the successor reconciles
+    without replaying stale history. **Deliberately not done this pass:** the OTLP listener,
+    `/budget`, the burn-rate alarm, the weighted concurrency budget (§10.5's other half), and topic
+    rename-once's `SessionStart`-reported-title path (only the first-`reply` path is implemented -
+    §4.4 names both, but the hook payload field for a session's own title was never independently
+    confirmed to exist). A resumed session whose underlying `claude --resume` call itself fails
+    asynchronously (bad/stale session_id) isn't specially detected - it self-heals via the ordinary
+    `SessionEnd` hook marking the row `dead`, which was enough in practice, but there's no
+    Bridge-side log line naming *that specific failure mode* the way a synchronous launch failure
+    gets one. **A second Telegram account, added as a regular member of the control group and driven
+    via Playwright (`web.telegram.org`), was used for live verification this sitting** instead of
+    relying solely on the operator's own screenshots - deliberately a separate account rather than
+    the operator's primary one (same reasoning as the fleet-only SSH key, §7.5: a lower-trust
+    automated surface shouldn't share a credential with something not worth risking). The automation
+    itself (`client.js`/`login.js`/etc.) lives outside this repo, under the session's own scratch
+    directory, not committed - it is dev/QA tooling for testing aibridge, not aibridge itself, same
+    boundary `scripts/dev-bridge.sh` draws. 286 tests passing (up from 267), tsc clean across all
+    five packages. **Exit criterion still not fully met**: four concurrent Sonnet sessions running an
+    hour unattended has not been attempted (three ran briefly, successfully, across one restart);
+    `/budget` and the weighted concurrency cap remain entirely unbuilt."
   - "0.21.0 (2026-08-03): Phase 5 (the fleet) started - the core lifecycle slice, not the whole
     phase. Built: repos-registry.ts (§7.5's repos.toml, hand-rolled parser matching config.ts's own
     convention rather than a TOML dependency); slug.ts (prompt -> sanitized, unique slug, §9
@@ -3166,19 +3258,24 @@ item 3 is moot until §7.6.
   toggling feed suppression, `/kill` closing a topic and stopping the process, `/rm` removing the
   worktree/topic/row. `/attach` is implemented and unit-tested (PTY ring-buffer tail plus a
   `claude --resume` hint) but not yet exercised live against a real multi-line PTY tail.
-- ~~Topic lifecycle including create, rename-once and delete.~~ **Create and delete done** (via
-  `createForumTopic`/`deleteForumTopic`, live-verified). **Rename-once (§4.4) not done** - `/new`
-  still names the topic from the prompt at creation and never calls `editForumTopic` again once the
-  session's real title is known.
-- ~~Worktree provisioning per session; the SQLite routing table.~~ **Done** - `session-store.ts`
-  persists §4.3's schema at `$STATE/aibridge.db`, with §4.3's state-transition table enforced
-  (`isValidTransition`); the hook-driven half of the table (`SessionStart`/`UserPromptSubmit`/
-  `Stop`/`StopFailure`/`SessionEnd`) and the permission/ask half (`awaiting_input` <-> `working`) are
-  both wired. **Not done:** reconciliation (`reconciliation.ts`) is unit-tested against §4.5's table
-  but not called on Bridge startup - no auto-resume across a restart yet, so a Bridge restart still
-  orphans every live session exactly as it did before this table existed; only the *persistence*
-  (surviving in `/ls` as a `dead`-eligible row rather than vanishing) is new.
-- The supervisor: launch (done, reused from Phase 1), health and restart-on-crash - **not done**.
+- ~~Topic lifecycle including create, rename-once and delete.~~ **Create, delete and rename-once all
+  done** (2026-08-04). Rename-once fires off a session's first real `reply` (a new `renamed` column,
+  capped at one edit per session); the `SessionStart`-reported-title path §4.4 also names is **not
+  implemented** - that hook payload field was never independently confirmed to exist, and the
+  reply-triggered path alone was enough to close the gap live testing actually hit.
+- ~~Worktree provisioning per session; the SQLite routing table.~~ **Done**, including
+  reconciliation now - `session-store.ts` persists §4.3's schema at `$STATE/aibridge.db`, with §4.3's
+  state-transition table enforced (`isValidTransition`); the hook-driven half of the table
+  (`SessionStart`/`UserPromptSubmit`/`Stop`/`StopFailure`/`SessionEnd`) and the permission/ask half
+  (`awaiting_input` <-> `working`) are both wired, and `sessionId` is now actually captured from
+  every hook event (missing until 2026-08-04 - see the 0.22.0 changelog entry). ~~Reconciliation not
+  wired into Bridge startup~~ **done** (2026-08-04): every non-dead row is resumed via
+  `claude --resume` on every restart, live-verified across three genuinely-live sessions surviving a
+  real restart with zero `No conversation found` errors.
+- The supervisor: launch (done, reused from Phase 1); ~~health and restart-on-crash~~ **done**
+  (2026-08-04) - a PTY's `onExit` triggers the identical `claude --resume` path a Bridge restart
+  gets, distinguishing a real crash from a deliberate `/kill`/`/rm` by whether the slug still points
+  at that exact PTY object at the time the (async) exit fires.
 - Package as a plugin so the allowlist path stays open (§10.1) - **not done**.
 - The OTLP listener and telemetry ingest (§5.7); `/ls` cost columns, `/budget`, the burn-rate alarm and
   the distinct "stopped on a usage limit" state (§10.5) - **not done**.
@@ -3195,19 +3292,26 @@ item 3 is moot until §7.6.
 - `/effort <name>` (§4.2.3) - **Done** (2026-08-03), added and live-verified in the same sitting,
   including the confirmation-dialog second `\r` (with its required delay) and a bare-`/effort` button
   keyboard.
-- `/restart` (§4.5.1): the self-respawn primitive the supervisor's own automatic restart-on-crash duty
-  already needs, made reachable as a fleet command. Depends on this phase's own session-id persistence
-  to stop being destructive to whatever conversation was mid-turn - do not backport to Phase 1.
+- ~~`/restart` (§4.5.1): the self-respawn primitive the supervisor's own automatic restart-on-crash
+  duty already needs, made reachable as a fleet command.~~ **Done** (2026-08-04): self-respawns via
+  `spawn(process.execPath, process.argv.slice(1), {detached:true})` then `process.exit(0)`,
+  control-topic only; live-verified the successor reconciles cleanly and does not replay stale
+  Telegram history (a real bug this exposed and fixed - see the 0.22.0 changelog's `getUpdates`
+  offset-persistence note).
+- `/rm --dead` and `/rm --prefix <text>` (added 2026-08-04, not originally in §4.2): bulk-cleanup
+  forms, always scoped to `dead` rows regardless of which filter matched, so a bulk command can never
+  turn into an accidental mass-`/kill` of a live session. Added because this phase's own live testing
+  routinely piles up many dead rows with no way to clear them but one `/rm <slug>` at a time -
+  live-verified removing nine at once while correctly leaving three live sessions untouched.
 - **Exit:** scenarios 24-28, 32, 42, 43 and 44 pass; four concurrent Sonnet sessions run for an hour
   without manual intervention, the weighted budget refuses a fifth, and the fleet's spend is visible in
-  `/budget` throughout. **Not yet met** - this pass shipped the fleet's core lifecycle (§4.2's six
-  commands, the persisted routing table, per-session model routing) and live-verified two concurrent
-  sessions, not four for an hour; scenarios 27 and 40 are unit-tested (`slug.test.ts`,
-  `session-store.test.ts`), scenario 24 is unit-tested (`reconciliation.test.ts`) but not wired into a
-  real restart, and scenarios 28/32/42-44 and the weighted budget are untouched this pass. Remaining
-  for a later Phase 5 sitting: wire `reconciliation.ts` into Bridge startup, `/restart`, rename-once,
-  the supervisor's health/restart-on-crash duty, the OTLP listener/`/budget`/burn-rate alarm, the
-  weighted concurrency cap, and plugin packaging.
+  `/budget` throughout. **Still not met, but much closer** - this pass closed every item the 0.21.0
+  sitting deferred except plugin packaging and the OTLP/`/budget`/weighted-concurrency half: startup
+  reconciliation, `/restart`, rename-once, and the supervisor's crash-restart duty are all done and
+  live-verified (scenario 24's live half, not just its unit test). Three concurrent sessions have
+  survived a real restart via genuine `claude --resume` with real session_ids; four for a full hour
+  has still not been attempted. `/budget`, the weighted concurrency cap, and plugin packaging remain
+  entirely unbuilt - the only work left for a future Phase 5 sitting to close this phase out.
 
 ### Phase 6 - hardening, and the WSL2 migration
 

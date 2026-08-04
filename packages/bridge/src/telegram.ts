@@ -234,6 +234,21 @@ export interface PollLoopOptions {
   timeoutSec?: number;
   /** Delay before retrying after a failed getUpdates call. */
   retryDelayMs?: number;
+  /** Resume from a persisted offset instead of 0 (§4.5.1/§9). Telegram only forgets an update once
+   * a *later* `getUpdates` call passes a higher offset - the offset bump on receipt only takes
+   * effect on the *next* call, so a process that dies (crash or `/restart`) right after handling an
+   * update, before making that next call, never actually told Telegram it was seen. Starting a
+   * successor at 0 replays every update since the last clean round-trip - confirmed live
+   * 2026-08-03: `/restart` reprocessed itself once immediately after its own successor booted,
+   * posting a duplicate confirmation. Defaults to 0 - only a caller that persists the offset (via
+   * `onOffsetChange`) has anything meaningful to resume from.
+   */
+  initialOffset?: number;
+  /** Fires synchronously with the new offset the instant it's known - before `onUpdate` runs, not
+   * after - so a caller that persists it (e.g. to disk) can do so ahead of any restart/exit that
+   * update's own handling might trigger. Without this, the persistence race above isn't actually
+   * closed even if a caller does pass `initialOffset`. */
+  onOffsetChange?: (offset: number) => void;
   onUpdate: (update: TelegramUpdate) => void;
   onError?: (err: unknown) => void;
 }
@@ -241,7 +256,7 @@ export interface PollLoopOptions {
 /** Starts the single `getUpdates` long-poll loop (§2, §12 Phase 1). Returns a stop function. */
 export function startPolling(source: UpdatesSource, opts: PollLoopOptions): () => void {
   let stopped = false;
-  let offset = 0;
+  let offset = opts.initialOffset ?? 0;
   const timeoutSec = opts.timeoutSec ?? 25;
   const retryDelayMs = opts.retryDelayMs ?? 1000;
 
@@ -251,6 +266,7 @@ export function startPolling(source: UpdatesSource, opts: PollLoopOptions): () =
         const updates = await source.getUpdates(offset, timeoutSec);
         for (const update of updates) {
           offset = update.update_id + 1;
+          opts.onOffsetChange?.(offset);
           opts.onUpdate(update);
         }
       } catch (err) {
