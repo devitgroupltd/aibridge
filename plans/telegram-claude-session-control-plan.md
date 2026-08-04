@@ -1,7 +1,7 @@
 ---
-version: 0.30.0
+version: 0.31.0
 status: solid
-last_modified_utc: 2026-08-04T13:45:00Z
+last_modified_utc: 2026-08-04T15:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,28 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.31.0 (2026-08-04): Redid the Phase 5 endurance run per 0.30.0's own prescription - four
+    concurrent Sonnet sessions (`using-only-read-and-git`, `using-only-read-and-grep`,
+    `using-only-grep-no-write`, `using-only-read-grep-and`), each given an independent real
+    analysis task restricted to already-pre-allowlisted tools (`Read`/`Grep`/`git log|diff|show`/
+    `mcp__aibridge__reply`, no `Write`, no other `Bash`) so no permission prompt could fire at
+    all. Launched ~13:56-13:58 UTC; a Bridge-log grep confirmed zero `PermissionRequest` events for
+    the batch. Ran a genuine hour (verified past the mark via `/ls` ages of 1h1m-1h3m, not rounded
+    down this time); `/ls` showed all four `idle` with real non-zero tracked cost ($0.23-$0.28
+    each) throughout, no `dead` rows, and the always-on Phase 1 `test-session` had to be `/kill`ed
+    first to free a weighted-cap slot for the fourth session - a real, if minor, operational
+    friction the always-on session imposes on every future four-session run. Verified each
+    session's *actual* task output (not fleet-command state) by reading its topic's rename-once
+    title and full first reply via `inspect-topic.js`: all four produced correct, detailed,
+    on-topic findings (a real 10-commit git-log summary, a real grep-based inventory of every
+    `setInterval` in `packages/bridge/src`, a real structural diff between `PermissionRegistry` and
+    `FleetConfirmRegistry`, and a real test-coverage review of `permission-registry.test.ts` that
+    caught genuine gaps - `onFinalizeError` never exercised with a real rejection, no TTL-boundary
+    test, `remove()` never tested directly). **Phase 5's endurance exit criterion is now genuinely
+    met**: real per-session task output verified, not just fleet-command output, across a real
+    concurrent hour with zero permission-prompt exposure. Fleet torn down via `/kill --all` +
+    `/rm --all` afterward. The launch-path cutover to the plugin form remains the one deliberately
+    open decision (see 0.25.0) - not raised or made this sitting."
   - "0.30.0 (2026-08-04): Attempted the Phase 5 endurance run (four concurrent Sonnet sessions,
     each given an independent real task requiring a `Write` or a `bun`/`bunx` `Bash` call not in
     the default `settings.json` allowlist) and found every single one permanently wedged after an
@@ -3555,14 +3577,14 @@ item 3 is moot until §7.6.
   posted when the command was typed from the control topic itself, because `postFleetConfirm`
   refused an `undefined` topic id that every sibling command handler already treats as "the control
   topic" and handles fine.
-- ~~The four-concurrent-Sonnet-sessions-for-an-hour endurance run.~~ **Attempted (2026-08-04),
-  claimed done, then found wrong within the hour - see the 0.27.0 changelog entry.** `/new` launched
-  three sessions alongside the pre-existing `test-session`; `/ls`/`/budget` looked clean for the full
-  hour and a genuine 5th `/new` was correctly refused by the weighted cap, but a subsequent restart
-  revealed all three `/new`-launched sessions had been wedged since the moment their initial prompt
-  was sent - `sendChannelText`'s trailing `\r` never actually submitted, so none of them ever ran a
-  real turn. **Not done** - the run needs to be repeated after `sendChannelText` is fixed, verifying
-  each session's actual task output this time, not just fleet-command output.
+- ~~The four-concurrent-Sonnet-sessions-for-an-hour endurance run.~~ **Done (2026-08-04) - see the
+  0.31.0 changelog entry.** Two attempts before this one failed for two different real reasons
+  (`sendChannelText`'s lost-Enter race, then the permission-expiry sweep's missing `deny` verdict -
+  both found and fixed live, see 0.27.0/0.30.0). The third attempt sidestepped the permission-prompt
+  path entirely (tasks restricted to already-allowlisted `Read`/`Grep`/`git log|diff|show`/
+  `mcp__aibridge__reply`) and ran a genuine hour with zero `PermissionRequest` events, `/ls` staying
+  clean throughout, and all four sessions' actual `reply` output verified as correct and on-topic via
+  `inspect-topic.js` - not just fleet-command state.
 - ~~`sendChannelText` (§4.3's inbound-delivery path, `index.ts`) writes the `<channel>`-tagged prompt
   and its trailing `\r` as two separate raw PTY writes with no confirmation the Enter actually
   submitted, then starts the "Thinking..." placeholder unconditionally regardless - found
@@ -3571,18 +3593,18 @@ item 3 is moot until §7.6.
   (non-ANSI-only) PTY output; retry just the `\r` once if there's none, give up loudly if the retry
   also produces nothing. Live-verified on two fresh `/new` calls: both showed real spinner activity
   immediately post-fix, unlike the original bug's total silence.
-- **Exit: not met.** Scenarios 24-28, 32, 42, 43 and 44 pass; the weighted budget correctly refused a
-  5th `/new` against a real, fully-occupied fleet and the fleet's spend was visible in `/budget`
-  throughout. Startup reconciliation, `/restart`, rename-once, the supervisor's crash-restart duty,
-  `/budget`, the weighted concurrency cap, the quota-stop state and the plugin-packaging artifact are
-  all built and live-verified on their own terms (scenario 24's live half, not just its unit test;
-  `/budget`/`/ls`'s cost column confirmed live against real tracked spend; the plugin
-  marketplace/install/launch chain confirmed live). **The only work left for a future Phase 5
-  sitting: redo the four-concurrent-sessions-for-an-hour endurance run now that `sendChannelText` is
-  fixed, verifying real per-session activity (the task's own file output, not just fleet-command
-  output) this time.** Whether to cut the fleet's actual launch path over from
+- **Exit: met (2026-08-04).** Scenarios 24-28, 32, 42, 43 and 44 pass; the weighted budget correctly
+  refused a 5th `/new` against a real, fully-occupied fleet and the fleet's spend was visible in
+  `/budget` throughout. Startup reconciliation, `/restart`, rename-once, the supervisor's
+  crash-restart duty, `/budget`, the weighted concurrency cap, the quota-stop state and the
+  plugin-packaging artifact are all built and live-verified on their own terms (scenario 24's live
+  half, not just its unit test; `/budget`/`/ls`'s cost column confirmed live against real tracked
+  spend; the plugin marketplace/install/launch chain confirmed live). The endurance run itself is now
+  also done and verified against real per-session output, not just fleet-command state (0.31.0).
+  Whether to cut the fleet's actual launch path over from
   `--dangerously-load-development-channels server:aibridge` to the plugin form remains a separate
-  decision, deliberately left open rather than made unasked (see the 0.25.0 changelog entry).
+  decision, deliberately left open rather than made unasked (see the 0.25.0 changelog entry) - the
+  one thing left open in this phase.
 
 ### Phase 6 - hardening, and the WSL2 migration
 
