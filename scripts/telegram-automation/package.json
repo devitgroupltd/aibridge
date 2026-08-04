@@ -1,0 +1,9 @@
+{
+  "name": "telegram-automation",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Dev/QA tooling for driving the real Telegram Web client as the operator, for testing aibridge end to end (§9). Not aibridge itself - same boundary scripts/dev-bridge.sh draws. One-time setup: `npm install && node login.js` (scan the QR code, Ctrl+C once status.txt says logged_in), then use send-command.js/check-topic.js.",
+  "dependencies": {
+    "playwright": "^1.62.1"
+  }
+}

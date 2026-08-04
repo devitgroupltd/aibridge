@@ -12,3 +12,9 @@ dist/
 # secrets - bot tokens live in %APPDATA%\aibridge\.env / ~/.config/aibridge/.env, never here
 .env
 .env.*
+
+# scripts/telegram-automation's persisted Chromium profile is a live logged-in Telegram session -
+# a credential, never committed - plus the screenshots/status files login.js polls on disk
+scripts/telegram-automation/profile/
+scripts/telegram-automation/*.png
+scripts/telegram-automation/status.txt
