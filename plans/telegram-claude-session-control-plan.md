@@ -1,7 +1,7 @@
 ---
-version: 0.27.0
+version: 0.28.0
 status: solid
-last_modified_utc: 2026-08-04T11:10:00Z
+last_modified_utc: 2026-08-04T11:26:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,27 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.28.0 (2026-08-04): Fixed 0.27.0's `sendChannelText` bug - the trailing `\r` after an inbound
+    prompt injection could silently fail to submit, wedging a session forever with the
+    'Thinking...' placeholder lying about it. Added a settle-then-verify retry: after the write's
+    own echo lands (which is itself real, non-empty PTY output and would otherwise always look like
+    'it worked'), check whether the session produces any further output that survives `stripAnsi`
+    (an ANSI-only cursor-blink/repaint chunk doesn't count - confirmed live that a wedged session
+    still periodically emits those, which false-negatived the first version of this check entirely);
+    if nothing real happens within the window, retry only the `\r` (never the content, to avoid a
+    double-injected prompt), and if the retry also produces nothing, give up loudly with a Telegram
+    notice instead of leaving the placeholder unexplained. Live-verified on two fresh, isolated
+    `/new` calls post-fix: both showed real spinner activity immediately, unlike the original bug's
+    total silence - confirming the submit itself now lands. One of the two then hit a genuine
+    Anthropic-side API error/retry loop, unrelated infrastructure flakiness rather than a
+    regression, and was killed rather than chased further. Also fixed
+    `scripts/telegram-automation/client.js`'s `openTopic` while investigating (Telegram Web's
+    topics-slider ripple overlay intercepts a plain click on a sidebar row - needed `force: true`,
+    discovered because the very tooling used to diagnose this bug hit it). **The endurance run
+    itself has not yet been redone** - 0.27.0's finding invalidated the original one, and this entry
+    only fixes the underlying bug; Phase 5's exit criterion is still 'not met' until a fresh
+    four-concurrent-sessions-for-an-hour run passes with each session's real task output verified,
+    not just fleet-command output."
   - "0.27.0 (2026-08-04): CORRECTION to 0.26.0's 'Phase 5 exit criterion fully met' claim, found
     wrong within the hour by the Bridge restart that deployed 0.26.0 itself. The three
     `/new`-launched endurance sessions never actually ran: `--resume` failed for all three
@@ -3494,31 +3515,26 @@ item 3 is moot until §7.6.
   was sent - `sendChannelText`'s trailing `\r` never actually submitted, so none of them ever ran a
   real turn. **Not done** - the run needs to be repeated after `sendChannelText` is fixed, verifying
   each session's actual task output this time, not just fleet-command output.
-- **Known open bug (found 2026-08-04, not yet fixed):** `sendChannelText` (§4.3's inbound-delivery
-  path, `index.ts`) writes the `<channel>`-tagged prompt and its trailing `\r` as two separate raw
-  PTY writes with no confirmation the Enter actually submitted, then starts the "Thinking..."
-  placeholder unconditionally regardless. Reproduced live on a single, isolated `/new` (not just the
-  original three-way launch burst) - `/attach`'s raw PTY capture showed the tagged prompt sitting
-  unsubmitted in the composer while Telegram already displayed "Thinking...". Same class of hazard as
-  `/effort`'s own second-`\r` timing fix (§4.2.3); `sendChannelText` never got the equivalent fix, and
-  `session.ready`/`waitForChannelConnected` (§10.1.2), meant to close this race deterministically, are
-  evidently insufficient alone. This silently wedges a session with no visible failure anywhere -
-  `/ls`/`/budget` cannot detect it, since a wedged-but-alive PTY looks identical to an idle one from
-  that vantage point.
+- ~~`sendChannelText` (§4.3's inbound-delivery path, `index.ts`) writes the `<channel>`-tagged prompt
+  and its trailing `\r` as two separate raw PTY writes with no confirmation the Enter actually
+  submitted, then starts the "Thinking..." placeholder unconditionally regardless - found
+  2026-08-04, reproduced live on a single, isolated `/new`.~~ **Fixed (2026-08-04):** a
+  settle-then-verify retry - wait for the write's own echo to land, then check for real
+  (non-ANSI-only) PTY output; retry just the `\r` once if there's none, give up loudly if the retry
+  also produces nothing. Live-verified on two fresh `/new` calls: both showed real spinner activity
+  immediately post-fix, unlike the original bug's total silence.
 - **Exit: not met.** Scenarios 24-28, 32, 42, 43 and 44 pass; the weighted budget correctly refused a
   5th `/new` against a real, fully-occupied fleet and the fleet's spend was visible in `/budget`
-  throughout - but "four concurrent Sonnet sessions ran for an hour" does not hold as a claim about
-  real Claude activity, since three of the four sat wedged the entire time on the
-  `sendChannelText` bug above. Startup reconciliation, `/restart`, rename-once, the supervisor's
-  crash-restart duty, `/budget`, the weighted concurrency cap, the quota-stop state and the
-  plugin-packaging artifact are all still built and live-verified on their own terms (scenario 24's
-  live half, not just its unit test; `/budget`/`/ls`'s cost column confirmed live against real tracked
-  spend; the plugin marketplace/install/launch chain confirmed live). **The only work left for a
-  future Phase 5 sitting: fix `sendChannelText`'s lost-Enter race, then redo the endurance run
-  verifying real per-session activity rather than trusting fleet-command output alone.** Whether to
-  cut the fleet's actual launch path over from `--dangerously-load-development-channels server:aibridge`
-  to the plugin form remains a separate decision, deliberately left open rather than made unasked (see
-  the 0.25.0 changelog entry).
+  throughout. Startup reconciliation, `/restart`, rename-once, the supervisor's crash-restart duty,
+  `/budget`, the weighted concurrency cap, the quota-stop state and the plugin-packaging artifact are
+  all built and live-verified on their own terms (scenario 24's live half, not just its unit test;
+  `/budget`/`/ls`'s cost column confirmed live against real tracked spend; the plugin
+  marketplace/install/launch chain confirmed live). **The only work left for a future Phase 5
+  sitting: redo the four-concurrent-sessions-for-an-hour endurance run now that `sendChannelText` is
+  fixed, verifying real per-session activity (the task's own file output, not just fleet-command
+  output) this time.** Whether to cut the fleet's actual launch path over from
+  `--dangerously-load-development-channels server:aibridge` to the plugin form remains a separate
+  decision, deliberately left open rather than made unasked (see the 0.25.0 changelog entry).
 
 ### Phase 6 - hardening, and the WSL2 migration
 
