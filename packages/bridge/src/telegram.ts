@@ -65,6 +65,18 @@ export interface SendChatActionSource {
   sendChatAction(chatId: string | number, messageThreadId: number | undefined, action: string): Promise<void>;
 }
 
+export interface BotCommand {
+  command: string;
+  description: string;
+}
+
+/** `setMyCommands` - drives Telegram's own native "/" autocomplete popup. Scoped via `BotCommandScopeChat`
+ * (a plain `chat_id`, no `message_thread_id`) because the Bot API has no forum-topic-level command
+ * scope at all - registering here surfaces the full fleet+session list in every topic alike. */
+export interface SetMyCommandsSource {
+  setMyCommands(chatId: string | number, commands: readonly BotCommand[]): Promise<void>;
+}
+
 /** §4.4/§7.5's topic lifecycle: create at `/new`, rename once on the first real title, close on
  * `/kill`/`/pause`, delete on `/rm`. */
 export interface ForumTopicSource {
@@ -176,6 +188,15 @@ export class TelegramClient implements UpdatesSource {
       }),
     });
     await parseTelegramResponse(res, "editMessageText");
+  }
+
+  async setMyCommands(chatId: string | number, commands: readonly BotCommand[]): Promise<void> {
+    const res = await fetch(this.url("setMyCommands"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ commands, scope: { type: "chat", chat_id: chatId } }),
+    });
+    await parseTelegramResponse(res, "setMyCommands");
   }
 
   async createForumTopic(chatId: string | number, name: string): Promise<{ message_thread_id: number }> {

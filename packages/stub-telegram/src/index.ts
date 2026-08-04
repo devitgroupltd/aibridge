@@ -68,6 +68,7 @@ interface TokenState {
   answeredCallbackQueries: string[];
   waiters: Array<() => void>;
   topics: Map<number, StubTopic>;
+  myCommands: unknown[];
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -91,6 +92,7 @@ export class StubTelegramServer {
         answeredCallbackQueries: [],
         waiters: [],
         topics: new Map(),
+        myCommands: [],
       };
       this.tokens.set(token, state);
     }
@@ -145,6 +147,11 @@ export class StubTelegramServer {
    * `createForumTopic` was never called for that id. */
   getTopic(token: string, messageThreadId: number): StubTopic | undefined {
     return this.stateFor(token).topics.get(messageThreadId);
+  }
+
+  /** The most recent `setMyCommands` call's command list for `token`'s bot - empty if never called. */
+  getMyCommands(token: string): unknown[] {
+    return [...this.stateFor(token).myCommands];
   }
 
   private async handleGetUpdates(state: TokenState, body: Record<string, unknown>): Promise<Response> {
@@ -252,6 +259,9 @@ export class StubTelegramServer {
         return this.handleDeleteForumTopic(state, body);
       case "answerCallbackQuery":
         state.answeredCallbackQueries.push(String(body.callback_query_id ?? ""));
+        return jsonResponse({ ok: true, result: true });
+      case "setMyCommands":
+        state.myCommands = Array.isArray(body.commands) ? body.commands : [];
         return jsonResponse({ ok: true, result: true });
       default:
         return jsonResponse({ ok: false, description: `unknown method ${method}` }, 404);

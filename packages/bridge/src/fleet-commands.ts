@@ -231,6 +231,33 @@ export function renderHelp(): string {
   ].join("\n");
 }
 
+/** Drives `index.ts`'s startup `setMyCommands` call - Telegram's native "/" autocomplete popup
+ * (`telegram.ts`'s `BotCommand`/`setMyCommands`). Mirrors `renderHelp()`'s content, minus the
+ * `/?`/`/h`/bare-`?` aliases: Telegram command names are restricted to `[a-z0-9_]`, so those three
+ * have no representable form here. The Bot API has no per-forum-topic command scope (only whole-chat
+ * scopes), so this single list necessarily includes both fleet- and session-scoped commands together
+ * - a suggestion tapped from the wrong topic just falls through to the existing wrong-topic rejection
+ * the text parser already sends, rather than being filtered out by Telegram itself. */
+export function botCommandList(): { command: string; description: string }[] {
+  return [
+    { command: "new", description: "Start a new session: /new [--model] <repo> <prompt>" },
+    { command: "ls", description: "List sessions" },
+    { command: "kill", description: "Stop a session: /kill [<slug>|--all]" },
+    { command: "rm", description: "Remove a dead session row: /rm [<slug>|--dead|--prefix <text>|--all]" },
+    { command: "attach", description: "Show a session's PTY tail" },
+    { command: "pause", description: "Pause a session" },
+    { command: "usage", description: "Token/cost usage" },
+    { command: "budget", description: "Fleet spend (5h/7d)" },
+    { command: "restart", description: "Restart the Bridge daemon" },
+    { command: "settings", description: "Registered repos + concurrency budget" },
+    { command: "autostart", description: "Manage the logon Task Scheduler entry: status|install|uninstall" },
+    { command: "help", description: "Show the full command list" },
+    { command: "model", description: `Set model: /model <${MODELS.join("|")}>` },
+    { command: "mode", description: `Set mode: /mode <${MODES.join("|")}>` },
+    { command: "effort", description: `Set effort: /effort <${EFFORTS.join("|")}>` },
+  ];
+}
+
 /** §4.2's `/attach`: the PTY tail plus the local pickup command - both best-effort, same "takes it
  * on faith" convention as `/model`'s confirmation (§4.2.1). Markdown-style triple backticks render
  * as literal text without a matching `parse_mode`, so this uses the same HTML `<pre>` convention as

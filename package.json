@@ -5,7 +5,13 @@
     "packages/*"
   ],
   "scripts": {
-    "test": "bun test"
+    "test": "bun test",
+    "setup": "powershell -ExecutionPolicy Bypass -File scripts/setup-windows.ps1",
+    "bridge:start": "bash scripts/dev-bridge.sh start",
+    "bridge:stop": "bash scripts/dev-bridge.sh stop",
+    "bridge:restart": "bash scripts/dev-bridge.sh restart",
+    "bridge:status": "bash scripts/dev-bridge.sh status",
+    "bridge:logs": "bash scripts/dev-bridge.sh logs"
   },
   "devDependencies": {
     "typescript": "^5.7.0",

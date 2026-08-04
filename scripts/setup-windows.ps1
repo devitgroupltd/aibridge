@@ -17,8 +17,35 @@
 $ErrorActionPreference = 'Stop'
 $results = @()
 
+# An unhandled terminating error anywhere below drops straight back to the interactive prompt with
+# no indication the script died mid-way - confirmed live 2026-08-04, looked exactly like a hang.
+# This trap prints a clear failure banner (and the completed-so-far results table) instead. Steps
+# already reported OK/CREATED/etc. above the failure point are genuinely done and safe to skip on
+# the next run - only the step that threw needs attention.
+trap {
+    Write-Host ""
+    Write-Host "== SETUP SCRIPT FAILED ==" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    Write-Host "at: $($_.InvocationInfo.PositionMessage)" -ForegroundColor Red
+    if ($results.Count -gt 0) {
+        Write-Host ""
+        Write-Host "Steps completed before the failure:" -ForegroundColor Yellow
+        $results | Format-Table -AutoSize | Out-String | Write-Host
+    }
+    Write-Host "Fix the error above and re-run this script - completed steps are skipped automatically." -ForegroundColor Yellow
+    exit 1
+}
+
 function Add-Result([string]$Item, [string]$Status, [string]$Detail = '') {
     $script:results += [pscustomobject]@{ Item = $Item; Status = $Status; Detail = $Detail }
+}
+
+# Several checks below (DISM's Get-WindowsCapability -Online in particular, plus bun install and
+# any winget/ssh-keygen call) run for real seconds-to-tens-of-seconds with zero console output of
+# their own - confirmed live 2026-08-04, indistinguishable from a hang without this. One line per
+# step, printed before the work starts, is enough to show progress without spamming.
+function Write-Step([string]$Text) {
+    Write-Host "-> $Text" -ForegroundColor DarkGray
 }
 
 $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).
@@ -37,6 +64,7 @@ $pinnedClaudeVersion = '2.1.220'   # keep in sync with §2.4 / §12 P-4 - re-che
 Write-Host "== aibridge P-1 host setup ==" -ForegroundColor Cyan
 
 # --- 1. Bun -----------------------------------------------------------------------------------
+Write-Step "Checking for Bun..."
 $bun = Get-Command bun -ErrorAction SilentlyContinue
 if ($bun) {
     Add-Result 'Bun' 'OK' (& bun --version)
@@ -55,6 +83,7 @@ if ($bun) {
 }
 
 # --- 2. node-pty build toolchain (native module - §12 P-1) -----------------------------------
+Write-Step "Checking for MSVC build tools (cl.exe)..."
 $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
 if ($cl) {
     Add-Result 'MSVC build tools (cl.exe)' 'OK' $cl.Source
@@ -73,6 +102,7 @@ if ($cl) {
     }
 }
 
+Write-Step "Checking for Python (node-gyp dependency)..."
 $python = Get-Command python -ErrorAction SilentlyContinue
 if ($python) {
     Add-Result 'Python (node-gyp dependency)' 'OK' $python.Source
@@ -81,6 +111,7 @@ if ($python) {
 }
 
 # --- 3. Defender exclusion for the worktree root (§7.1) ---------------------------------------
+Write-Step "Checking Defender exclusion for $worktrees..."
 if (-not (Test-Path $worktrees)) {
     New-Item -ItemType Directory -Path $worktrees -Force | Out-Null
 }
@@ -97,6 +128,7 @@ if ($currentExclusions -contains $worktrees) {
 }
 
 # --- 4. LongPathsEnabled (§7.1) ----------------------------------------------------------------
+Write-Step "Checking LongPathsEnabled..."
 $lpKey = 'HKLM:\SYSTEM\CurrentControlSet\Control\FileSystem'
 $lp = (Get-ItemProperty -Path $lpKey -Name LongPathsEnabled -ErrorAction SilentlyContinue).LongPathsEnabled
 if ($lp -eq 1) {
@@ -107,10 +139,23 @@ if ($lp -eq 1) {
 }
 
 # --- 5. OpenSSH Authentication Agent service (§7.5) --------------------------------------------
-$sshAgentCap = Get-WindowsCapability -Online -Name 'OpenSSH.Client*' -ErrorAction SilentlyContinue
-if ($sshAgentCap -and $sshAgentCap.State -ne 'Installed') {
-    Add-WindowsCapability -Online -Name $sshAgentCap.Name | Out-Null
+# Get-WindowsCapability throws a terminating "Class not registered" COM error on some machines
+# (most commonly: invoked from a 32-bit PowerShell host on 64-bit Windows, where the DISM provider
+# isn't registered for WOW64 - confirmed live 2026-08-04, took the whole script down with it since
+# -ErrorAction SilentlyContinue doesn't catch a terminating provider-init exception, only ordinary
+# non-terminating error records). Wrapped so this one prerequisite degrades to a reported step
+# instead of aborting everything after it - the ssh-agent service already ships in Windows 10+ by
+# default in most cases, so this capability check is a nice-to-have, not load-bearing.
+Write-Step "Checking OpenSSH.Client capability (this runs a DISM scan and can take 10-30s with no output)..."
+try {
+    $sshAgentCap = Get-WindowsCapability -Online -Name 'OpenSSH.Client*' -ErrorAction Stop
+    if ($sshAgentCap -and $sshAgentCap.State -ne 'Installed') {
+        Add-WindowsCapability -Online -Name $sshAgentCap.Name | Out-Null
+    }
+} catch {
+    Add-Result 'OpenSSH.Client capability check' 'SKIPPED' "$($_.Exception.Message) - if this is 'Class not registered', re-run from a 64-bit PowerShell (System32\WindowsPowerShell, not SysWOW64), or install the capability manually via Settings -> Optional Features."
 }
+
 $svc = Get-Service ssh-agent -ErrorAction SilentlyContinue
 if ($svc) {
     if ($svc.StartType -ne 'Automatic') {
@@ -125,6 +170,7 @@ if ($svc) {
 }
 
 # --- 6. Fleet-only deploy key (§7.5 - dedicated, separately revocable) -------------------------
+Write-Step "Checking fleet SSH deploy key..."
 $sshDir = Join-Path $secrets 'ssh'
 $fleetKey = Join-Path $sshDir 'aibridge-fleet'
 if (-not (Test-Path $fleetKey)) {
@@ -137,6 +183,7 @@ if (-not (Test-Path $fleetKey)) {
 }
 
 # --- 7. git identity (§7.5 - required for commits made from a worktree) ------------------------
+Write-Step "Checking git identity..."
 $gitName = git config --global user.name
 $gitEmail = git config --global user.email
 if ($gitName -and $gitEmail) {
@@ -145,26 +192,109 @@ if ($gitName -and $gitEmail) {
     Add-Result 'git identity' 'MISSING' 'Set git config --global user.name / user.email before running any session that commits.'
 }
 
-# --- 8. $STATE and secrets directories (§7.5) ---------------------------------------------------
+# --- 8. Workspace dependencies (bun install) -----------------------------------------------------
+Write-Step "Installing workspace dependencies (bun install) - first run can take a minute..."
+try {
+    Push-Location $repoRoot
+    & bun install
+    Pop-Location
+    Add-Result 'bun install' 'OK' $repoRoot
+} catch {
+    Pop-Location -ErrorAction SilentlyContinue
+    Add-Result 'bun install' 'FAILED' $_.Exception.Message
+}
+
+# --- 9. $STATE and secrets directories (§7.5) ---------------------------------------------------
+Write-Step "Checking state/secrets directories..."
 New-Item -ItemType Directory -Path (Join-Path $state 'sessions') -Force | Out-Null
 Add-Result 'State dir' 'OK' $state
 
 New-Item -ItemType Directory -Path $secrets -Force | Out-Null
 $envFile = Join-Path $secrets '.env'
-if (-not (Test-Path $envFile)) {
-    @'
-# aibridge secrets - mode-restricted directory, never committed (see plan §4.1, §5.4, §7.5).
-# Fill these in once the Telegram supergroup + two bots exist (P-2).
-CONTROL_BOT_TOKEN=
-FEED_BOT_TOKEN=
-SUPERGROUP_CHAT_ID=
-'@ | Set-Content -Path $envFile -Encoding utf8
-    Add-Result 'Secrets .env template' 'CREATED' $envFile
+$envValues = [ordered]@{ CONTROL_BOT_TOKEN = ''; FEED_BOT_TOKEN = ''; SUPERGROUP_CHAT_ID = '' }
+$envExisted = Test-Path $envFile
+if ($envExisted) {
+    foreach ($line in Get-Content $envFile) {
+        if ($line -match '^\s*([A-Z_]+)\s*=\s*(.*)$' -and $envValues.Contains($Matches[1])) {
+            $envValues[$Matches[1]] = $Matches[2].Trim()
+        }
+    }
+}
+$envBefore = [ordered]@{}
+foreach ($k in $envValues.Keys) { $envBefore[$k] = $envValues[$k] }
+
+# --- 9a. Guided Telegram setup (P-2) - prompts for whatever's still missing, walks through the
+# manual @BotFather/supergroup steps first since nothing here can be scripted, then offers to
+# auto-detect the chat id (the one value with no UI anywhere that just shows it to you) via a live
+# getUpdates call once both tokens are known. Only asks for what's missing - a second run with a
+# fully-populated .env skips this section entirely. -----------------------------------------------
+if ($envValues['CONTROL_BOT_TOKEN'] -and $envValues['FEED_BOT_TOKEN'] -and $envValues['SUPERGROUP_CHAT_ID']) {
+    Add-Result 'Telegram secrets' 'OK' $envFile
 } else {
-    Add-Result 'Secrets .env' 'OK' $envFile
+    Write-Host ""
+    Write-Host "== Telegram setup (P-2) ==" -ForegroundColor Cyan
+    Write-Host "You need a Telegram supergroup with Topics enabled, and two bots. If you haven't done this yet:"
+    Write-Host "  1. In Telegram, message @BotFather -> /newbot -> create the CONTROL bot (polls for commands)."
+    Write-Host "  2. /newbot again -> create the FEED bot (send-only, posts the activity feed)."
+    Write-Host "  3. Create a new group, enable Topics in its group settings (turns it into a forum supergroup)."
+    Write-Host "  4. Add both bots to the group; promote the CONTROL bot to admin with 'Manage Topics' permission."
+    Write-Host ""
+
+    if (-not $envValues['CONTROL_BOT_TOKEN']) {
+        $envValues['CONTROL_BOT_TOKEN'] = Read-Host "Paste the CONTROL bot's token from @BotFather (blank to skip and fill in later)"
+    }
+    if (-not $envValues['FEED_BOT_TOKEN']) {
+        $envValues['FEED_BOT_TOKEN'] = Read-Host "Paste the FEED bot's token from @BotFather (blank to skip and fill in later)"
+    }
+
+    if (-not $envValues['SUPERGROUP_CHAT_ID']) {
+        if ($envValues['CONTROL_BOT_TOKEN']) {
+            Write-Host ""
+            Write-Host "To auto-detect the chat id: send any message in the supergroup right now (e.g. 'hello'), then press Enter." -ForegroundColor Yellow
+            Read-Host "Press Enter once you've sent a message in the group" | Out-Null
+            try {
+                $updates = Invoke-RestMethod -Uri "https://api.telegram.org/bot$($envValues['CONTROL_BOT_TOKEN'])/getUpdates" -Method Get
+                $chatIds = $updates.result | ForEach-Object { $_.message.chat.id } | Where-Object { $_ } | Select-Object -Unique
+                if ($chatIds.Count -eq 1) {
+                    $envValues['SUPERGROUP_CHAT_ID'] = [string]$chatIds[0]
+                    Write-Host "Detected chat id: $($chatIds[0])" -ForegroundColor Green
+                } elseif ($chatIds.Count -gt 1) {
+                    Write-Host "Found multiple chat ids ($($chatIds -join ', ')) - the bot is in more than one chat." -ForegroundColor Yellow
+                    $envValues['SUPERGROUP_CHAT_ID'] = Read-Host "Paste the correct one"
+                } else {
+                    Write-Host "No messages seen yet - the bot may not be added to the group, or Telegram hasn't delivered the update." -ForegroundColor Yellow
+                    $envValues['SUPERGROUP_CHAT_ID'] = Read-Host "Paste the SUPERGROUP_CHAT_ID manually (blank to skip and fill in later)"
+                }
+            } catch {
+                Write-Host "getUpdates call failed: $($_.Exception.Message)" -ForegroundColor Yellow
+                $envValues['SUPERGROUP_CHAT_ID'] = Read-Host "Paste the SUPERGROUP_CHAT_ID manually (blank to skip and fill in later)"
+            }
+        } else {
+            $envValues['SUPERGROUP_CHAT_ID'] = Read-Host "Paste the SUPERGROUP_CHAT_ID manually (blank to skip and fill in later)"
+        }
+    }
+
+    if ($envValues['CONTROL_BOT_TOKEN'] -and $envValues['FEED_BOT_TOKEN'] -and $envValues['SUPERGROUP_CHAT_ID']) {
+        Add-Result 'Telegram secrets' 'COMPLETE' $envFile
+    } else {
+        Add-Result 'Telegram secrets' 'INCOMPLETE' "Fill in the remaining blank value(s) in $envFile before starting the Bridge."
+    }
 }
 
-# --- 9. repos.toml, seeded with this repo itself (§7.5) -----------------------------------------
+$envChanged = (-not $envExisted) -or ($envValues['CONTROL_BOT_TOKEN'] -ne $envBefore['CONTROL_BOT_TOKEN']) `
+    -or ($envValues['FEED_BOT_TOKEN'] -ne $envBefore['FEED_BOT_TOKEN']) `
+    -or ($envValues['SUPERGROUP_CHAT_ID'] -ne $envBefore['SUPERGROUP_CHAT_ID'])
+if ($envChanged) {
+    @"
+# aibridge secrets - mode-restricted directory, never committed (see plan §4.1, §5.4, §7.5).
+CONTROL_BOT_TOKEN=$($envValues['CONTROL_BOT_TOKEN'])
+FEED_BOT_TOKEN=$($envValues['FEED_BOT_TOKEN'])
+SUPERGROUP_CHAT_ID=$($envValues['SUPERGROUP_CHAT_ID'])
+"@ | Set-Content -Path $envFile -Encoding utf8
+}
+
+# --- 10. repos.toml, seeded with this repo itself (§7.5) -----------------------------------------
+Write-Step "Checking repos.toml..."
 $reposToml = Join-Path $state 'repos.toml'
 if (-not (Test-Path $reposToml)) {
     $repoPathToml = $repoRoot -replace '\\', '\\'
@@ -179,7 +309,8 @@ model = "sonnet"
     Add-Result 'repos.toml' 'OK' $reposToml
 }
 
-# --- 10. Claude Code version pin (§12 P-4) -------------------------------------------------------
+# --- 11. Claude Code version pin (§12 P-4) -------------------------------------------------------
+Write-Step "Checking Claude Code version..."
 $claude = Get-Command claude -ErrorAction SilentlyContinue
 if ($claude) {
     $ver = (& claude --version) 2>$null
@@ -198,10 +329,15 @@ Write-Host "== Result =="  -ForegroundColor Cyan
 $results | Format-Table -AutoSize | Out-String | Write-Host
 
 $manual = @(
-    "Telegram (P-2): create a supergroup, enable Topics, create two bots via @BotFather, promote the control bot to admin with can_manage_topics, add both tokens + the chat id to $envFile."
     "channelsEnabled (§4.1): confirm it is ON for whatever claude.ai org this machine's 'claude' login belongs to (Admin settings -> Claude Code -> Channels)."
     "Monthly spend limit (P-5): set under claude.ai Settings -> Usage before any unattended run."
     "Claude Code login: run 'claude' once interactively and complete the browser login, as the account the Bridge will run as."
+    "Fleet SSH deploy key: add the .pub (see 'Fleet SSH key' above) as a deploy key on every repo registered in $reposToml."
 )
+if (-not ($envValues['CONTROL_BOT_TOKEN'] -and $envValues['FEED_BOT_TOKEN'] -and $envValues['SUPERGROUP_CHAT_ID'])) {
+    $manual += "Telegram secrets: fill in the remaining blank value(s) in $envFile - re-run this script and it will prompt for just those."
+}
 Write-Host "== Still needs a human (cannot be scripted) ==" -ForegroundColor Yellow
 $manual | ForEach-Object { Write-Host "- $_" }
+Write-Host ""
+Write-Host "Once secrets + Claude Code login are in place, start the Bridge with: bash scripts/dev-bridge.sh start" -ForegroundColor Cyan

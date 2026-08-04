@@ -13,6 +13,29 @@ probed and verified against a real Claude Code client, lives in
 [`plans/telegram-claude-session-control-plan.md`](plans/telegram-claude-session-control-plan.md).
 Start there before writing any code.
 
+## Running the Bridge
+
+One-time host setup on a new Windows machine (installs Bun, MSVC build tools, sets the Defender
+exclusion, generates the fleet SSH key, and walks you through the Telegram bot/chat-id setup):
+
+```powershell
+# from an elevated PowerShell
+bun run setup
+```
+
+Then, day to day, from the repo root:
+
+```
+bun run bridge:start     # start the dev Bridge (packages/bridge/src/index.ts)
+bun run bridge:status    # is it running, and where's the log
+bun run bridge:logs      # tail the log
+bun run bridge:restart
+bun run bridge:stop
+```
+
+These are thin wrappers around `scripts/dev-bridge.sh` (bash - Git for Windows already puts `bash`
+on PATH) - see that file for what "start" actually does (env vars, log/pid file locations).
+
 ## Why this is its own repo
 
 This project was originally designed inside [SeoWrite](https://github.com/devitgroupltd/seowrite)'s

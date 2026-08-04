@@ -13,7 +13,7 @@ import { FeedCoalescer } from "./feed-coalescer.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
-import { parseFleetCommand, renderAttach, renderBudget, renderHelp, renderLsTable, renderSettings } from "./fleet-commands.ts";
+import { botCommandList, parseFleetCommand, renderAttach, renderBudget, renderHelp, renderLsTable, renderSettings } from "./fleet-commands.ts";
 import { renderCard } from "./feed-renderer.ts";
 import { applyEvent, createFeedState, promptsInLastHour } from "./feed-state.ts";
 import { normalizeHookEvent } from "./hook-events.ts";
@@ -81,6 +81,14 @@ async function main(): Promise<void> {
 
   await validateTokens(controlBot, feedBot);
   log("INFO", "both bot tokens validated via getMe");
+
+  try {
+    await controlBot.setMyCommands(config.supergroupChatId, botCommandList());
+    log("INFO", "registered Telegram's native '/' command list via setMyCommands");
+  } catch (err) {
+    // Best-effort: the manual /help path still works, so a failure here shouldn't block startup.
+    log("WARN", `setMyCommands failed - Telegram's native command popup won't reflect the current list: ${err}`);
+  }
 
   // Nested under the repo itself (like SeoWrite's .worktrees/<topic> convention) rather than a
   // sibling path - VS Code's Git extension only scans for repos INSIDE the opened folder, so this
