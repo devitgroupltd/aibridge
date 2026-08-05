@@ -210,6 +210,50 @@ describe("RateGovernor", () => {
     expect(attempts).toBe(1);
   });
 
+  describe("scheduleAsync", () => {
+    test("resolves with the scheduled function's own result once actually sent", async () => {
+      const clock = makeClock(0);
+      const governor = new RateGovernor({ capacity: 20, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+      await expect(governor.scheduleAsync("P0", async () => ({ message_id: 42 }))).resolves.toEqual({ message_id: 42 });
+    });
+
+    test("rejects once the 3-retry budget is exhausted, same task the caller awaited", async () => {
+      const clock = makeClock(0);
+      const governor = new RateGovernor({ capacity: 20, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+      let caught: unknown;
+      const promise = governor.scheduleAsync("P1", async () => {
+        throw new Error("network error");
+      });
+      promise.catch((err) => {
+        caught = err;
+      });
+      await flushMicrotasks(); // attempt 1 (immediate, no backoff wait yet)
+      clock.advance(1000); // attempt 2
+      await flushMicrotasks();
+      clock.advance(2000); // attempt 3
+      await flushMicrotasks();
+      clock.advance(4000); // attempt 4 - retry budget exhausted here, task.reject() fires
+      await flushMicrotasks();
+      expect(caught).toBeInstanceOf(Error);
+      expect((caught as Error).message).toBe("network error");
+    });
+
+    test("schedule() (fire-and-forget) never produces an unhandled rejection on the same failure path", async () => {
+      const clock = makeClock(0);
+      const governor = new RateGovernor({ capacity: 20, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+      governor.schedule("P0", async () => {
+        throw new Error("network error");
+      });
+      await flushMicrotasks(); // attempt 1
+      clock.advance(1000); // attempt 2
+      await flushMicrotasks();
+      clock.advance(2000); // attempt 3
+      await flushMicrotasks();
+      clock.advance(4000); // attempt 4 - exhausted; if this rejects unhandled, bun test surfaces it
+      await flushMicrotasks();
+    });
+  });
+
   describe("p2PressureExceeded (§5.4 point 4's quiet-mode trigger)", () => {
     test("never reports pressure below the minimum sample count, even at a 100% drop rate", () => {
       const clock = makeClock(0);

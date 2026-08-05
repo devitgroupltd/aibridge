@@ -33,12 +33,14 @@ export interface StubUpdate {
 }
 
 export interface SentMessage {
-  method: "sendMessage" | "editMessageText";
+  method: "sendMessage" | "editMessageText" | "sendDocument";
   chat_id: number;
   message_thread_id?: number;
   text: string;
   message_id: number;
   reply_markup?: unknown;
+  /** Only set for `sendDocument` (§5.5's oversized-`details` path) - the uploaded file's own name. */
+  filename?: string;
 }
 
 export interface PushUpdateInput {
@@ -74,6 +76,9 @@ interface TokenState {
   waiters: Array<() => void>;
   topics: Map<number, StubTopic>;
   myCommands: unknown[];
+  /** §5.4's 429 path (`force429`) - one-shot per queued entry, keyed by method, consumed in
+   * FIFO order so a test can script "fail once, then succeed" without any real rate limiting. */
+  forced429: Map<string, number[]>;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -98,6 +103,7 @@ export class StubTelegramServer {
         waiters: [],
         topics: new Map(),
         myCommands: [],
+        forced429: new Map(),
       };
       this.tokens.set(token, state);
     }
@@ -160,6 +166,16 @@ export class StubTelegramServer {
     return [...this.stateFor(token).myCommands];
   }
 
+  /** Queues a one-shot 429 (`retry_after: retryAfterSec`) for the next call to `method` on
+   * `token`'s bot - §5.4's "honour `retry_after` exactly" path, exercised without a real rate
+   * limit. Queue, not a flag: calling this twice fails the next two calls, not just one. */
+  force429(token: string, method: string, retryAfterSec: number): void {
+    const state = this.stateFor(token);
+    const queue = state.forced429.get(method) ?? [];
+    queue.push(retryAfterSec);
+    state.forced429.set(method, queue);
+  }
+
   private async handleGetUpdates(state: TokenState, body: Record<string, unknown>): Promise<Response> {
     const offset = Number(body.offset ?? 0);
     const timeoutSec = Number(body.timeout ?? 0);
@@ -207,6 +223,22 @@ export class StubTelegramServer {
     return jsonResponse({ ok: true, result: { message_id: messageId, chat: { id: Number(body.chat_id) }, text: body.text } });
   }
 
+  /** §5.5: `sendDocument` is multipart, not JSON, so it's parsed via `req.formData()` in
+   * `handleRequest` before this ever sees a `body` object - the shape here mirrors the other
+   * handlers' `Record<string, unknown>` just enough to stay a plain function. */
+  private async handleSendDocument(state: TokenState, req: Request): Promise<Response> {
+    const form = await req.formData();
+    const chatId = Number(form.get("chat_id") ?? 0);
+    const threadRaw = form.get("message_thread_id");
+    const messageThreadId = threadRaw === null ? undefined : Number(threadRaw);
+    const file = form.get("document");
+    const text = file instanceof Blob ? await file.text() : "";
+    const filename = file instanceof File ? file.name : undefined;
+    const messageId = state.nextMessageId++;
+    state.sent.push({ method: "sendDocument", chat_id: chatId, message_thread_id: messageThreadId, text, message_id: messageId, filename });
+    return jsonResponse({ ok: true, result: { message_id: messageId, chat: { id: chatId }, text } });
+  }
+
   private handleCreateForumTopic(state: TokenState, body: Record<string, unknown>): Response {
     const messageThreadId = state.nextTopicId++;
     state.topics.set(messageThreadId, { name: String(body.name ?? ""), closed: false, deleted: false });
@@ -241,6 +273,22 @@ export class StubTelegramServer {
 
     const [, token, method] = match as [string, string, string];
     const state = this.stateFor(token);
+
+    const forcedQueue = state.forced429.get(method);
+    const forcedRetryAfter = forcedQueue?.shift();
+    if (forcedRetryAfter !== undefined) {
+      return jsonResponse(
+        { ok: false, error_code: 429, description: `Too Many Requests: retry after ${forcedRetryAfter}`, parameters: { retry_after: forcedRetryAfter } },
+        429,
+      );
+    }
+
+    // Multipart, not JSON - must branch before the generic `req.json()` parse below, which would
+    // otherwise consume the request body stream trying (and failing) to parse it as JSON first.
+    if (method === "sendDocument") {
+      return this.handleSendDocument(state, req);
+    }
+
     const body =
       req.method === "POST"
         ? ((await req.json().catch(() => ({}))) as Record<string, unknown>)

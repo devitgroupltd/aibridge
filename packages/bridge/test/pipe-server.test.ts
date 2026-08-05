@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import net from "node:net";
 import { encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protocol";
-import type { HelloFromChannel, Message, ReplyMessage } from "@aibridge/protocol";
+import type { HelloFromChannel, HookAskMessage, Message, PermissionRequestMessage, ReplyMessage } from "@aibridge/protocol";
 import { startPipeServer } from "../src/pipe-server.ts";
+import { RateGovernor } from "../src/rate-governor.ts";
 import { Routing } from "../src/routing.ts";
 import { createThinkingPlaceholder } from "../src/thinking-placeholder.ts";
 import type { SendMessageSource } from "../src/telegram.ts";
@@ -290,6 +291,134 @@ describe("startPipeServer", () => {
     expect(calls).toEqual(["still works"]);
     await waitFor(() => warnings.length >= 1);
     expect(warnings[0]).toMatch(/some_future_type/);
+  });
+
+  // §5.4: when a governor is supplied, permission/ask cards and their resolutions go through its
+  // P0 lane and replies through P1 - not a behaviour change from the caller's point of view (same
+  // eventual sendMessage call, same message_id back), just routed through the budget instead of
+  // calling controlBot directly.
+  describe("governor wiring (§5.4)", () => {
+    test("a permission_request card is sent via the governor's P0 lane", async () => {
+      const path = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const lanes: string[] = [];
+      const governor = new RateGovernor({ log: () => {} });
+      const originalSchedule = governor.scheduleAsync.bind(governor);
+      governor.scheduleAsync = ((lane, fn) => {
+        lanes.push(lane);
+        return originalSchedule(lane, fn);
+      }) as typeof governor.scheduleAsync;
+      const controlBot: SendMessageSource = { sendMessage: async () => ({ message_id: 7 }) };
+
+      const handle = startPipeServer({ pipePath: path, routing, controlBot, governor, chatId: "-1" });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket } = connectClient(path);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(
+        encodeMessage({
+          v: PROTOCOL_VERSION,
+          type: "permission_request",
+          slug: "test-session",
+          request_id: "abcde",
+          tool_name: "Bash",
+          description: "run a command",
+          input_preview: "echo hi",
+        } satisfies PermissionRequestMessage),
+      );
+
+      await waitFor(() => lanes.length >= 1);
+      expect(lanes).toEqual(["P0"]);
+      expect(handle.permissionRegistry.get("abcde")?.messageId).toBe(7);
+    });
+
+    test("an ask card is sent via the governor's P0 lane", async () => {
+      const path = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const lanes: string[] = [];
+      const governor = new RateGovernor({ log: () => {} });
+      const originalSchedule = governor.scheduleAsync.bind(governor);
+      governor.scheduleAsync = ((lane, fn) => {
+        lanes.push(lane);
+        return originalSchedule(lane, fn);
+      }) as typeof governor.scheduleAsync;
+      const controlBot: SendMessageSource = { sendMessage: async () => ({ message_id: 8 }) };
+
+      const handle = startPipeServer({ pipePath: path, routing, controlBot, governor, chatId: "-1" });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket } = connectClient(path);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(
+        encodeMessage({
+          v: PROTOCOL_VERSION,
+          type: "ask",
+          slug: "test-session",
+          request_id: "req-1",
+          questions: [{ question: "Which approach?", options: [{ label: "A" }, { label: "B" }] }],
+        } satisfies HookAskMessage),
+      );
+
+      await waitFor(() => lanes.length >= 1);
+      expect(lanes).toEqual(["P0"]);
+    });
+
+    test("a reply is sent via the governor's P1 lane", async () => {
+      const path = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const lanes: string[] = [];
+      const governor = new RateGovernor({ log: () => {} });
+      const originalSchedule = governor.scheduleAsync.bind(governor);
+      governor.scheduleAsync = ((lane, fn) => {
+        lanes.push(lane);
+        return originalSchedule(lane, fn);
+      }) as typeof governor.scheduleAsync;
+      const controlBot: SendMessageSource = { sendMessage: async () => ({ message_id: 1 }) };
+
+      const handle = startPipeServer({ pipePath: path, routing, controlBot, governor, chatId: "-1" });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket } = connectClient(path);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(
+        encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "hi" } satisfies ReplyMessage),
+      );
+
+      await waitFor(() => lanes.length >= 1);
+      expect(lanes).toEqual(["P1"]);
+    });
+
+    test("with no governor supplied, sends still go straight to controlBot (pre-governor behaviour, unchanged)", async () => {
+      const path = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const calls: string[] = [];
+      const controlBot: SendMessageSource = {
+        sendMessage: async (_chatId, _threadId, text) => {
+          calls.push(text);
+          return { message_id: 1 };
+        },
+      };
+
+      const handle = startPipeServer({ pipePath: path, routing, controlBot, chatId: "-1" });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket } = connectClient(path);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(
+        encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "hi" } satisfies ReplyMessage),
+      );
+
+      await waitFor(() => calls.length >= 1);
+      expect(calls).toEqual(["hi"]);
+    });
   });
 
   describe("sendInbound", () => {

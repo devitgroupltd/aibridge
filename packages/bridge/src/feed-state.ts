@@ -19,10 +19,15 @@ export interface FeedState {
   /** One timestamp per `turn_start`, pruned to the last hour on every mutation - the raw series
    * behind the §10.4.1 prompts-per-hour metric. */
   promptTimestampsMs: number[];
+  /** §5.5's `<turn>` in `d:<slug>:<turn>` - incremented on every `turn_start`, starting at 1 for
+   * the first turn. `lines` resets on the same event, so this is also what tells a stale button
+   * tap (from a turn whose log is already gone) apart from a fresh one: a tap only resolves
+   * against `lines` if its `turn` still matches the session's current `turnSeq`. */
+  turnSeq: number;
 }
 
 export function createFeedState(slug: string): FeedState {
-  return { slug, turnActive: false, turnStartedAtMs: null, lines: [], promptTimestampsMs: [] };
+  return { slug, turnActive: false, turnStartedAtMs: null, lines: [], promptTimestampsMs: [], turnSeq: 0 };
 }
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
@@ -49,6 +54,7 @@ export function applyEvent(state: FeedState, event: FeedEvent, nowMs: number): F
         turnStartedAtMs: nowMs,
         lines: [],
         promptTimestampsMs: pruneOldPrompts([...state.promptTimestampsMs, nowMs], nowMs),
+        turnSeq: state.turnSeq + 1,
       };
 
     case "tool_start":

@@ -22,6 +22,7 @@ import {
   resolveCommandAction,
 } from "./commands.ts";
 import { loadConfig, STATE_DIR } from "./config.ts";
+import { buildDetailsKeyboard, parseDetailsCallback } from "./details-button.ts";
 import { FeedCoalescer } from "./feed-coalescer.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
@@ -44,7 +45,7 @@ import {
   renderSettings,
   stripBotMention,
 } from "./fleet-commands.ts";
-import { renderCard } from "./feed-renderer.ts";
+import { renderCard, renderDetails, renderDetailsPlainText } from "./feed-renderer.ts";
 import { applyEvent, createFeedState, promptsInLastHour } from "./feed-state.ts";
 import { monotonicNowMs } from "./monotonic-clock.ts";
 import { normalizeHookEvent } from "./hook-events.ts";
@@ -184,8 +185,10 @@ async function main(): Promise<void> {
     if (!row || row.state === "quota_stopped" || row.state === "dead") return;
     if (!isValidTransition(row.state, "quota_stopped")) return;
     sessionStore.setState(slug, "quota_stopped", nowIso());
-    controlBot
-      .sendMessage(config.supergroupChatId, row.topicId, `⚠️ "${slug}" stopped on a usage limit (§10.5) - this looks frozen but isn't wedged; it should resume once the window resets.`)
+    feedGovernor
+      .scheduleAsync("P1", () =>
+        controlBot.sendMessage(config.supergroupChatId, row.topicId, `⚠️ "${slug}" stopped on a usage limit (§10.5) - this looks frozen but isn't wedged; it should resume once the window resets.`),
+      )
       .catch((err) => log("WARN", `failed to post quota-stop notice for "${slug}": ${(err as Error).message}`));
   }
 
@@ -218,11 +221,13 @@ async function main(): Promise<void> {
       .sort((a, b) => b.spend - a.spend)
       .map((r) => `  ${r.slug}: $${r.spend.toFixed(2)}`)
       .join("\n");
-    controlBot
-      .sendMessage(
-        config.supergroupChatId,
-        undefined,
-        `⚠️ Burn-rate alarm: fleet has spent $${fleetFiveHour.toFixed(2)} in the last 5h (threshold $${BURN_RATE_THRESHOLD_USD.toFixed(2)}).\n${breakdown}`,
+    feedGovernor
+      .scheduleAsync("P1", () =>
+        controlBot.sendMessage(
+          config.supergroupChatId,
+          undefined,
+          `⚠️ Burn-rate alarm: fleet has spent $${fleetFiveHour.toFixed(2)} in the last 5h (threshold $${BURN_RATE_THRESHOLD_USD.toFixed(2)}).\n${breakdown}`,
+        ),
       )
       .catch((err) => log("WARN", `failed to post burn-rate alarm: ${(err as Error).message}`));
   }
@@ -325,6 +330,22 @@ async function main(): Promise<void> {
   // storm notifies again rather than staying silent forever after the first one.
   let quietModeNotified = false;
 
+  /** §5.5: one small, un-edited anchor message per turn carrying the `details` button - see
+   * `details-button.ts` for why this can't just live on the turn card itself. P1 lane (a
+   * lifecycle notice, not a permission/question card), and skipped for a `/pause`d session for
+   * the same reason `feedCoalescer`'s own flush is (§4.2: "replies and prompts still flow, only
+   * the feed card stops updating" - this is feed-adjacent, not a reply or a prompt). */
+  function postDetailsButton(slug: string, turnSeq: number): void {
+    if (sessionStore.get(slug)?.paused) return;
+    const route = routing.get(slug);
+    if (!route) return;
+    feedGovernor
+      .scheduleAsync("P1", () =>
+        controlBot.sendMessage(config.supergroupChatId, route.topicId, "📋", { inline_keyboard: buildDetailsKeyboard(slug, turnSeq) }),
+      )
+      .catch((err) => log("WARN", `failed to post details button for "${slug}": ${(err as Error).message}`));
+  }
+
   function handleHookEvent(msg: HookEventMessage): void {
     // §4.5's resume path needs a real session_id to hand to `claude --resume` - every hook event
     // carries one (§5.1), so this is the only place it's ever known, and it's cheap to keep fresh
@@ -361,6 +382,7 @@ async function main(): Promise<void> {
       if (promptCount > PROMPTS_PER_HOUR_WARN_THRESHOLD) {
         log("WARN", `session "${msg.slug}" started ${promptCount} turns in the last hour - check whether its allowlist has grown too broad (§10.4.1)`);
       }
+      postDetailsButton(msg.slug, next.turnSeq);
     }
 
     feedCoalescer.notify(msg.slug, renderCard(next, nowMs));
@@ -437,6 +459,7 @@ async function main(): Promise<void> {
   const pipeHandle = startPipeServer({
     routing,
     controlBot,
+    governor: feedGovernor,
     chatId: config.supergroupChatId,
     thinkingPlaceholder,
     onReplySent: (topicId, text) => {
@@ -721,9 +744,13 @@ async function main(): Promise<void> {
     confirmSubmitted(slug, topicId, write);
   }
 
+  // §5.4's P1 lane: every fleet-command echo and session lifecycle notice this Bridge posts on
+  // its own initiative funnels through here, so wiring it through the governor once covers all of
+  // them - never delayed behind P2 feed traffic, itself never allowed to delay a P0 permission
+  // prompt or question.
   function confirmSessionCommand(topicId: number | undefined, text: string, parseMode?: "HTML"): void {
-    controlBot
-      .sendMessage(config.supergroupChatId, topicId, text, undefined, parseMode)
+    feedGovernor
+      .scheduleAsync("P1", () => controlBot.sendMessage(config.supergroupChatId, topicId, text, undefined, parseMode))
       .catch((err: unknown) => log("WARN", `failed to send command confirmation: ${(err as Error).message}`));
   }
 
@@ -974,7 +1001,7 @@ async function main(): Promise<void> {
     typingIndicator.stop(topicIdStr);
     thinkingPlaceholder.consume(topicIdStr).then((messageId) => {
       if (messageId === undefined || !controlBot.editMessageText) return;
-      return controlBot.editMessageText(config.supergroupChatId, messageId, "Session ended.");
+      return feedGovernor.scheduleAsync("P1", () => controlBot.editMessageText!(config.supergroupChatId, messageId, "Session ended."));
     }).catch((err: unknown) => log("WARN", `failed to clear thinking placeholder for topic ${topicId}: ${(err as Error).message}`));
   }
 
@@ -1575,8 +1602,8 @@ async function main(): Promise<void> {
     onUpdate: (update) => {
       const callbackQuery = update.callback_query;
       if (callbackQuery) {
-        controlBot
-          .answerCallbackQuery(callbackQuery.id)
+        feedGovernor
+          .scheduleAsync("P0", () => controlBot.answerCallbackQuery(callbackQuery.id))
           .catch((err) => log("WARN", `answerCallbackQuery failed: ${(err as Error).message}`));
 
         const threadId = callbackQuery.message?.message_thread_id;
@@ -1598,6 +1625,32 @@ async function main(): Promise<void> {
           if (result.allAnswered) {
             pipeHandle.completeAsk(askAction.id);
             maybeSetState(result.entry.slug, "working");
+          }
+          return;
+        }
+
+        // §5.5's `details` button - "d:", a fresh namespace alongside "ask:"/"perm:"/etc. Nothing
+        // to resolve against a registry (the reference is self-contained: slug + turn number), so
+        // this only needs `feedStates` to check the tapped turn is still the session's current one.
+        const detailsAction = callbackQuery.data ? parseDetailsCallback(callbackQuery.data) : null;
+        if (detailsAction) {
+          const state = feedStates.get(detailsAction.slug);
+          const stillCurrent = state && state.turnSeq === detailsAction.turnSeq;
+          const text = stillCurrent ? renderDetails(state) : "That turn has ended - its log is no longer available.";
+          if (text.length <= 4096) {
+            // renderDetails renders the same `<code>`/escaped-entity markup the turn card itself
+            // uses (feed-renderer.ts) - needs "HTML" here or Telegram shows the literal tags.
+            confirmSessionCommand(threadId, text, "HTML");
+          } else {
+            // §5.5: "Diffs always go as documents" - the same reasoning applies to a details log
+            // too long to fit in one message. Plain text, not renderDetails's HTML markup - a
+            // document viewer has no HTML renderer to make that markup invisible.
+            const plainText = stillCurrent ? renderDetailsPlainText(state) : text;
+            feedGovernor
+              .scheduleAsync("P1", () =>
+                controlBot.sendDocument(config.supergroupChatId, threadId, `${detailsAction.slug}-turn${detailsAction.turnSeq}-details.txt`, plainText),
+              )
+              .catch((err) => log("WARN", `sendDocument (details) failed: ${(err as Error).message}`));
           }
           return;
         }

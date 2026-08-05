@@ -16,6 +16,7 @@ import { buildAskKeyboard, renderAskCard } from "./ask-callback.ts";
 import { AskRegistry, type PendingAsk } from "./ask-registry.ts";
 import { buildPermissionKeyboard, renderPermissionCard } from "./permission-callback.ts";
 import { PermissionRegistry, type PendingPermissionRequest } from "./permission-registry.ts";
+import type { RateGovernor } from "./rate-governor.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import type { Routing } from "./routing.ts";
 import type { SendMessageSource } from "./telegram.ts";
@@ -28,6 +29,11 @@ export interface PipeServerOptions {
   pipePath?: string;
   routing: Routing;
   controlBot: SendMessageSource;
+  /** §5.4's P0 lane: permission/question cards, their resolutions and callback acks - never
+   * dropped, never delayed by the feed bot's P2 traffic. Optional so existing stub-server tests
+   * that construct `PipeServerOptions` without a governor keep working unchanged (falls back to
+   * calling `controlBot` directly, the pre-governor behaviour). */
+  governor?: RateGovernor;
   /** The one supergroup chat every session's topics live in (§4.1). */
   chatId: string;
   /** If a "🤔 Thinking..." placeholder is pending for this topic, the reply edits it in place
@@ -97,13 +103,23 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
   // connection for the same slug.
   const askSocketsById = new Map<string, net.Socket>();
 
+  // §5.4's two control-bot lanes. Both fall back to calling `controlBot` directly when no
+  // governor is supplied (existing stub-server tests), so this is additive rather than a
+  // behaviour change for anything that doesn't opt in.
+  function p0<T>(fn: () => Promise<T>): Promise<T> {
+    return opts.governor ? opts.governor.scheduleAsync("P0", fn) : fn();
+  }
+  function p1<T>(fn: () => Promise<T>): Promise<T> {
+    return opts.governor ? opts.governor.scheduleAsync("P1", fn) : fn();
+  }
+
   async function handleReply(msg: ReplyMessage): Promise<void> {
     try {
       const placeholderId = await opts.thinkingPlaceholder?.consume(msg.topic_id);
       if (placeholderId !== undefined && opts.controlBot.editMessageText) {
-        await opts.controlBot.editMessageText(opts.chatId, placeholderId, msg.text);
+        await p1(() => opts.controlBot.editMessageText!(opts.chatId, placeholderId, msg.text));
       } else {
-        await opts.controlBot.sendMessage(opts.chatId, Number(msg.topic_id), msg.text);
+        await p1(() => opts.controlBot.sendMessage(opts.chatId, Number(msg.topic_id), msg.text));
       }
       opts.onReplySent?.(msg.topic_id, msg.text);
     } catch (err) {
@@ -130,9 +146,11 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
         description: msg.description,
         inputPreview: msg.input_preview,
       });
-      const sent = await opts.controlBot.sendMessage(opts.chatId, route.topicId, text, {
-        inline_keyboard: buildPermissionKeyboard(msg.request_id),
-      });
+      const sent = await p0(() =>
+        opts.controlBot.sendMessage(opts.chatId, route.topicId, text, {
+          inline_keyboard: buildPermissionKeyboard(msg.request_id),
+        }),
+      );
       permissionRegistry.add({
         requestId: msg.request_id,
         slug: msg.slug,
@@ -171,9 +189,11 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     try {
       const questions: PendingAsk["questions"] = [];
       for (const q of msg.questions) {
-        const sent = await opts.controlBot.sendMessage(opts.chatId, route.topicId, renderAskCard(msg.slug, q.question, q.header), {
-          inline_keyboard: buildAskKeyboard(msg.request_id, questions.length, q.options),
-        });
+        const sent = await p0(() =>
+          opts.controlBot.sendMessage(opts.chatId, route.topicId, renderAskCard(msg.slug, q.question, q.header), {
+            inline_keyboard: buildAskKeyboard(msg.request_id, questions.length, q.options),
+          }),
+        );
         questions.push({ question: q.question, header: q.header, options: q.options, topicId: route.topicId, messageId: sent.message_id });
       }
       askRegistry.add({ id: msg.request_id, slug: msg.slug, questions });
@@ -300,7 +320,7 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
 
   async function finalizePermissionMessage(messageId: number, text: string): Promise<void> {
     if (!opts.controlBot.editMessageText) return;
-    await opts.controlBot.editMessageText(opts.chatId, messageId, text, { inline_keyboard: [] });
+    await p0(() => opts.controlBot.editMessageText!(opts.chatId, messageId, text, { inline_keyboard: [] }));
   }
 
   function answerAsk(id: string, questionIndex: number, optionIndex: number): { entry: PendingAsk; label: string; allAnswered: boolean } | null {

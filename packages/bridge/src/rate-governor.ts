@@ -71,7 +71,12 @@ class TokenBucket {
 
 interface ControlTask {
   lane: "P0" | "P1";
-  run: () => Promise<void>;
+  run: () => Promise<unknown>;
+  /** Resolves/rejects `scheduleAsync`'s returned promise once this task's own outcome is final
+   * (delivered, or retries exhausted). `schedule()` wires no-op callbacks here - it stays
+   * fire-and-forget, same as before this existed. */
+  resolve: (value: unknown) => void;
+  reject: (err: unknown) => void;
   retriesLeft: number;
   backoffMs: number;
 }
@@ -127,7 +132,27 @@ export class RateGovernor {
       this.scheduleP2(fn);
       return;
     }
-    this.enqueueControl({ lane, run: fn, retriesLeft: 3, backoffMs: 1000 });
+    // Fire-and-forget: swallow the rejection `scheduleAsync` would otherwise surface, so a
+    // caller that doesn't need the result (and doesn't await anything) never sees an unhandled
+    // rejection - the ERROR log inside `runControlTask` is still the record of a real failure.
+    this.scheduleAsync(lane, fn).catch(() => {});
+  }
+
+  /** Same P0/P1 semantics as `schedule()`, but returns a promise resolving to `fn`'s own result
+   * once actually delivered (or rejecting once the 3-retry budget is exhausted) - what a caller
+   * that needs a `message_id` back (a permission card, a question card) actually needs, since
+   * `schedule()` alone has nowhere to hand that back. */
+  scheduleAsync<T>(lane: "P0" | "P1", fn: () => Promise<T>): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      this.enqueueControl({
+        lane,
+        run: fn,
+        resolve: resolve as (value: unknown) => void,
+        reject,
+        retriesLeft: 3,
+        backoffMs: 1000,
+      });
+    });
   }
 
   private scheduleP2(fn: () => Promise<void>): void {
@@ -200,7 +225,8 @@ export class RateGovernor {
 
   private async runControlTask(task: ControlTask): Promise<void> {
     try {
-      await task.run();
+      const result = await task.run();
+      task.resolve(result);
     } catch (err) {
       if (err instanceof RateLimitedError) {
         this.controlBucket.pauseFor(err.retryAfterSec * 1000);
@@ -222,6 +248,7 @@ export class RateGovernor {
       // §9 scenario 41: exhausted the retry budget - log loud, leave whatever this task was
       // supposed to deliver (a permission prompt, a reply) undelivered rather than pretend it went out.
       this.log("ERROR", `${task.lane} send failed after 3 retries: ${(err as Error).message}`);
+      task.reject(err);
     }
   }
 

@@ -47,8 +47,23 @@ export function renderCard(state: FeedState, nowMs: number): string {
   return parts.join("\n");
 }
 
-/** §5.5's `details` button target: the complete, untruncated per-turn log. */
+/** §5.5's `details` button target: the complete, untruncated per-turn log, HTML-formatted the
+ * same way as the card itself - the caller is expected to send this with `parse_mode: "HTML"`. */
 export function renderDetails(state: FeedState): string {
   if (state.lines.length === 0) return "No activity recorded for this turn.";
   return state.lines.map(renderLine).join("\n");
+}
+
+/** Same content as `renderDetails`, but plain text - no `<code>` tags, no HTML-entity escaping.
+ * §5.5's oversized-log path sends this as a `.txt` document instead of a chat message; a document
+ * viewer has no HTML renderer, so `renderDetails`'s markup would show up as literal tag/entity
+ * soup instead of being invisible formatting. */
+export function renderDetailsPlainText(state: FeedState): string {
+  if (state.lines.length === 0) return "No activity recorded for this turn.";
+  return state.lines
+    .map((line) => {
+      const errorSuffix = line.status === "failed" && line.error ? ` — ${line.error}` : "";
+      return `${icon(line.status)} ${line.summary}${errorSuffix}`;
+    })
+    .join("\n");
 }

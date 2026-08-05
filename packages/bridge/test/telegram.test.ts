@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { StubTelegramServer } from "@aibridge/stub-telegram";
+import { RateLimitedError } from "../src/rate-governor.ts";
 import { startPolling, TelegramClient, validateTokens } from "../src/telegram.ts";
 import type { GetMeSource, TelegramUpdate, UpdatesSource } from "../src/telegram.ts";
 
@@ -175,6 +176,57 @@ describe("TelegramClient", () => {
       const keyboard = { inline_keyboard: [[{ text: "/compact", callback_data: "run:builtin:compact" }]] };
       await client.sendMessage(-1, 3, "Available commands:", keyboard);
       expect(stub.getSent("control-token")[0]?.reply_markup).toEqual(keyboard);
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("§5.4: a real 429 becomes a RateLimitedError carrying the response's own retry_after", async () => {
+    const stub = new StubTelegramServer();
+    const { baseUrl } = stub.start(0);
+    try {
+      const client = new TelegramClient("control-token", baseUrl);
+      stub.force429("control-token", "sendMessage", 7);
+      let caught: unknown;
+      try {
+        await client.sendMessage(-1, 3, "hello");
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(RateLimitedError);
+      expect((caught as InstanceType<typeof RateLimitedError>).retryAfterSec).toBe(7);
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("a non-429 failure (e.g. sendChatAction - not implemented by the stub) stays a plain Error, not RateLimitedError", async () => {
+    const stub = new StubTelegramServer();
+    const { baseUrl } = stub.start(0);
+    try {
+      const client = new TelegramClient("control-token", baseUrl);
+      let caught: unknown;
+      try {
+        await client.sendChatAction(-1, 3, "typing");
+      } catch (err) {
+        caught = err;
+      }
+      expect(caught).toBeInstanceOf(Error);
+      expect(caught).not.toBeInstanceOf(RateLimitedError);
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("§5.5: sendDocument uploads the details log as a real file, not inline text", async () => {
+    const stub = new StubTelegramServer();
+    const { baseUrl } = stub.start(0);
+    try {
+      const client = new TelegramClient("control-token", baseUrl);
+      const content = "line 1\nline 2\nline 3";
+      await client.sendDocument(-1, 3, "session-turn1-details.txt", content);
+      const sent = stub.getSent("control-token")[0];
+      expect(sent).toMatchObject({ method: "sendDocument", chat_id: -1, message_thread_id: 3, text: content, filename: "session-turn1-details.txt" });
     } finally {
       stub.stop();
     }

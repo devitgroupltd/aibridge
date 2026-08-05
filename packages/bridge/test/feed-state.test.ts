@@ -54,6 +54,18 @@ describe("applyEvent", () => {
     expect(state.lines).toHaveLength(1);
   });
 
+  test("§5.5: turnSeq increments on every turn_start, starting at 1, and is untouched by anything else", () => {
+    let state = createFeedState("slug");
+    expect(state.turnSeq).toBe(0);
+    state = applyEvent(state, { kind: "turn_start" }, T0);
+    expect(state.turnSeq).toBe(1);
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Read", summary: "Read a" }, T0);
+    state = applyEvent(state, { kind: "turn_end", success: true }, T0 + 10);
+    expect(state.turnSeq).toBe(1);
+    state = applyEvent(state, { kind: "turn_start" }, T0 + 20);
+    expect(state.turnSeq).toBe(2);
+  });
+
   test("subagent and compaction events append note lines with no toolUseId", () => {
     let state = createFeedState("slug");
     state = applyEvent(state, { kind: "compacting" }, T0);

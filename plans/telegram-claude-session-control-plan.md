@@ -1,7 +1,7 @@
 ---
-version: 0.40.0
+version: 0.41.0
 status: solid
-last_modified_utc: 2026-08-05T08:25:00Z
+last_modified_utc: 2026-08-05T10:40:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,44 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.41.0 (2026-08-05): closed Phase 3's two named gaps. (1) The §5.5 `details` button: a
+    per-turn `turnSeq` counter (feed-state.ts) plus a new details-button.ts encode/parse
+    `d:<slug>:<turn>` callback_data; since a callback_query always routes back to whichever bot
+    posted the message and the feed bot never polls getUpdates (send-only, by design), the button
+    can't live on the turn card itself - it's posted as a small separate un-edited '📋' anchor
+    message from the control bot once per turn instead. Tapping it posts the full untruncated log
+    (renderDetails, HTML-formatted) as a new message, or - past Telegram's 4096-char limit - as a
+    real uploaded .txt document via a new TelegramClient.sendDocument (plain-text rendered via a
+    new renderDetailsPlainText, since a document viewer has no HTML renderer to hide renderDetails'
+    own <code>/entity markup). A stale tap (the session has since started a new turn) answers 'That
+    turn has ended' rather than the wrong turn's log. Caught live before shipping: the first pass
+    sent the message-length case through confirmSessionCommand with no parse_mode, so Telegram
+    rendered renderDetails' <code> tags as literal text instead of monospace - fixed by passing
+    'HTML' explicitly. (2) P0/P1 governor wiring: RateGovernor gained scheduleAsync<T> (returns the
+    scheduled call's own result/rejection, so a caller needing a message_id - a permission card, a
+    question card - isn't limited to the existing fire-and-forget schedule()); TelegramClient's
+    parseTelegramResponse now converts a real HTTP 429 into RateLimitedError carrying the response
+    body's own retry_after, which the governor's §5.4 pause-and-resend path needed but never had a
+    real source for (every failure used to collapse into a generic Error, i.e. the governor's 429
+    handling was previously unreachable in production). pipe-server.ts now routes permission/ask
+    cards, their resolutions and finalizePermissionMessage through the governor's P0 lane, and
+    reply through P1, both falling back to a direct controlBot call when no governor is supplied
+    (existing stub-server tests unaffected); index.ts wires confirmSessionCommand (the shared
+    funnel for every fleet-command echo and lifecycle notice), the quota-stop notice, the burn-rate
+    alarm, the session-ended placeholder edit and answerCallbackQuery through the same governor
+    instance. Scope was deliberately kept to exactly what §5.4's own P0/P1 itemization names -
+    fleet-confirm.ts/stale-confirm.ts's destructive-action confirm cards and the /new-repo/-about/
+    -commands/-skills custom-keyboard sends stay direct, unchanged, not part of the relay this
+    protects. New stub-telegram support added alongside: force429 (one-shot per-method 429
+    injection) and a real multipart sendDocument handler, both exercised by telegram.test.ts. Live-
+    verified against the real dev Bridge/Telegram end to end: a real Bash permission request
+    (P0) still posted, Allow still finalized it correctly; a real turn produced the 📋 anchor,
+    tapping it returned the correctly HTML-rendered log; /ls (P1 via confirmSessionCommand) still
+    returned the right table. 449 tests pass, tsc --noEmit clean. One real test-authoring bug
+    caught along the way and fixed before it could hide a regression: a scheduleAsync retry-
+    exhaustion test omitted the initial flushMicrotasks() the fake-timer sequence depends on,
+    desyncing the schedule so the assertion never settled - bun test hung rather than failing
+    loudly, diagnosed by bisecting file-by-file and test-by-test rather than guessed at."
   - "0.40.0 (2026-08-05): /ls gained a per-session detail line answering the owner's 'what is each
     session currently doing/stuck/waiting on' question - discussed first (a fleet-wide command is
     valuable since it aggregates across every topic in one glance; a session-scoped equivalent would be
@@ -3656,20 +3694,23 @@ item 3 is moot until §7.6.
   (`bun build --compile`), forwarding every §5.1 event over the pipe with a `hello`+`event` pair per
   firing; wired into `settings.ts`'s `hooks` block, all `async: true`.
 - ~~Turn card renderer; per-topic coalescing; the two-token priority governor; `details` button.~~
-  **Mostly done** - `hook-events.ts` (normalizer), `feed-state.ts` (turn-card state + prompts-per-hour),
-  `feed-renderer.ts` (§5.3's card layout, 8-line cap, HTML escaping via `feed-escape.ts`),
-  `rate-governor.ts` (P0/P1/P2 lanes, 429 handling, retry/backoff) and `feed-coalescer.ts`
-  (session-count-scaled flush interval) are all built and live-verified. The `details` button
-  (§5.5) is not wired yet - `renderDetails()` exists but nothing calls it - deferred rather than
-  invented against an unverified `callback_data` UX.
+  **Done** - `hook-events.ts` (normalizer), `feed-state.ts` (turn-card state + prompts-per-hour +
+  `turnSeq`), `feed-renderer.ts` (§5.3's card layout, 8-line cap, HTML escaping via
+  `feed-escape.ts`, plus `renderDetailsPlainText` for the oversized-log document path),
+  `rate-governor.ts` (P0/P1/P2 lanes, 429 handling, retry/backoff, plus `scheduleAsync<T>`) and
+  `feed-coalescer.ts` (session-count-scaled flush interval) are all built and live-verified. The
+  `details` button (§5.5) shipped in 0.41.0: `details-button.ts`'s `d:<slug>:<turn>` callback_data,
+  posted as a small separate control-bot anchor message once per turn (the card itself can't carry
+  it - see that changelog entry for why), tap posts the full log or, past 4096 chars, a real
+  uploaded document via a new `TelegramClient.sendDocument`.
 - **The prompts-per-hour metric**, promoted here from Phase 6. Implemented as a rolling-hour counter in
   `feed-state.ts`, logged at `WARN` past a threshold (20/hour - this implementation's own choice, not a
   number the plan specifies) - exposing it via a fleet command is Phase 5 work.
-- **Deliberately deferred rather than done in this pass:** P0/P1 (reply, permission cards,
-  `answerCallbackQuery`) still call the control bot directly rather than through `rate-governor.ts`.
-  Phase 1/2's own call volume is far below the 20/minute ceiling the governor exists to protect, and
-  routing Phase 2's already live-verified permission relay through a new queueing/retry layer was
-  judged a real regression risk not worth taking for a budget concern that isn't yet observable.
+- ~~**Deliberately deferred rather than done in this pass:** P0/P1 (reply, permission cards,
+  `answerCallbackQuery`) still call the control bot directly rather than through `rate-governor.ts`.~~
+  **Done in 0.41.0** - see that changelog entry. `TelegramClient` needed one real fix first
+  (converting an actual HTTP 429 into `RateLimitedError`, which the governor's own 429-pause path
+  had never had a live source for) before the wiring meant anything.
 - **Live-verified 2026-08-03** against the real Telegram group: a real Read+Bash+subagent turn produced
   a turn card from the feed bot (`om-aibridge-feed`, a distinct sender identity from the control bot,
   confirming the two-token design), updating in place with correct icons and duration; a concurrently
@@ -3681,8 +3722,8 @@ item 3 is moot until §7.6.
   `feed-coalescer.test.ts`, `feed-renderer.test.ts`, `feed-escape.test.ts`, `hook-events.test.ts`,
   `feed-state.test.ts`), and a real tool-heavy turn stays inside the rate budget - confirmed with one
   session; the two-concurrent-sessions half of this exit criterion is carried forward to Phase 5.
-  **Phase 3 is functionally complete; the `details` button and P0/P1 governor wiring are the two
-  named gaps carried forward.**
+  **Phase 3 is complete - both named gaps (the `details` button, P0/P1 governor wiring) closed in
+  0.41.0, live-verified against the real dev Bridge.**
 
 ### Phase 4 - questions
 

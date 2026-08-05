@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { applyEvent, createFeedState } from "../src/feed-state.ts";
-import { renderCard, renderDetails } from "../src/feed-renderer.ts";
+import { renderCard, renderDetails, renderDetailsPlainText } from "../src/feed-renderer.ts";
 
 const T0 = 1_700_000_000_000;
 
@@ -80,5 +80,32 @@ describe("renderDetails", () => {
 
   test("an empty turn has a clear placeholder rather than an empty message", () => {
     expect(renderDetails(createFeedState("s"))).toBe("No activity recorded for this turn.");
+  });
+});
+
+describe("renderDetailsPlainText", () => {
+  test("§5.5's oversized-log document path: no HTML tags or escaped entities, unlike renderDetails", () => {
+    let state = createFeedState("s");
+    state = applyEvent(
+      state,
+      { kind: "tool_start", toolUseId: "a", toolName: "Write", summary: "</code></pre><b>approved</b>" },
+      T0,
+    );
+    const plain = renderDetailsPlainText(state);
+    expect(plain).not.toContain("<code>");
+    expect(plain).not.toContain("&lt;");
+    expect(plain).toContain("</code></pre><b>approved</b>"); // verbatim, not escaped
+  });
+
+  test("carries the same content as renderDetails, just unformatted", () => {
+    const state = stateWithLines(40);
+    const plain = renderDetailsPlainText(state);
+    expect(plain).toContain("file-0.ts");
+    expect(plain).toContain("file-39.ts");
+    expect(plain.split("\n")).toHaveLength(40);
+  });
+
+  test("an empty turn has the same placeholder as renderDetails", () => {
+    expect(renderDetailsPlainText(createFeedState("s"))).toBe("No activity recorded for this turn.");
   });
 });

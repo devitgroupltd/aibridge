@@ -1,3 +1,5 @@
+import { RateLimitedError } from "./rate-governor.ts";
+
 export interface TelegramMessage {
   message_id: number;
   chat: { id: number };
@@ -91,8 +93,20 @@ export interface ForumTopicSource {
 }
 
 async function parseTelegramResponse<T>(res: Response, method: string): Promise<T> {
-  const body = (await res.json()) as { ok: boolean; result?: T; description?: string };
+  const body = (await res.json()) as {
+    ok: boolean;
+    result?: T;
+    description?: string;
+    parameters?: { retry_after?: number };
+  };
   if (!body.ok) {
+    // §5.4: "honour `retry_after` from the response body exactly" - a real 429 carries it under
+    // `parameters.retry_after` seconds. `RateGovernor` is the only thing that knows what to do
+    // with a `RateLimitedError`; every other failure (network, timeout, 5xx, a non-429 4xx) stays
+    // a plain `Error` and falls into the governor's fixed 1s/2s/4s retry policy instead.
+    if (res.status === 429) {
+      throw new RateLimitedError(body.parameters?.retry_after ?? 1);
+    }
     throw new Error(`Telegram ${method} failed: ${body.description ?? JSON.stringify(body)}`);
   }
   return body.result as T;
@@ -192,6 +206,25 @@ export class TelegramClient implements UpdatesSource {
       }),
     });
     await parseTelegramResponse(res, "editMessageText");
+  }
+
+  /** §5.5: a `details` payload over Telegram's 4096-character message limit goes as a document
+   * instead ("Diffs always go as documents; a diff rendered into a chat bubble on a phone is
+   * unreadable and burns budget" - the same reasoning applies to an oversized activity log).
+   * Multipart, unlike every other method here, since `sendDocument` takes a file rather than a
+   * JSON body - plain `FormData`/`Blob` from the global `fetch` implementation, no extra dependency. */
+  async sendDocument(
+    chatId: string | number,
+    messageThreadId: number | undefined,
+    filename: string,
+    content: string,
+  ): Promise<{ message_id: number }> {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    if (messageThreadId !== undefined) form.append("message_thread_id", String(messageThreadId));
+    form.append("document", new Blob([content], { type: "text/plain" }), filename);
+    const res = await fetch(this.url("sendDocument"), { method: "POST", body: form });
+    return parseTelegramResponse(res, "sendDocument");
   }
 
   async setMyCommands(chatId: string | number, commands: readonly BotCommand[]): Promise<void> {
