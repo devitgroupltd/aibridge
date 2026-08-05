@@ -1,7 +1,7 @@
 ---
-version: 0.35.0
+version: 0.36.0
 status: solid
-last_modified_utc: 2026-08-05T06:00:00Z
+last_modified_utc: 2026-08-05T06:15:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,21 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.36.0 (2026-08-05): Ran Phase 6a's own exit drill live (scenarios 24/37 under a real
+    restart, not just their unit tests) - triggered a real permission prompt on
+    give-me-a-unique-one-line's own topic (a Bash git-commit ask), killed the dev Bridge alone via
+    `Stop-Process` while the prompt sat unanswered, and confirmed zero survivors again (no
+    claude.exe/bun.exe left for that session - consistent with the 2026-08-03 scenario-37
+    measurement, this time with a prompt outstanding rather than mid-turn only). On restart,
+    reconciliation posted both expected notices in order - \"The pending question was lost - please
+    re-ask.\" then \"Session ... resumed.\" - and set the row back to `working` per
+    `resumeSession`'s `awaiting_input` branch, not left wedged. Tapping the now-stale permission
+    button afterward answered the callback (spinner cleared) and produced no new message and no log
+    error - `resolvePermission` returning undefined for an id the restarted process's in-memory
+    registry never held, exactly the designed silent-no-op (§9 scenarios 6-7's same discipline
+    applied to a lost-on-restart id rather than an expired one). No dead/hanging button, no crash,
+    no double-delivery. Phase 6a's exit criterion is now met on its own terms, live, not just via
+    the unit-tested reconcile() decision function."
   - "0.35.0 (2026-08-05): Closed the remaining two Phase 6a items besides quiet mode's own
     threshold (below) and §7.4's stale-inbound handling: (1) **Automatic quiet mode** (§5.4 point
     4). `RateGovernor` gained `p2PressureExceeded()` - a rolling 60s window of P2 outcomes,
@@ -3752,9 +3767,13 @@ unattended running defensible, and **should not be skipped just because Phases 1
   `FeedCoalescer`'s doubled interval and a one-time "feed throttled" notice. Unit-tested with a
   fake clock; not yet live-forced with a real four-session feed storm.
 - **Exit:** scenarios 24 and 37 pass under a real restart - kill the Bridge mid-turn with a permission
-  prompt open, restart it, and the system converges to a correct state with no dead buttons. **Not
-  yet run** - every other 6a item is done or live-verified on its own terms, but this specific
-  mid-turn-restart drill hasn't been performed as its own pass.
+  prompt open, restart it, and the system converges to a correct state with no dead buttons.
+  **Done (0.36.0), live.** Killed the dev Bridge alone with a real Bash-commit permission prompt
+  outstanding on a live session; zero survivors (reconfirms 2026-08-03's scenario-37 measurement,
+  now with a prompt pending); on restart, reconciliation posted "the pending question was lost -
+  please re-ask" then "resumed", set the row back to `working`, and re-added routing; tapping the
+  stale permission button afterward answered the callback with no new message and no error - a
+  silent no-op, not a hang. Phase 6a is now fully closed.
 
 **6b, the migration (§7.6),** triggered by wanting unattended overnight runs, by prompts-per-hour
 showing an uncomfortably broad allowlist, or by adding a repo other than this one:
