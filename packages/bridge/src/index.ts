@@ -23,6 +23,7 @@ import {
 } from "./commands.ts";
 import { loadConfig, STATE_DIR } from "./config.ts";
 import { buildDetailsKeyboard, parseDetailsCallback } from "./details-button.ts";
+import { buildVoiceModelKeyboard, listAvailableVoiceModels, resolveVoiceModelCallback } from "./voice-model.ts";
 import { FeedCoalescer } from "./feed-coalescer.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
@@ -1000,6 +1001,53 @@ async function main(): Promise<void> {
       .catch((err) => log("WARN", `sendMessage (/budget) failed: ${(err as Error).message}`));
   }
 
+  /** `/voice [<model>]` - control-topic-only (voice-model.ts), same reasoning as `/budget`/`/ls`:
+   * there is exactly one whisper-server for the whole Bridge, not one per session, so there is
+   * nothing to scope this to besides the fleet itself. Bare `/voice` lists what's on disk with a
+   * button per model (current one checkmarked); `/voice <model>` or a button tap switches live via
+   * `/load` - live-verified 2026-08-05, no process restart needed. */
+  function handleVoiceModelCommand(cmd: Extract<FleetCommand, { kind: "voice" }>, topicId: number | undefined): void {
+    if (!voiceServer) {
+      confirmSessionCommand(topicId, "Voice input isn't enabled on this Bridge (VOICE_ENABLED=false).");
+      return;
+    }
+    const voiceDir = path.dirname(config.voice.modelPath);
+    const models = listAvailableVoiceModels(voiceDir);
+    const currentName = path.basename(voiceServer.currentModelPath()).replace(/^ggml-/, "").replace(/\.bin$/, "");
+    if (!cmd.model) {
+      if (models.length === 0) {
+        confirmSessionCommand(topicId, `No Whisper models found under ${voiceDir} - run scripts/setup-windows.ps1's voice step.`);
+        return;
+      }
+      controlBot
+        .sendMessage(config.supergroupChatId, topicId, `Current model: ${currentName}\nChoose a model:`, { inline_keyboard: buildVoiceModelKeyboard(models, currentName) })
+        .catch((err) => log("WARN", `sendMessage (/voice) failed: ${(err as Error).message}`));
+      return;
+    }
+    void applyVoiceModelSwitch(topicId, cmd.model, voiceDir, models, currentName);
+  }
+
+  /** Re-validates `name` against a freshly re-scanned model list rather than trusting the caller
+   * (a typed `/voice <name>` argument is untrusted text; a button tap is re-checked too, since the
+   * list on disk could have changed between the button being posted and tapped). */
+  async function applyVoiceModelSwitch(topicId: number | undefined, name: string, voiceDir: string, models: readonly string[], currentName: string): Promise<void> {
+    if (!voiceServer) return;
+    if (name === currentName) {
+      confirmSessionCommand(topicId, `🎤 Already using "${name}".`);
+      return;
+    }
+    if (!models.includes(name)) {
+      confirmSessionCommand(topicId, `Unknown model "${name}" - available: ${models.length > 0 ? models.join(", ") : "(none found)"}`);
+      return;
+    }
+    try {
+      await voiceServer.switchModel(path.join(voiceDir, `ggml-${name}.bin`));
+      confirmSessionCommand(topicId, `🎤 Switched to "${name}".`);
+    } catch (err) {
+      confirmSessionCommand(topicId, `Failed to switch to "${name}": ${(err as Error).message}`);
+    }
+  }
+
   /** §4.2's `/kill`/`/rm`: no `reply` will ever land for this topic again, so the two "Claude is
    * working" signals (§5) need an explicit stop rather than their normal reply-triggered one - left
    * running, the typing indicator nags Telegram for up to its 30-minute backstop and the "🤔
@@ -1098,13 +1146,25 @@ async function main(): Promise<void> {
    * it locally against the Bridge's own supervised whisper-server, and posts a Send/Re-record/
    * Type-instead card - never dispatched directly. Whisper's accuracy varies a lot by language
    * (Azerbaijani meaningfully weaker than English/Russian/Ukrainian per the voice-input design
-   * decision), so showing the transcript before it reaches a live session is load-bearing. */
+   * decision), so showing the transcript before it reaches a live session is load-bearing.
+   *
+   * A real recording is several seconds of download+ffmpeg+whisper before there's anything to
+   * show - same "nothing visible is happening" gap thinking-placeholder.ts exists to close for a
+   * turn, and observed live the same way (an 8s voice note with no feedback at all reads as
+   * "did this even work?"). Same fix: post a "🎤 Transcribing..." placeholder immediately, then
+   * edit that same message into the real confirm card - one message per voice note, not two. */
   async function handleVoiceMessage(voice: { file_id: string; duration: number }, threadId: number | undefined, messageId: number, from: string): Promise<void> {
     if (!config.voice.enabled) {
       confirmSessionCommand(threadId, "Voice input isn't set up on this Bridge yet - see scripts/setup-windows.ps1's voice step, then set VOICE_ENABLED=true.");
       return;
     }
+    let placeholderId: number | undefined;
     try {
+      const placeholder = await feedGovernor.scheduleAsync("P1", () =>
+        controlBot.sendMessage(config.supergroupChatId, threadId, "🎤 Transcribing..."),
+      );
+      placeholderId = placeholder.message_id;
+
       const { file_path } = await controlBot.getFile(voice.file_id);
       const oggBytes = await controlBot.downloadFile(file_path);
       const { text } = await transcribeVoiceNote(
@@ -1113,13 +1173,20 @@ async function main(): Promise<void> {
       );
       const id = randomUUID().slice(0, 8);
       const preview = text.length > 0 ? text : "(nothing recognised - try again?)";
-      const sent = await feedGovernor.scheduleAsync("P1", () =>
-        controlBot.sendMessage(config.supergroupChatId, threadId, `🎤 ${preview}`, { inline_keyboard: buildVoiceConfirmKeyboard(id) }),
-      );
-      voiceConfirmRegistry.add({ id, threadId, messageId, transcript: text, from, confirmCardMessageId: sent.message_id });
+      if (controlBot.editMessageText) {
+        await feedGovernor.scheduleAsync("P1", () =>
+          controlBot.editMessageText!(config.supergroupChatId, placeholderId!, `🎤 ${preview}`, { inline_keyboard: buildVoiceConfirmKeyboard(id) }),
+        );
+      }
+      voiceConfirmRegistry.add({ id, threadId, messageId, transcript: text, from, confirmCardMessageId: placeholderId });
     } catch (err) {
       log("WARN", `voice transcription failed: ${(err as Error).message}`);
-      confirmSessionCommand(threadId, "Couldn't transcribe that voice note - try again, or just type it.");
+      const failText = "Couldn't transcribe that voice note - try again, or just type it.";
+      if (placeholderId !== undefined && controlBot.editMessageText) {
+        await controlBot.editMessageText(config.supergroupChatId, placeholderId, failText).catch(() => {});
+      } else {
+        confirmSessionCommand(threadId, failText);
+      }
     }
   }
 
@@ -1487,6 +1554,10 @@ async function main(): Promise<void> {
         handleReposCommand(fleetCmd, threadId);
         return;
       }
+      if (fleetCmd.kind === "voice") {
+        handleVoiceModelCommand(fleetCmd, threadId);
+        return;
+      }
       handlePauseCommand(fleetCmd, threadId, currentSlug);
       return;
     }
@@ -1769,9 +1840,9 @@ async function main(): Promise<void> {
         }
 
         // Voice input's own confirm keyboard (voice-confirm.ts) - "vc:", a fresh namespace
-        // alongside "sc:"/"fc:"/"d:". "Re-record" and "Type instead" both discard the transcript;
-        // they differ only in which follow-up text is shown, so both fall into the same finalize
-        // call below rather than needing separate registry/dispatch handling.
+        // alongside "sc:"/"fc:"/"d:". "Re-record"/"Type instead"/"Cancel" all discard the
+        // transcript; they differ only in which follow-up text is shown, so all three fall into
+        // the same finalize call below rather than needing separate registry/dispatch handling.
         const voiceConfirmAction = callbackQuery.data ? resolveVoiceConfirmCallback(callbackQuery.data) : null;
         if (voiceConfirmAction) {
           const pending = voiceConfirmRegistry.resolve(voiceConfirmAction.id);
@@ -1786,8 +1857,22 @@ async function main(): Promise<void> {
           const doneText =
             voiceConfirmAction.action === "rerecord"
               ? "🔁 Discarded - send another voice note whenever you're ready."
-              : "✏️ Discarded - go ahead and type it.";
+              : voiceConfirmAction.action === "type"
+                ? "✏️ Discarded - go ahead and type it."
+                : "❌ Cancelled.";
           void finalizeVoiceConfirmMessage(pending, doneText);
+          return;
+        }
+
+        // `/voice`'s own model-picker keyboard (voice-model.ts) - "vm:", a fresh namespace
+        // alongside "vc:"/"d:"/"sc:"/"fc:". Re-scans the model list rather than reusing whatever
+        // was on disk when the button was posted - see applyVoiceModelSwitch's own doc comment.
+        const voiceModelName = callbackQuery.data ? resolveVoiceModelCallback(callbackQuery.data) : null;
+        if (voiceModelName && voiceServer) {
+          const voiceDir = path.dirname(config.voice.modelPath);
+          const models = listAvailableVoiceModels(voiceDir);
+          const currentName = path.basename(voiceServer.currentModelPath()).replace(/^ggml-/, "").replace(/\.bin$/, "");
+          void applyVoiceModelSwitch(threadId, voiceModelName, voiceDir, models, currentName);
           return;
         }
 

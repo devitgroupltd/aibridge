@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 /**
@@ -46,6 +47,7 @@ export interface BridgeConfig {
     whisperServerExe: string;
     modelPath: string;
     port: number;
+    threads: number;
   };
 }
 
@@ -81,8 +83,16 @@ export function loadConfig(envPath = path.join(SECRETS_DIR, ".env")): BridgeConf
       // Live-verified 2026-08-05: whisper-bin-x64.zip extracts into its own Release\ subfolder,
       // not flat - see setup-windows.ps1's matching comment.
       whisperServerExe: parsed.WHISPER_SERVER_EXE || path.join(STATE_DIR, "voice", "Release", "whisper-server.exe"),
-      modelPath: parsed.WHISPER_MODEL_PATH || path.join(STATE_DIR, "voice", "ggml-medium.bin"),
+      // small, not medium: benchmarked live 2026-08-05 - medium/4t took 16.1s to transcribe an 8s
+      // clip on a 6-core box, small/6t took 3.7s. Model size was the actual bottleneck; the
+      // accuracy gap (small vs medium) is a modest cost given the transcript is always reviewed
+      // before it's sent anyway (voice-confirm.ts) - see the plan's changelog entry for the numbers.
+      modelPath: parsed.WHISPER_MODEL_PATH || path.join(STATE_DIR, "voice", "ggml-small.bin"),
       port: Number(parsed.WHISPER_SERVER_PORT || "8383"),
+      // Defaults to every logical core - inference is brief (a few seconds) and infrequent enough
+      // that saturating the CPU briefly beats a slow transcription. Override via WHISPER_THREADS
+      // if this ever needs to leave headroom for other work happening at the same time.
+      threads: Number(parsed.WHISPER_THREADS || String(os.cpus().length || 4)),
     },
   };
 }

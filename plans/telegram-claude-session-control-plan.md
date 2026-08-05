@@ -1,7 +1,7 @@
 ---
-version: 0.44.0
+version: 0.47.0
 status: solid
-last_modified_utc: 2026-08-05T14:30:00Z
+last_modified_utc: 2026-08-05T15:55:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,54 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.47.0 (2026-08-05): new /voice command - switch the Whisper model from Telegram, requested
+    live after the 0.45.0 model/speed change. Researched first rather than assumed: whisper.cpp's
+    server supports a /load endpoint (multipart, -F model=<path>) that swaps the loaded model with
+    no process restart - live-verified against the real running whisper-server before building on
+    it (loaded medium, confirmed via /inference latency it really switched, loaded small back in
+    under half a second). New voice-model.ts: listAvailableVoiceModels scans the voice directory
+    for ggml-<name>.bin files rather than hardcoding a list (only models actually on disk can ever
+    be offered), buildVoiceModelKeyboard/resolveVoiceModelCallback follow the same vm: callback
+    shape as every other namespace here. voice-transcribe.ts's WhisperServerHandle gained
+    switchModel/currentModelPath (the latter is what makes '/voice' 's list able to checkmark the
+    active model without a second piece of state to keep in sync) and a new loadWhisperModel
+    function. Deliberately Bridge-global, not per-session - there is exactly one whisper-server for
+    the whole Bridge, same reasoning /budget/-ls are control-topic-only. Bare /voice lists models
+    on disk with a button per model; /voice <name> or a button tap switches, re-validating the name
+    against a freshly re-scanned disk listing rather than trusting the tap. 10 new tests
+    (voice-model.test.ts, plus voice-transcribe.test.ts's loadWhisperModel/switchModel cases). 523
+    tests pass monorepo-wide, tsc --noEmit clean. Live-verified end to end against the real
+    Telegram client and the real dev Bridge: /voice listed 'small' as current, tapping medium
+    posted '🎤 Switched to \"medium\".' and a re-sent /voice correctly showed medium as current, a
+    real /inference call afterward confirmed the switch took effect (dramatically slower than
+    small's speed), tapping small switched back cleanly."
+  - "0.46.0 (2026-08-05): voice-confirm.ts's card gained a fourth button, ❌ Cancel, alongside
+    Re-record/Type-instead - requested live after trying the card for real. All three discard
+    actions were already functionally identical past the send/no-send branch (same registry
+    resolve, same finalizeVoiceConfirmMessage call), differing only in which follow-up text is
+    shown, so this was a callback-code/keyboard addition, not new logic: VoiceConfirmAction gained
+    'cancel', the vc: regex gained the c code, and index.ts's doneText ternary gained a third
+    branch ('❌ Cancelled.'). buildVoiceConfirmKeyboard also moved Send onto its own row above the
+    three discard buttons, rather than cramming four buttons into one row - the primary action
+    reads clearer separated from 'don't send this' options. 513 tests pass monorepo-wide, tsc
+    --noEmit clean."
+  - "0.45.0 (2026-08-05): two live-driven fixes to voice input's felt latency. (1) The operator
+    reported an 8s voice note gave zero feedback until the confirm card appeared, indistinguishable
+    from 'did this even work?' - same gap thinking-placeholder.ts already exists to close for a
+    turn. Fixed the same way: index.ts's handleVoiceMessage now posts a '🎤 Transcribing...'
+    placeholder immediately, then edits that same message into the real Send/Re-record/
+    Type-instead card once transcription finishes (or into a failure note) - one message per voice
+    note, not two. (2) The operator then asked whether transcription could be sped up - benchmarked
+    live rather than guessed: an 8s clip took medium-model/4-threads 16.1s, medium/6-threads 13.2s,
+    small-model/6-threads 3.7s. Model size was the real bottleneck, not thread count. Switched the
+    default model to small (config.ts, setup-windows.ps1) and added a threads field defaulting to
+    every logical core (WhisperServerConfig, --threads passed to whisper-server) - both overridable
+    via WHISPER_MODEL_PATH/WHISPER_THREADS. The already-downloaded ggml-medium.bin is left in place,
+    not auto-deleted; setup-windows.ps1 now flags it as unused so the operator can reclaim the
+    ~1.5GB manually if they want to. 4 new tests (config.ts's modelPath/threads default+override
+    cases) - the placeholder-edit behaviour itself isn't separately unit tested, since index.ts's
+    own logic is verified live per this project's existing convention, same as every other index.ts
+    change. 512 tests pass monorepo-wide, tsc --noEmit clean."
   - "0.44.0 (2026-08-05): first real run of scripts/setup-windows.ps1's voice step surfaced a real
     bug: whisper-bin-x64.zip extracts into its own Release\\ subfolder, not flat, so the assumed
     whisperServerExe path (<voice dir>\\whisper-server.exe) never matched what actually landed on
@@ -1703,9 +1751,12 @@ this - Premium's own voice-to-text transcription is a client-side feature for hu
 never exposed via the Bot API, and explicitly disabled anywhere a bot's visibility would matter. So
 this is a Bridge-owned pipeline, not a toggle: `getFile` resolves the note's `file_id` to a CDN path,
 `downloadFile` fetches the raw Ogg/Opus bytes, `ffmpeg` converts to 16kHz mono WAV, and a Bridge-
-supervised **self-hosted Whisper** (`whisper.cpp`'s `whisper-server`, `medium` model, `language: auto`)
+supervised **self-hosted Whisper** (`whisper.cpp`'s `whisper-server`, `small` model, every logical
+core, `language: auto` - the model/thread choice is benchmark-driven, see the 0.45.0 changelog entry)
 transcribes it - chosen over a cloud API (OpenAI/Groq, both viable and cheaper to operate) specifically
-so no audio leaves the machine, at the cost of the setup surface described below.
+so no audio leaves the machine, at the cost of the setup surface described below. The model is
+switchable live from Telegram (`/voice`, added 0.47.0) via whisper-server's own `/load` endpoint -
+no process restart needed - rather than only being fixed at Bridge startup.
 
 **Self-hosted means one long-lived process, not one call.** whisper-server loads its model once at
 startup and is reused for every voice note; spawning a fresh process per message would reload a

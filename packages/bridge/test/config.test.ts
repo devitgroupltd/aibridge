@@ -67,3 +67,29 @@ describe("loadConfig - voice.enabled", () => {
     });
   });
 });
+
+describe("loadConfig - voice.modelPath / threads", () => {
+  test("defaults to the small model, not medium - benchmarked live 2026-08-05 (see the plan's changelog)", async () => {
+    await withEnvFile(REQUIRED, (envPath) => {
+      expect(loadConfig(envPath).voice.modelPath).toMatch(/ggml-small\.bin$/);
+    });
+  });
+
+  test("WHISPER_MODEL_PATH overrides the default", async () => {
+    await withEnvFile(`${REQUIRED}WHISPER_MODEL_PATH=C:\\custom\\model.bin\n`, (envPath) => {
+      expect(loadConfig(envPath).voice.modelPath).toBe("C:\\custom\\model.bin");
+    });
+  });
+
+  test("defaults threads to a positive number (the machine's logical core count) without an override", async () => {
+    await withEnvFile(REQUIRED, (envPath) => {
+      expect(loadConfig(envPath).voice.threads).toBeGreaterThan(0);
+    });
+  });
+
+  test("WHISPER_THREADS overrides the default", async () => {
+    await withEnvFile(`${REQUIRED}WHISPER_THREADS=2\n`, (envPath) => {
+      expect(loadConfig(envPath).voice.threads).toBe(2);
+    });
+  });
+});

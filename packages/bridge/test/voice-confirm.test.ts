@@ -59,6 +59,7 @@ describe("resolveVoiceConfirmCallback", () => {
     expect(resolveVoiceConfirmCallback("vc:abcde123:s")).toEqual({ id: "abcde123", action: "send" });
     expect(resolveVoiceConfirmCallback("vc:abcde123:r")).toEqual({ id: "abcde123", action: "rerecord" });
     expect(resolveVoiceConfirmCallback("vc:abcde123:t")).toEqual({ id: "abcde123", action: "type" });
+    expect(resolveVoiceConfirmCallback("vc:abcde123:c")).toEqual({ id: "abcde123", action: "cancel" });
   });
 
   test("rejects a malformed action code (tampered callback_data)", () => {
@@ -74,12 +75,20 @@ describe("resolveVoiceConfirmCallback", () => {
 });
 
 describe("buildVoiceConfirmKeyboard", () => {
-  test("builds a send/re-record/type row matching resolveVoiceConfirmCallback's own encoding", () => {
+  test("builds send/re-record/type/cancel buttons matching resolveVoiceConfirmCallback's own encoding", () => {
     const keyboard = buildVoiceConfirmKeyboard("abcde123");
     const flat = keyboard.flat().map((btn) => btn.callback_data);
     for (const data of flat) {
       expect(resolveVoiceConfirmCallback(data)).not.toBeNull();
     }
-    expect(flat).toHaveLength(3);
+    expect(flat).toHaveLength(4);
+  });
+
+  test("Send gets its own row, separate from the three discard actions", () => {
+    const keyboard = buildVoiceConfirmKeyboard("abcde123");
+    expect(keyboard).toHaveLength(2);
+    expect(keyboard[0]).toHaveLength(1);
+    expect(resolveVoiceConfirmCallback(keyboard[0]?.[0]?.callback_data ?? "")?.action).toBe("send");
+    expect(keyboard[1]).toHaveLength(3);
   });
 });

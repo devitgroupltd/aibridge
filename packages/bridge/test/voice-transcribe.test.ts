@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import {
   convertOggToWav,
+  loadWhisperModel,
   parseWhisperServerResponse,
   startWhisperServer,
   transcribeVoiceNote,
@@ -15,13 +16,61 @@ describe("startWhisperServer", () => {
   test("a missing binary/model warns once and no-ops, rather than spawning and crash-looping - voice input now defaults to enabled without assuming setup has run", () => {
     const logs: Array<{ level: string; msg: string }> = [];
     const handle = startWhisperServer(
-      { whisperServerExe: "C:\\definitely\\does\\not\\exist\\whisper-server.exe", modelPath: "C:\\definitely\\does\\not\\exist\\model.bin", port: 8383 },
+      { whisperServerExe: "C:\\definitely\\does\\not\\exist\\whisper-server.exe", modelPath: "C:\\definitely\\does\\not\\exist\\model.bin", port: 8383, threads: 4 },
       (level, msg) => logs.push({ level, msg }),
     );
     expect(logs).toHaveLength(1);
     expect(logs[0]?.level).toBe("WARN");
     expect(logs[0]?.msg).toContain("isn't installed yet");
     expect(() => handle.stop()).not.toThrow();
+  });
+
+  test("the no-op handle still reports its configured model, and switchModel rejects rather than silently no-opping", async () => {
+    const handle = startWhisperServer(
+      { whisperServerExe: "C:\\definitely\\does\\not\\exist\\whisper-server.exe", modelPath: "C:\\definitely\\does\\not\\exist\\model.bin", port: 8383, threads: 4 },
+      () => {},
+    );
+    expect(handle.currentModelPath()).toBe("C:\\definitely\\does\\not\\exist\\model.bin");
+    await expect(handle.switchModel("C:\\other\\model.bin")).rejects.toThrow(/isn't running/);
+  });
+});
+
+describe("loadWhisperModel (/load)", () => {
+  let server: ReturnType<typeof Bun.serve>;
+  let serverUrl: string;
+  let statusCode = 200;
+  let lastModelField: string | null = null;
+
+  beforeAll(() => {
+    server = Bun.serve({
+      port: 0,
+      fetch: async (req) => {
+        if (new URL(req.url).pathname === "/load" && req.method === "POST") {
+          const form = await req.formData();
+          lastModelField = String(form.get("model") ?? "");
+          if (statusCode !== 200) return new Response("error", { status: statusCode });
+          return new Response("Load was successful!"); // live-verified 2026-08-05 response text
+        }
+        return new Response("not found", { status: 404 });
+      },
+    });
+    serverUrl = `http://127.0.0.1:${server.port}`;
+  });
+
+  afterAll(() => {
+    server.stop(true);
+  });
+
+  test("posts the model path as a multipart form field", async () => {
+    statusCode = 200;
+    await loadWhisperModel(serverUrl, "C:\\models\\ggml-medium.bin");
+    expect(lastModelField).toBe("C:\\models\\ggml-medium.bin");
+  });
+
+  test("throws with the status on a non-2xx response", async () => {
+    statusCode = 500;
+    await expect(loadWhisperModel(serverUrl, "C:\\models\\ggml-medium.bin")).rejects.toThrow(/500/);
+    statusCode = 200;
   });
 });
 

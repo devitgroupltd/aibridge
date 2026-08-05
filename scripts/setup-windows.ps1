@@ -230,10 +230,11 @@ $whisperZip = Join-Path $voiceDir 'whisper-bin-x64.zip'
 # SDL2.dll - all of which need to stay siblings of the exe for Windows DLL loading, so this points
 # INTO Release\ rather than moving the exe back out to $voiceDir's own root.
 $whisperServerExe = Join-Path $voiceDir 'Release\whisper-server.exe'
-# medium: ~5GB RAM at runtime, comfortably faster than realtime on CPU, meaningfully better
-# accuracy than small/base - see the voice-input design changelog entry for the full trade-off.
-# Bump to ggml-large-v3-turbo.bin (same URL pattern) later if this machine has GPU headroom to spare.
-$modelFile = Join-Path $voiceDir 'ggml-medium.bin'
+# small, not medium: benchmarked live 2026-08-05 on a 6-core CPU-only box - medium/4-threads took
+# 16.1s to transcribe an 8s clip, small/6-threads took 3.7s. Model size was the real bottleneck;
+# the accuracy gap is a modest cost given the transcript is always reviewed before it's sent
+# anyway (voice-confirm.ts) - see the plan's changelog entry for the full numbers.
+$modelFile = Join-Path $voiceDir 'ggml-small.bin'
 
 New-Item -ItemType Directory -Path $voiceDir -Force | Out-Null
 
@@ -260,14 +261,19 @@ if (-not (Test-Path $whisperServerExe)) {
 
 if (-not (Test-Path $modelFile)) {
     try {
-        Write-Host "Downloading the medium Whisper model (~1.5GB - this can take a while)..." -ForegroundColor Yellow
-        Invoke-WebRequest -Uri 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin' -OutFile $modelFile
-        Add-Result 'whisper model (medium)' 'DOWNLOADED' "$modelFile ($([math]::Round((Get-Item $modelFile).Length / 1MB)) MB)"
+        Write-Host "Downloading the small Whisper model (~500MB)..." -ForegroundColor Yellow
+        Invoke-WebRequest -Uri 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin' -OutFile $modelFile
+        Add-Result 'whisper model (small)' 'DOWNLOADED' "$modelFile ($([math]::Round((Get-Item $modelFile).Length / 1MB)) MB)"
     } catch {
-        Add-Result 'whisper model (medium)' 'FAILED' $_.Exception.Message
+        Add-Result 'whisper model (small)' 'FAILED' $_.Exception.Message
     }
 } else {
-    Add-Result 'whisper model (medium)' 'OK' $modelFile
+    Add-Result 'whisper model (small)' 'OK' $modelFile
+}
+
+$oldMediumModel = Join-Path $voiceDir 'ggml-medium.bin'
+if (Test-Path $oldMediumModel) {
+    Add-Result 'old medium model' 'UNUSED' "$oldMediumModel is no longer the default (superseded by ggml-small.bin above) - safe to delete manually to reclaim ~1.5GB."
 }
 
 # --- 10. $STATE and secrets directories (§7.5) ---------------------------------------------------

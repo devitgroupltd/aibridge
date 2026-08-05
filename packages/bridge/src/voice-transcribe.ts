@@ -23,10 +23,25 @@ export interface WhisperServerConfig {
   whisperServerExe: string;
   modelPath: string;
   port: number;
+  /** whisper-server defaults to 4 threads regardless of the machine's real core count. Benchmarked
+   * live 2026-08-05 on a 6-core box: an 8s clip went medium/4t 16.1s -> medium/6t 13.2s ->
+   * small/6t 3.7s - model size was the real bottleneck, threads a smaller but free win on top of
+   * it. Defaults to every logical core (see config.ts) since inference is brief and infrequent
+   * enough that a few seconds of full CPU beats a slow transcription. */
+  threads: number;
 }
 
 export interface WhisperServerHandle {
   stop(): void;
+  /** Switches the live server to a different model via `/load` (see `loadWhisperModel` below) -
+   * no process restart, so no re-download/re-check of `existsSync` beyond what `/load` itself
+   * does. Rejects, leaving `currentModelPath()` unchanged, if the switch fails - never marks a
+   * failed switch as the new current model. */
+  switchModel(modelPath: string): Promise<void>;
+  /** The model path currently loaded - starts as `cfg.modelPath`, updates only after a successful
+   * `switchModel`. Lets `/voice` (voice-model.ts) show what's active without a second variable
+   * threaded through index.ts to keep in sync. */
+  currentModelPath(): string;
 }
 
 /**
@@ -40,6 +55,8 @@ export function startWhisperServer(cfg: WhisperServerConfig, log: (level: "INFO"
   let stopped = false;
   let child: ChildProcess | null = null;
   let restartTimer: ReturnType<typeof setTimeout> | null = null;
+  let currentModelPath = cfg.modelPath;
+  const serverUrl = `http://127.0.0.1:${cfg.port}`;
 
   // Voice input can default to enabled (see the voice-input design decision) without assuming
   // the setup step has actually been run on this machine - a missing binary/model is reported
@@ -49,14 +66,22 @@ export function startWhisperServer(cfg: WhisperServerConfig, log: (level: "INFO"
       "WARN",
       `voice input is enabled but whisper-server/model isn't installed yet (looked for ${cfg.whisperServerExe} and ${cfg.modelPath}) - run scripts/setup-windows.ps1's voice step, or set VOICE_ENABLED=false to silence this.`,
     );
-    return { stop() {} };
+    return {
+      stop() {},
+      async switchModel() {
+        throw new Error("whisper-server isn't running (binary/model missing at startup)");
+      },
+      currentModelPath: () => currentModelPath,
+    };
   }
 
   const launch = () => {
     if (stopped) return;
-    child = spawn(cfg.whisperServerExe, ["-m", cfg.modelPath, "--port", String(cfg.port), "--host", "127.0.0.1"], {
-      stdio: "ignore",
-    });
+    child = spawn(
+      cfg.whisperServerExe,
+      ["-m", currentModelPath, "--port", String(cfg.port), "--host", "127.0.0.1", "--threads", String(cfg.threads)],
+      { stdio: "ignore" },
+    );
     child.on("exit", (code) => {
       child = null;
       if (stopped) return;
@@ -75,7 +100,26 @@ export function startWhisperServer(cfg: WhisperServerConfig, log: (level: "INFO"
       if (restartTimer) clearTimeout(restartTimer);
       child?.kill();
     },
+    async switchModel(modelPath: string) {
+      await loadWhisperModel(serverUrl, modelPath);
+      currentModelPath = modelPath;
+    },
+    currentModelPath: () => currentModelPath,
   };
+}
+
+/** `/load` - live-verified 2026-08-05 against a real running whisper-server: switching from
+ * `small` to `medium` and back worked with no process restart (confirmed by re-running /inference
+ * and seeing the expected model's latency each time), the smaller model reloading in well under a
+ * second. Multipart, like `sendDocument`/`TelegramClient` elsewhere in this codebase, since the
+ * documented usage is `-F model=<path>` rather than a JSON body. */
+export async function loadWhisperModel(serverUrl: string, modelPath: string): Promise<void> {
+  const form = new FormData();
+  form.append("model", modelPath);
+  const res = await fetch(`${serverUrl}/load`, { method: "POST", body: form });
+  if (!res.ok) {
+    throw new Error(`whisper-server /load failed: ${res.status} ${res.statusText}`);
+  }
 }
 
 /** Telegram voice notes arrive as Ogg/Opus; whisper.cpp expects 16kHz mono PCM. */

@@ -35,7 +35,8 @@ export type FleetCommand =
   | { kind: "autostart"; action: "status" | "install" | "uninstall" }
   | { kind: "repos"; action: "list" }
   | { kind: "repos"; action: "add"; name: string; path?: string; base?: string; model?: string }
-  | { kind: "repos"; action: "rm"; name: string };
+  | { kind: "repos"; action: "rm"; name: string }
+  | { kind: "voice"; model?: string };
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
 
@@ -188,7 +189,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
  * "for us, but invalid" split as `session-commands.ts`'s parser. */
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|settings|autostart|repos)\b(.*)$/s);
+  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|settings|autostart|repos|voice)\b(.*)$/s);
   if (!match) return null;
   const [, cmd, rest] = match as [string, string, string];
   switch (cmd) {
@@ -206,6 +207,10 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return parseAutostart(rest);
     case "repos":
       return parseRepos(rest);
+    case "voice": {
+      const model = rest.trim();
+      return { kind: "voice", model: model.length > 0 ? model : undefined };
+    }
     case "rm":
       return parseRm(rest);
     case "kill":
@@ -432,6 +437,7 @@ export function renderHelp(): string {
     "  /settings - registered repos + concurrency budget",
     "  /repos [list|add <name> [path|git-url] [--base <b>] [--model <m>]|rm <name>] - manage repos.toml",
     "  /autostart [status|install|uninstall] - manage the logon Task Scheduler entry",
+    "  /voice [<model>] - show/switch the Whisper model used for voice-note transcription",
     "",
     "Session commands (inside a session's own topic):",
     `  /model <${MODELS.join("|")}>`,
@@ -466,6 +472,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "settings", description: "Registered repos + concurrency budget" },
     { command: "repos", description: "Manage repos.toml: list|add <name> [path|git-url]|rm <name>" },
     { command: "autostart", description: "Manage the logon Task Scheduler entry: status|install|uninstall" },
+    { command: "voice", description: "Show/switch the Whisper model used for voice-note transcription" },
     { command: "help", description: "Show the full command list" },
     { command: "model", description: `Set model: /model <${MODELS.join("|")}>` },
     { command: "mode", description: `Set mode: /mode <${MODES.join("|")}>` },
