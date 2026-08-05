@@ -1,3 +1,5 @@
+import { readFileSync, existsSync } from "node:fs";
+import path from "node:path";
 import net from "node:net";
 import { DEFAULT_PIPE_PATH, encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protocol";
 import type {
@@ -9,11 +11,13 @@ import type {
   Message,
   PermissionRequestMessage,
   ReplyMessage,
+  SendFileMessage,
   VerdictBehavior,
   VerdictMessage,
 } from "@aibridge/protocol";
 import { buildAskKeyboard, renderAskCard } from "./ask-callback.ts";
 import { AskRegistry, type PendingAsk } from "./ask-registry.ts";
+import { isImagePath, resolveOutboxPath } from "./outbox.ts";
 import { buildPermissionKeyboard, renderPermissionCard } from "./permission-callback.ts";
 import { PermissionRegistry, type PendingPermissionRequest } from "./permission-registry.ts";
 import type { RateGovernor } from "./rate-governor.ts";
@@ -36,6 +40,11 @@ export interface PipeServerOptions {
   governor?: RateGovernor;
   /** The one supergroup chat every session's topics live in (§4.1). */
   chatId: string;
+  /** §5.8: root for `outbox.ts`'s `resolveOutboxPath` - every `send_file` path is checked against
+   * `<stateDir>/sessions/<slug>/outbox/` before anything is read off disk. Optional so existing
+   * tests that never exercise `send_file` don't need to supply one; a `send_file` arriving with no
+   * `stateDir` configured is logged and dropped rather than defaulting to something guessed. */
+  stateDir?: string;
   /** If a "🤔 Thinking..." placeholder is pending for this topic, the reply edits it in place
    * instead of sending a second message (see `thinking-placeholder.ts`). */
   thinkingPlaceholder?: ThinkingPlaceholder;
@@ -124,6 +133,46 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       opts.onReplySent?.(msg.topic_id, msg.text);
     } catch (err) {
       log("ERROR", `failed to deliver reply for slug "${msg.slug}": ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * §5.8: forwards a file Claude saved in its own outbox to Telegram, as a photo if the
+   * extension is one `sendPhoto` renders inline, a document otherwise. Every failure mode here
+   * (no `stateDir` configured, path outside the outbox, file missing, bot methods unavailable) is
+   * logged and dropped rather than thrown - `send_file` has no caller waiting on a result the way
+   * a tool call normally would (the MCP response was already returned "sent" by the channel
+   * server before the Bridge ever sees this).
+   */
+  async function handleSendFile(msg: SendFileMessage): Promise<void> {
+    if (!opts.stateDir) {
+      log("WARN", `send_file for slug "${msg.slug}" dropped - no stateDir configured`);
+      return;
+    }
+    const resolved = resolveOutboxPath(opts.stateDir, msg.slug, msg.path);
+    if (!resolved) {
+      log("WARN", `send_file for slug "${msg.slug}" rejected - "${msg.path}" is outside its outbox`);
+      return;
+    }
+    if (!existsSync(resolved)) {
+      log("WARN", `send_file for slug "${msg.slug}" rejected - "${resolved}" does not exist`);
+      return;
+    }
+    try {
+      const bytes = readFileSync(resolved);
+      const filename = path.basename(resolved);
+      const asPhoto = isImagePath(filename);
+      if (asPhoto && opts.controlBot.sendPhotoFile) {
+        await p1(() => opts.controlBot.sendPhotoFile!(opts.chatId, Number(msg.topic_id), filename, bytes, msg.caption));
+        log("INFO", `sent "${filename}" (${bytes.length} bytes) as a photo for slug "${msg.slug}"`);
+      } else if (opts.controlBot.sendDocumentFile) {
+        await p1(() => opts.controlBot.sendDocumentFile!(opts.chatId, Number(msg.topic_id), filename, bytes, msg.caption));
+        log("INFO", `sent "${filename}" (${bytes.length} bytes) as a document for slug "${msg.slug}"`);
+      } else {
+        log("WARN", `send_file for slug "${msg.slug}" dropped - control bot has no file-sending method`);
+      }
+    } catch (err) {
+      log("ERROR", `failed to deliver send_file for slug "${msg.slug}": ${(err as Error).message}`);
     }
   }
 
@@ -235,6 +284,9 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
         return;
       case "reply":
         void handleReply(msg);
+        return;
+      case "send_file":
+        void handleSendFile(msg);
         return;
       case "permission_request":
         void handlePermissionRequest(msg);

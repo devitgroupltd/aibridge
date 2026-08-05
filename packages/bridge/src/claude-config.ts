@@ -62,6 +62,44 @@ export interface EnsureRegistrationResult {
  * and the server is never spawned at all. See `ensureMcpJsonRegistration` below for where the
  * channel entry actually has to live.
  */
+/**
+ * §5.8: registers the official Microsoft Playwright MCP server (`@playwright/mcp`) at
+ * `projects[canonicalWorktreePath].mcpServers.playwright` - an *ordinary* MCP tool, not the
+ * `aibridge` channel, so (per the correction above) it genuinely does work registered here rather
+ * than needing the worktree's own `.mcp.json`: confirmed by this project's own prior observation
+ * that SeoWrite's `playwright`/`chrome-devtools` entries in `~/.claude.json` work with no
+ * `.mcp.json` at all. `--output-dir` is pointed at this session's own outbox so a screenshot
+ * Claude takes lands exactly where `send_file` is allowed to read from, with no extra "move it
+ * into the outbox" step. Idempotent like `ensureTrustDialogAccepted` - only writes if the entry
+ * would actually change.
+ */
+export function ensurePlaywrightRegistration(
+  claudeJsonPath: string,
+  canonicalWorktreePath: string,
+  outboxDir: string,
+): EnsureRegistrationResult {
+  const doc = JSON.parse(readFileSync(claudeJsonPath, "utf8")) as ClaudeJsonDoc;
+  doc.projects ??= {};
+  const existing = doc.projects[canonicalWorktreePath];
+
+  const serverEntry: McpServerEntry = {
+    command: "npx",
+    args: ["-y", "@playwright/mcp@latest", "--output-dir", outboxDir],
+  };
+
+  if (JSON.stringify(existing?.mcpServers?.playwright) === JSON.stringify(serverEntry)) {
+    return { changed: false };
+  }
+
+  doc.projects[canonicalWorktreePath] = {
+    ...existing,
+    mcpServers: { ...existing?.mcpServers, playwright: serverEntry },
+  };
+
+  writeFileSync(claudeJsonPath, JSON.stringify(doc, null, 2));
+  return { changed: true };
+}
+
 export function ensureTrustDialogAccepted(
   claudeJsonPath: string,
   canonicalWorktreePath: string,

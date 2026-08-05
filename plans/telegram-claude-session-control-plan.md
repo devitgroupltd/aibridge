@@ -1,7 +1,7 @@
 ---
-version: 0.48.0
+version: 0.49.0
 status: solid
-last_modified_utc: 2026-08-05T17:52:00Z
+last_modified_utc: 2026-08-05T20:10:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,43 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.49.0 (2026-08-05): implemented §5.8's outbound screenshots/files - the symmetric other half
+    of §5.6's inbound attachments. Prompted by the operator wanting to visually verify a running
+    web app (start backend+frontend, screenshot at a given viewport/device) or a desktop app (not
+    a URL, Playwright can't see it) from a phone with no other access, and asking to think through
+    the whole \"see what Claude did\" problem rather than just wire one script. New SendFileMessage
+    (protocol) and a send_file channel tool, symmetric to reply but forwarding a path instead of
+    text - the channel server does no validation, the Bridge is the only thing deciding whether a
+    byte reaches Telegram. New outbox.ts: outboxDir/ensureOutboxDir ($STATE/sessions/<slug>/outbox/,
+    eagerly created at launch), resolveOutboxPath (path.resolve then a containment check - rejects
+    ../ escapes, another session's outbox, or any path outside this session's own outbox, silently
+    and before a byte is read), isImagePath (Telegram's own sendPhoto format allowlist, nothing
+    guessed). TelegramClient gained sendPhotoFile/sendDocumentFile (raw-bytes multipart siblings of
+    the existing text-content sendDocument). New assets/screenshot-desktop.ps1 (System.Drawing
+    CopyFromScreen, whole virtual screen or one window by title via EnumWindows/GetWindowRect - a
+    no-match throws rather than silently falling back to full-screen). claude-config.ts gained
+    ensurePlaywrightRegistration: registers the official @playwright/mcp as an *ordinary* per-
+    project MCP tool in ~/.claude.json (not the aibridge channel's .mcp.json path), --output-dir
+    pointed at the session's own outbox. Both directories travel as AIBRIDGE_OUTBOX_DIR/
+    AIBRIDGE_SCREENSHOT_SCRIPT env vars on the channel server's own .mcp.json env block (so its
+    instructions text can name the real path) and on ptyEnv (so Bash commands can reference them
+    directly). mcp__aibridge__send_file pre-approved in the settings baseline like reply; running
+    the screenshot script or a Playwright tool call itself still raises the normal escalation - only
+    the outbox-restricted delivery step is pre-approved. 25 new tests (outbox.test.ts,
+    pipe-server.test.ts's send_file suite, claude-config.test.ts's ensurePlaywrightRegistration
+    suite) plus stub-telegram's new sendPhoto handling, 560 tests pass monorepo-wide, tsc --noEmit
+    clean. Live-verified against the real Bridge and Telegram client: asked a live session (via a
+    new send-to-topic.js one-off) to run the desktop screenshot script and send_file it - two Bash
+    permission prompts approved via tap-topic-button.js (the script's first attempt hit PowerShell's
+    execution policy, retried with -ExecutionPolicy Bypass), then a 952,699-byte PNG arrived as a
+    real inline photo bubble with the caption \"desktop screenshot test\", confirmed both by the
+    Bridge's own \"sent ... as a photo\" log line and by reading the delivered image back (a genuine
+    live capture, not a placeholder). One gap surfaced by the same pass and left open, not silently
+    called done: the Playwright registration is confirmed correctly written to ~/.claude.json and
+    the package runs fine standalone, but the one already-running (--resume'd) session tested
+    against it reported no playwright tools available, no error, no visible trust dialog - needs a
+    genuinely fresh, non-resumed session to confirm before this half counts as verified rather than
+    merely wired up."
   - "0.48.0 (2026-08-05): implemented §5.6's inbound attachments - photos, documents, videos,
     forwarded/uploaded audio files, and video-note bubbles sent to a session topic are downloaded
     and announced by path, no protocol extension needed. Prompted by the operator asking whether
@@ -2447,6 +2484,92 @@ Two deliberate restraints. `OTEL_LOG_USER_PROMPTS` and the tool-content variable
 and tool output would put source code and secrets into a second store for no operational gain. And
 telemetry is strictly read-only input to the Bridge - nothing in the feed or the permission path
 depends on it, so an OTLP listener failure degrades `/ls` and nothing else.
+
+### 5.8 Screenshots and outbound files
+
+§5.6 solved half of "let the operator see what's happening from a phone" - files travelling
+*into* a session. The other half is Claude showing the operator something it produced: a running
+web app at a given viewport, a desktop app that isn't a URL at all, or any other file Claude wants
+to hand back. The `reply` tool (§3.3) is text-only, and §5.5's "details" mechanism only turns
+oversized *text* into a document - neither carries a screenshot's bytes. This closes that gap.
+
+**Outbound path: a new `send_file` channel tool, symmetric to the inbound design.** Claude saves a
+file under this session's own `$AIBRIDGE_OUTBOX_DIR` (`$STATE/sessions/<slug>/outbox/` -
+`outbox.ts`, eagerly created at launch same as the settings file) and calls
+`send_file({ topic_id, path, caption? })`. The channel server does no validation itself - it just
+forwards a `SendFileMessage` over the pipe, exactly as `reply` forwards text. The Bridge is the
+only thing that decides whether a byte reaches Telegram: `resolveOutboxPath` re-resolves `path`
+against `<stateDir>/sessions/<slug>/outbox/` and returns `null` for anything outside it (a `../`
+escape, another session's outbox, an arbitrary absolute path like `~/.ssh/id_rsa`) - rejected
+silently, logged, never read off disk. `mcp__aibridge__send_file` is pre-approved in the settings
+baseline (§6.2) the same way `mcp__aibridge__reply` is, but that pre-approval only covers *calling
+the tool*, not *which files* - the outbox boundary is what actually keeps this from becoming an
+exfiltration path for anything Claude's context could name a path to. Once the Bridge has the
+bytes, it sends a Telegram photo (`sendPhotoFile`, inline-rendered) for `.png`/`.jpg`/`.jpeg`/
+`.webp`, or a document (`sendDocumentFile`) for everything else - deliberately narrow, matching
+Telegram's own `sendPhoto` format allowlist rather than guessing.
+
+**Web screenshots: the official Microsoft Playwright MCP server (`@playwright/mcp`), registered as
+an *ordinary* MCP tool, not the aibridge channel.** `ensurePlaywrightRegistration`
+(`claude-config.ts`) writes `projects[canonicalWorktreePath].mcpServers.playwright` into
+`~/.claude.json` at every launch, `--output-dir` pointed at that session's own outbox so a
+screenshot lands exactly where `send_file` is allowed to read from - no "move it into the outbox"
+step. This is the same registry §2.4 already established genuinely works for *ordinary* MCP tools
+with no `.mcp.json`/consent-dialog dance (SeoWrite's own `playwright`/`chrome-devtools` entries),
+unlike the aibridge channel itself, which needed the worktree's own `.mcp.json` instead (§10.1.2's
+correction). Claude drives the browser normally - navigate, resize the viewport or pick one of the
+143 device presets Playwright MCP ships, screenshot to a path under the outbox, `send_file` it.
+
+**Desktop screenshots: a bundled PowerShell helper, for the "it's not a URL" case.**
+`packages/bridge/assets/screenshot-desktop.ps1` uses `System.Drawing.Graphics.CopyFromScreen` to
+capture either the whole virtual screen (all monitors) or, given `-WindowTitle`, one window's own
+bounds (resolved via `user32.dll`'s `EnumWindows`/`GetWindowRect` - a no-match throws naming what
+was searched for, rather than silently falling back to a full-screen capture that would look right
+while showing the wrong thing). Its resolved path travels to the session as
+`$AIBRIDGE_SCREENSHOT_SCRIPT`, run directly via `Bash` - it is a plain asset file, not a compiled
+binary, so unlike the hook client there is nothing to `bun build --compile` here.
+
+**Both paths' directories travel as env vars, set on three different places for three different
+reasons:** the channel server's own `.mcp.json` `env` block (so its `instructions` text can name
+the real absolute path instead of a placeholder - same "own env, not inherited from the PTY"
+reasoning §2.4 already documents for `AIBRIDGE_SLUG`/`AIBRIDGE_TOPIC`), and the PTY's own `ptyEnv`
+(so a `Bash` command Claude runs directly - the screenshot script, or pointing a dev server's own
+asset dump somewhere - can reference `$AIBRIDGE_OUTBOX_DIR`/`$AIBRIDGE_SCREENSHOT_SCRIPT` without
+being told the path in every prompt).
+
+**What starting the backend/frontend itself needs: nothing new.** A session's `Bash` tool is
+already unrestricted enough to `npm run dev &` in its own worktree: this section is only about the
+missing "now show me" half, not about running the app.
+
+**Permission model.** Running the screenshot script or a Playwright tool call raises the normal
+allow/ask/deny escalation (§6) like any other `Bash`/MCP call not on the baseline allowlist -
+deliberately *not* pre-approved, since "take a screenshot" can be steered into "read this file and
+call it a screenshot" by a sufficiently adversarial prompt. Only the *delivery* tool (`send_file`)
+is pre-approved, and only because its own path is path-restricted regardless of approval.
+
+**RESOLVED, implemented and live-verified 2026-08-05.** New files: `outbox.ts` (`isImagePath`,
+`outboxDir`/`ensureOutboxDir`, `resolveOutboxPath`), `assets/screenshot-desktop.ps1`,
+`SendFileMessage` (protocol), the `send_file` channel tool, `TelegramClient.sendPhotoFile`/
+`sendDocumentFile`, `claude-config.ts`'s `ensurePlaywrightRegistration`. 25 new unit tests
+(`outbox.test.ts`, `pipe-server.test.ts`'s `send_file` suite, `claude-config.test.ts`'s
+`ensurePlaywrightRegistration` suite) plus `stub-telegram`'s new `sendPhoto` handling, 560 tests
+pass monorepo-wide, `tsc --noEmit` clean. Live-verified end to end against the real Bridge and
+Telegram client (`scripts/telegram-automation/send-to-topic.js`, a new one-off): asked a live
+session to run the desktop screenshot script and `send_file` it - two Bash permission prompts
+(the script's own first attempt hit PowerShell's execution policy, retried with
+`-ExecutionPolicy Bypass`) approved via `tap-topic-button.js`, then a 952,699-byte PNG arrived in
+the topic as a real inline photo bubble with the caption "desktop screenshot test", confirmed both
+via the Bridge's own `sent "desktop-test.png" (952699 bytes) as a photo` log line and by reading
+the delivered image back (it showed the live browser window mid-approval-flow - a genuine capture,
+not a placeholder). **One open gap found by the same pass, not yet resolved:** the Playwright MCP
+registration is confirmed correctly written to `~/.claude.json` (verified by reading the file back)
+and the package itself runs fine standalone (`npx @playwright/mcp@latest --help` succeeds, already
+cached), but the one already-running session tested against it (resumed via `--resume`, not a
+fresh launch) reported "No playwright MCP tools are available in this session" with no error and no
+trust-dialog prompt visible in the PTY - most likely the same class of gotcha §2.4/§10.1.2 already
+hit twice (a registration written before spawn was still not what a *resumed* session actually
+loaded); needs a genuinely fresh, non-`--resume` session to confirm one way or the other before
+this half is called done rather than merely wired up.
 
 ---
 

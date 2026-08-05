@@ -3,7 +3,7 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { assertValidBehavior, buildMeta, PROTOCOL_VERSION } from "@aibridge/protocol";
-import type { InboundMessage, Message, PermissionRequestMessage, ReplyMessage, VerdictMessage } from "@aibridge/protocol";
+import type { InboundMessage, Message, PermissionRequestMessage, ReplyMessage, SendFileMessage, VerdictMessage } from "@aibridge/protocol";
 import { PipeClient } from "./pipe-client.ts";
 import { resolveSlug } from "./resolve-slug.ts";
 
@@ -53,6 +53,11 @@ const server = new Server(
       "To answer the operator, call the reply tool and pass back the topic_id from the tag.",
       "Reply as you would in a terminal: the operator is reading on a phone, so be brief.",
       "Do not narrate tool use in replies; the operator already sees a live activity feed.",
+      "To show the operator a screenshot: for a web page, use the playwright MCP tools (already",
+      `registered) and save the PNG under ${process.env.AIBRIDGE_OUTBOX_DIR ?? "<AIBRIDGE_OUTBOX_DIR>"};`,
+      `for a desktop app or the whole screen, run ${process.env.AIBRIDGE_SCREENSHOT_SCRIPT ?? "<AIBRIDGE_SCREENSHOT_SCRIPT>"}`,
+      "via Bash with -Out <a path in that same directory> (and optionally -WindowTitle). Either way,",
+      "then call send_file with that topic_id and the file's path - it is sent as a photo or document.",
     ].join(" "),
   },
 );
@@ -71,30 +76,65 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["topic_id", "text"],
       },
     },
+    {
+      name: "send_file",
+      description:
+        "Send a file (e.g. a screenshot) already saved under $AIBRIDGE_OUTBOX_DIR to the operator's Telegram topic, as a photo or document.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          topic_id: { type: "string" },
+          path: { type: "string", description: "Absolute path under $AIBRIDGE_OUTBOX_DIR." },
+          caption: { type: "string" },
+        },
+        required: ["topic_id", "path"],
+      },
+    },
   ],
 }));
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name !== "reply") {
-    throw new Error(`unknown tool "${request.params.name}"`);
-  }
   const args = request.params.arguments;
-  if (typeof args?.topic_id !== "string" || typeof args?.text !== "string") {
-    throw new Error("reply requires { topic_id: string, text: string }");
+
+  if (request.params.name === "reply") {
+    if (typeof args?.topic_id !== "string" || typeof args?.text !== "string") {
+      throw new Error("reply requires { topic_id: string, text: string }");
+    }
+    // §3.3: forwarding to the Bridge is independent of the pipe's own connection state - if
+    // disconnected, PipeClient queues it (reply is priority) rather than dropping it.
+    const msg: ReplyMessage = {
+      v: PROTOCOL_VERSION,
+      type: "reply",
+      slug,
+      topic_id: args.topic_id,
+      text: args.text,
+    };
+    pipe.send(msg);
+    return { content: [{ type: "text", text: "sent" }] };
   }
 
-  // §3.3: forwarding to the Bridge is independent of the pipe's own connection state - if
-  // disconnected, PipeClient queues it (reply is priority) rather than dropping it.
-  const msg: ReplyMessage = {
-    v: PROTOCOL_VERSION,
-    type: "reply",
-    slug,
-    topic_id: args.topic_id,
-    text: args.text,
-  };
-  pipe.send(msg);
+  if (request.params.name === "send_file") {
+    if (typeof args?.topic_id !== "string" || typeof args?.path !== "string") {
+      throw new Error("send_file requires { topic_id: string, path: string, caption?: string }");
+    }
+    if (args.caption !== undefined && typeof args.caption !== "string") {
+      throw new Error("send_file's caption, if given, must be a string");
+    }
+    // §5.8: the Bridge re-validates `path` against this session's own outbox - the channel server
+    // never decides that on its own, it only forwards what Claude asked for.
+    const msg: SendFileMessage = {
+      v: PROTOCOL_VERSION,
+      type: "send_file",
+      slug,
+      topic_id: args.topic_id,
+      path: args.path,
+      ...(args.caption !== undefined ? { caption: args.caption as string } : {}),
+    };
+    pipe.send(msg);
+    return { content: [{ type: "text", text: "sent" }] };
+  }
 
-  return { content: [{ type: "text", text: "sent" }] };
+  throw new Error(`unknown tool "${request.params.name}"`);
 });
 
 async function forwardInbound(msg: InboundMessage): Promise<void> {

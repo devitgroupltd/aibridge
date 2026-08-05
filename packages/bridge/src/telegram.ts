@@ -85,6 +85,25 @@ export interface SendMessageSource {
     replyMarkup?: InlineKeyboardMarkup,
     parseMode?: "HTML",
   ): Promise<void>;
+  /** §5.8: renders inline in the topic, unlike `sendDocumentFile` below. Optional for the same
+   * reason `editMessageText` is - existing stub/test doubles that never exercise `send_file` stay
+   * unaffected. */
+  sendPhotoFile?(
+    chatId: string | number,
+    messageThreadId: number | undefined,
+    filename: string,
+    bytes: Uint8Array,
+    caption?: string,
+  ): Promise<{ message_id: number }>;
+  /** §5.8: the `sendDocument` fallback for a file `sendPhotoFile` wouldn't render inline (anything
+   * outside Telegram's own photo-format allowlist - see `outbox.ts`'s `isImagePath`). */
+  sendDocumentFile?(
+    chatId: string | number,
+    messageThreadId: number | undefined,
+    filename: string,
+    bytes: Uint8Array,
+    caption?: string,
+  ): Promise<{ message_id: number }>;
 }
 
 export interface SendChatActionSource {
@@ -243,6 +262,42 @@ export class TelegramClient implements UpdatesSource {
     form.append("chat_id", String(chatId));
     if (messageThreadId !== undefined) form.append("message_thread_id", String(messageThreadId));
     form.append("document", new Blob([content], { type: "text/plain" }), filename);
+    const res = await fetch(this.url("sendDocument"), { method: "POST", body: form });
+    return parseTelegramResponse(res, "sendDocument");
+  }
+
+  /** §5.8: an outbound screenshot/image, rendered inline in the topic - same multipart shape as
+   * `sendDocument` above, just a different field name and endpoint. */
+  async sendPhotoFile(
+    chatId: string | number,
+    messageThreadId: number | undefined,
+    filename: string,
+    bytes: Uint8Array,
+    caption?: string,
+  ): Promise<{ message_id: number }> {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    if (messageThreadId !== undefined) form.append("message_thread_id", String(messageThreadId));
+    if (caption) form.append("caption", caption);
+    form.append("photo", new Blob([bytes]), filename);
+    const res = await fetch(this.url("sendPhoto"), { method: "POST", body: form });
+    return parseTelegramResponse(res, "sendPhoto");
+  }
+
+  /** §5.8: an outbound non-image file (or an image in a format Telegram's `sendPhoto` won't take) -
+   * a raw-bytes sibling of `sendDocument`'s text-content overload above. */
+  async sendDocumentFile(
+    chatId: string | number,
+    messageThreadId: number | undefined,
+    filename: string,
+    bytes: Uint8Array,
+    caption?: string,
+  ): Promise<{ message_id: number }> {
+    const form = new FormData();
+    form.append("chat_id", String(chatId));
+    if (messageThreadId !== undefined) form.append("message_thread_id", String(messageThreadId));
+    if (caption) form.append("caption", caption);
+    form.append("document", new Blob([bytes]), filename);
     const res = await fetch(this.url("sendDocument"), { method: "POST", body: form });
     return parseTelegramResponse(res, "sendDocument");
   }

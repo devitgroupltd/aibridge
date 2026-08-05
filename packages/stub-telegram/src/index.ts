@@ -42,14 +42,17 @@ export interface StubUpdate {
 }
 
 export interface SentMessage {
-  method: "sendMessage" | "editMessageText" | "sendDocument";
+  method: "sendMessage" | "editMessageText" | "sendDocument" | "sendPhoto";
   chat_id: number;
   message_thread_id?: number;
   text: string;
   message_id: number;
   reply_markup?: unknown;
-  /** Only set for `sendDocument` (§5.5's oversized-`details` path) - the uploaded file's own name. */
+  /** Set for `sendDocument`/`sendPhoto` (§5.5's oversized-`details` path, §5.8's outbound-file
+   * path) - the uploaded file's own name. */
   filename?: string;
+  /** §5.8: only set for `sendPhoto`/`sendDocument` when the caller passed one. */
+  caption?: string;
 }
 
 export interface PushUpdateInput {
@@ -267,8 +270,41 @@ export class StubTelegramServer {
     const file = form.get("document");
     const text = file instanceof Blob ? await file.text() : "";
     const filename = file instanceof File ? file.name : undefined;
+    const caption = form.get("caption");
     const messageId = state.nextMessageId++;
-    state.sent.push({ method: "sendDocument", chat_id: chatId, message_thread_id: messageThreadId, text, message_id: messageId, filename });
+    state.sent.push({
+      method: "sendDocument",
+      chat_id: chatId,
+      message_thread_id: messageThreadId,
+      text,
+      message_id: messageId,
+      filename,
+      ...(typeof caption === "string" ? { caption } : {}),
+    });
+    return jsonResponse({ ok: true, result: { message_id: messageId, chat: { id: chatId }, text } });
+  }
+
+  /** §5.8: outbound screenshots/images - same multipart shape as `sendDocument` above, a
+   * different field name (`photo`) and method. */
+  private async handleSendPhoto(state: TokenState, req: Request): Promise<Response> {
+    const form = await req.formData();
+    const chatId = Number(form.get("chat_id") ?? 0);
+    const threadRaw = form.get("message_thread_id");
+    const messageThreadId = threadRaw === null ? undefined : Number(threadRaw);
+    const file = form.get("photo");
+    const text = file instanceof Blob ? await file.text() : "";
+    const filename = file instanceof File ? file.name : undefined;
+    const caption = form.get("caption");
+    const messageId = state.nextMessageId++;
+    state.sent.push({
+      method: "sendPhoto",
+      chat_id: chatId,
+      message_thread_id: messageThreadId,
+      text,
+      message_id: messageId,
+      filename,
+      ...(typeof caption === "string" ? { caption } : {}),
+    });
     return jsonResponse({ ok: true, result: { message_id: messageId, chat: { id: chatId }, text } });
   }
 
@@ -338,6 +374,9 @@ export class StubTelegramServer {
     // otherwise consume the request body stream trying (and failing) to parse it as JSON first.
     if (method === "sendDocument") {
       return this.handleSendDocument(state, req);
+    }
+    if (method === "sendPhoto") {
+      return this.handleSendPhoto(state, req);
     }
 
     const body =

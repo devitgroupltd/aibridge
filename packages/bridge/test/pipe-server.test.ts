@@ -1,7 +1,11 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { promises as fsPromises } from "node:fs";
 import net from "node:net";
+import os from "node:os";
+import path from "node:path";
 import { encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protocol";
 import type { HelloFromChannel, HookAskMessage, Message, PermissionRequestMessage, ReplyMessage } from "@aibridge/protocol";
+import { ensureOutboxDir } from "../src/outbox.ts";
 import { startPipeServer } from "../src/pipe-server.ts";
 import { RateGovernor } from "../src/rate-governor.ts";
 import { Routing } from "../src/routing.ts";
@@ -466,5 +470,128 @@ describe("startPipeServer", () => {
       const ok = handle.sendInbound("test-session", "nobody home", { topic_id: "3", msg_id: "1", from: "x", seq: 1 });
       expect(ok).toBe(false);
     });
+  });
+});
+
+describe("send_file", () => {
+  function makeControlBot() {
+    const photoCalls: Array<{ chatId: string | number; threadId?: number; filename: string; bytes: Uint8Array; caption?: string }> = [];
+    const documentCalls: Array<{ chatId: string | number; threadId?: number; filename: string; bytes: Uint8Array; caption?: string }> = [];
+    const controlBot: SendMessageSource = {
+      sendMessage: async () => ({ message_id: 1 }),
+      sendPhotoFile: async (chatId, threadId, filename, bytes, caption) => {
+        photoCalls.push({ chatId, threadId, filename, bytes, caption });
+        return { message_id: 2 };
+      },
+      sendDocumentFile: async (chatId, threadId, filename, bytes, caption) => {
+        documentCalls.push({ chatId, threadId, filename, bytes, caption });
+        return { message_id: 3 };
+      },
+    };
+    return { controlBot, photoCalls, documentCalls };
+  }
+
+  test("a path inside the session's outbox is sent as a photo (image extension)", async () => {
+    const path_ = pipePath();
+    const routing = new Routing();
+    routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+    const { controlBot, photoCalls } = makeControlBot();
+    const stateDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "aibridge-pipe-outbox-"));
+    const outbox = ensureOutboxDir(stateDir, "test-session");
+    const filePath = path.join(outbox, "shot.png");
+    await fsPromises.writeFile(filePath, Buffer.from([1, 2, 3]));
+
+    const handle = startPipeServer({ pipePath: path_, routing, controlBot, chatId: "-1", stateDir });
+    servers.push(handle.server);
+    await waitFor(() => handle.server.listening);
+
+    const { socket } = connectClient(path_);
+    await waitFor(() => socket.readyState === "open");
+    socket.write(
+      encodeMessage({
+        v: PROTOCOL_VERSION,
+        type: "send_file",
+        slug: "test-session",
+        topic_id: "3",
+        path: filePath,
+        caption: "what does this look like?",
+      }),
+    );
+
+    await waitFor(() => photoCalls.length >= 1);
+    expect(photoCalls[0]).toMatchObject({ chatId: "-1", threadId: 3, filename: "shot.png", caption: "what does this look like?" });
+  });
+
+  test("a non-image extension is sent as a document instead", async () => {
+    const path_ = pipePath();
+    const routing = new Routing();
+    routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+    const { controlBot, documentCalls } = makeControlBot();
+    const stateDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "aibridge-pipe-outbox-"));
+    const outbox = ensureOutboxDir(stateDir, "test-session");
+    const filePath = path.join(outbox, "report.pdf");
+    await fsPromises.writeFile(filePath, Buffer.from([9]));
+
+    const handle = startPipeServer({ pipePath: path_, routing, controlBot, chatId: "-1", stateDir });
+    servers.push(handle.server);
+    await waitFor(() => handle.server.listening);
+
+    const { socket } = connectClient(path_);
+    await waitFor(() => socket.readyState === "open");
+    socket.write(
+      encodeMessage({ v: PROTOCOL_VERSION, type: "send_file", slug: "test-session", topic_id: "3", path: filePath }),
+    );
+
+    await waitFor(() => documentCalls.length >= 1);
+    expect(documentCalls[0]).toMatchObject({ filename: "report.pdf" });
+  });
+
+  test("a path outside the session's outbox is silently dropped, never read or sent", async () => {
+    const path_ = pipePath();
+    const routing = new Routing();
+    routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+    const { controlBot, photoCalls, documentCalls } = makeControlBot();
+    const stateDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "aibridge-pipe-outbox-"));
+
+    const handle = startPipeServer({ pipePath: path_, routing, controlBot, chatId: "-1", stateDir });
+    servers.push(handle.server);
+    await waitFor(() => handle.server.listening);
+
+    const { socket } = connectClient(path_);
+    await waitFor(() => socket.readyState === "open");
+    socket.write(
+      encodeMessage({
+        v: PROTOCOL_VERSION,
+        type: "send_file",
+        slug: "test-session",
+        topic_id: "3",
+        path: "C:\\Users\\operator\\.ssh\\id_rsa",
+      }),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(photoCalls.length).toBe(0);
+    expect(documentCalls.length).toBe(0);
+  });
+
+  test("send_file with no stateDir configured is dropped, not thrown", async () => {
+    const path_ = pipePath();
+    const routing = new Routing();
+    routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+    const { controlBot, photoCalls, documentCalls } = makeControlBot();
+
+    const handle = startPipeServer({ pipePath: path_, routing, controlBot, chatId: "-1" });
+    servers.push(handle.server);
+    await waitFor(() => handle.server.listening);
+
+    const { socket } = connectClient(path_);
+    await waitFor(() => socket.readyState === "open");
+    socket.write(
+      encodeMessage({ v: PROTOCOL_VERSION, type: "send_file", slug: "test-session", topic_id: "3", path: "C:\\anything.png" }),
+    );
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    expect(photoCalls.length).toBe(0);
+    expect(documentCalls.length).toBe(0);
   });
 });

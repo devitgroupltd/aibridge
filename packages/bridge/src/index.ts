@@ -478,6 +478,7 @@ async function main(): Promise<void> {
     controlBot,
     governor: feedGovernor,
     chatId: config.supergroupChatId,
+    stateDir: STATE_DIR,
     thinkingPlaceholder,
     onReplySent: (topicId, text) => {
       typingIndicator.stop(topicId);

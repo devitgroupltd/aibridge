@@ -3,8 +3,9 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import * as pty from "node-pty";
-import { canonicalizeWindowsPath, ensureMcpJsonRegistration, ensureTrustDialogAccepted } from "./claude-config.ts";
+import { canonicalizeWindowsPath, ensureMcpJsonRegistration, ensurePlaywrightRegistration, ensureTrustDialogAccepted } from "./claude-config.ts";
 import { STATE_DIR } from "./config.ts";
+import { ensureOutboxDir } from "./outbox.ts";
 import { generateSettings, writeSettingsFile } from "./settings.ts";
 import { ensureWorktree } from "./worktree.ts";
 
@@ -80,6 +81,13 @@ function newestSourceMtimeMs(srcDir: string): number {
  * newer than the existing binary, not just when the binary is missing outright.
  */
 let cachedHookClientPath: string | undefined;
+
+/** §5.8: the desktop-capture helper (System.Drawing screenshot, whole desktop or one named
+ * window) - a plain asset file, not a compiled binary like the hook client, so there is nothing
+ * to build here, only a path to resolve once. */
+function resolveScreenshotScriptPath(): string {
+  return path.resolve(import.meta.dirname, "../assets/screenshot-desktop.ps1");
+}
 
 function resolveHookClientBinary(): string {
   if (cachedHookClientPath) return cachedHookClientPath;
@@ -251,6 +259,18 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   const canonicalPath = canonicalizeWindowsPath(worktreePath);
   ensureTrustDialogAccepted(claudeJsonPath, canonicalPath);
 
+  // §5.8: created eagerly, same as the settings file below, so the path named in
+  // AIBRIDGE_OUTBOX_DIR (and handed to Playwright's --output-dir just below) always exists by the
+  // time Claude's first turn could possibly try to write to it.
+  const outboxPath = ensureOutboxDir(opts.stateDir ?? STATE_DIR, opts.slug);
+  const { changed: playwrightChanged } = ensurePlaywrightRegistration(claudeJsonPath, canonicalPath, outboxPath);
+  log(
+    "INFO",
+    playwrightChanged
+      ? `registered playwright MCP server in ~/.claude.json (output-dir ${outboxPath})`
+      : "playwright MCP server already registered in ~/.claude.json",
+  );
+
   const debugLogFile = process.env.AIBRIDGE_DEBUG_LOG_FILE;
   const { changed } = ensureMcpJsonRegistration(worktreePath, {
     command: resolveBunExecutable(),
@@ -264,6 +284,11 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
     env: {
       AIBRIDGE_SLUG: opts.slug,
       AIBRIDGE_TOPIC: String(opts.topicId),
+      // §5.8: read by the channel server's own instructions text so Claude is told the real
+      // absolute path, not a placeholder - same "own env, not inherited" reasoning as the two
+      // vars above.
+      AIBRIDGE_OUTBOX_DIR: outboxPath,
+      AIBRIDGE_SCREENSHOT_SCRIPT: resolveScreenshotScriptPath(),
       // Claude Code does not surface an MCP server's stderr anywhere visible, so this is the only
       // way to observe the channel server's own log lines during manual verification (Stage 7).
       ...(debugLogFile ? { AIBRIDGE_DEBUG_LOG_FILE: debugLogFile } : {}),
@@ -299,7 +324,16 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
       cols: 120,
       rows: 40,
       cwd: worktreePath,
-      env: ptyEnv({ AIBRIDGE_SLUG: opts.slug, AIBRIDGE_TOPIC: String(opts.topicId) }),
+      // §5.8: also on the PTY's own env (not just the channel server's) so a Bash/PowerShell
+      // command Claude runs directly - e.g. the desktop-screenshot script's -Out argument, or
+      // pointing a dev server's own asset dump at it - can reference $AIBRIDGE_OUTBOX_DIR without
+      // needing to be told the path in every prompt.
+      env: ptyEnv({
+        AIBRIDGE_SLUG: opts.slug,
+        AIBRIDGE_TOPIC: String(opts.topicId),
+        AIBRIDGE_OUTBOX_DIR: outboxPath,
+        AIBRIDGE_SCREENSHOT_SCRIPT: resolveScreenshotScriptPath(),
+      }),
     },
   );
 

@@ -42,6 +42,19 @@ export interface Ack extends EnvelopeBase {
   type: "ack";
 }
 
+/**
+ * §5.8's outbound counterpart to attachment-inbox.ts's inbound path: `path` must resolve inside
+ * this session's own `$STATE/sessions/<slug>/outbox/` (enforced Bridge-side by `outbox.ts`, never
+ * trusted from the channel server) - a screenshot Claude saved there, or any other file it wants
+ * the operator to see, gets forwarded as a Telegram photo or document depending on its extension.
+ */
+export interface SendFileMessage extends EnvelopeBase {
+  type: "send_file";
+  topic_id: string;
+  path: string;
+  caption?: string;
+}
+
 export interface ChannelMetaFields {
   topic_id: string;
   msg_id: string;
@@ -163,4 +176,5 @@ export type Message =
   | VerdictMessage
   | HookEventMessage
   | HookAskMessage
-  | HookAnswerMessage;
+  | HookAnswerMessage
+  | SendFileMessage;

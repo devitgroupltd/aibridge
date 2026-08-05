@@ -109,6 +109,7 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         "TodoWrite",
         "NotebookRead",
         "mcp__aibridge__reply",
+        "mcp__aibridge__send_file",
         "Bash(git status *)",
         "Bash(git diff *)",
         "Bash(git log *)",
