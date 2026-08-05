@@ -16,6 +16,8 @@ export interface StubMessage {
   message_thread_id?: number;
   text?: string;
   from?: { id: number; username?: string; first_name?: string };
+  /** Unix seconds - mirrors the real Bot API field aibridge's §7.4 stale-inbound check reads. */
+  date: number;
 }
 
 export interface StubCallbackQuery {
@@ -44,6 +46,9 @@ export interface PushUpdateInput {
   text: string;
   messageThreadId?: number;
   from?: { id: number; username?: string; first_name?: string };
+  /** Unix seconds - defaults to "now", override to simulate a backlog message that arrived while
+   * the Bridge was offline (§7.4's stale-inbound path). */
+  date?: number;
 }
 
 export interface PushCallbackQueryInput {
@@ -110,6 +115,7 @@ export class StubTelegramServer {
         message_thread_id: input.messageThreadId,
         text: input.text,
         from: input.from,
+        date: input.date ?? Math.floor(Date.now() / 1000),
       },
     };
     state.pendingUpdates.push(update);

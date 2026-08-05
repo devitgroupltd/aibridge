@@ -8,6 +8,12 @@
 
 export interface FeedCoalescerOptions {
   activeSessionCount: () => number;
+  /** §5.4 point 4's automatic quiet mode: while this returns true, the coalescing interval
+   * doubles. Optional and defaulted to "never quiet" so every existing/test caller that doesn't
+   * pass it keeps today's behaviour unchanged. Expected to be backed by
+   * `RateGovernor.p2PressureExceeded()` - this class only consumes the signal, it doesn't compute
+   * it, so the pressure calculation stays unit-testable on its own. */
+  quietMode?: () => boolean;
   now?: () => number;
   setTimeoutFn?: (fn: () => void, ms: number) => unknown;
   clearTimeoutFn?: (handle: unknown) => void;
@@ -38,7 +44,8 @@ export class FeedCoalescer {
   }
 
   private interval(): number {
-    return Math.max(3000, 3000 * this.opts.activeSessionCount());
+    const base = Math.max(3000, 3000 * this.opts.activeSessionCount());
+    return this.opts.quietMode?.() ? base * 2 : base;
   }
 
   /** Call on every card re-render (i.e. on every hook event that changed the state), not just

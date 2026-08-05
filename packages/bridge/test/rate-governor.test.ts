@@ -209,4 +209,46 @@ describe("RateGovernor", () => {
     await flushMicrotasks();
     expect(attempts).toBe(1);
   });
+
+  describe("p2PressureExceeded (§5.4 point 4's quiet-mode trigger)", () => {
+    test("never reports pressure below the minimum sample count, even at a 100% drop rate", () => {
+      const clock = makeClock(0);
+      // Zero-capacity feed bucket: every P2 attempt drops immediately, so this isolates the
+      // sample-count guard from the drop-rate arithmetic.
+      const governor = new RateGovernor({ capacity: 0, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+      governor.schedule("P2", async () => {});
+      governor.schedule("P2", async () => {});
+      governor.schedule("P2", async () => {});
+      expect(governor.droppedP2Count).toBe(3);
+      expect(governor.p2PressureExceeded()).toBe(false); // below MIN_SAMPLES_FOR_PRESSURE (4)
+    });
+
+    test("reports pressure once drops exceed 50% of a window with enough samples", () => {
+      const clock = makeClock(0);
+      const governor = new RateGovernor({ capacity: 0, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+      for (let i = 0; i < 4; i++) governor.schedule("P2", async () => {}); // 4/4 dropped - 100%
+      expect(governor.p2PressureExceeded()).toBe(true);
+    });
+
+    test("does not report pressure at exactly 50% - the plan says 'exceed', not 'reach'", () => {
+      const clock = makeClock(0);
+      const governor = new RateGovernor({ capacity: 2, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+      // Bucket starts with 2 tokens: first 2 attempts succeed, next 2 drop - exactly 50%.
+      governor.schedule("P2", async () => {});
+      governor.schedule("P2", async () => {});
+      governor.schedule("P2", async () => {});
+      governor.schedule("P2", async () => {});
+      expect(governor.droppedP2Count).toBe(2);
+      expect(governor.p2PressureExceeded()).toBe(false);
+    });
+
+    test("drops older than the 60s window stop counting, so pressure can clear on its own", () => {
+      const clock = makeClock(0);
+      const governor = new RateGovernor({ capacity: 0, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+      for (let i = 0; i < 4; i++) governor.schedule("P2", async () => {});
+      expect(governor.p2PressureExceeded()).toBe(true);
+      clock.advance(60_001); // every one of those 4 outcomes is now outside the window
+      expect(governor.p2PressureExceeded()).toBe(false); // back below the minimum sample count
+    });
+  });
 });

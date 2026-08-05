@@ -88,6 +88,14 @@ export interface RateGovernorOptions {
   log?: LogFn;
 }
 
+/** §5.4 point 4's window: 60s, and a minimum sample count before the drop rate means anything -
+ * one dropped edit out of one attempt is a 100% "rate" that says nothing about pressure, so
+ * quiet mode never engages below `MIN_SAMPLES_FOR_PRESSURE` P2 attempts in the window (§9's
+ * silent-wrong discipline: an unguarded ratio on tiny volume would false-trigger on ordinary,
+ * healthy single-session traffic). */
+const QUIET_MODE_WINDOW_MS = 60_000;
+const MIN_SAMPLES_FOR_PRESSURE = 4;
+
 export class RateGovernor {
   private readonly controlBucket: TokenBucket;
   private readonly feedBucket: TokenBucket;
@@ -95,7 +103,11 @@ export class RateGovernor {
   private readonly p1Queue: ControlTask[] = [];
   private readonly setTimeoutFn: (fn: () => void, ms: number) => unknown;
   private readonly log: LogFn;
+  private readonly now: () => number;
   private p2DroppedCount = 0;
+  /** Rolling window of recent P2 outcomes, pruned to the last 60s on every read/write - backs
+   * `p2PressureExceeded()` (§5.4 point 4: "if P2 drops exceed 50% over a 60s window"). */
+  private readonly p2Outcomes: Array<{ atMs: number; dropped: boolean }> = [];
 
   constructor(opts: RateGovernorOptions = {}) {
     const now = opts.now ?? Date.now;
@@ -105,6 +117,7 @@ export class RateGovernor {
     this.feedBucket = new TokenBucket(capacity, refillIntervalMs, now);
     this.setTimeoutFn = opts.setTimeoutFn ?? ((fn, ms) => setTimeout(fn, ms));
     this.log = opts.log ?? (() => {});
+    this.now = now;
   }
 
   /** P0/P1 are queued when their bucket is empty and drained as tokens free up (never dropped);
@@ -120,15 +133,42 @@ export class RateGovernor {
   private scheduleP2(fn: () => Promise<void>): void {
     if (!this.feedBucket.tryTake()) {
       this.p2DroppedCount += 1;
+      this.recordP2Outcome(true);
       this.log("WARN", "P2 feed edit dropped - feed bucket empty");
       return;
     }
+    this.recordP2Outcome(false);
     fn().catch((err) => {
       if (err instanceof RateLimitedError) {
         this.feedBucket.pauseFor(err.retryAfterSec * 1000);
       }
       // Never retried, success or failure (§5.4): a newer frame supersedes a dropped one anyway.
     });
+  }
+
+  private recordP2Outcome(dropped: boolean): void {
+    const nowMs = this.now();
+    this.p2Outcomes.push({ atMs: nowMs, dropped });
+    this.prunePressureWindow(nowMs);
+  }
+
+  private prunePressureWindow(nowMs: number): void {
+    while (this.p2Outcomes.length > 0 && nowMs - this.p2Outcomes[0]!.atMs > QUIET_MODE_WINDOW_MS) {
+      this.p2Outcomes.shift();
+    }
+  }
+
+  /** §5.4 point 4's quiet-mode trigger: more than half of P2 attempts in the last 60s were
+   * dropped. Below `MIN_SAMPLES_FOR_PRESSURE` attempts in the window this always reads false -
+   * there isn't enough signal yet to call it pressure rather than noise. Pure and clock-driven
+   * (via the same injectable `now` as the token buckets), so a caller can poll it on any cadence
+   * without this class needing its own timer. */
+  p2PressureExceeded(): boolean {
+    const nowMs = this.now();
+    this.prunePressureWindow(nowMs);
+    if (this.p2Outcomes.length < MIN_SAMPLES_FOR_PRESSURE) return false;
+    const droppedCount = this.p2Outcomes.filter((o) => o.dropped).length;
+    return droppedCount / this.p2Outcomes.length > 0.5;
   }
 
   private enqueueControl(task: ControlTask): void {

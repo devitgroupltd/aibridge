@@ -124,4 +124,51 @@ describe("FeedCoalescer", () => {
     clock.advance(60_000);
     expect(flushCount).toBe(0);
   });
+
+  test("§5.4 point 4: quiet mode doubles the coalescing interval", () => {
+    const clock = makeClock(0);
+    const flushes: string[] = [];
+    const coalescer = new FeedCoalescer({
+      activeSessionCount: () => 1,
+      quietMode: () => true,
+      now: clock.now,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+      onFlush: (_slug, text) => flushes.push(text),
+    });
+
+    coalescer.notify("s1", "a"); // the first notify for a fresh slug always flushes immediately
+    expect(flushes).toEqual(["a"]);
+
+    coalescer.notify("s1", "b"); // now timed against the interval - doubled, since quiet mode is on
+    clock.advance(3000); // the ordinary 3s interval - not enough while quiet mode is active
+    expect(flushes).toEqual(["a"]);
+
+    clock.advance(3000); // 6s total, matching the doubled interval
+    expect(flushes).toEqual(["a", "b"]);
+  });
+
+  test("quiet mode clearing mid-wait does not retroactively shorten an already-armed timer", () => {
+    const clock = makeClock(0);
+    const flushes: string[] = [];
+    let quiet = true;
+    const coalescer = new FeedCoalescer({
+      activeSessionCount: () => 1,
+      quietMode: () => quiet,
+      now: clock.now,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+      onFlush: (_slug, text) => flushes.push(text),
+    });
+
+    coalescer.notify("s1", "a"); // the first notify for a fresh slug always flushes immediately
+    expect(flushes).toEqual(["a"]);
+
+    coalescer.notify("s1", "b"); // armed at the doubled 6s interval, quiet mode still on
+    quiet = false;
+    clock.advance(3000); // the now-current (non-quiet) interval, but this timer was armed for 6s
+    expect(flushes).toEqual(["a"]);
+    clock.advance(3000); // 6s total - the timer it was actually armed with
+    expect(flushes).toEqual(["a", "b"]);
+  });
 });

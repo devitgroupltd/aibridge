@@ -24,6 +24,9 @@ import { loadConfig, STATE_DIR } from "./config.ts";
 import { FeedCoalescer } from "./feed-coalescer.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
+import { formatStaleAge, isStaleInbound } from "./stale-inbound.ts";
+import { buildStaleConfirmKeyboard, resolveStaleConfirmCallback, StaleConfirmRegistry } from "./stale-confirm.ts";
+import type { PendingStaleConfirm } from "./stale-confirm.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import {
   botCommandList,
@@ -245,6 +248,7 @@ async function main(): Promise<void> {
   // on every live session at once, so they go through the same confirm-button pattern as a
   // permission prompt instead of executing on the same message (fleet-confirm.ts).
   const fleetConfirmRegistry = new FleetConfirmRegistry();
+  const staleConfirmRegistry = new StaleConfirmRegistry();
 
   function maybeSetState(slug: string, target: SessionState): void {
     const row = sessionStore.get(slug);
@@ -280,6 +284,7 @@ async function main(): Promise<void> {
   const feedGovernor = new RateGovernor({ log });
   const feedCoalescer = new FeedCoalescer({
     activeSessionCount: () => routing.all().length,
+    quietMode: () => feedGovernor.p2PressureExceeded(),
     onFlush: (slug, text) => {
       feedGovernor.schedule("P2", async () => {
         // §4.2's /pause: replies and prompts still flow, only the feed card stops updating.
@@ -301,6 +306,11 @@ async function main(): Promise<void> {
   // conservative "worth a look" signal for whether the allowlist has grown too broad on a host
   // with no sandbox, surfaced as a log line now and left for a Phase 5 fleet command to expose.
   const PROMPTS_PER_HOUR_WARN_THRESHOLD = 20;
+
+  // §5.4 point 4's quiet-mode notice: posted once on the rising edge only ("posts ... once", not
+  // on every tick while pressure persists), and reset once pressure clears so a later, separate
+  // storm notifies again rather than staying silent forever after the first one.
+  let quietModeNotified = false;
 
   function handleHookEvent(msg: HookEventMessage): void {
     // §4.5's resume path needs a real session_id to hand to `claude --resume` - every hook event
@@ -459,6 +469,18 @@ async function main(): Promise<void> {
           .finalizePermissionMessage(q.messageId, renderAskCancelledCard(entry.slug, q.question, q.header))
           .catch((err) => log("WARN", `failed to mark question as cancelled: ${(err as Error).message}`));
       }
+    }
+
+    // §5.4 point 4: more than half of P2 (feed card) sends dropped over the last 60s means the
+    // feed bot's bucket is genuinely saturated, not just one unlucky edit - tell the operator once
+    // rather than let cards silently go stale with no explanation. feed-coalescer.ts already reads
+    // this same signal to double its own interval; this is only the notice half.
+    const quiet = feedGovernor.p2PressureExceeded();
+    if (quiet && !quietModeNotified) {
+      quietModeNotified = true;
+      confirmSessionCommand(undefined, `⚠️ feed throttled, ${routing.all().length} sessions active`);
+    } else if (!quiet && quietModeNotified) {
+      quietModeNotified = false;
     }
   }, 60_000);
 
@@ -997,6 +1019,31 @@ async function main(): Promise<void> {
     }
   }
 
+  /** §7.4's stale-inbound path: posts the "received while offline, still want this?" card instead
+   * of dispatching a backlog message directly, and registers the replay payload. Mirrors
+   * `postFleetConfirm`'s shape exactly. */
+  async function postStaleConfirm(threadId: number | undefined, messageId: number, rawText: string, from: string, ageLabel: string): Promise<void> {
+    const id = randomUUID().slice(0, 8);
+    const preview = rawText.length > 200 ? `${rawText.slice(0, 200)}…` : rawText;
+    try {
+      const sent = await controlBot.sendMessage(config.supergroupChatId, threadId, `⏳ received while offline (${ageLabel}) - still want this?\n\n${preview}`, {
+        inline_keyboard: buildStaleConfirmKeyboard(id),
+      });
+      staleConfirmRegistry.add({ id, threadId, messageId, rawText, from, confirmCardMessageId: sent.message_id });
+    } catch (err) {
+      log("WARN", `failed to post stale-inbound confirmation: ${(err as Error).message}`);
+    }
+  }
+
+  async function finalizeStaleConfirmMessage(pending: PendingStaleConfirm, text: string): Promise<void> {
+    if (!controlBot.editMessageText) return;
+    try {
+      await controlBot.editMessageText(config.supergroupChatId, pending.confirmCardMessageId, text, { inline_keyboard: [] });
+    } catch (err) {
+      log("WARN", `failed to finalize stale-confirm message: ${(err as Error).message}`);
+    }
+  }
+
   /** Runs after a `/kill --all`/`/rm --all` confirm tap - re-looks-up rows by slug rather than
    * trusting a snapshot from when the confirm card was posted, since a session can die or get
    * removed independently in the minutes between posting and the tap. */
@@ -1217,6 +1264,221 @@ async function main(): Promise<void> {
     }
   }
 
+  /**
+   * The full plain-text/command dispatch that used to sit inline inside `onUpdate` - extracted
+   * (§7.4) so a stale backlog message can be replayed from `staleConfirmRegistry`'s "yes" tap
+   * through the exact same path a live message takes, rather than duplicating or approximating
+   * that logic at the confirm-tap call site. Pure code motion off the live path below: no branch
+   * here changed behaviour, only how the four already-computed values it depends on
+   * (`isControl`/`route`/`currentSlug`/`from`) arrive - as parameters instead of closed-over
+   * `const`s - plus `text` now derives from `rawText` internally instead of being handed in
+   * pre-stripped, so a replay strips a `@botusername` mention the same way a live message would.
+   */
+  function dispatchInboundMessage(
+    messageId: number,
+    rawText: string,
+    threadId: number | undefined,
+    isControl: boolean,
+    route: ReturnType<typeof routing.getByTopicId>,
+    currentSlug: string | undefined,
+    from: string,
+  ): void {
+    // Strip a Telegram-inserted "@botusername" before any command parsing below - see
+    // stripBotMention's doc comment for why this has to happen exactly once, here.
+    const text = stripBotMention(rawText.trim());
+
+    const fleetCmd = parseFleetCommand(text);
+    if (fleetCmd) {
+      if (fleetCmd.kind === "new") {
+        if (!isControl) {
+          confirmSessionCommand(threadId, "/new only works from the control topic.");
+          return;
+        }
+        void handleNewCommand(fleetCmd, threadId);
+        return;
+      }
+      if (fleetCmd.kind === "ls") {
+        handleLsCommand(threadId);
+        return;
+      }
+      if (fleetCmd.kind === "budget") {
+        if (!isControl) {
+          confirmSessionCommand(threadId, "/budget only works from the control topic.");
+          return;
+        }
+        handleBudgetCommand(threadId);
+        return;
+      }
+      if (fleetCmd.kind === "kill") {
+        void handleKillCommand(fleetCmd, threadId, currentSlug);
+        return;
+      }
+      if (fleetCmd.kind === "rm") {
+        void handleRmCommand(fleetCmd, threadId, currentSlug);
+        return;
+      }
+      if (fleetCmd.kind === "attach") {
+        handleAttachCommand(fleetCmd, threadId, currentSlug);
+        return;
+      }
+      if (fleetCmd.kind === "usage") {
+        void handleUsageCommand(fleetCmd, threadId, currentSlug);
+        return;
+      }
+      if (fleetCmd.kind === "restart") {
+        void handleRestartCommand(threadId);
+        return;
+      }
+      if (fleetCmd.kind === "settings") {
+        handleSettingsCommand(threadId);
+        return;
+      }
+      if (fleetCmd.kind === "autostart") {
+        void handleAutostartCommand(fleetCmd, threadId);
+        return;
+      }
+      handlePauseCommand(fleetCmd, threadId, currentSlug);
+      return;
+    }
+
+    // "?" bare (no slash) is only treated as a help request from the control topic - inside a
+    // session topic it's plausible real content meant for Claude (e.g. "?" as a shorthand
+    // question), so only the unambiguous slash forms are recognised there.
+    if (isHelpCommand(text, isControl)) {
+      const repoCommands = route ? listRepoCommands(route.worktreePath) : [];
+      const repoSkills = route ? listRepoSkills(route.worktreePath) : [];
+      controlBot
+        .sendMessage(config.supergroupChatId, threadId, renderHelp(), {
+          inline_keyboard: buildCommandKeyboard(repoCommands, repoSkills),
+        })
+        .catch((err) => log("WARN", `sendMessage (command list) failed: ${(err as Error).message}`));
+      return;
+    }
+
+    // `/commands [<term>]`/`/skills [<term>]` - the per-project, item-count-scoped lists (see
+    // commands.ts's doc comments on `buildCommandKeyboard` for why these replaced per-item
+    // buttons: seowrite, confirmed live 2026-08-04, has 43 repo commands and 66 skills, and a
+    // flat button-per-item keyboard can't scale to that). Session-scoped only - control topic
+    // has no worktree to read commands/skills from.
+    const commandsQuery = parseCommandsQuery(text);
+    if (commandsQuery) {
+      const text_ = route
+        ? renderCommandsListText(listRepoCommands(route.worktreePath), commandsQuery.term)
+        : "Repo commands are session-scoped - send /commands inside a session's own topic.";
+      controlBot.sendMessage(config.supergroupChatId, threadId, text_).catch((err) => log("WARN", `sendMessage (/commands) failed: ${(err as Error).message}`));
+      return;
+    }
+    const skillsQuery = parseSkillsQuery(text);
+    if (skillsQuery) {
+      const text_ = route
+        ? renderSkillsListText(listRepoSkills(route.worktreePath), skillsQuery.term)
+        : "Repo skills are session-scoped - send /skills inside a session's own topic.";
+      controlBot.sendMessage(config.supergroupChatId, threadId, text_).catch((err) => log("WARN", `sendMessage (/skills) failed: ${(err as Error).message}`));
+      return;
+    }
+
+    // A bare /model, /mode or /effort (no argument to act on) surfaces a button per option
+    // instead of falling through to the ordinary inbound-message path, where it would just
+    // arrive as plain chat text and get answered conversationally rather than switching
+    // anything (confirmed live for /effort).
+    const bareCommandKeyboards: Record<string, { prompt: string; keyboard: () => ReturnType<typeof buildEffortKeyboard> }> = {
+      "/model": { prompt: "Choose a model:", keyboard: buildModelKeyboard },
+      "/mode": { prompt: "Choose a permission mode:", keyboard: buildModeKeyboard },
+      "/effort": { prompt: "Choose an effort level:", keyboard: buildEffortKeyboard },
+    };
+    const bareCommand = bareCommandKeyboards[text];
+    if (bareCommand) {
+      controlBot
+        .sendMessage(config.supergroupChatId, threadId, bareCommand.prompt, {
+          inline_keyboard: bareCommand.keyboard(),
+        })
+        .catch((err) => log("WARN", `sendMessage (${text} list) failed: ${(err as Error).message}`));
+      return;
+    }
+
+    // §4.2.1/§4.2.2: neither /model nor /mode fires a hook or a reply call, so the Bridge
+    // confirms them itself rather than waiting for an ack that will never arrive. Both are
+    // session-scoped only (§4.2.2) - sent from the control topic they're rejected outright.
+    const attempt = parseSessionCommand(text);
+    if (attempt) {
+      if (!currentSlug || threadId === undefined) {
+        confirmSessionCommand(threadId, "/model, /mode and /effort are session-scoped - send them inside that session's own topic.");
+        return;
+      }
+      if (attempt.kind === "model") {
+        applyModelSwitch(currentSlug, threadId, attempt.model);
+      } else if (attempt.kind === "effort") {
+        applyEffortSwitch(currentSlug, threadId, attempt.effort);
+      } else {
+        applyModeSwitch(currentSlug, threadId, attempt.mode);
+      }
+      return;
+    }
+    if (isSessionCommandAttempt(text)) {
+      confirmSessionCommand(
+        threadId,
+        `Unrecognised /model, /mode or /effort argument. Models: ${MODELS.join(", ")}. Modes: ${MODES.join(", ")}. Effort: ${EFFORTS.join(", ")}.`,
+      );
+      return;
+    }
+
+    const builtinName = text.startsWith("/") ? text.slice(1) : "";
+    if (isBuiltinPassthroughCommand(builtinName)) {
+      if (currentSlug) sendRaw(currentSlug, text);
+      return;
+    }
+
+    if (!currentSlug || threadId === undefined) {
+      if (isControl) confirmSessionCommand(threadId, "Unrecognised control-topic command. Try /new, /ls or /help.");
+      return;
+    }
+
+    // §4.3: a message to a topic whose row is `dead` is acknowledged, not queued or silently
+    // dropped - the one case the state table doesn't cover on its own.
+    if (sessionStore.get(currentSlug)?.state === "dead") {
+      confirmSessionCommand(threadId, "This session has ended.");
+      return;
+    }
+
+    // Manual typing equivalent of the old per-item buttons (removed 2026-08-04 - see
+    // commands.ts's `buildCommandKeyboard` doc comment): `/cmd <name>`/`/commands <name>`
+    // invokes a repo command by name, `/<name>` invokes a repo skill by name if - and only if -
+    // `<name>` matches a real skill; anything else falls through untouched rather than treating
+    // every leading "/" as an error, since ordinary chat text can start with "/" too.
+    if (route) {
+      const cmdInvoke = parseCmdInvocation(text);
+      if (cmdInvoke) {
+        if (listRepoCommands(route.worktreePath).includes(cmdInvoke.name)) {
+          sendChannelText(currentSlug, threadId, buildCmdShimText(cmdInvoke.name, cmdInvoke.args), String(messageId), from);
+        } else {
+          confirmSessionCommand(threadId, `No repo command named "${cmdInvoke.name}" in this project. Try /commands to list them.`);
+        }
+        return;
+      }
+      // A bare `/<name>` is checked against both skills and repo commands (in that order) -
+      // `/cmd`/`/commands` stays available as an explicit disambiguator for the rare case a
+      // skill and a command share a name, but for everything else typing `/deep-check` should
+      // just work without the operator needing to know which category it's in.
+      const skillInvoke = parseSkillInvocation(text);
+      if (skillInvoke) {
+        if (listRepoSkills(route.worktreePath).includes(skillInvoke.name)) {
+          sendChannelText(currentSlug, threadId, buildSkillShimText(skillInvoke.name, skillInvoke.args), String(messageId), from);
+          return;
+        }
+        if (listRepoCommands(route.worktreePath).includes(skillInvoke.name)) {
+          sendChannelText(currentSlug, threadId, buildCmdShimText(skillInvoke.name, skillInvoke.args), String(messageId), from);
+          return;
+        }
+      }
+    }
+
+    // §10.1.2: notifications/claude/channel is confirmed broken upstream (getClientCapabilities()
+    // never negotiates the capability), so inbound delivery writes the same <channel> tag
+    // Claude Code would have rendered itself directly to the session's PTY, exactly as an
+    // operator typing it and pressing Enter would.
+    sendChannelText(currentSlug, threadId, rawText, String(messageId), from);
+  }
+
   const offsetPath = path.join(STATE_DIR, "telegram-offset.json");
   startPolling(controlBot, {
     initialOffset: loadOffset(offsetPath),
@@ -1297,6 +1559,27 @@ async function main(): Promise<void> {
           return;
         }
 
+        // §7.4's stale-inbound confirm keyboard (stale-confirm.ts) - "sc:", a fresh namespace
+        // alongside "fc:". Recomputes isControl/route/currentSlug fresh from the pending card's
+        // own threadId rather than trusting anything cached from when the card was first posted -
+        // the topic's routing could have changed (e.g. the session was `/kill`ed) in the minutes
+        // the card sat waiting for a tap, and dispatchInboundMessage already handles an
+        // unrecognised/dead currentSlug the same way a live message would.
+        const staleConfirmAction = callbackQuery.data ? resolveStaleConfirmCallback(callbackQuery.data) : null;
+        if (staleConfirmAction) {
+          const pending = staleConfirmRegistry.resolve(staleConfirmAction.id);
+          if (!pending) return;
+          if (!staleConfirmAction.confirmed) {
+            void finalizeStaleConfirmMessage(pending, "Cancelled - not actioned.");
+            return;
+          }
+          void finalizeStaleConfirmMessage(pending, "✅ Confirmed - processing now.");
+          const pendingIsControl = isControlTopic(pending.threadId);
+          const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
+          dispatchInboundMessage(pending.messageId, pending.rawText, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from);
+          return;
+        }
+
         const model = callbackQuery.data ? resolveModelCallback(callbackQuery.data) : null;
         if (model) {
           if (currentSlug && threadId !== undefined) applyModelSwitch(currentSlug, threadId, model);
@@ -1344,201 +1627,20 @@ async function main(): Promise<void> {
       // Neither the control topic nor a topic this Bridge recognises as a session - ignore.
       if (!isControl && !route) return;
 
-      // Strip a Telegram-inserted "@botusername" before any command parsing below - see
-      // stripBotMention's doc comment for why this has to happen exactly once, here.
-      const text = stripBotMention(message.text.trim());
       const from = message.from?.username ?? message.from?.first_name ?? "unknown";
 
-      const fleetCmd = parseFleetCommand(text);
-      if (fleetCmd) {
-        if (fleetCmd.kind === "new") {
-          if (!isControl) {
-            confirmSessionCommand(threadId, "/new only works from the control topic.");
-            return;
-          }
-          void handleNewCommand(fleetCmd, threadId);
-          return;
-        }
-        if (fleetCmd.kind === "ls") {
-          handleLsCommand(threadId);
-          return;
-        }
-        if (fleetCmd.kind === "budget") {
-          if (!isControl) {
-            confirmSessionCommand(threadId, "/budget only works from the control topic.");
-            return;
-          }
-          handleBudgetCommand(threadId);
-          return;
-        }
-        if (fleetCmd.kind === "kill") {
-          void handleKillCommand(fleetCmd, threadId, currentSlug);
-          return;
-        }
-        if (fleetCmd.kind === "rm") {
-          void handleRmCommand(fleetCmd, threadId, currentSlug);
-          return;
-        }
-        if (fleetCmd.kind === "attach") {
-          handleAttachCommand(fleetCmd, threadId, currentSlug);
-          return;
-        }
-        if (fleetCmd.kind === "usage") {
-          void handleUsageCommand(fleetCmd, threadId, currentSlug);
-          return;
-        }
-        if (fleetCmd.kind === "restart") {
-          void handleRestartCommand(threadId);
-          return;
-        }
-        if (fleetCmd.kind === "settings") {
-          handleSettingsCommand(threadId);
-          return;
-        }
-        if (fleetCmd.kind === "autostart") {
-          void handleAutostartCommand(fleetCmd, threadId);
-          return;
-        }
-        handlePauseCommand(fleetCmd, threadId, currentSlug);
+      // §7.4: a backlog burst on resume (Telegram queues updates for 24h while the Bridge is
+      // down/asleep) can replay a command typed long ago - confirm rather than act on anything
+      // older than 30 minutes, exactly as an operator would want "yes, push it" treated after
+      // finding it hours later. Checked before any command parsing so nothing below ever sees a
+      // stale message directly.
+      const nowMs = Date.now();
+      if (isStaleInbound(message.date, nowMs)) {
+        void postStaleConfirm(threadId, message.message_id, message.text, from, formatStaleAge(message.date, nowMs));
         return;
       }
 
-      // "?" bare (no slash) is only treated as a help request from the control topic - inside a
-      // session topic it's plausible real content meant for Claude (e.g. "?" as a shorthand
-      // question), so only the unambiguous slash forms are recognised there.
-      if (isHelpCommand(text, isControl)) {
-        const repoCommands = route ? listRepoCommands(route.worktreePath) : [];
-        const repoSkills = route ? listRepoSkills(route.worktreePath) : [];
-        controlBot
-          .sendMessage(config.supergroupChatId, threadId, renderHelp(), {
-            inline_keyboard: buildCommandKeyboard(repoCommands, repoSkills),
-          })
-          .catch((err) => log("WARN", `sendMessage (command list) failed: ${(err as Error).message}`));
-        return;
-      }
-
-      // `/commands [<term>]`/`/skills [<term>]` - the per-project, item-count-scoped lists (see
-      // commands.ts's doc comments on `buildCommandKeyboard` for why these replaced per-item
-      // buttons: seowrite, confirmed live 2026-08-04, has 43 repo commands and 66 skills, and a
-      // flat button-per-item keyboard can't scale to that). Session-scoped only - control topic
-      // has no worktree to read commands/skills from.
-      const commandsQuery = parseCommandsQuery(text);
-      if (commandsQuery) {
-        const text_ = route
-          ? renderCommandsListText(listRepoCommands(route.worktreePath), commandsQuery.term)
-          : "Repo commands are session-scoped - send /commands inside a session's own topic.";
-        controlBot.sendMessage(config.supergroupChatId, threadId, text_).catch((err) => log("WARN", `sendMessage (/commands) failed: ${(err as Error).message}`));
-        return;
-      }
-      const skillsQuery = parseSkillsQuery(text);
-      if (skillsQuery) {
-        const text_ = route
-          ? renderSkillsListText(listRepoSkills(route.worktreePath), skillsQuery.term)
-          : "Repo skills are session-scoped - send /skills inside a session's own topic.";
-        controlBot.sendMessage(config.supergroupChatId, threadId, text_).catch((err) => log("WARN", `sendMessage (/skills) failed: ${(err as Error).message}`));
-        return;
-      }
-
-      // A bare /model, /mode or /effort (no argument to act on) surfaces a button per option
-      // instead of falling through to the ordinary inbound-message path, where it would just
-      // arrive as plain chat text and get answered conversationally rather than switching
-      // anything (confirmed live for /effort).
-      const bareCommandKeyboards: Record<string, { prompt: string; keyboard: () => ReturnType<typeof buildEffortKeyboard> }> = {
-        "/model": { prompt: "Choose a model:", keyboard: buildModelKeyboard },
-        "/mode": { prompt: "Choose a permission mode:", keyboard: buildModeKeyboard },
-        "/effort": { prompt: "Choose an effort level:", keyboard: buildEffortKeyboard },
-      };
-      const bareCommand = bareCommandKeyboards[text];
-      if (bareCommand) {
-        controlBot
-          .sendMessage(config.supergroupChatId, threadId, bareCommand.prompt, {
-            inline_keyboard: bareCommand.keyboard(),
-          })
-          .catch((err) => log("WARN", `sendMessage (${text} list) failed: ${(err as Error).message}`));
-        return;
-      }
-
-      // §4.2.1/§4.2.2: neither /model nor /mode fires a hook or a reply call, so the Bridge
-      // confirms them itself rather than waiting for an ack that will never arrive. Both are
-      // session-scoped only (§4.2.2) - sent from the control topic they're rejected outright.
-      const attempt = parseSessionCommand(text);
-      if (attempt) {
-        if (!currentSlug || threadId === undefined) {
-          confirmSessionCommand(threadId, "/model, /mode and /effort are session-scoped - send them inside that session's own topic.");
-          return;
-        }
-        if (attempt.kind === "model") {
-          applyModelSwitch(currentSlug, threadId, attempt.model);
-        } else if (attempt.kind === "effort") {
-          applyEffortSwitch(currentSlug, threadId, attempt.effort);
-        } else {
-          applyModeSwitch(currentSlug, threadId, attempt.mode);
-        }
-        return;
-      }
-      if (isSessionCommandAttempt(text)) {
-        confirmSessionCommand(
-          threadId,
-          `Unrecognised /model, /mode or /effort argument. Models: ${MODELS.join(", ")}. Modes: ${MODES.join(", ")}. Effort: ${EFFORTS.join(", ")}.`,
-        );
-        return;
-      }
-
-      const builtinName = text.startsWith("/") ? text.slice(1) : "";
-      if (isBuiltinPassthroughCommand(builtinName)) {
-        if (currentSlug) sendRaw(currentSlug, text);
-        return;
-      }
-
-      if (!currentSlug || threadId === undefined) {
-        if (isControl) confirmSessionCommand(threadId, "Unrecognised control-topic command. Try /new, /ls or /help.");
-        return;
-      }
-
-      // §4.3: a message to a topic whose row is `dead` is acknowledged, not queued or silently
-      // dropped - the one case the state table doesn't cover on its own.
-      if (sessionStore.get(currentSlug)?.state === "dead") {
-        confirmSessionCommand(threadId, "This session has ended.");
-        return;
-      }
-
-      // Manual typing equivalent of the old per-item buttons (removed 2026-08-04 - see
-      // commands.ts's `buildCommandKeyboard` doc comment): `/cmd <name>`/`/commands <name>`
-      // invokes a repo command by name, `/<name>` invokes a repo skill by name if - and only if -
-      // `<name>` matches a real skill; anything else falls through untouched rather than treating
-      // every leading "/" as an error, since ordinary chat text can start with "/" too.
-      if (route) {
-        const cmdInvoke = parseCmdInvocation(text);
-        if (cmdInvoke) {
-          if (listRepoCommands(route.worktreePath).includes(cmdInvoke.name)) {
-            sendChannelText(currentSlug, threadId, buildCmdShimText(cmdInvoke.name, cmdInvoke.args), String(message.message_id), from);
-          } else {
-            confirmSessionCommand(threadId, `No repo command named "${cmdInvoke.name}" in this project. Try /commands to list them.`);
-          }
-          return;
-        }
-        // A bare `/<name>` is checked against both skills and repo commands (in that order) -
-        // `/cmd`/`/commands` stays available as an explicit disambiguator for the rare case a
-        // skill and a command share a name, but for everything else typing `/deep-check` should
-        // just work without the operator needing to know which category it's in.
-        const skillInvoke = parseSkillInvocation(text);
-        if (skillInvoke) {
-          if (listRepoSkills(route.worktreePath).includes(skillInvoke.name)) {
-            sendChannelText(currentSlug, threadId, buildSkillShimText(skillInvoke.name, skillInvoke.args), String(message.message_id), from);
-            return;
-          }
-          if (listRepoCommands(route.worktreePath).includes(skillInvoke.name)) {
-            sendChannelText(currentSlug, threadId, buildCmdShimText(skillInvoke.name, skillInvoke.args), String(message.message_id), from);
-            return;
-          }
-        }
-      }
-
-      // §10.1.2: notifications/claude/channel is confirmed broken upstream (getClientCapabilities()
-      // never negotiates the capability), so inbound delivery writes the same <channel> tag
-      // Claude Code would have rendered itself directly to the session's PTY, exactly as an
-      // operator typing it and pressing Enter would.
-      sendChannelText(currentSlug, threadId, message.text, String(message.message_id), from);
+      dispatchInboundMessage(message.message_id, message.text, threadId, isControl, route, currentSlug, from);
     },
     onError: (err) => {
       log("WARN", `getUpdates failed, retrying: ${(err as Error).message}`);

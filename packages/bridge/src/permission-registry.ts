@@ -1,3 +1,5 @@
+import { monotonicNowMs } from "./monotonic-clock.ts";
+
 export interface PendingPermissionRequest {
   requestId: string;
   slug: string;
@@ -13,7 +15,9 @@ const DEFAULT_TTL_MS = 30 * 60 * 1000;
 
 export interface PermissionRegistryOptions {
   ttlMs?: number;
-  /** Clock injection for scenario 7's expiry test - never `Date.now()` directly in the class body. */
+  /** Clock injection for scenario 7's expiry test - never `Date.now()` directly in the class
+   * body. Defaults to `monotonicNowMs` (§7.4), not `Date.now` - this class only ever computes a
+   * duration (`now() - createdAt`), and a wall clock is the wrong tool for that across a sleep. */
   now?: () => number;
 }
 
@@ -29,7 +33,7 @@ export class PermissionRegistry {
 
   constructor(opts: PermissionRegistryOptions = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
-    this.now = opts.now ?? Date.now;
+    this.now = opts.now ?? monotonicNowMs;
   }
 
   add(entry: Omit<PendingPermissionRequest, "createdAt">): void {

@@ -1,3 +1,4 @@
+import { monotonicNowMs } from "./monotonic-clock.ts";
 import type { InlineKeyboardButton } from "./telegram.ts";
 
 export type FleetConfirmKind = "kill" | "rm";
@@ -15,7 +16,9 @@ const DEFAULT_TTL_MS = 5 * 60 * 1000;
 
 export interface FleetConfirmRegistryOptions {
   ttlMs?: number;
-  /** Clock injection for expiry tests - never `Date.now()` directly in the class body. */
+  /** Clock injection for expiry tests - never `Date.now()` directly in the class body, and
+   * defaults to `monotonicNowMs` (§7.4): this only ever computes a duration, and a wall clock is
+   * the wrong tool for that across a sleep. */
   now?: () => number;
 }
 
@@ -34,7 +37,7 @@ export class FleetConfirmRegistry {
 
   constructor(opts: FleetConfirmRegistryOptions = {}) {
     this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
-    this.now = opts.now ?? Date.now;
+    this.now = opts.now ?? monotonicNowMs;
   }
 
   add(entry: Omit<PendingFleetConfirm, "createdAt">): void {

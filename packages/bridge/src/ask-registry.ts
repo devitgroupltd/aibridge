@@ -1,4 +1,5 @@
 import type { AskQuestionOption } from "@aibridge/protocol";
+import { monotonicNowMs } from "./monotonic-clock.ts";
 
 export interface AskQuestionEntry {
   question: string;
@@ -23,7 +24,9 @@ const CANCEL_AT_MS = 3540 * 1000;
 
 export interface AskRegistryOptions {
   cancelAtMs?: number;
-  /** Clock injection, same pattern as `PermissionRegistry` - never `Date.now()` directly in the class body. */
+  /** Clock injection, same pattern as `PermissionRegistry` - never `Date.now()` directly in the
+   * class body, and defaults to `monotonicNowMs` (§7.4) for the same reason: this only ever
+   * computes a duration, and a wall clock is the wrong tool for that across a sleep. */
   now?: () => number;
 }
 
@@ -41,7 +44,7 @@ export class AskRegistry {
 
   constructor(opts: AskRegistryOptions = {}) {
     this.cancelAtMs = opts.cancelAtMs ?? CANCEL_AT_MS;
-    this.now = opts.now ?? Date.now;
+    this.now = opts.now ?? monotonicNowMs;
   }
 
   add(entry: Omit<PendingAsk, "createdAt">): void {

@@ -4,6 +4,10 @@ export interface TelegramMessage {
   message_thread_id?: number;
   text?: string;
   from?: { id: number; username?: string; first_name?: string };
+  /** Unix seconds (UTC), set by Telegram's servers when the message was sent - always present on
+   * a real message, per the Bot API. §7.4's stale-inbound check (`stale-inbound.ts`) is the only
+   * consumer so far. */
+  date: number;
 }
 
 export interface TelegramCallbackQuery {

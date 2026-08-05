@@ -1,7 +1,7 @@
 ---
-version: 0.33.0
+version: 0.35.0
 status: solid
-last_modified_utc: 2026-08-04T17:00:00Z
+last_modified_utc: 2026-08-05T06:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,59 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.35.0 (2026-08-05): Closed the remaining two Phase 6a items besides quiet mode's own
+    threshold (below) and §7.4's stale-inbound handling: (1) **Automatic quiet mode** (§5.4 point
+    4). `RateGovernor` gained `p2PressureExceeded()` - a rolling 60s window of P2 outcomes,
+    reporting pressure only once drops exceed 50% *and* the window holds at least 4 samples (a
+    silent-wrong guard: one dropped edit out of one attempt is a meaningless 100%, not real
+    pressure). `FeedCoalescer` consumes it via an optional `quietMode` callback that doubles its
+    coalescing interval; `index.ts` wires the two together and posts a one-time 'feed throttled, N
+    sessions active' notice on the rising edge only (existing 60s sweep interval, not a new timer),
+    resetting so a later, separate storm notifies again. (2) **§7.4's stale-inbound handling and
+    the monotonic-clock swap.** New `stale-inbound.ts` (pure `isStaleInbound`/`formatStaleAge`
+    against Telegram's own `message.date`, deliberately wall-clock since it anchors to an external
+    absolute timestamp, not a duration) and `stale-confirm.ts` (a `fc:`-shaped sibling registry,
+    `sc:` namespace, holding a full replay payload rather than forcing it into
+    `FleetConfirmRegistry`'s slugs-array shape). Any inbound message older than 30 minutes now
+    posts a Yes/No 'received while offline, still want this?' card instead of dispatching
+    directly; a 'Yes' tap replays it through the exact same path a live message takes. That path
+    itself (`dispatchInboundMessage`) is `index.ts`'s ~200-line plain-text/command dispatch,
+    extracted verbatim (pure code motion, confirmed by an unchanged `bun test` pass count before
+    vs. after) into a standalone function so replay and the live path share one implementation
+    instead of a second one drifting out of sync with the first. New `monotonic-clock.ts`
+    (`process.hrtime.bigint()`-backed, per §7.4's own naming of `QueryPerformanceCounter`) is now
+    the default clock for every TTL/expiry registry that only ever computes a duration -
+    `permission-registry.ts`, `ask-registry.ts`, `fleet-confirm.ts`, `stale-confirm.ts` - all still
+    independently clock-injectable for tests, just no longer defaulting to a wall clock that jumps
+    across a suspend. `TelegramMessage` gained the real `date` field (already present on every
+    live Bot API message; `stub-telegram` updated to populate it too, with an optional override
+    for simulating a backlog message in a future integration test). Live-verified against the real
+    Telegram group post-refactor: a real `/ls` and a real plain-text message both round-tripped
+    correctly through the extracted `dispatchInboundMessage`, confirming the extraction changed
+    nothing about the live behaviour of either branch it touches. **Not independently
+    live-verified:** the stale-confirm card itself (would need either a real 30-minute-old
+    backlog message or a manipulated system clock, neither attempted this pass) and the monotonic
+    clock's actual behaviour across a real modern-standby suspend (§7.4's own stated caveat -
+    the mechanism is in place, the specific Windows guarantee is not proven). `bun test` (416
+    pass, up from 397) and `tsc --noEmit` clean across all six packages."
+  - "0.34.0 (2026-08-05): Closed the Task Scheduler item's README-and-recovery-doc half, the last
+    of 0.32.0's three open items still outstanding besides §7.4's stale-inbound handling and quiet
+    mode. `README.md` gained: a Setup section spelling out the two things `setup-windows.ps1`
+    deliberately does not do (`repos.toml`, the interactive `claude` login) so a fresh box doesn't
+    silently fail at first session launch; an autostart subsection documenting `/autostart
+    status|install|uninstall`, restating §7.2's own log-on-not-boot gap, and naming a real,
+    previously-undocumented gap found while writing this: a Task Scheduler launch captures no
+    stdout/stderr today, so there is no production equivalent of `bridge:logs` and diagnosing a
+    silent post-reboot failure means `/autostart status`'s `Last result` field plus Windows' own
+    Task Scheduler operational log; a Recovery section (dead-looking session after restart, orphan
+    process, deleted topic, stuck permission/question button, stale post-sleep command) each
+    pointing at the specific mechanism that already handles it rather than inventing new advice;
+    and a VPS-escape-hatch note per §7.4/§11's cross-reference, framed as a pressure-release valve
+    (a smaller step than the WSL2 migration) rather than a roadmap item, since nothing is built for
+    it. Also corrected the file's stale top-of-file status line (\"design complete, implementation
+    not started\") and \"Status of the design\" section, both of which had not been updated since
+    before Phase 1 and were actively wrong once Phases 1-5 shipped. No code changed; `bun test` and
+    `tsc --noEmit` untouched by this pass."
   - "0.33.0 (2026-08-04): Closed out three of 0.32.0's open items. (1) Live-verified `/autostart`
     for real, not just against a hand-written fixture: ran the actual `schtasks /Create` ->
     `/Query` -> `/Delete` round trip on the operator's own box using `buildCreateArgs`/
@@ -3682,12 +3735,26 @@ unattended running defensible, and **should not be skipped just because Phases 1
   `reconciliation.ts`. The "partial-re-adoption" case (row 1, "process alive") is confirmed not to occur
   on this stack (§4.5's 2026-08-03 measurement) - `readopt` is kept only as defensive handling for a
   recycled pid, per that section's own note.
-- The Task Scheduler task itself (`autostart.ts`, `/autostart`) is built and live-verified (0.32.0/
-  0.33.0); the README half (setup, recovery, VPS escape hatch) is still open.
-- Stale-inbound handling and monotonic timers (§7.4), verified across a real modern-standby suspend.
-- Quiet mode.
+- ~~The Task Scheduler task itself (`autostart.ts`, `/autostart`); the README half (setup, recovery,
+  VPS escape hatch).~~ **Both done.** The task/command is built and live-verified (0.32.0/0.33.0); the
+  README half landed in 0.34.0, including one real gap found while writing it - a Task Scheduler
+  launch captures no stdout/stderr, so there is no production log file today.
+- ~~Stale-inbound handling and monotonic timers (§7.4).~~ **Done (0.35.0).** `stale-inbound.ts`/
+  `stale-confirm.ts` gate any inbound message older than 30 minutes behind a Yes/No confirm card
+  instead of dispatching it; `monotonic-clock.ts` is now the default clock for every TTL/expiry
+  registry. Unit-tested and live-verified for the *unaffected* live path (a real `/ls` and a real
+  plain-text message both round-tripped correctly post-refactor); **not** independently
+  live-verified: the stale-confirm card firing for a genuinely 30-minute-old backlog message, or
+  the monotonic clock's behaviour across a real modern-standby suspend - §7.4's own named risk,
+  still open as a live check rather than a build item.
+- ~~Quiet mode.~~ **Done (0.35.0).** `RateGovernor.p2PressureExceeded()` (60s window, minimum
+  4-sample guard against false-triggering on ordinary low-volume traffic) drives both
+  `FeedCoalescer`'s doubled interval and a one-time "feed throttled" notice. Unit-tested with a
+  fake clock; not yet live-forced with a real four-session feed storm.
 - **Exit:** scenarios 24 and 37 pass under a real restart - kill the Bridge mid-turn with a permission
-  prompt open, restart it, and the system converges to a correct state with no dead buttons.
+  prompt open, restart it, and the system converges to a correct state with no dead buttons. **Not
+  yet run** - every other 6a item is done or live-verified on its own terms, but this specific
+  mid-turn-restart drill hasn't been performed as its own pass.
 
 **6b, the migration (§7.6),** triggered by wanting unattended overnight runs, by prompts-per-hour
 showing an uncomfortably broad allowlist, or by adding a repo other than this one:
