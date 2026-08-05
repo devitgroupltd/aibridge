@@ -61,6 +61,12 @@ export class PermissionRegistry {
     return this.pending.get(requestId);
   }
 
+  /** Non-consuming snapshot of every pending entry - `/ls`'s detail column (fleet-commands.ts's
+   * `buildLsDetail`) needs to find "the pending permission for slug X", not resolve one. */
+  all(): PendingPermissionRequest[] {
+    return [...this.pending.values()];
+  }
+
   /** All entries past their TTL, for the periodic expiry sweep (§6.5: strip the keyboard, mark "expired"). */
   expired(): PendingPermissionRequest[] {
     const now = this.now();

@@ -249,8 +249,22 @@ function formatUsd(amount: number): string {
  * optional so every existing caller/test that only cares about the lifecycle columns is unaffected,
  * and a session with no `session_id` yet (or simply no recorded spend) shows `$0.00` rather than a
  * blank cell. Rendered as an HTML `<pre>` block (call sites must pass `parseMode: "HTML"`) so the
- * columns line up as a monospace table instead of Telegram's default proportional font. */
-export function renderLsTable(rows: readonly SessionRow[], nowMs: number, costBySlug?: ReadonlyMap<string, number>): string {
+ * columns line up as a monospace table instead of Telegram's default proportional font.
+ *
+ * `detailBySlug` (added 2026-08-05): the `state` column alone only says a session is `working` or
+ * `awaiting_input`, not *what* it's doing or *what* it's waiting on - the actually urgent question
+ * when glancing at the fleet from a phone. `index.ts` builds this map from the same sources the
+ * per-session turn card already reads (`feed-state.ts`'s current activity line for `working`,
+ * `PermissionRegistry`/`AskRegistry`'s pending entries for `awaiting_input`) rather than inventing a
+ * new state machine - this is a read-only join, not new tracked state. Rendered as a second section
+ * below the table, one line per session that has something to say, so a fleet where nothing is
+ * waiting doesn't grow an empty section. */
+export function renderLsTable(
+  rows: readonly SessionRow[],
+  nowMs: number,
+  costBySlug?: ReadonlyMap<string, number>,
+  detailBySlug?: ReadonlyMap<string, string>,
+): string {
   if (rows.length === 0) return "No sessions.";
   const header = ["SLUG", "STATE", "MODEL", "BRANCH", "AGE", "COST"];
   const body = rows.map((r) => [
@@ -265,7 +279,83 @@ export function renderLsTable(rows: readonly SessionRow[], nowMs: number, costBy
   const headerLine = (paddedHeader as string[]).join("  ");
   const separator = "-".repeat(headerLine.length);
   const lines = [headerLine, separator, ...paddedBody.map((row) => row.join("  "))];
-  return `<pre>${escapeForFeed(lines.join("\n"))}</pre>`;
+  let text = `<pre>${escapeForFeed(lines.join("\n"))}</pre>`;
+  const details = rows.map((r) => [r.slug, detailBySlug?.get(r.slug)] as const).filter(([, detail]) => detail !== undefined);
+  if (details.length > 0) {
+    const detailLines = details.map(([slug, detail]) => `  ${slug}: ${detail}`);
+    text += `\n${escapeForFeed(detailLines.join("\n"))}`;
+  }
+  return text;
+}
+
+/** Elapsed-time label for a turn/wait duration already in milliseconds - `ageLabel`'s sibling, kept
+ * separate since that one takes an ISO timestamp and this always takes a precomputed delta (a turn's
+ * `turnStartedAtMs`, a pending permission/ask's `createdAt`). */
+function durationLabel(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000));
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  return `${hours}h${minutes % 60}m`;
+}
+
+/** Truncates a tool-input preview to keep the `/ls` detail line short - the full text is already
+ * available on the permission card itself in that session's own topic, this is just an at-a-glance
+ * hint of *which* pending prompt it is. */
+function truncatePreview(text: string, maxLen = 40): string {
+  return text.length > maxLen ? `${text.slice(0, maxLen - 1)}…` : text;
+}
+
+/** Builds `renderLsTable`'s `detailBySlug` from the same sources the per-session turn card already
+ * reads. Empty/absent for a session with nothing worth calling out (`idle`, `dead`, `quota_stopped`,
+ * or a `working` session between hook events with no `feed-state.ts` line yet).
+ *
+ * Takes *two* clocks, not one - confirmed live 2026-08-05: a first pass that reused `nowMs` (wall
+ * clock, matching `feed-state.ts`'s `turnStartedAtMs`) to also diff against
+ * `PermissionRegistry`/`AskRegistry`'s `createdAt` produced a nonsense duration ("496088h12m"),
+ * because those two registries stamp `createdAt` with `monotonicNowMs()` (§7.4 - never wall-clock,
+ * so a suspend/resume can't mass-expire every pending prompt). Mixing the two clock bases in one
+ * subtraction is exactly the silent-wrong failure mode §9 asks this kind of helper to be tested
+ * against, not a crash - it would have shipped looking plausible. */
+export function buildLsDetail(
+  rows: readonly SessionRow[],
+  nowMs: number,
+  monotonicNowMs: number,
+  feedStates: ReadonlyMap<string, { turnActive: boolean; turnStartedAtMs: number | null; lines: readonly { summary: string; status: string }[] }>,
+  pendingPermissions: readonly { slug: string; toolName: string; inputPreview: string; createdAt: number }[],
+  pendingAsks: readonly { slug: string; questions: readonly { question: string; answerLabel?: string }[]; createdAt: number }[],
+): Map<string, string> {
+  const detail = new Map<string, string>();
+  for (const r of rows) {
+    if (r.state === "working") {
+      const state = feedStates.get(r.slug);
+      const running = [...(state?.lines ?? [])].reverse().find((l) => l.status === "running");
+      if (running && state?.turnStartedAtMs != null) {
+        detail.set(r.slug, `running: ${truncatePreview(running.summary)} (${durationLabel(nowMs - state.turnStartedAtMs)})`);
+      }
+    } else if (r.state === "awaiting_input") {
+      const permission = pendingPermissions.find((p) => p.slug === r.slug);
+      if (permission) {
+        detail.set(
+          r.slug,
+          `waiting: permission (${permission.toolName}: ${truncatePreview(permission.inputPreview)}) - ${durationLabel(monotonicNowMs - permission.createdAt)}`,
+        );
+        continue;
+      }
+      const ask = pendingAsks.find((a) => a.slug === r.slug);
+      if (ask) {
+        const unanswered = ask.questions.find((q) => q.answerLabel === undefined);
+        detail.set(
+          r.slug,
+          `waiting: question${unanswered ? ` (${truncatePreview(unanswered.question)})` : ""} - ${durationLabel(monotonicNowMs - ask.createdAt)}`,
+        );
+        continue;
+      }
+      detail.set(r.slug, "waiting: reply");
+    }
+  }
+  return detail;
 }
 
 /** §10.5 point 2's `/budget`: rolling 5-hour and weekly fleet spend, plus a per-session breakdown
@@ -331,7 +421,7 @@ export function renderHelp(): string {
     "Fleet commands (control topic; also /help, /?, /h, or bare ? here):",
     "  /about - what this bot can do, with examples (start here if you're new)",
     "  /new [--model] <repo> <prompt> - start a new session",
-    "  /ls - list sessions",
+    "  /ls - list sessions, with what's running/waiting on each",
     "  /kill [<slug>|--all] - stop a session (or all, confirm-gated)",
     "  /rm [<slug>|--dead|--prefix <text>|--all] - remove a dead session row",
     "  /attach [<slug>] - show a session's PTY tail",
@@ -365,7 +455,7 @@ export function botCommandList(): { command: string; description: string }[] {
   return [
     { command: "about", description: "What this bot can do, with examples" },
     { command: "new", description: "Start a new session: /new [--model] <repo> <prompt>" },
-    { command: "ls", description: "List sessions" },
+    { command: "ls", description: "List sessions, with what's running/waiting on each" },
     { command: "kill", description: "Stop a session: /kill [<slug>|--all]" },
     { command: "rm", description: "Remove a dead session row: /rm [<slug>|--dead|--prefix <text>|--all]" },
     { command: "attach", description: "Show a session's PTY tail" },

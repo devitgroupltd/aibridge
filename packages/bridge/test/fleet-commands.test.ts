@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildLsDetail,
   isHelpCommand,
   parseCommandsQuery,
   parseFleetCommand,
@@ -383,6 +384,106 @@ describe("renderLsTable", () => {
   test("a session missing from the cost map (no session_id yet, or no recorded spend) shows $0.00", () => {
     const text = renderLsTable([row()], Date.parse("2026-08-03T00:10:00.000Z"));
     expect(text).toContain("$0.00");
+  });
+
+  test("a detail map appends a waiting/running line under the table, HTML-escaped", () => {
+    const text = renderLsTable(
+      [row()],
+      Date.parse("2026-08-03T00:10:00.000Z"),
+      undefined,
+      new Map([["fix-bug", "running: Edit <b>x</b>.ts (12s)"]]),
+    );
+    expect(text).toContain("fix-bug: running: Edit &lt;b&gt;x&lt;/b&gt;.ts (12s)");
+  });
+
+  test("no detail section at all when the map is empty or omitted", () => {
+    const withoutMap = renderLsTable([row()], Date.parse("2026-08-03T00:10:00.000Z"));
+    const withEmptyMap = renderLsTable([row()], Date.parse("2026-08-03T00:10:00.000Z"), undefined, new Map());
+    expect(withoutMap.endsWith("</pre>")).toBe(true);
+    expect(withEmptyMap.endsWith("</pre>")).toBe(true);
+  });
+});
+
+describe("buildLsDetail", () => {
+  const nowMs = Date.parse("2026-08-03T00:10:00.000Z");
+  // Deliberately a wildly different magnitude from `nowMs` - `PermissionRegistry`/`AskRegistry`
+  // stamp `createdAt` with the monotonic clock (§7.4, process-uptime-based), not wall time, so a
+  // test that picked a monotonic value close to `nowMs` would pass even with the two clocks
+  // accidentally swapped in the implementation (the exact bug this caught live 2026-08-05).
+  const monotonicNowMs = 500_000;
+
+  test("a working session with a running activity line shows what it's doing and for how long", () => {
+    const detail = buildLsDetail(
+      [row({ state: "working" })],
+      nowMs,
+      monotonicNowMs,
+      new Map([["fix-bug", { turnActive: true, turnStartedAtMs: nowMs - 12_000, lines: [{ summary: "Edit src/foo.ts", status: "running" }] }]]),
+      [],
+      [],
+    );
+    expect(detail.get("fix-bug")).toBe("running: Edit src/foo.ts (12s)");
+  });
+
+  test("a working session with no running line yet (between hook events) gets no detail", () => {
+    const detail = buildLsDetail(
+      [row({ state: "working" })],
+      nowMs,
+      monotonicNowMs,
+      new Map([["fix-bug", { turnActive: true, turnStartedAtMs: nowMs, lines: [] }]]),
+      [],
+      [],
+    );
+    expect(detail.has("fix-bug")).toBe(false);
+  });
+
+  test("an awaiting_input session with a pending permission names the tool and preview, timed off the monotonic clock", () => {
+    const detail = buildLsDetail(
+      [row({ state: "awaiting_input" })],
+      nowMs,
+      monotonicNowMs,
+      new Map(),
+      [{ slug: "fix-bug", toolName: "Bash", inputPreview: "npm test", createdAt: monotonicNowMs - 5_000 }],
+      [],
+    );
+    expect(detail.get("fix-bug")).toBe("waiting: permission (Bash: npm test) - 5s");
+  });
+
+  test("an awaiting_input session with a pending question names it, preferring the first unanswered one", () => {
+    const detail = buildLsDetail(
+      [row({ state: "awaiting_input" })],
+      nowMs,
+      monotonicNowMs,
+      new Map(),
+      [],
+      [
+        {
+          slug: "fix-bug",
+          createdAt: monotonicNowMs - 30_000,
+          questions: [
+            { question: "Use library A or B?", answerLabel: "A" },
+            { question: "Add tests?" },
+          ],
+        },
+      ],
+    );
+    expect(detail.get("fix-bug")).toBe("waiting: question (Add tests?) - 30s");
+  });
+
+  test("an awaiting_input session with neither a pending permission nor ask falls back to a generic wait", () => {
+    const detail = buildLsDetail([row({ state: "awaiting_input" })], nowMs, monotonicNowMs, new Map(), [], []);
+    expect(detail.get("fix-bug")).toBe("waiting: reply");
+  });
+
+  test("idle/dead/quota_stopped sessions get no detail at all", () => {
+    const detail = buildLsDetail(
+      [row({ state: "idle" }), row({ slug: "d", state: "dead" }), row({ slug: "q", state: "quota_stopped" })],
+      nowMs,
+      monotonicNowMs,
+      new Map(),
+      [],
+      [],
+    );
+    expect(detail.size).toBe(0);
   });
 });
 

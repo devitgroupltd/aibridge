@@ -32,6 +32,7 @@ import type { FleetCommand } from "./fleet-commands.ts";
 import {
   botCommandList,
   isHelpCommand,
+  buildLsDetail,
   parseCommandsQuery,
   parseFleetCommand,
   parseSkillsQuery,
@@ -45,6 +46,7 @@ import {
 } from "./fleet-commands.ts";
 import { renderCard } from "./feed-renderer.ts";
 import { applyEvent, createFeedState, promptsInLastHour } from "./feed-state.ts";
+import { monotonicNowMs } from "./monotonic-clock.ts";
 import { normalizeHookEvent } from "./hook-events.ts";
 import { CostTracker, FIVE_HOURS_MS, ONE_WEEK_MS } from "./cost-tracker.ts";
 import { checkConcurrencyCap, currentUnits, WEIGHTED_CAP } from "./concurrency-cap.ts";
@@ -936,12 +938,14 @@ async function main(): Promise<void> {
 
   function handleLsCommand(topicId: number | undefined): void {
     const rows = sessionStore.all();
+    const nowMs = Date.now();
     const costBySlug = new Map<string, number>();
     for (const row of rows) {
       if (row.sessionId) costBySlug.set(row.slug, costTracker.lifetimeSpend(row.sessionId));
     }
+    const detailBySlug = buildLsDetail(rows, nowMs, monotonicNowMs(), feedStates, pipeHandle.permissionRegistry.all(), pipeHandle.askRegistry.all());
     controlBot
-      .sendMessage(config.supergroupChatId, topicId, renderLsTable(rows, Date.now(), costBySlug), undefined, "HTML")
+      .sendMessage(config.supergroupChatId, topicId, renderLsTable(rows, nowMs, costBySlug, detailBySlug), undefined, "HTML")
       .catch((err) => log("WARN", `sendMessage (/ls) failed: ${(err as Error).message}`));
   }
 

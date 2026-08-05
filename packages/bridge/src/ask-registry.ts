@@ -55,6 +55,12 @@ export class AskRegistry {
     return this.pending.get(id);
   }
 
+  /** Non-consuming snapshot of every pending ask - `/ls`'s detail column (fleet-commands.ts's
+   * `buildLsDetail`) needs to find "the pending ask for slug X", not resolve/answer one. */
+  all(): PendingAsk[] {
+    return [...this.pending.values()];
+  }
+
   remove(id: string): void {
     this.pending.delete(id);
   }

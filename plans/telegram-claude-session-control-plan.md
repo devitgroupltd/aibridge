@@ -1,7 +1,7 @@
 ---
-version: 0.39.0
+version: 0.40.0
 status: solid
-last_modified_utc: 2026-08-05T07:55:00Z
+last_modified_utc: 2026-08-05T08:25:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,26 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.40.0 (2026-08-05): /ls gained a per-session detail line answering the owner's 'what is each
+    session currently doing/stuck/waiting on' question - discussed first (a fleet-wide command is
+    valuable since it aggregates across every topic in one glance; a session-scoped equivalent would be
+    redundant with the turn card already live in that topic, so wasn't built) then implemented as a
+    read-only join, not new tracked state: fleet-commands.ts's buildLsDetail reads feed-state.ts's
+    current running activity line + turnStartedAtMs for a working row, or PermissionRegistry/
+    AskRegistry's pending entry (tool+preview, question text, or a generic 'waiting: reply' fallback)
+    for an awaiting_input row; renderLsTable appends one indented line per session with something to
+    say below the existing table, HTML-escaped, omitted entirely when nothing is pending. Both
+    registries gained a non-consuming all() snapshot getter for this. Caught live before shipping: a
+    first pass diffed a pending permission's monotonic-clock createdAt (§7.4) against /ls's own
+    wall-clock nowMs, producing a nonsense '496088h12m' wait duration - buildLsDetail now takes both
+    clocks explicitly (nowMs for feed-state's wall-clock turnStartedAtMs, monotonicNowMs for the two
+    registries), with a regression test using a monotonic value at a different order of magnitude from
+    nowMs so the two clocks can't be accidentally swapped again without failing. Live-verified against
+    the real dev Bridge/Telegram: a real Bash permission request showed 'waiting: permission (Bash:
+    ...) - 15s' while pending, approving it flipped the row to 'working' with 'running: Bash ... (58s)'
+    counting up, and the row returned to plain idle with no detail line once the command finished -
+    confirmed via tap-topic-button.js and a fire-and-forget send-session-message variant (cleaned up
+    after, not kept as a permanent script)."
   - "0.39.0 (2026-08-05): /repos add's <path> argument made optional and/or a clone source, answering
     the owner's follow-up on the 0.38.0 work below. repos-registry.ts gained isGitUrl (scheme URLs,
     scp-style git@host:path, or a bare ...git suffix - a Windows drive path never matches, no @ before
@@ -1683,7 +1703,7 @@ permission relay and feed renderer are all already scoped to a single Bridge pro
 |---|---|
 | `/about` | Friendly capability overview (control topic or a session's own topic) with a "more info" button per fiddly feature (bulk `/rm`, mode/effort, permission buttons, autostart, repo commands/skills) - the on-ramp `/help` deliberately isn't (§4.2, added 2026-08-05) |
 | `/new [--opus\|--haiku] <repo> <prompt>` | Create worktree, create topic, launch session, send prompt as first message. Sonnet unless overridden |
-| `/ls` | List live sessions: slug, state, worktree, branch, age, last activity, model, session cost and tokens (§5.7) |
+| `/ls` | List live sessions: slug, state, worktree, branch, age, last activity, model, session cost and tokens (§5.7). A `working` or `awaiting_input` row gets an extra detail line - the current tool/activity and elapsed turn time for `working` (from `feed-state.ts`'s activity log), or what it's specifically waiting on for `awaiting_input` (the pending permission's tool+preview, the pending question's text, or a generic "reply" if neither registry has an entry) - built as a read-only join over the same sources the session's own turn card already reads, not a new tracked state. Added 2026-08-05 |
 | `/budget` | Rolling 5-hour spend across the fleet, per-session breakdown, and the cap (§10.5) |
 | `/kill <slug>` | SIGTERM the session, close the topic, leave the worktree in place |
 | `/rm <slug>` | As `/kill`, plus remove the worktree and delete the topic |
