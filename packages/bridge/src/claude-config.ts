@@ -82,9 +82,16 @@ export function ensurePlaywrightRegistration(
   doc.projects ??= {};
   const existing = doc.projects[canonicalWorktreePath];
 
+  // `command: "npx"` bare fails silently: on Windows npx is npx.cmd, a batch file, and Claude
+  // Code spawns an MCP server's command directly (no shell) - the same class of "bare command
+  // name unresolvable via a direct Windows spawn" issue session-launcher.ts already hit with
+  // `bun` (needing `where bun.exe`'s absolute path). Confirmed live 2026-08-05: a bare-npx entry
+  // produced no error anywhere (MCP server spawn failures are invisible per §2.4's own note) and
+  // the tool was simply never in Claude's toolset; wrapping via `cmd /c` - exactly what SeoWrite's
+  // own already-working playwright/chrome-devtools entries do - fixed it.
   const serverEntry: McpServerEntry = {
-    command: "npx",
-    args: ["-y", "@playwright/mcp@latest", "--output-dir", outboxDir],
+    command: "cmd",
+    args: ["/c", "npx", "-y", "@playwright/mcp@latest", "--output-dir", outboxDir],
   };
 
   if (JSON.stringify(existing?.mcpServers?.playwright) === JSON.stringify(serverEntry)) {

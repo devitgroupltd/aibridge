@@ -1,7 +1,7 @@
 ---
-version: 0.49.0
+version: 0.49.1
 status: solid
-last_modified_utc: 2026-08-05T20:10:00Z
+last_modified_utc: 2026-08-05T20:45:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,31 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.49.1 (2026-08-05): fixed §5.8's Playwright gap left open by 0.49.0 - two real bugs in
+    ensurePlaywrightRegistration, both invisible with no error anywhere, found only by looking.
+    (1) command: \"npx\" bare never resolves - Windows npx is npx.cmd, a batch file, and Claude
+    Code spawns an MCP server's own command directly with no shell, the same class of issue
+    session-launcher.ts already hit with bun. Fixed by wrapping via cmd /c, matching SeoWrite's
+    own already-working entry exactly (diffed against it to find this). (2) the registration key
+    was the worktree's own canonical path; confirmed live via claude mcp add's own write target
+    that Claude Code's ~/.claude.json per-project identity for a git worktree checkout follows
+    git rev-parse --git-common-dir back to the *main repo*, not the worktree - unlike .mcp.json-
+    based registration (the aibridge channel itself), which genuinely is per-worktree. Consequence:
+    since this registration (and its --output-dir) is now necessarily shared across every
+    concurrent session on the same repo, --output-dir points at a new playwrightSharedDir
+    ($STATE/playwright-shared/, outbox.ts) rather than any one session's own outbox, and the
+    channel server's instructions now tell Claude to mv a screenshot into its own
+    $AIBRIDGE_OUTBOX_DIR before calling send_file - send_file's own path check still only ever
+    accepts paths inside that session's outbox, verified by a new test. Diagnosis ruled out
+    --resume as the cause first (a genuinely fresh /new session showed the same failure), then
+    found claude mcp list doesn't show a broken hand-written entry at all - not even as \"pending
+    approval\" - which is what pointed at the registration itself. 4 new tests
+    (playwrightSharedDir/ensurePlaywrightSharedDir, plus a resolveOutboxPath case proving a file in
+    the shared dir can't be sent directly), 564 tests pass monorepo-wide, tsc --noEmit clean.
+    Re-verified live end to end: a fresh /new session's first turn correctly listed the full
+    Playwright toolset (browser_navigate, browser_take_screenshot, browser_snapshot, ... 20 tools)
+    unprompted, no error, no missing-tool reply. Diagnostic worktrees/sessions/~/.claude.json
+    entries created while probing this were cleaned up afterward."
   - "0.49.0 (2026-08-05): implemented §5.8's outbound screenshots/files - the symmetric other half
     of §5.6's inbound attachments. Prompted by the operator wanting to visually verify a running
     web app (start backend+frontend, screenshot at a given viewport/device) or a desktop app (not
@@ -2511,14 +2536,47 @@ Telegram's own `sendPhoto` format allowlist rather than guessing.
 
 **Web screenshots: the official Microsoft Playwright MCP server (`@playwright/mcp`), registered as
 an *ordinary* MCP tool, not the aibridge channel.** `ensurePlaywrightRegistration`
-(`claude-config.ts`) writes `projects[canonicalWorktreePath].mcpServers.playwright` into
-`~/.claude.json` at every launch, `--output-dir` pointed at that session's own outbox so a
-screenshot lands exactly where `send_file` is allowed to read from - no "move it into the outbox"
-step. This is the same registry §2.4 already established genuinely works for *ordinary* MCP tools
-with no `.mcp.json`/consent-dialog dance (SeoWrite's own `playwright`/`chrome-devtools` entries),
-unlike the aibridge channel itself, which needed the worktree's own `.mcp.json` instead (§10.1.2's
-correction). Claude drives the browser normally - navigate, resize the viewport or pick one of the
-143 device presets Playwright MCP ships, screenshot to a path under the outbox, `send_file` it.
+(`claude-config.ts`) writes `projects[<key>].mcpServers.playwright` into `~/.claude.json` at every
+launch. Two corrections against the first implementation, both found only by looking (§10.0/§6.5's
+own discipline), not by trusting the plan's prior claim that this registry "just works" the way
+SeoWrite's entries did:
+
+1. **`command` must be `cmd`/`["/c", "npx", ...]`, not bare `"npx"`.** On Windows, `npx` is
+   `npx.cmd`, a batch file - Claude Code spawns an MCP server's command directly, no shell, the
+   same class of "bare command name unresolvable via a direct Windows spawn" issue
+   `session-launcher.ts` already hit with `bun` (§2.4's `where bun.exe` fix). A bare-`npx` entry
+   produced **no error anywhere** - not in the PTY, not in `claude mcp list` (the tool didn't even
+   appear as "pending"), matching this file's own two prior documented failure modes exactly
+   (§2.4's channel registry, §6.5's `tool_use_id`). Confirmed by diffing against SeoWrite's actual
+   `~/.claude.json` entry, which wraps via `cmd /c` - the "just works" claim was only ever true
+   *because* of that wrapping, never mentioned as significant until this session went looking.
+2. **The registration key is the *main repo's* canonical path, not the worktree's.** Confirmed live
+   by running `claude mcp add` from inside a worktree and reading back which project key it
+   actually wrote to: `C:/data/projects/aibridge` (the main repo), not
+   `C:/data/worktrees/<slug>`. `git rev-parse --git-common-dir` from the same worktree resolves to
+   `<main repo>/.git` - Claude Code's per-project identity for `~/.claude.json` state follows a
+   worktree's *git-common-dir* back to the main repo, unlike `.mcp.json`-based registration
+   (`ensureTrustDialogAccepted`/`ensureMcpJsonRegistration`, resolved by plain cwd and genuinely
+   per-worktree). Registering under the worktree's own path - the original implementation - wrote
+   to a key Claude Code never reads, again with no error surfaced anywhere.
+
+**Consequence of correction 2: this registration, and its `--output-dir`, is now necessarily
+*shared* by every concurrent session on the same repo** - aibridge's whole point is several
+sessions in parallel worktrees of one repo, and they'd otherwise clobber each other's
+`--output-dir`. So `--output-dir` points at `playwrightSharedDir` (`$STATE/playwright-shared/`,
+`outbox.ts`), not any one session's own outbox, and the channel server's instructions tell Claude
+to `mv` a screenshot from there into its own `$AIBRIDGE_OUTBOX_DIR` before calling `send_file` -
+`resolveOutboxPath` only ever accepts paths inside that session's own outbox, so a file merely
+sitting in the shared directory can never be sent directly regardless of what path is named,
+verified by its own test (`outbox.test.ts`). Filename collisions between two sessions shooting at
+once are mitigated by Playwright's own default filename already including a timestamp, and by this
+being single-operator tooling rather than a multi-tenant boundary - acceptable for what this is.
+
+Once actually loaded, Claude drives the browser normally - navigate, resize the viewport or pick
+one of the 143 device presets Playwright MCP ships, screenshot (`browser_take_screenshot`, its
+`filename` "prefers" a relative name into the shared dir - Playwright MCP restricts writes outside
+its own output root unless `--allow-unrestricted-file-access` is passed, which this registration
+deliberately omits), `mv` into the outbox, `send_file` it.
 
 **Desktop screenshots: a bundled PowerShell helper, for the "it's not a URL" case.**
 `packages/bridge/assets/screenshot-desktop.ps1` uses `System.Drawing.Graphics.CopyFromScreen` to
@@ -2547,29 +2605,38 @@ deliberately *not* pre-approved, since "take a screenshot" can be steered into "
 call it a screenshot" by a sufficiently adversarial prompt. Only the *delivery* tool (`send_file`)
 is pre-approved, and only because its own path is path-restricted regardless of approval.
 
-**RESOLVED, implemented and live-verified 2026-08-05.** New files: `outbox.ts` (`isImagePath`,
-`outboxDir`/`ensureOutboxDir`, `resolveOutboxPath`), `assets/screenshot-desktop.ps1`,
-`SendFileMessage` (protocol), the `send_file` channel tool, `TelegramClient.sendPhotoFile`/
-`sendDocumentFile`, `claude-config.ts`'s `ensurePlaywrightRegistration`. 25 new unit tests
-(`outbox.test.ts`, `pipe-server.test.ts`'s `send_file` suite, `claude-config.test.ts`'s
-`ensurePlaywrightRegistration` suite) plus `stub-telegram`'s new `sendPhoto` handling, 560 tests
-pass monorepo-wide, `tsc --noEmit` clean. Live-verified end to end against the real Bridge and
-Telegram client (`scripts/telegram-automation/send-to-topic.js`, a new one-off): asked a live
-session to run the desktop screenshot script and `send_file` it - two Bash permission prompts
-(the script's own first attempt hit PowerShell's execution policy, retried with
-`-ExecutionPolicy Bypass`) approved via `tap-topic-button.js`, then a 952,699-byte PNG arrived in
-the topic as a real inline photo bubble with the caption "desktop screenshot test", confirmed both
-via the Bridge's own `sent "desktop-test.png" (952699 bytes) as a photo` log line and by reading
-the delivered image back (it showed the live browser window mid-approval-flow - a genuine capture,
-not a placeholder). **One open gap found by the same pass, not yet resolved:** the Playwright MCP
-registration is confirmed correctly written to `~/.claude.json` (verified by reading the file back)
-and the package itself runs fine standalone (`npx @playwright/mcp@latest --help` succeeds, already
-cached), but the one already-running session tested against it (resumed via `--resume`, not a
-fresh launch) reported "No playwright MCP tools are available in this session" with no error and no
-trust-dialog prompt visible in the PTY - most likely the same class of gotcha §2.4/§10.1.2 already
-hit twice (a registration written before spawn was still not what a *resumed* session actually
-loaded); needs a genuinely fresh, non-`--resume` session to confirm one way or the other before
-this half is called done rather than merely wired up.
+**RESOLVED, implemented and live-verified 2026-08-05 (in two passes).** New files: `outbox.ts`
+(`isImagePath`, `outboxDir`/`ensureOutboxDir`, `playwrightSharedDir`/`ensurePlaywrightSharedDir`,
+`resolveOutboxPath`), `assets/screenshot-desktop.ps1`, `SendFileMessage` (protocol), the
+`send_file` channel tool, `TelegramClient.sendPhotoFile`/`sendDocumentFile`, `claude-config.ts`'s
+`ensurePlaywrightRegistration`. 29 new unit tests (`outbox.test.ts`, `pipe-server.test.ts`'s
+`send_file` suite, `claude-config.test.ts`'s `ensurePlaywrightRegistration` suite) plus
+`stub-telegram`'s new `sendPhoto` handling, 564 tests pass monorepo-wide, `tsc --noEmit` clean.
+
+Pass 1 live-verified the desktop-screenshot half end to end against the real Bridge and Telegram
+client (`scripts/telegram-automation/send-to-topic.js`, a new one-off): asked a live session to
+run the desktop screenshot script and `send_file` it - two Bash permission prompts (the script's
+own first attempt hit PowerShell's execution policy, retried with `-ExecutionPolicy Bypass`)
+approved via `tap-topic-button.js`, then a 952,699-byte PNG arrived in the topic as a real inline
+photo bubble with the caption "desktop screenshot test", confirmed both via the Bridge's own
+`sent "desktop-test.png" (952699 bytes) as a photo` log line and by reading the delivered image
+back (it showed the live browser window mid-approval-flow - a genuine capture, not a placeholder).
+Pass 1 also surfaced, but left open, that the Playwright half reported no tools available.
+
+Pass 2 diagnosed and fixed that gap - see the two corrections in the "Web screenshots" paragraph
+above (bare `npx` unresolvable via Windows spawn; registration key is the main repo, not the
+worktree). Diagnosis method, in order: ruled out `--resume` as the cause (a genuinely fresh `/new`
+session showed the same failure); ruled out the network/package (`npx @playwright/mcp@latest
+--help` succeeds, already cached); found that `claude mcp list` doesn't show the hand-written
+`playwright` entry **at all** - not even as "pending approval" - the same "no error surfaces
+anywhere" failure mode as §2.4/§6.5, which is what pointed at the registration itself rather than
+anything downstream; diffed against `claude mcp add`'s own output for the *correct* shape and
+where it actually wrote (confirming both corrections simultaneously, since `add`'s own write
+landed at the main-repo key with the `cmd`-wrapped command). Fix applied, and re-verified live: a
+fresh `/new` session's first turn correctly listed the full Playwright toolset
+(`browser_navigate`, `browser_take_screenshot`, `browser_snapshot`, `browser_click`, ... 20 tools)
+unprompted. Diagnostic worktrees/sessions/`~/.claude.json` entries created during this probe were
+cleaned up afterward, not left behind.
 
 ---
 

@@ -5,7 +5,7 @@ import path from "node:path";
 import * as pty from "node-pty";
 import { canonicalizeWindowsPath, ensureMcpJsonRegistration, ensurePlaywrightRegistration, ensureTrustDialogAccepted } from "./claude-config.ts";
 import { STATE_DIR } from "./config.ts";
-import { ensureOutboxDir } from "./outbox.ts";
+import { ensureOutboxDir, ensurePlaywrightSharedDir } from "./outbox.ts";
 import { generateSettings, writeSettingsFile } from "./settings.ts";
 import { ensureWorktree } from "./worktree.ts";
 
@@ -263,11 +263,24 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   // AIBRIDGE_OUTBOX_DIR (and handed to Playwright's --output-dir just below) always exists by the
   // time Claude's first turn could possibly try to write to it.
   const outboxPath = ensureOutboxDir(opts.stateDir ?? STATE_DIR, opts.slug);
-  const { changed: playwrightChanged } = ensurePlaywrightRegistration(claudeJsonPath, canonicalPath, outboxPath);
+  // Keyed by the *main repo's* canonical path, not the worktree's - confirmed live 2026-08-05 via
+  // `claude mcp add`'s own "local" scope (git-common-dir resolves a worktree back to the main
+  // repo, per `git rev-parse --git-common-dir`) that Claude Code's per-project ~/.claude.json
+  // identity for a worktree checkout is the *main* repo, unlike `.mcp.json`-based registration
+  // (ensureTrustDialogAccepted/ensureMcpJsonRegistration above), which is resolved by plain cwd
+  // and genuinely is per-worktree. Registering under the worktree's own canonical path here (the
+  // original implementation) silently produced an entry Claude Code never read at all - not shown
+  // even as "pending" in `claude mcp list` - with no error anywhere, the same class of invisible
+  // failure §2.4/§10.1.2 already document twice for this exact config file. Because this
+  // registration (and its --output-dir) is necessarily shared by every concurrent session on the
+  // same repo, it points at playwrightSharedDir, not this session's own outbox - see outbox.ts.
+  const canonicalRepoPath = canonicalizeWindowsPath(opts.repoPath);
+  const playwrightSharedPath = ensurePlaywrightSharedDir(opts.stateDir ?? STATE_DIR);
+  const { changed: playwrightChanged } = ensurePlaywrightRegistration(claudeJsonPath, canonicalRepoPath, playwrightSharedPath);
   log(
     "INFO",
     playwrightChanged
-      ? `registered playwright MCP server in ~/.claude.json (output-dir ${outboxPath})`
+      ? `registered playwright MCP server in ~/.claude.json under the main repo (output-dir ${playwrightSharedPath})`
       : "playwright MCP server already registered in ~/.claude.json",
   );
 
@@ -289,6 +302,7 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
       // vars above.
       AIBRIDGE_OUTBOX_DIR: outboxPath,
       AIBRIDGE_SCREENSHOT_SCRIPT: resolveScreenshotScriptPath(),
+      AIBRIDGE_PLAYWRIGHT_SHARED_DIR: playwrightSharedPath,
       // Claude Code does not surface an MCP server's stderr anywhere visible, so this is the only
       // way to observe the channel server's own log lines during manual verification (Stage 7).
       ...(debugLogFile ? { AIBRIDGE_DEBUG_LOG_FILE: debugLogFile } : {}),
@@ -333,6 +347,7 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
         AIBRIDGE_TOPIC: String(opts.topicId),
         AIBRIDGE_OUTBOX_DIR: outboxPath,
         AIBRIDGE_SCREENSHOT_SCRIPT: resolveScreenshotScriptPath(),
+        AIBRIDGE_PLAYWRIGHT_SHARED_DIR: playwrightSharedPath,
       }),
     },
   );

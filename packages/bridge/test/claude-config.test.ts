@@ -106,6 +106,9 @@ describe("ensureTrustDialogAccepted", () => {
 // §5.8: an *ordinary* MCP tool - unlike the aibridge channel above, this one genuinely does
 // resolve from ~/.claude.json's per-project mcpServers (confirmed by this project's own prior
 // observation of SeoWrite's playwright/chrome-devtools entries working with no .mcp.json at all).
+// command must be `cmd /c npx ...`, not bare `npx` - confirmed live 2026-08-05 that a bare-npx
+// entry never actually loads (npx is npx.cmd on Windows, unresolvable via Claude Code's own
+// direct, shell-less MCP server spawn) with no error surfaced anywhere.
 describe("ensurePlaywrightRegistration", () => {
   let dir: string;
 
@@ -127,8 +130,8 @@ describe("ensurePlaywrightRegistration", () => {
 
     const doc = JSON.parse(readFileSync(claudeJsonPath, "utf8"));
     expect(doc.projects["c:/data/worktrees/test-session"].mcpServers.playwright).toEqual({
-      command: "npx",
-      args: ["-y", "@playwright/mcp@latest", "--output-dir", "c:/state/sessions/test-session/outbox"],
+      command: "cmd",
+      args: ["/c", "npx", "-y", "@playwright/mcp@latest", "--output-dir", "c:/state/sessions/test-session/outbox"],
     });
   });
 
