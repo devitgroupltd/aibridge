@@ -1,7 +1,7 @@
 ---
-version: 0.52.0
+version: 0.53.0
 status: solid
-last_modified_utc: 2026-08-05T23:15:00Z
+last_modified_utc: 2026-08-05T23:45:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,26 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.53.0 (2026-08-05): CORRECTION to 0.52.0's gap #2, found by actually live-testing rather than
+    reasoning about it. Ran a real plugin-mode launch (a throwaway pipe/stateDir/worktree harness,
+    not the real dev Bridge - see below) and captured the channel server's own real process.env: all
+    three of AIBRIDGE_OUTBOX_DIR/AIBRIDGE_SCREENSHOT_SCRIPT/AIBRIDGE_PLAYWRIGHT_SHARED_DIR were
+    present and correct, with zero fallback warnings in the debug log. Root cause of the wrong
+    assumption: 0.52.0 only checked whether these three were set on the *`.mcp.json` registration's*
+    own env block (server:aibridge-mode-specific, and indeed skipped for plugin mode), but missed
+    that session-launcher.ts *also* sets all three directly on the outer PTY's own env,
+    unconditionally, regardless of mode - and Claude Code's plugin-declared MCP servers inherit that
+    outer PTY env in full, unlike a `.mcp.json`-registered server, which resolve-slug.ts's own
+    comment already documented does NOT inherit it. Two genuinely different MCP-spawn mechanisms,
+    two different inheritance behaviours - conflating them was the mistake. The gap does not exist;
+    reverted resolve-outbox-env.ts and its wiring/tests entirely rather than keep a fix for a bug
+    that isn't real (per the operator's own stated preference against carrying unused code) -
+    instructions text is back to reading straight off process.env, unchanged from before 0.52.0.
+    Plugin bundle rebuilt again post-revert. bun test (607 pass) and tsc --noEmit clean
+    monorepo-wide. Gap #1 (the stale bundle) stands as found and fixed. AIBRIDGE_CHANNEL_MODE=plugin
+    remains in session-launcher.ts as the gating toggle, default still unchanged - what's left before
+    flipping it is one live test against the real dev Bridge and real Telegram (this pass only
+    proved the MCP handshake and env in isolation, not a real reply/send_file round trip)."
   - "0.52.0 (2026-08-05): started on §10.1's plugin cutover (the last item Phase 5's exit note left
     open) after the operator added {marketplace: devitgroup-plugins, plugin: aibridge-telegram} to
     the org's real allowedChannelPlugins in claude.ai's managed settings. Two real gaps found before
@@ -4521,12 +4541,16 @@ item 3 is moot until §7.6.
   ~~Whether to cut the fleet's actual launch path over from
   `--dangerously-load-development-channels server:aibridge` to the plugin form remains a separate
   decision, deliberately left open rather than made unasked (see the 0.25.0 changelog entry).~~
-  **In progress (0.52.0):** the operator opted in and set the org's real `allowedChannelPlugins`.
-  Two real gaps were found before any live test (a stale plugin bundle, now rebuilt; §5.8's
-  send_file/screenshot tools silently losing their env vars under the plugin's static `plugin.json`
-  - not yet fixed). `session-launcher.ts` now supports both modes side by side behind an explicit
-  `AIBRIDGE_CHANNEL_MODE=plugin` toggle, default unchanged. **Still the one thing left open in this
-  phase** - the send_file/screenshot gap has to close before a live test is safe to run.
+  **In progress (0.52.0/0.53.0):** the operator opted in and set the org's real
+  `allowedChannelPlugins`. One real gap found and fixed (a stale plugin bundle); one suspected gap
+  (§5.8's send_file/screenshot env vars under plugin mode) turned out not to exist once actually
+  live-tested (0.53.0) - `session-launcher.ts` already sets all three on the outer PTY's own env
+  unconditionally, and Claude Code's plugin-declared MCP servers inherit that in full. A throwaway
+  isolated harness confirmed the MCP handshake and env end to end. `session-launcher.ts` now
+  supports both modes side by side behind an explicit `AIBRIDGE_CHANNEL_MODE=plugin` toggle, default
+  unchanged. **Still the one thing left open in this phase** - one live test against the real dev
+  Bridge and real Telegram (a genuine reply/send_file round trip, not just the isolated harness)
+  before flipping the default and removing the old dev-flag path.
 
 ### Phase 6 - hardening, and the WSL2 migration
 
