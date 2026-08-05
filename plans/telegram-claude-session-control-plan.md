@@ -1,7 +1,7 @@
 ---
-version: 0.49.1
+version: 0.50.0
 status: solid
-last_modified_utc: 2026-08-05T20:45:00Z
+last_modified_utc: 2026-08-05T21:15:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,25 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.50.0 (2026-08-05): added §5.9 - /deploy <slug>, control-topic only: merges a session's own
+    branch into its repo via git merge --ff-only, runs the same gate §9 already calls the test plan
+    (bun test at the repo root, tsc --noEmit per package via discoverTypecheckedPackages), and rolls
+    back with git reset --hard on any gate failure so a bad merge never lands untested. If the repo
+    being merged into is aibridge's own checkout (isSelfRepo, compared against
+    resolveBridgeRepoRoot), performs the identical self-respawn §4.5.1's /restart already does -
+    this is the answer to \"can aibridge fix itself from Telegram\": /new aibridge against
+    aibridge's own repo (nothing in §7.5's registry model prevents it), then /deploy the resulting
+    branch. New crash-loop safety net /restart never needed (a human always triggered that
+    knowingly): deployMarker ($STATE/deploy-pending.json) is written just before the self-respawn
+    with the pre-merge commit and the chat/topic to notify, survives across process crashes by
+    design, and is checked at both ends of main() - stale (>45s, matching §7's own Task Scheduler
+    restart cadence) means the deploy never started cleanly, so the *next* boot rolls the repo back
+    and self-respawns again; present at the end of a boot that reached its last line without
+    throwing means this attempt succeeded, so it's confirmed and cleared. New deploy.ts, all
+    git/test invocations through an injectable CommandRunner (same pattern as rate-governor.ts's
+    injected clock) so merge/gate/rollback/crash-loop logic is unit-tested (24 new tests) without a
+    real repo or a real bun test run. 589 tests pass monorepo-wide, tsc --noEmit clean. Not yet
+    live-verified against a real self-deploy - stated as an open exit bar, not glossed over."
   - "0.49.1 (2026-08-05): fixed §5.8's Playwright gap left open by 0.49.0 - two real bugs in
     ensurePlaywrightRegistration, both invisible with no error anywhere, found only by looking.
     (1) command: \"npx\" bare never resolves - Windows npx is npx.cmd, a batch file, and Claude
@@ -2637,6 +2656,88 @@ fresh `/new` session's first turn correctly listed the full Playwright toolset
 (`browser_navigate`, `browser_take_screenshot`, `browser_snapshot`, `browser_click`, ... 20 tools)
 unprompted. Diagnostic worktrees/sessions/`~/.claude.json` entries created during this probe were
 cleaned up afterward, not left behind.
+
+### 5.9 Fixing the Bridge itself from Telegram
+
+A natural question once §7.5 makes "which project" a plain `repos.toml` lookup: can aibridge fix
+*itself* the same way, from a phone, with no desk involved? Nothing stops aibridge's own repo from
+being registered like any other project - `/new aibridge fix the thing that's broken` cuts a
+worktree and starts a session against aibridge's own source exactly like any other `/new`. The gap
+was landing that fix and applying it: a worktree session produces a branch, not a change on the
+checkout the running Bridge process actually loaded its code from, and §4.5.1's `/restart` only
+ever re-execs whatever is already on disk - it has no opinion about getting a fix onto that disk in
+the first place.
+
+**`/deploy <slug>`, control-topic only.** Looks up that session's row for `repoPath`/`branch`
+(already tracked per-session, §4.2's routing table), and:
+
+1. **Merge, fast-forward only.** `git merge --ff-only <branch>` into `repoPath`'s current HEAD -
+   deliberately never a real merge commit; a branch that's diverged from main is a "rebase it
+   yourself" case, not something worth resolving automatically over a chat window. Refuses outright
+   (no merge attempted at all) on a dirty tree, a missing branch, or a non-fast-forward branch.
+2. **Gate.** The same check an operator would run by hand per §9: `bun test` once at the repo root
+   (covers every workspace), then `tsc --noEmit` per package that declares a `typecheck` script
+   (`discoverTypecheckedPackages` - computed from `packages/*/package.json` at deploy time, not
+   hardcoded, so a future new package is covered for free). A gate failure after a real merge runs
+   `git reset --hard` back to the commit recorded before the merge started - the repo is never left
+   sitting on an untested commit.
+3. **Restart, only if this was aibridge's own repo.** `isSelfRepo` compares `repoPath` against
+   `resolveBridgeRepoRoot` (the running process's own module directory, resolved three directories
+   up from `packages/bridge/src` regardless of the Bridge's actual launch cwd) via the same
+   drive-letter/slash canonicalisation §2.4 already uses for `~/.claude.json` keys. Merging a branch
+   into any *other* registered project is just the merge+gate above with a confirmation message -
+   there's no "Bridge" to restart for it. Merging into aibridge's own repo does the identical
+   self-respawn `/restart` already performs (`spawn(process.execPath, ...)`, `detached: true`,
+   `process.exit(0)`), so every live session dies and comes back the same way any other Bridge
+   restart already does (§4.5) - not a new code path, `/deploy`'s self-repo branch *is* `/restart`,
+   just reached after a merge+gate instead of on its own.
+
+**The crash-loop problem `/restart` never had to solve, because a human always triggered it
+knowingly.** A `/deploy`-triggered restart can be wrong in a way `/restart` itself can't: the commit
+being restarted *into* might simply not work - and the only thing that could ever tell the operator
+that is the Bridge process itself, which is exactly what's failing to come up. `deployMarker`
+(`deploy.ts`, `$STATE/deploy-pending.json`) is the safety net: written right before the self-respawn
+with the pre-merge commit and the chat/topic to notify, it survives across process boundaries
+(unlike anything held only in memory) precisely because a crash is the failure mode being guarded
+against. Two checks in `main()`, one at each end of startup:
+
+- **Near the very start** (right after the bot tokens validate, deliberately before any heavier
+  setup): if a marker exists and is older than `DEPLOY_CRASH_LOOP_THRESHOLD_MS` (45s - matches §7's
+  own Task Scheduler restart cadence, "restart every 1 minute, up to 99 times", so a marker is only
+  treated as stale once a boot attempt has had a full cycle to either clear it or crash again, never
+  mid-way through the very attempt that wrote it), that boot clearly isn't the attempt the marker
+  was written for - `rollbackStaleDeploy` resets `repoRoot` back to `previousHeadSha`, notifies the
+  recorded chat/topic, and self-respawns once more (this time onto the reverted commit).
+- **At the very end** (once `main()` has reached its last line without throwing - the same "this
+  boot actually worked" signal `§4.5`'s own reconciliation already relies on): a marker still
+  present is *this* attempt succeeding, not a crash-loop - notified with the new commit, then
+  cleared, so the stale check above never sees it again.
+
+This is a best-effort net, not a guarantee, stated as plainly as §4.5.1's own restart-recovery
+caveat: if the very first boot after a bad deploy corrupts state badly enough to prevent even
+*this* check from running (rather than merely crashing on the way there), nothing here saves it -
+that failure mode needs the same physical/Task-Scheduler-level recovery any other unrecoverable
+crash would. What it does cover, and was the actual point: an ordinary bug that would otherwise
+crash-loop the Bridge forever on a broken commit, with the operator locked out of the one channel
+that would tell them, now reverts itself within about a minute and says so.
+
+**Scope.** `/deploy` intentionally does not: merge anything other than fast-forward (no auto-resolve
+of a real conflict), run outside the gate this project's own `§9` already calls the test plan, or
+touch any session's worktree - `/rm`/`/kill` remain the only things that ever delete a worktree.
+
+**RESOLVED, implemented 2026-08-05.** New `deploy.ts` (`resolveBridgeRepoRoot`, `isSelfRepo`,
+`discoverTypecheckedPackages`, `runGate`, `deployBranch`, the `deployMarker` read/write/clear/
+staleness helpers, `rollbackStaleDeploy`, `truncateForTelegram`), all git/test invocations going
+through an injectable `CommandRunner` (mirrors the injected-clock convention already used by
+`rate-governor.ts`) so the merge/gate/rollback/crash-loop logic is unit-tested (24 new tests,
+`deploy.test.ts`) without a real git repo or a real `bun test` run. `fleet-commands.ts` gained
+`/deploy <slug>`, `index.ts` gained `handleDeployCommand` and the two startup marker checks above.
+25 new tests total (`deploy.test.ts` plus `fleet-commands.test.ts`'s parsing/help coverage), 589
+tests pass monorepo-wide, `tsc --noEmit` clean across every package. Not yet live-verified against
+a real self-deploy (that requires actually registering aibridge's own repo and running a fix
+through the full loop) - the exit bar for calling this proven, not just built, is the same live
+walkthrough §9's own scenario list asks for everything else: a real session on aibridge's own repo
+fixing something, `/deploy`d, and the Bridge visibly coming back up on the new commit.
 
 ---
 

@@ -22,6 +22,18 @@ import {
   resolveCommandAction,
 } from "./commands.ts";
 import { loadConfig, STATE_DIR } from "./config.ts";
+import {
+  clearDeployMarker,
+  deployBranch,
+  discoverTypecheckedPackages,
+  isDeployMarkerStale,
+  isSelfRepo,
+  readDeployMarker,
+  resolveBridgeRepoRoot,
+  rollbackStaleDeploy,
+  truncateForTelegram,
+  writeDeployMarker,
+} from "./deploy.ts";
 import { buildDetailsKeyboard, parseDetailsCallback } from "./details-button.ts";
 import {
   attachmentKindLabel,
@@ -133,6 +145,36 @@ async function main(): Promise<void> {
 
   await validateTokens(controlBot, feedBot);
   log("INFO", "both bot tokens validated via getMe");
+
+  // §5.9's crash-loop safety net for `/deploy`'s self-restart path: a marker written just before
+  // the *previous* boot attempt's self-respawn that is still here, and old enough that this boot
+  // clearly isn't that same attempt continuing (§7's Task Scheduler restart cadence), means the
+  // deployed commit never reached "started cleanly" (see the marker-clearing call near the end of
+  // `main()`) - roll the repo back on our own rather than crash-looping forever with no way to say
+  // so. A fresh marker (this boot IS that attempt) is left alone here and consumed later instead.
+  {
+    const marker = readDeployMarker(STATE_DIR);
+    if (marker && isDeployMarkerStale(marker, Date.now())) {
+      log("WARN", `deploy marker for "${marker.branch}" is stale - Bridge never started cleanly after that deploy, rolling back to ${marker.previousHeadSha.slice(0, 8)}`);
+      const reset = await rollbackStaleDeploy(marker);
+      clearDeployMarker(STATE_DIR);
+      if (reset.status === 0) {
+        try {
+          await controlBot.sendMessage(
+            marker.chatId,
+            marker.topicId,
+            `⚠️ Deploy of "${marker.branch}" didn't come back up cleanly - rolled back to ${marker.previousHeadSha.slice(0, 8)} and restarting again.`,
+          );
+        } catch (err) {
+          log("WARN", `failed to send deploy-rollback notice: ${(err as Error).message}`);
+        }
+        spawn(process.execPath, process.argv.slice(1), { detached: true, stdio: "ignore" }).unref();
+        process.exit(0);
+      } else {
+        log("ERROR", `deploy rollback itself failed (${reset.stderr || reset.stdout}) - continuing this boot on whatever commit is on disk`);
+      }
+    }
+  }
 
   try {
     await controlBot.setMyCommands(config.supergroupChatId, botCommandList());
@@ -1410,6 +1452,80 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  /**
+   * §5.9's `/deploy <slug>`: lets a fix written by a Claude session - including one against
+   * aibridge's own repo, registered like any other project (§7.5) - land without a desk. Merges
+   * that session's own branch into its repo's main checkout via `deployBranch` (fast-forward only,
+   * rolled back automatically on a gate failure), then only if the repo being merged into is this
+   * Bridge's own checkout (`isSelfRepo` - any other project's branch is just a merge+test, there is
+   * no "Bridge" to restart for it) does the same self-respawn `/restart` already does, first
+   * writing `deployMarker` so a boot that never comes up cleanly gets rolled back automatically
+   * (see the startup check near the end of `main()`) rather than crash-looping on a bad commit
+   * with no way to say so.
+   */
+  async function handleDeployCommand(topicId: number | undefined, slug: string): Promise<void> {
+    if (!isControlTopic(topicId)) {
+      confirmSessionCommand(topicId, "/deploy only works from the control topic.");
+      return;
+    }
+    const row = sessionStore.get(slug);
+    if (!row) {
+      confirmSessionCommand(topicId, `No session "${slug}".`);
+      return;
+    }
+    const { repoPath, branch } = row;
+    try {
+      await controlBot.sendMessage(config.supergroupChatId, topicId, `Deploying "${branch}" (session "${slug}") into ${repoPath}…`);
+    } catch (err) {
+      log("WARN", `failed to send /deploy ack: ${(err as Error).message}`);
+    }
+    log("INFO", `/deploy requested for slug "${slug}" -> merging "${branch}" into ${repoPath}`);
+    const packageDirs = discoverTypecheckedPackages(repoPath);
+    const outcome = await deployBranch(repoPath, branch, packageDirs);
+    if (!outcome.ok) {
+      log("WARN", `/deploy failed for "${branch}": ${outcome.message}`);
+      try {
+        await controlBot.sendMessage(config.supergroupChatId, topicId, truncateForTelegram(outcome.message));
+      } catch (err) {
+        log("WARN", `failed to send /deploy failure message: ${(err as Error).message}`);
+      }
+      return;
+    }
+    try {
+      await controlBot.sendMessage(config.supergroupChatId, topicId, truncateForTelegram(outcome.message));
+    } catch (err) {
+      log("WARN", `failed to send /deploy success message: ${(err as Error).message}`);
+    }
+
+    const bridgeRepoRoot = resolveBridgeRepoRoot(import.meta.dirname);
+    if (!isSelfRepo(repoPath, bridgeRepoRoot)) {
+      log("INFO", `/deploy: "${repoPath}" isn't this Bridge's own repo - merged only, no restart`);
+      return;
+    }
+
+    writeDeployMarker(STATE_DIR, {
+      previousHeadSha: outcome.previousHeadSha ?? "",
+      newHeadSha: outcome.newHeadSha ?? "",
+      repoRoot: repoPath,
+      branch,
+      chatId: config.supergroupChatId,
+      topicId,
+      deployedAtIso: new Date().toISOString(),
+    });
+    try {
+      await controlBot.sendMessage(
+        config.supergroupChatId,
+        topicId,
+        "This is aibridge's own repo - restarting now to apply the fix (§5.9). If it doesn't come back up cleanly within a minute, it rolls itself back automatically and restarts again.",
+      );
+    } catch (err) {
+      log("WARN", `failed to send /deploy restart notice: ${(err as Error).message}`);
+    }
+    log("INFO", "/deploy: self-repo, spawning detached successor and exiting");
+    spawn(process.execPath, process.argv.slice(1), { detached: true, stdio: "ignore" }).unref();
+    process.exit(0);
+  }
+
   /** `/settings`: control-topic only, same reasoning as `/budget` - repos.toml and the weighted
    * concurrency budget are fleet-wide, not scoped to any one session's topic. */
   function handleSettingsCommand(topicId: number | undefined): void {
@@ -1590,6 +1706,10 @@ async function main(): Promise<void> {
       }
       if (fleetCmd.kind === "restart") {
         void handleRestartCommand(threadId);
+        return;
+      }
+      if (fleetCmd.kind === "deploy") {
+        void handleDeployCommand(threadId, fleetCmd.slug);
         return;
       }
       if (fleetCmd.kind === "settings") {
@@ -2053,6 +2173,25 @@ async function main(): Promise<void> {
   });
 
   log("INFO", "Bridge started - getUpdates loop running");
+
+  // §5.9: this boot reached the end of startup without throwing, so any deploy marker still
+  // sitting here is *this* attempt succeeding, not a crash-loop - confirm it to the operator and
+  // clear it so the stale-marker check above never sees it again.
+  {
+    const marker = readDeployMarker(STATE_DIR);
+    if (marker) {
+      clearDeployMarker(STATE_DIR);
+      try {
+        await controlBot.sendMessage(
+          marker.chatId,
+          marker.topicId,
+          `✅ Deploy succeeded - Bridge is back up on ${marker.newHeadSha.slice(0, 8)} ("${marker.branch}").`,
+        );
+      } catch (err) {
+        log("WARN", `failed to send deploy-success notice: ${(err as Error).message}`);
+      }
+    }
+  }
 }
 
 await main();

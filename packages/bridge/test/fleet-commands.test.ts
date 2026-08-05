@@ -161,6 +161,12 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/restart")).toEqual({ kind: "restart" });
   });
 
+  test("/deploy requires a slug", () => {
+    expect(parseFleetCommand("/deploy fix-the-thing")).toEqual({ kind: "deploy", slug: "fix-the-thing" });
+    expect(parseFleetCommand("/deploy")).toBeNull();
+    expect(parseFleetCommand("/deploy   ")).toBeNull();
+  });
+
   test("/settings takes no argument", () => {
     expect(parseFleetCommand("/settings")).toEqual({ kind: "settings" });
   });
@@ -274,7 +280,7 @@ describe("parseFleetCommand", () => {
 describe("renderHelp", () => {
   test("lists every fleet-scoped and session-scoped command", () => {
     const text = renderHelp();
-    for (const cmd of ["/new", "/ls", "/kill", "/rm", "/attach", "/pause", "/usage", "/budget", "/restart", "/settings", "/repos", "/autostart"]) {
+    for (const cmd of ["/new", "/ls", "/kill", "/rm", "/attach", "/pause", "/usage", "/budget", "/restart", "/deploy", "/settings", "/repos", "/autostart"]) {
       expect(text).toContain(cmd);
     }
     expect(text).toContain("/model <");

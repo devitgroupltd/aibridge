@@ -31,6 +31,7 @@ export type FleetCommand =
   | { kind: "usage"; slug?: string }
   | { kind: "budget" }
   | { kind: "restart" }
+  | { kind: "deploy"; slug: string }
   | { kind: "settings" }
   | { kind: "autostart"; action: "status" | "install" | "uninstall" }
   | { kind: "repos"; action: "list" }
@@ -189,7 +190,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
  * "for us, but invalid" split as `session-commands.ts`'s parser. */
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|settings|autostart|repos|voice)\b(.*)$/s);
+  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|deploy|settings|autostart|repos|voice)\b(.*)$/s);
   if (!match) return null;
   const [, cmd, rest] = match as [string, string, string];
   switch (cmd) {
@@ -201,6 +202,10 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return { kind: "budget" };
     case "restart":
       return { kind: "restart" };
+    case "deploy": {
+      const slug = rest.trim();
+      return slug.length > 0 ? { kind: "deploy", slug } : null;
+    }
     case "settings":
       return { kind: "settings" };
     case "autostart":
@@ -434,6 +439,8 @@ export function renderHelp(): string {
     "  /usage [<slug>] - token/cost usage",
     "  /budget - fleet spend (5h/7d)",
     "  /restart - restart the Bridge daemon",
+    "  /deploy <slug> - merge that session's branch into its repo, run tests, and (if the repo is",
+    "    aibridge's own) restart the Bridge to pick up the fix (§5.9)",
     "  /settings - registered repos + concurrency budget",
     "  /repos [list|add <name> [path|git-url] [--base <b>] [--model <m>]|rm <name>] - manage repos.toml",
     "  /autostart [status|install|uninstall] - manage the logon Task Scheduler entry",
@@ -469,6 +476,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "usage", description: "Token/cost usage" },
     { command: "budget", description: "Fleet spend (5h/7d)" },
     { command: "restart", description: "Restart the Bridge daemon" },
+    { command: "deploy", description: "Merge a session's branch and run tests: /deploy <slug> (restarts if it's aibridge's own repo)" },
     { command: "settings", description: "Registered repos + concurrency budget" },
     { command: "repos", description: "Manage repos.toml: list|add <name> [path|git-url]|rm <name>" },
     { command: "autostart", description: "Manage the logon Task Scheduler entry: status|install|uninstall" },
