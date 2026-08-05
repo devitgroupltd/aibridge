@@ -55,12 +55,13 @@ export interface EnsureRegistrationResult {
  *
  * §10.1.2 correction (2026-08-03): this used to also write `mcpServers.aibridge` here, on the
  * theory that "register user-level, not in a worktree's `.mcp.json`" (§2.4) applied to the channel
- * server too. Confirmed live it does not:
- * `--dangerously-load-development-channels server:aibridge` resolves its argument against the
- * worktree's own `.mcp.json`, never against this file's per-project `mcpServers`, so a channel
- * registered only here produces Claude Code's "no MCP server configured with that name" warning
- * and the server is never spawned at all. See `ensureMcpJsonRegistration` below for where the
- * channel entry actually has to live.
+ * server too. Confirmed live it does not: the old `--dangerously-load-development-channels
+ * server:aibridge` launch form (removed in 0.55.0 once the plugin form it was superseded by was
+ * live-verified as the fleet's real default, §10.1) resolved its argument against the worktree's
+ * own `.mcp.json`, never against this file's per-project `mcpServers`, so a channel registered
+ * only here produced Claude Code's "no MCP server configured with that name" warning and the
+ * server was never spawned at all. The plugin form registers the channel via its own static
+ * `plugin.json` instead, so there is no `.mcp.json` registration step left to need at all.
  */
 /**
  * §5.8: registers the official Microsoft Playwright MCP server (`@playwright/mcp`) at
@@ -133,29 +134,3 @@ export function ensureTrustDialogAccepted(
   return { changed: true };
 }
 
-interface McpJsonDoc {
-  mcpServers?: Record<string, McpServerEntry>;
-  [key: string]: unknown;
-}
-
-/**
- * Ensures `<worktreePath>/.mcp.json` declares the `aibridge` server matching `serverEntry`,
- * writing the file only if something needs to change (idempotent). This is what
- * `--dangerously-load-development-channels server:aibridge` actually resolves against (see the
- * correction above) - it also means the "New MCP server found in this project" consent dialog
- * fires on every `/new`, which §2.4's original design specifically tried to avoid and could not,
- * for this specific feature.
- */
-export function ensureMcpJsonRegistration(worktreePath: string, serverEntry: McpServerEntry): EnsureRegistrationResult {
-  const mcpJsonPath = `${worktreePath}/.mcp.json`;
-  const doc: McpJsonDoc = existsSync(mcpJsonPath) ? (JSON.parse(readFileSync(mcpJsonPath, "utf8")) as McpJsonDoc) : {};
-
-  const alreadyRegistered = JSON.stringify(doc.mcpServers?.aibridge) === JSON.stringify(serverEntry);
-  if (alreadyRegistered) {
-    return { changed: false };
-  }
-
-  doc.mcpServers = { ...doc.mcpServers, aibridge: serverEntry };
-  writeFileSync(mcpJsonPath, JSON.stringify(doc, null, 2));
-  return { changed: true };
-}

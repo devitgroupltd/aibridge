@@ -93,8 +93,8 @@ describe("walking skeleton (§9 scenario 29)", () => {
       });
       cleanups.push(() => stopPolling());
 
-      // Stand in for `claude --dangerously-load-development-channels server:aibridge`: spawn the
-      // real channel server over stdio, exactly as Claude Code would.
+      // Stand in for `claude --channels plugin:aibridge-telegram@devitgroup-plugins` (the real launch
+      // form since 0.55.0, §10.1): spawn the real channel server over stdio, exactly as Claude Code would.
       const channelServerEntry = path.resolve(import.meta.dirname, "../../channel-server/src/index.ts");
       const transport = new StdioClientTransport({
         command: "bun",

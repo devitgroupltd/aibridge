@@ -312,7 +312,6 @@ async function main(): Promise<void> {
   }
 
   const ptyProcessBySlug = new Map<string, pty.IPty>();
-  const channelServerEntryPath = path.resolve(import.meta.dirname, "../../channel-server/src/index.ts");
   // `sendChannelText`'s own lost-Enter detector (found 2026-08-04, see the 0.27.0 changelog entry):
   // the last time each session's PTY produced *any* output, so a write that never gets a single
   // further onData event within the check window is treated as "the trailing \r never submitted"
@@ -588,7 +587,6 @@ async function main(): Promise<void> {
       slug: config.phase1.slug,
       topicId: config.phase1.topicId,
       repoPath: config.phase1.repoPath,
-      channelServerEntryPath,
       worktreesRoot: phase1WorktreesRoot,
       mirrorPtyToConsole: process.env.AIBRIDGE_DEV_MIRROR_PTY === "1",
       otlpPort,
@@ -883,7 +881,6 @@ async function main(): Promise<void> {
         slug,
         topicId,
         repoPath: row.repoPath,
-        channelServerEntryPath,
         worktreesRoot: path.dirname(row.worktreePath),
         model: row.model,
         resumeSessionId: row.sessionId,
@@ -973,7 +970,6 @@ async function main(): Promise<void> {
         slug,
         topicId: topic.message_thread_id,
         repoPath: repo.path,
-        channelServerEntryPath,
         worktreesRoot: fleetWorktreesRoot,
         model,
         otlpPort,

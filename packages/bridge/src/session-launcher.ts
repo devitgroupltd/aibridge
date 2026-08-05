@@ -3,7 +3,7 @@ import { existsSync, readdirSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import * as pty from "node-pty";
-import { canonicalizeWindowsPath, ensureMcpJsonRegistration, ensurePlaywrightRegistration, ensureTrustDialogAccepted } from "./claude-config.ts";
+import { canonicalizeWindowsPath, ensurePlaywrightRegistration, ensureTrustDialogAccepted } from "./claude-config.ts";
 import { STATE_DIR } from "./config.ts";
 import { ensureOutboxDir, ensurePlaywrightSharedDir } from "./outbox.ts";
 import { generateSettings, writeSettingsFile } from "./settings.ts";
@@ -111,16 +111,16 @@ export interface SessionLaunchOptions {
   slug: string;
   topicId: number;
   repoPath: string;
-  /** Absolute path to packages/channel-server/src/index.ts, run via `bun run`. */
-  channelServerEntryPath: string;
   worktreesRoot?: string;
   claudeJsonPath?: string;
   /** Overrides where the generated `--settings` file is written under - defaults to `$STATE`. */
   stateDir?: string;
   /**
-   * §10.1 correction: the dev-flag confirm keystroke is Phase 5 work, not Phase 1 ("Manual
-   * launch" per §12). When set, mirrors the PTY's I/O to this process's own stdio so the
-   * operator can watch for and answer the development-channels warning dialog by hand.
+   * §10.1's original "Manual launch" affordance (Phase 1, before the Phase 5 supervisor existed to
+   * answer startup dialogs automatically): mirrors the PTY's I/O to this process's own stdio so an
+   * operator can watch and type into a session directly. The dev-flag dialog this was built to
+   * answer by hand is gone as of 0.55.0 (the plugin launch form has none), but the mirror itself
+   * still has standalone debugging value, so it stays.
    */
   mirrorPtyToConsole?: boolean;
   log?: LogFn;
@@ -142,12 +142,13 @@ export interface LaunchedSession {
   branch: string;
   ptyProcess: pty.IPty;
   /**
-   * Resolves once the dev-channels dialog is confirmed (or a safety timeout elapses assuming none
-   * ever showed up). A caller that writes anything else to the PTY - `/new`'s initial prompt, in
-   * particular - before this resolves races the still-open dialog: confirmed live 2026-08-04, a
-   * `/new` prompt sent immediately after launch corrupted the dialog's input and the session never
-   * got past it at all, with no error anywhere. Everyone who writes to a freshly-launched PTY must
-   * await this first.
+   * Resolves once the startup splash sequence's own status bar appears (or a safety timeout
+   * elapses assuming it never will). A caller that writes anything else to the PTY - `/new`'s
+   * initial prompt, in particular - before this resolves races Claude Code's own still-rendering
+   * startup: confirmed live 2026-08-04 (back when a startup dialog sat in that window too), a
+   * `/new` prompt sent too early corrupted in-flight input and the session never got past it at
+   * all, with no error anywhere. Everyone who writes to a freshly-launched PTY must await this
+   * first.
    */
   ready: Promise<void>;
 }
@@ -174,87 +175,50 @@ export function stripAnsi(text: string): string {
 }
 
 /**
- * Watches the PTY's own output for a known startup dialog's banner text and its own confirm hint,
- * rather than a fixed delay - render time isn't fixed (Claude Code's own startup cost varies), and
- * the known PTY-timing hazard elsewhere in this codebase (`/effort`'s second `\r`) is exactly what
- * a fixed delay would risk here too. Two dialogs are known, and can both show up in sequence on a
- * genuinely fresh worktree (confirmed live 2026-08-04): the "New MCP server found in this project"
- * consent dialog (documented in `claude-config.ts` as unavoidable for this feature - it fires on
- * the worktree's first-ever launch, before the dev-channels dialog) and the dev-channels dialog
- * itself (fires on *every* launch, unconditionally). Each is confirmed with a bare Enter (both
- * pre-select the "use this session only" option), and the buffer is reset after each confirm so
- * trailing dialog text can't falsely re-match. Resolving as soon as the dev-channels dialog is
- * confirmed is NOT enough, though - confirmed live 2026-08-04, even with a 500ms settle delay
- * afterward, a caller's very next write (e.g. `/new`'s initial prompt) could still race Claude
- * Code's own post-dialog startup (the `SessionStart` hook firing, the MCP handshake, the banner
- * render) and silently lose its trailing Enter, wedging the session with no further output at all
- * and no error anywhere. So this waits for an explicit, later signal instead of any fixed delay:
- * the bottom status bar text that's the last thing the splash sequence renders, proving the REPL
- * prompt is actually live and accepting input.
+ * Watches the PTY's own output for the splash sequence's final status-bar line rather than a
+ * fixed delay - render time isn't fixed (Claude Code's own startup cost varies), and the known
+ * PTY-timing hazard elsewhere in this codebase (`/effort`'s second `\r`) is exactly what a fixed
+ * delay would risk here too.
+ *
+ * Through 0.54.0 this also had to watch for and auto-confirm two startup dialogs first - the "New
+ * MCP server found in this project" consent dialog (fired on a worktree's first-ever launch, from
+ * the old `.mcp.json` registration) and the `--dangerously-load-development-channels` warning
+ * (fired on *every* launch, unconditionally). Removed in 0.55.0: the plugin launch form that
+ * replaced both (live-verified as the fleet's real default, §10.1) registers the channel via its
+ * own static `plugin.json` instead of a per-worktree `.mcp.json`, and needs no dev flag at all, so
+ * neither dialog can fire anymore - there is nothing left here to detect or confirm.
+ *
+ * Resolving as soon as the status bar appears is NOT enough, though - confirmed live 2026-08-04,
+ * even with a 500ms settle delay afterward, a caller's very next write (e.g. `/new`'s initial
+ * prompt) could still race Claude Code's own post-splash startup (the `SessionStart` hook firing,
+ * the MCP handshake, the banner render) and silently lose its trailing Enter, wedging the session
+ * with no further output at all and no error anywhere. So this waits for an explicit, later signal
+ * instead of any fixed delay: the bottom status bar text that's the last thing the splash sequence
+ * renders, proving the REPL prompt is actually live and accepting input - and a caller that also
+ * needs the MCP handshake settled (`/new`'s initial prompt does) waits on the real `channel server
+ * connected` event from the pipe server instead (`index.ts`'s `waitForChannelConnected`), which is
+ * what actually closes that race deterministically rather than guessing a delay.
  */
-/**
- * §10.1's escape hatch, now the default as of 0.54.0 - live-verified 2026-08-05 (a real reply +
- * Bash round trip against the real dev Bridge, both existing sessions reconciling cleanly through
- * a restart under this mode) after the operator added this plugin to the org's real
- * `allowedChannelPlugins`. `--channels plugin:<name>@<marketplace>` resolves without the dev flag
- * at all, so *neither* startup dialog `autoConfirmDevChannelsDialog` used to wait for actually
- * fires - not the dev-channels warning (no dev flag to warn about) and not the "New MCP server
- * found" consent dialog (no `.mcp.json` registration in this mode; the plugin's `mcpServers` block
- * replaces it). `AIBRIDGE_CHANNEL_MODE=dev-flag` reverts to the old
- * `--dangerously-load-development-channels server:aibridge` path for rollback safety - kept as an
- * escape hatch, not deleted outright yet, since the org-level `allowedChannelPlugins` setting
- * this depends on is a lever the operator controls independently of any code change here.
- */
-function isPluginChannelMode(): boolean {
-  return process.env.AIBRIDGE_CHANNEL_MODE !== "dev-flag";
-}
-
-function autoConfirmDevChannelsDialog(ptyProcess: pty.IPty, log: LogFn, skipDialogs: boolean): Promise<void> {
+function waitForStartupPrompt(ptyProcess: pty.IPty, log: LogFn): Promise<void> {
   return new Promise((resolve) => {
-    let stage: "dialogs" | "prompt" | "done" = skipDialogs ? "prompt" : "dialogs";
+    let done = false;
     let rawBuffer = "";
-    // A sequence that never completes (unexpected CLI version, `--resume` skipping straight past
-    // both dialogs to a differently-rendered prompt, etc.) must not wedge every caller waiting on
+    // A sequence that never renders this line at all (unexpected CLI version, `--resume` skipping
+    // straight to a differently-rendered prompt, etc.) must not wedge every caller waiting on
     // `ready` forever - proceeds anyway past this, logged loudly since it means something about the
     // assumed startup sequence changed.
     const timeout = setTimeout(() => {
-      if (stage === "done") return;
-      stage = "done";
-      log("WARN", "timed out waiting for startup dialogs/prompt to settle - proceeding anyway");
+      if (done) return;
+      done = true;
+      log("WARN", "timed out waiting for the startup prompt to settle - proceeding anyway");
       resolve();
     }, 30_000);
     ptyProcess.onData((data) => {
-      if (stage === "done") return;
+      if (done) return;
       rawBuffer = (rawBuffer + data).slice(-8000);
       const plain = stripAnsi(rawBuffer);
-
-      if (stage === "dialogs") {
-        if (/new mcp server found/i.test(plain) && /enter to confirm/i.test(plain)) {
-          ptyProcess.write("\r");
-          log("INFO", 'auto-confirmed the "New MCP server found" consent dialog');
-          rawBuffer = "";
-          return;
-        }
-        if (/development channels/i.test(plain) && /enter to confirm/i.test(plain)) {
-          ptyProcess.write("\r");
-          log("INFO", "auto-confirmed the --dangerously-load-development-channels dialog");
-          rawBuffer = "";
-          stage = "prompt";
-        }
-        return;
-      }
-
-      // stage === "prompt": the "? for shortcuts · ← for agents" status bar is the last thing the
-      // splash sequence renders, so seeing it is a real (not guessed) lower bound on readiness.
-      // It is not sufficient by itself, though - confirmed live 2026-08-04 that a write right after
-      // it can still silently lose its trailing Enter, because the MCP handshake (the channel
-      // server registering itself with this Claude Code process) hasn't finished yet, and that has
-      // no signal at all in the PTY stream. A caller that also needs *that* settled - `/new`'s
-      // initial prompt does - waits on the real `channel server connected` event from the pipe
-      // server instead (index.ts's `waitForChannelConnected`), which is what actually closes this
-      // race deterministically rather than guessing a delay.
       if (/for shortcuts/i.test(plain) || /for agents/i.test(plain)) {
-        stage = "done";
+        done = true;
         clearTimeout(timeout);
         resolve();
       }
@@ -283,14 +247,14 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   // Keyed by the *main repo's* canonical path, not the worktree's - confirmed live 2026-08-05 via
   // `claude mcp add`'s own "local" scope (git-common-dir resolves a worktree back to the main
   // repo, per `git rev-parse --git-common-dir`) that Claude Code's per-project ~/.claude.json
-  // identity for a worktree checkout is the *main* repo, unlike `.mcp.json`-based registration
-  // (ensureTrustDialogAccepted/ensureMcpJsonRegistration above), which is resolved by plain cwd
-  // and genuinely is per-worktree. Registering under the worktree's own canonical path here (the
-  // original implementation) silently produced an entry Claude Code never read at all - not shown
-  // even as "pending" in `claude mcp list` - with no error anywhere, the same class of invisible
-  // failure §2.4/§10.1.2 already document twice for this exact config file. Because this
-  // registration (and its --output-dir) is necessarily shared by every concurrent session on the
-  // same repo, it points at playwrightSharedDir, not this session's own outbox - see outbox.ts.
+  // identity for a worktree checkout is the *main* repo, unlike `ensureTrustDialogAccepted` above
+  // (resolved by plain cwd, genuinely per-worktree). Registering under the worktree's own
+  // canonical path instead (the original implementation) silently produced an entry Claude Code
+  // never read at all - not shown even as "pending" in `claude mcp list` - with no error anywhere,
+  // the same class of invisible failure §2.4/§10.1.2 already document twice for this exact config
+  // file. Because this registration (and its --output-dir) is necessarily shared by every
+  // concurrent session on the same repo, it points at playwrightSharedDir, not this session's own
+  // outbox - see outbox.ts.
   const canonicalRepoPath = canonicalizeWindowsPath(opts.repoPath);
   const playwrightSharedPath = ensurePlaywrightSharedDir(opts.stateDir ?? STATE_DIR);
   const { changed: playwrightChanged } = ensurePlaywrightRegistration(claudeJsonPath, canonicalRepoPath, playwrightSharedPath);
@@ -301,61 +265,25 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
       : "playwright MCP server already registered in ~/.claude.json",
   );
 
-  const debugLogFile = process.env.AIBRIDGE_DEBUG_LOG_FILE;
-  const pluginMode = isPluginChannelMode();
-  // §10.1: the plugin's own `mcpServers` block (plugin.json) is what registers the channel server
-  // in plugin mode - a `.mcp.json` entry would be a second, conflicting registration of the same
-  // server name, not a harmless no-op. AIBRIDGE_SLUG/AIBRIDGE_TOPIC/etc. can't ride along on a
-  // per-session `.mcp.json` env block here the way `server:aibridge` mode does, since plugin.json
-  // is one static file shared by every worktree - `resolve-slug.ts` (channel-server package) is
-  // what recovers the slug from `CLAUDE_PROJECT_DIR` instead in this mode.
-  if (!pluginMode) {
-    const { changed } = ensureMcpJsonRegistration(worktreePath, {
-      command: resolveBunExecutable(),
-      args: ["run", opts.channelServerEntryPath],
-      // Claude Code spawns a registered MCP server as its own child process, not as a child of the
-      // claude.exe PTY - it does not inherit AIBRIDGE_SLUG/AIBRIDGE_TOPIC from ptyEnv() just because
-      // claude.exe itself has them. Without this, the channel server throws on its own AIBRIDGE_SLUG
-      // guard before it ever opens the pipe, which also happens to be before its log() helper even
-      // exists - so the crash produces no debug-log line and surfaces only as Claude Code's own
-      // generic "server:aibridge - no MCP server configured with that name" channel-load warning.
-      env: {
-        AIBRIDGE_SLUG: opts.slug,
-        AIBRIDGE_TOPIC: String(opts.topicId),
-        // §5.8: read by the channel server's own instructions text so Claude is told the real
-        // absolute path, not a placeholder - same "own env, not inherited" reasoning as the two
-        // vars above.
-        AIBRIDGE_OUTBOX_DIR: outboxPath,
-        AIBRIDGE_SCREENSHOT_SCRIPT: resolveScreenshotScriptPath(),
-        AIBRIDGE_PLAYWRIGHT_SHARED_DIR: playwrightSharedPath,
-        // Claude Code does not surface an MCP server's stderr anywhere visible, so this is the only
-        // way to observe the channel server's own log lines during manual verification (Stage 7).
-        ...(debugLogFile ? { AIBRIDGE_DEBUG_LOG_FILE: debugLogFile } : {}),
-      },
-    });
-    log(
-      "INFO",
-      changed
-        ? `registered aibridge channel server in ${worktreePath}\\.mcp.json`
-        : `channel server already registered in ${worktreePath}\\.mcp.json`,
-    );
-  } else {
-    log("INFO", `plugin channel mode - skipping .mcp.json registration for ${worktreePath}`);
-  }
-
   // §6.2/§5.1: written fresh on every launch, before the process is spawned - same ordering
-  // requirement as the .mcp.json/.claude.json registrations above. Resolving the hook client
-  // binary can trigger a one-time `bun build --compile`, so it happens before the settings file
-  // (and therefore the spawn) rather than racing it.
+  // requirement as the `.claude.json` registrations above. Resolving the hook client binary can
+  // trigger a one-time `bun build --compile`, so it happens before the settings file (and
+  // therefore the spawn) rather than racing it.
   const settingsPath = writeSettingsFile(opts.stateDir ?? STATE_DIR, opts.slug, generateSettings(resolveHookClientBinary(), opts.otlpPort));
   log("INFO", `wrote permission settings baseline to ${settingsPath}`);
 
+  // §10.1: `--channels plugin:aibridge-telegram@devitgroup-plugins` - the fleet's real default as
+  // of 0.55.0, live-verified against the real dev Bridge (a real reply+Bash round trip, both
+  // existing sessions reconciling cleanly through a restart under this mode). Needs no dev flag
+  // and no `.mcp.json` registration - the plugin's own static `plugin.json` registers the channel
+  // server instead, and `resolve-slug.ts` (channel-server package) recovers the slug from
+  // `CLAUDE_PROJECT_DIR` since `plugin.json` is one static file shared by every worktree and can't
+  // carry a per-session `AIBRIDGE_SLUG` the way a per-worktree `.mcp.json` env block used to.
   const ptyProcess = pty.spawn(
     resolveClaudeExecutable(),
     [
-      ...(pluginMode
-        ? ["--channels", "plugin:aibridge-telegram@devitgroup-plugins"]
-        : ["--dangerously-load-development-channels", "server:aibridge"]),
+      "--channels",
+      "plugin:aibridge-telegram@devitgroup-plugins",
       "--model",
       opts.model ?? "sonnet",
       "--settings",
@@ -383,16 +311,7 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
 
   log("INFO", `spawned claude (pid ${ptyProcess.pid}) for slug "${opts.slug}"`);
 
-  // `--dangerously-load-development-channels` shows a one-time interactive warning on every
-  // launch (confirmed live 2026-08-03: it is not persisted anywhere, and re-appears identically
-  // after a `--resume`) - this is what the "Manual launch" affordance (`mirrorPtyToConsole`/the
-  // dev-control-port `/write` handler, both wired to the Phase 1 hardcoded session only) existed
-  // to answer by hand. Every `/new`-created fleet session had no such wiring at all and sat stuck
-  // at this dialog forever - never reaching `SessionStart`, never getting a `session_id`, never
-  // even seeing the prompt `/new` sent it. That is the automation §10.1/§9's own comment named as
-  // "the Phase 5 supervisor's" job; this is it. The pre-selected option is always "I am using this
-  // for local development" (confirmed live), so a bare Enter is the correct answer every time.
-  const ready = autoConfirmDevChannelsDialog(ptyProcess, log, pluginMode);
+  const ready = waitForStartupPrompt(ptyProcess, log);
 
   if (process.env.AIBRIDGE_DEBUG_PTY_LOG === "1") {
     ptyProcess.onData((data) => log("INFO", `[pty:${opts.slug}] ${JSON.stringify(stripAnsi(data))}`));

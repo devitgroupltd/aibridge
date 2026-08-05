@@ -47,7 +47,7 @@ describe("findOrphanProcesses (§9 scenario 24, §4.5's reconciliation table)", 
     expect(findOrphanProcesses(processes, [row()])).toEqual([]);
   });
 
-  test("a plugin-mode orphan (0.54.0's default launch form) is flagged too, not just the dev-flag form", () => {
+  test("a plugin-mode orphan (0.55.0's only launch form) is flagged too, not just the dev-flag form", () => {
     const processes = [{ pid: 6666, commandLine: '"claude.exe" --channels plugin:aibridge-telegram@devitgroup-plugins --model sonnet' }];
     expect(findOrphanProcesses(processes, [row()])).toEqual([
       { pid: 6666, commandLine: '"claude.exe" --channels plugin:aibridge-telegram@devitgroup-plugins --model sonnet' },

@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { canonicalizeWindowsPath, ensureMcpJsonRegistration, ensurePlaywrightRegistration, ensureTrustDialogAccepted } from "../src/claude-config.ts";
+import { canonicalizeWindowsPath, ensurePlaywrightRegistration, ensureTrustDialogAccepted } from "../src/claude-config.ts";
 
 describe("canonicalizeWindowsPath", () => {
   test("uppercases the drive letter and normalises slashes", () => {
@@ -181,53 +181,5 @@ describe("ensurePlaywrightRegistration", () => {
     const second = ensurePlaywrightRegistration(claudeJsonPath, "c:/data/worktrees/test-session", "c:/state/sessions/test-session/outbox");
     expect(second.changed).toBe(false);
     expect(readFileSync(claudeJsonPath, "utf8")).toBe(afterFirstWrite);
-  });
-});
-
-// §10.1.2: --dangerously-load-development-channels resolves server:aibridge against the
-// worktree's own .mcp.json, not ~/.claude.json's per-project registration - confirmed live.
-describe("ensureMcpJsonRegistration", () => {
-  let dir: string;
-
-  const serverEntry = { command: "bun.exe", args: ["run", "channel-server.ts"] };
-
-  afterEach(() => {
-    rmSync(dir, { recursive: true, force: true });
-  });
-
-  test("creates .mcp.json when none exists", () => {
-    dir = mkdtempSync(path.join(os.tmpdir(), "aibridge-mcp-json-"));
-
-    const result = ensureMcpJsonRegistration(dir, serverEntry);
-    expect(result.changed).toBe(true);
-
-    const doc = JSON.parse(readFileSync(path.join(dir, ".mcp.json"), "utf8"));
-    expect(doc.mcpServers.aibridge).toEqual(serverEntry);
-  });
-
-  test("preserves other servers already declared in .mcp.json", () => {
-    dir = mkdtempSync(path.join(os.tmpdir(), "aibridge-mcp-json-"));
-    writeFileSync(
-      path.join(dir, ".mcp.json"),
-      JSON.stringify({ mcpServers: { playwright: { command: "npx", args: ["playwright-mcp"] } } }, null, 2),
-    );
-
-    ensureMcpJsonRegistration(dir, serverEntry);
-
-    const doc = JSON.parse(readFileSync(path.join(dir, ".mcp.json"), "utf8"));
-    expect(doc.mcpServers.playwright).toEqual({ command: "npx", args: ["playwright-mcp"] });
-    expect(doc.mcpServers.aibridge).toEqual(serverEntry);
-  });
-
-  test("is idempotent: a second call with identical inputs is a no-op", () => {
-    dir = mkdtempSync(path.join(os.tmpdir(), "aibridge-mcp-json-"));
-
-    const first = ensureMcpJsonRegistration(dir, serverEntry);
-    expect(first.changed).toBe(true);
-    const afterFirstWrite = readFileSync(path.join(dir, ".mcp.json"), "utf8");
-
-    const second = ensureMcpJsonRegistration(dir, serverEntry);
-    expect(second.changed).toBe(false);
-    expect(readFileSync(path.join(dir, ".mcp.json"), "utf8")).toBe(afterFirstWrite);
   });
 });
