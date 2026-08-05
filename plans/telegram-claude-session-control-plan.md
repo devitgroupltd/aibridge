@@ -1,7 +1,7 @@
 ---
-version: 0.51.0
+version: 0.51.1
 status: solid
-last_modified_utc: 2026-08-05T22:00:00Z
+last_modified_utc: 2026-08-05T22:30:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,18 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.51.1 (2026-08-05): live-verified both §5.9's /deploy and §5.10's /detail+/verbose against
+    the real dev Bridge, closing the exit bar each section's 0.50.0/0.51.0 entry left open. /deploy:
+    a real trivial commit on test-session's branch, merged via a real /deploy test-session from the
+    control topic - gate ran and passed for real (bun test + tsc --noEmit), the self-respawn
+    happened, the deploy-pending.json marker was confirmed written pre-respawn and cleared
+    post-boot, both pre-existing sessions reconciled to idle with zero dead rows, ~18s total
+    wall-clock. /detail+/verbose: a real Bash+reply turn with both switches on produced Telegram's
+    actual native <blockquote class=\"quote-like-collapsable\"> in the served HTML, carrying the
+    full input line and the tool's real output line together - also newly confirms a second
+    tool_response shape (Bash) beyond the one Stage-0-confirmed Read shape, live rather than
+    doc-sourced. No code changes, only the plan doc's own bookkeeping and one doc-comment in
+    deploy.ts recording the live-verification date."
   - "0.51.0 (2026-08-05): added §5.10 - /detail [<slug>] [compact|full] and /verbose [<slug>]
     [on|off], per session, both default off/compact. Telegram has supported
     <blockquote expandable> natively since Bot API 7.3 - collapsed by default, one tap to open, no
@@ -2752,11 +2764,22 @@ through an injectable `CommandRunner` (mirrors the injected-clock convention alr
 `deploy.test.ts`) without a real git repo or a real `bun test` run. `fleet-commands.ts` gained
 `/deploy <slug>`, `index.ts` gained `handleDeployCommand` and the two startup marker checks above.
 25 new tests total (`deploy.test.ts` plus `fleet-commands.test.ts`'s parsing/help coverage), 589
-tests pass monorepo-wide, `tsc --noEmit` clean across every package. Not yet live-verified against
-a real self-deploy (that requires actually registering aibridge's own repo and running a fix
-through the full loop) - the exit bar for calling this proven, not just built, is the same live
-walkthrough §9's own scenario list asks for everything else: a real session on aibridge's own repo
-fixing something, `/deploy`d, and the Bridge visibly coming back up on the new commit.
+tests pass monorepo-wide, `tsc --noEmit` clean across every package.
+
+**Live-verified 2026-08-05** against the real dev Bridge and aibridge's own repo (self-deploy, the
+exact case §5.9 exists for): fast-forwarded `test-session`'s worktree branch onto the checkout's
+current HEAD, added one real trivial commit on it, then ran a real `/deploy test-session` from the
+control topic. All four Telegram messages landed in order - the "Deploying..." ack, "Merged ...
+(8685fa40 -> e6898729) - gate passed." with the real pre/post SHAs, the self-repo restart notice,
+then (from the successor process, after a genuine self-respawn) "Deploy succeeded - Bridge is back
+up on e6898729." The `deploy-pending.json` marker was confirmed written before the respawn and
+gone afterward - the boot-end "this attempt succeeded, not a crash-loop" check fired for real, not
+just in `deploy.test.ts`'s injected-runner tests. Both pre-existing sessions reconciled to `idle`
+with zero dead rows post-respawn, confirmed via a real `/ls`. Total wall-clock from `/deploy` to
+the successor's first response: about 18 seconds. One incidental, unrelated finding: the
+successor's own orphan-scan correctly flagged a leftover `claude.exe` orphaned by an earlier manual
+`dev-bridge.sh restart` in the same sitting, and correctly did not kill it automatically (§6a's own
+design) - noted, not acted on.
 
 ### 5.10 Detail on demand: `/detail` and `/verbose`
 
@@ -2829,9 +2852,18 @@ shared between them) plus help/command-list entries; `index.ts` gained `handleDe
 `handleVerboseCommand` and passes each session's own settings into `renderCard`/`renderDetails`/
 `renderDetailsPlainText` at their call sites. 18 new tests (`feed-renderer.test.ts`,
 `hook-events.test.ts`, `fleet-commands.test.ts`, `session-store.test.ts`), 607 tests pass
-monorepo-wide, `tsc --noEmit` clean across every package. Not yet live-verified against a real
-multi-tool turn with `/detail full`/`/verbose on` set - same open exit bar as §5.9's own closing
-note, stated rather than assumed.
+monorepo-wide, `tsc --noEmit` clean across every package.
+
+**Live-verified 2026-08-05** against the real dev Bridge: `/detail give-me-a-unique-one-line full`
+and `/verbose give-me-a-unique-one-line on` set from the control topic, then a real Bash+reply turn
+run in that session's own topic. The resulting feed card rendered Telegram's real native
+`<blockquote class="quote quote-block quote-like-collapsable ...">` (confirmed from the actual
+served HTML, not just the outgoing HTML this project generates) with the full `$ echo ...` input on
+its own line and the tool's real output appended on the line below - both the `fullInput` and
+`output` paths firing together, exactly as designed. Confirms `PostToolUse`'s `tool_response`
+carries recognisable output for a live Bash call too, not just the one Stage-0-confirmed Read shape
+- one more shape now independently observed rather than doc-sourced only. Both settings reset to
+compact/off afterward.
 
 ---
 
