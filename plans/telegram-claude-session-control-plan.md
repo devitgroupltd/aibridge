@@ -1,7 +1,7 @@
 ---
-version: 0.53.0
+version: 0.54.0
 status: solid
-last_modified_utc: 2026-08-05T23:45:00Z
+last_modified_utc: 2026-08-06T00:10:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,30 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.54.0 (2026-08-05/06): §10.1's plugin cutover finished - live-verified end to end against the
+    real dev Bridge, then flipped to the real default. Restarted the dev Bridge under
+    AIBRIDGE_CHANNEL_MODE=plugin (both real tracked sessions, test-session and
+    give-me-a-unique-one-line, reconciled to idle through the restart with zero dead rows - the
+    same clean reconciliation §5.9's 0.51.1 live-verification already proved for /deploy's
+    self-respawn, now proved for a channel-mode switch too); sent a real message into
+    give-me-a-unique-one-line asking for a Bash echo followed by a reply, and got back a real
+    mcp__aibridge__reply call, a correct feed card (Bash + reply + subagent-finished ticks), and the
+    actual reply text (\"confirmed\") in Telegram - a genuine round trip through the plugin-spawned
+    channel server, not just the isolated harness 0.53.0 already covered. Found one real thing the
+    isolated harness couldn't have caught: orphan-scan.ts's findOrphanProcesses only matched
+    --dangerously-load-development-channels in a process's command line, so every future orphan
+    launched under the new default would have been invisible to it - fixed to match either launch
+    form. isPluginChannelMode() inverted from an opt-in (AIBRIDGE_CHANNEL_MODE=plugin) to an opt-out
+    (AIBRIDGE_CHANNEL_MODE=dev-flag reverts to the old path) - kept as a rollback lever rather than
+    deleted outright, since allowedChannelPlugins is an org-level setting the operator controls
+    independently of any code here, not something this codebase should assume can never be reverted.
+    Re-confirmed the flip is real by restarting once more with the env var completely unset (not
+    just un-exported from a prior shell) and observing plugin mode load anyway. The old
+    --dangerously-load-development-channels/.mcp.json code path (ensureMcpJsonRegistration, the
+    dialog-detection stage in autoConfirmDevChannelsDialog) is NOT deleted yet - it's what
+    AIBRIDGE_CHANNEL_MODE=dev-flag still runs, and deleting it is a separate, smaller follow-up now
+    that it's provably dead by default rather than the thing every session runs. bun test (609
+    pass) and tsc --noEmit clean across all 5 packages."
   - "0.53.0 (2026-08-05): CORRECTION to 0.52.0's gap #2, found by actually live-testing rather than
     reasoning about it. Ran a real plugin-mode launch (a throwaway pipe/stateDir/worktree harness,
     not the real dev Bridge - see below) and captured the channel server's own real process.env: all
@@ -4541,16 +4565,16 @@ item 3 is moot until §7.6.
   ~~Whether to cut the fleet's actual launch path over from
   `--dangerously-load-development-channels server:aibridge` to the plugin form remains a separate
   decision, deliberately left open rather than made unasked (see the 0.25.0 changelog entry).~~
-  **In progress (0.52.0/0.53.0):** the operator opted in and set the org's real
-  `allowedChannelPlugins`. One real gap found and fixed (a stale plugin bundle); one suspected gap
-  (§5.8's send_file/screenshot env vars under plugin mode) turned out not to exist once actually
-  live-tested (0.53.0) - `session-launcher.ts` already sets all three on the outer PTY's own env
-  unconditionally, and Claude Code's plugin-declared MCP servers inherit that in full. A throwaway
-  isolated harness confirmed the MCP handshake and env end to end. `session-launcher.ts` now
-  supports both modes side by side behind an explicit `AIBRIDGE_CHANNEL_MODE=plugin` toggle, default
-  unchanged. **Still the one thing left open in this phase** - one live test against the real dev
-  Bridge and real Telegram (a genuine reply/send_file round trip, not just the isolated harness)
-  before flipping the default and removing the old dev-flag path.
+**Done (0.54.0).** The operator opted in and set the org's real `allowedChannelPlugins`. One real
+  gap found and fixed (a stale plugin bundle); one suspected gap (§5.8's send_file/screenshot env
+  vars under plugin mode) turned out not to exist once actually live-tested (0.53.0). A real
+  restart of the dev Bridge under the plugin default reconciled both live sessions cleanly, and a
+  real message into one of them produced a real `mcp__aibridge__reply` round trip with no dev-flag
+  dialog anywhere in the path. `session-launcher.ts`'s default is now the plugin form;
+  `AIBRIDGE_CHANNEL_MODE=dev-flag` reverts to the old path as a rollback lever, kept rather than
+  deleted since `allowedChannelPlugins` is an org-level setting the operator controls independently
+  of this code. The old dev-flag/`.mcp.json` code itself is not deleted yet - a smaller follow-up,
+  now that it's provably dead by default rather than the thing every session runs.
 
 ### Phase 6 - hardening, and the WSL2 migration
 

@@ -193,17 +193,20 @@ export function stripAnsi(text: string): string {
  * prompt is actually live and accepting input.
  */
 /**
- * §10.1's escape hatch, gated behind `AIBRIDGE_CHANNEL_MODE=plugin` rather than a default flip:
- * once the org's `allowedChannelPlugins` allowlist carries this plugin, `--channels
- * plugin:<name>@<marketplace>` resolves without the dev flag at all, so *neither* startup dialog
- * `autoConfirmDevChannelsDialog` waits for below actually fires - not the dev-channels warning
- * (there's no dev flag to warn about) and not the "New MCP server found" consent dialog (there's
- * no `.mcp.json` registration in this mode; the plugin's `mcpServers` block replaces it). Kept as
- * an explicit env toggle, not the default, until a real `/new` under this mode is live-verified -
- * flipping the default before that would move every session onto an unverified path at once.
+ * §10.1's escape hatch, now the default as of 0.54.0 - live-verified 2026-08-05 (a real reply +
+ * Bash round trip against the real dev Bridge, both existing sessions reconciling cleanly through
+ * a restart under this mode) after the operator added this plugin to the org's real
+ * `allowedChannelPlugins`. `--channels plugin:<name>@<marketplace>` resolves without the dev flag
+ * at all, so *neither* startup dialog `autoConfirmDevChannelsDialog` used to wait for actually
+ * fires - not the dev-channels warning (no dev flag to warn about) and not the "New MCP server
+ * found" consent dialog (no `.mcp.json` registration in this mode; the plugin's `mcpServers` block
+ * replaces it). `AIBRIDGE_CHANNEL_MODE=dev-flag` reverts to the old
+ * `--dangerously-load-development-channels server:aibridge` path for rollback safety - kept as an
+ * escape hatch, not deleted outright yet, since the org-level `allowedChannelPlugins` setting
+ * this depends on is a lever the operator controls independently of any code change here.
  */
 function isPluginChannelMode(): boolean {
-  return process.env.AIBRIDGE_CHANNEL_MODE === "plugin";
+  return process.env.AIBRIDGE_CHANNEL_MODE !== "dev-flag";
 }
 
 function autoConfirmDevChannelsDialog(ptyProcess: pty.IPty, log: LogFn, skipDialogs: boolean): Promise<void> {
