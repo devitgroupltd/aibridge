@@ -19,6 +19,14 @@ export interface StubMessage {
   /** Unix seconds - mirrors the real Bot API field aibridge's §7.4 stale-inbound check reads. */
   date: number;
   voice?: { file_id: string; duration: number };
+  /** §5.6's attachment-inbox path - mirrors the real Bot API shapes closely enough for aibridge's
+   * own tests, not a full model of every Telegram media field. */
+  photo?: Array<{ file_id: string; file_size?: number; width: number; height: number }>;
+  document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  video?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  audio?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  video_note?: { file_id: string; file_size?: number };
+  caption?: string;
 }
 
 export interface StubCallbackQuery {
@@ -53,6 +61,12 @@ export interface PushUpdateInput {
    * the Bridge was offline (§7.4's stale-inbound path). */
   date?: number;
   voice?: { file_id: string; duration: number };
+  photo?: Array<{ file_id: string; file_size?: number; width: number; height: number }>;
+  document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  video?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  audio?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  video_note?: { file_id: string; file_size?: number };
+  caption?: string;
 }
 
 export interface PushCallbackQueryInput {
@@ -129,6 +143,12 @@ export class StubTelegramServer {
         from: input.from,
         date: input.date ?? Math.floor(Date.now() / 1000),
         voice: input.voice,
+        photo: input.photo,
+        document: input.document,
+        video: input.video,
+        audio: input.audio,
+        video_note: input.video_note,
+        caption: input.caption,
       },
     };
     state.pendingUpdates.push(update);

@@ -23,6 +23,14 @@ import {
 } from "./commands.ts";
 import { loadConfig, STATE_DIR } from "./config.ts";
 import { buildDetailsKeyboard, parseDetailsCallback } from "./details-button.ts";
+import {
+  attachmentKindLabel,
+  buildAttachmentAnnouncement,
+  guessAttachmentFilename,
+  TELEGRAM_MAX_DOWNLOAD_BYTES,
+  writeAttachmentToInbox,
+} from "./attachment-inbox.ts";
+import type { AttachmentKind } from "./attachment-inbox.ts";
 import { buildVoiceModelKeyboard, listAvailableVoiceModels, resolveVoiceModelCallback } from "./voice-model.ts";
 import { FeedCoalescer } from "./feed-coalescer.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
@@ -1190,6 +1198,47 @@ async function main(): Promise<void> {
     }
   }
 
+  /** Inbound photos/documents/videos/audio/video-notes (§5.6): downloaded into the session's own
+   * `inbox/` directory and announced by path - "no protocol extension is needed, because a path
+   * in context is enough." Unlike voice input, there's no transcription step and no confirm card:
+   * the announcement (plus any caption) goes straight to the session through the same
+   * `dispatchInboundMessage` path a typed message would, since there's nothing ambiguous here for
+   * an operator to review first. Only fires for a real session topic - the control topic has no
+   * worktree/session to hand a landed file to. */
+  async function handleAttachmentMessage(
+    kind: AttachmentKind,
+    fileId: string,
+    fileSize: number | undefined,
+    fileName: string | undefined,
+    mimeType: string | undefined,
+    threadId: number | undefined,
+    route: ReturnType<typeof routing.getByTopicId>,
+    isControl: boolean,
+    messageId: number,
+    caption: string | undefined,
+    from: string,
+  ): Promise<void> {
+    if (!route) {
+      if (isControl) confirmSessionCommand(threadId, `Send ${attachmentKindLabel(kind)} in a session topic - the control topic has no session to hand it to.`);
+      return;
+    }
+    if (fileSize !== undefined && fileSize > TELEGRAM_MAX_DOWNLOAD_BYTES) {
+      confirmSessionCommand(threadId, `That's too large to download (${Math.round(fileSize / (1024 * 1024))} MB) - Telegram's Bot API caps bot downloads at 20 MB.`);
+      return;
+    }
+    try {
+      const { file_path } = await controlBot.getFile(fileId);
+      const bytes = await controlBot.downloadFile(file_path);
+      const suggestedName = guessAttachmentFilename(kind, fileName, mimeType);
+      const absPath = writeAttachmentToInbox(STATE_DIR, route.slug, suggestedName, bytes);
+      const announcement = buildAttachmentAnnouncement(kind, absPath, caption);
+      dispatchInboundMessage(messageId, announcement, threadId, isControl, route, route.slug, from);
+    } catch (err) {
+      log("WARN", `attachment download failed: ${(err as Error).message}`);
+      confirmSessionCommand(threadId, `Couldn't download that ${kind} - try sending it again.`);
+    }
+  }
+
   async function finalizeVoiceConfirmMessage(pending: PendingVoiceConfirm, text: string): Promise<void> {
     if (!controlBot.editMessageText) return;
     try {
@@ -1948,6 +1997,37 @@ async function main(): Promise<void> {
       // matters, not staleness of when the note was recorded.
       if (message.voice) {
         void handleVoiceMessage(message.voice, threadId, message.message_id, from);
+        return;
+      }
+
+      // §5.6: photos/documents/videos/audio/video-notes - landed in the session's inbox and
+      // announced by path rather than transcribed. `photo` arrives as one entry per resolution,
+      // smallest to largest; the largest is the one worth downloading. Telegram allows a message
+      // to carry at most one kind of media, so these are mutually exclusive with each other and
+      // with `voice`/`text` above - order here doesn't matter beyond that.
+      if (message.photo && message.photo.length > 0) {
+        const largest = message.photo[message.photo.length - 1]!;
+        void handleAttachmentMessage("image", largest.file_id, largest.file_size, undefined, undefined, threadId, route, isControl, message.message_id, message.caption, from);
+        return;
+      }
+      if (message.document) {
+        const doc = message.document;
+        void handleAttachmentMessage("document", doc.file_id, doc.file_size, doc.file_name, doc.mime_type, threadId, route, isControl, message.message_id, message.caption, from);
+        return;
+      }
+      if (message.video) {
+        const video = message.video;
+        void handleAttachmentMessage("video", video.file_id, video.file_size, video.file_name, video.mime_type, threadId, route, isControl, message.message_id, message.caption, from);
+        return;
+      }
+      if (message.audio) {
+        const audio = message.audio;
+        void handleAttachmentMessage("audio", audio.file_id, audio.file_size, audio.file_name, audio.mime_type, threadId, route, isControl, message.message_id, message.caption, from);
+        return;
+      }
+      if (message.video_note) {
+        const note = message.video_note;
+        void handleAttachmentMessage("video note", note.file_id, note.file_size, undefined, undefined, threadId, route, isControl, message.message_id, message.caption, from);
         return;
       }
 

@@ -1,7 +1,7 @@
 ---
-version: 0.47.0
+version: 0.48.0
 status: solid
-last_modified_utc: 2026-08-05T15:55:00Z
+last_modified_utc: 2026-08-05T17:52:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,35 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.48.0 (2026-08-05): implemented §5.6's inbound attachments - photos, documents, videos,
+    forwarded/uploaded audio files, and video-note bubbles sent to a session topic are downloaded
+    and announced by path, no protocol extension needed. Prompted by the operator asking whether
+    Telegram attachments reach Claude at all (they didn't - TelegramMessage had no
+    photo/document/video/audio/video_note/caption fields and onUpdate silently dropped anything
+    that wasn't text or voice) and separately noting Telegram allows a caption alongside media in
+    one message. New attachment-inbox.ts: sanitizeAttachmentFilename (path.basename first to
+    defeat ../ traversal, then collapses to a safe charset - scenario 36),
+    guessAttachmentFilename (mime-derived extension when Telegram gives no filename - always true
+    for photo/video_note), buildInboxFilename (timestamp + short random id, collision-proof),
+    writeAttachmentToInbox ($STATE/sessions/<slug>/inbox/, deliberately outside the worktree so
+    nothing gets committed by accident), buildAttachmentAnnouncement (path plus any caption on the
+    next line). index.ts gained one onUpdate branch per media field, all routed through a shared
+    handleAttachmentMessage: downloads via the same getFile/downloadFile pair voice input already
+    uses, rejects anything over Telegram's real 20MB getFile cap with a friendly size-in-MB error
+    before attempting a download, and - unlike voice input - skips any confirm card and hands the
+    announcement straight to dispatchInboundMessage, since there's nothing ambiguous here for an
+    operator to review first. Attachments sent to the control topic (no session/worktree to hand a
+    file to) get a guidance reply instead of being downloaded. 19 new tests
+    (attachment-inbox.test.ts), 542 tests pass monorepo-wide, tsc --noEmit clean. Live-verified
+    against the real Telegram client and the real dev Bridge, not just unit tests: sent a real PNG
+    with the caption \"what color is this square? one word\" to a live session topic - it landed
+    at sessions/<slug>/inbox/2026-08-05T14-49-53-b96e6d-test-attach.png and Claude replied \"Red\";
+    separately sent a .txt document asking for its word count and got back the correct count,
+    confirming Claude actually opened the landed file rather than guessing from the filename/
+    caption alone. New one-off scripts/telegram-automation/send-attachment.js (Playwright's
+    filechooser event to attach a real file, plus the media-preview composer's caption input -
+    disambiguated by data-animation-group=\"NEW-MEDIA\", the same class of overlay pitfall
+    client.js's own composer note already documents)."
   - "0.47.0 (2026-08-05): new /voice command - switch the Whisper model from Telegram, requested
     live after the 0.45.0 model/speed change. Researched first rather than assumed: whisper.cpp's
     server supports a /load endpoint (multipart, -F model=<path>) that swaps the loaded model with
@@ -2335,15 +2364,40 @@ documents; a diff rendered into a chat bubble on a phone is unreadable and burns
 Two smaller paths, both previously unmentioned.
 
 **Inbound attachments.** A phone is a camera, and the most natural way to report a bug from one is a
-screenshot. Photos and documents sent to a session topic are downloaded by the Bridge into
+screenshot. Photos, documents, videos, forwarded/uploaded audio files, and Telegram's round "video
+note" bubbles sent to a session topic are downloaded by the Bridge into
 `$STATE/sessions/<slug>/inbox/` and announced as an ordinary channel message naming the path:
 
 > operator sent an image: `/home/…/inbox/2026-08-02-141233-screenshot.png`
+
+A caption sent alongside the attachment (Telegram allows exactly one, on the message itself) rides
+along on the next line of that same announcement, so "here's the error, what's wrong?" and the
+screenshot arrive as one turn, not two.
 
 Claude then reads it with the normal file tools, which is the whole trick: no protocol extension is
 needed, because a path in context is enough. The official Telegram plugin uses the same inbox pattern
 and caps at Telegram's 20MB bot-download limit; we inherit both. The inbox sits inside the session
 state directory rather than the worktree, so nothing accidentally gets committed.
+
+**RESOLVED, implemented and live-verified 2026-08-05.** New `attachment-inbox.ts`:
+`sanitizeAttachmentFilename` (defeats `../` traversal via `path.basename` first, then collapses to a
+safe charset - scenario 36), `guessAttachmentFilename` (mime-derived extension when Telegram gives no
+filename, true for `photo`/`video_note` always), `buildInboxFilename` (timestamp + short random id
+prefix, so two attachments landed in the same second can't collide), `writeAttachmentToInbox`, and
+`buildAttachmentAnnouncement`. `index.ts`'s `onUpdate` gained one branch per media field
+(`photo`/`document`/`video`/`audio`/`video_note`), each routed through a shared
+`handleAttachmentMessage` that downloads via the same `getFile`/`downloadFile` pair voice input
+already uses, then hands the announcement straight to `dispatchInboundMessage` - no confirm card,
+unlike voice input, since there's nothing ambiguous here for an operator to review first. A message
+over the 20MB cap is rejected with a friendly size-in-MB error before any download is attempted, not
+after a partial one. Attachments to the control topic (no session/worktree to hand a file to) get a
+guidance reply instead of being downloaded. 19 new unit tests (`attachment-inbox.test.ts`), 542 tests
+pass monorepo-wide, `tsc --noEmit` clean. Live-verified against the real Telegram client and the real
+dev Bridge: sent a real PNG with the caption "what color is this square? one word" to a live session
+topic - the file landed at `sessions/<slug>/inbox/2026-08-05T14-49-53-b96e6d-test-attach.png`, Claude
+read it and replied "Red"; sent a `.txt` document with a caption asking for its word count - Claude
+read the file's actual content and replied with the correct count, confirming the path-in-context
+trick works for both images and plain documents, not just conceptually.
 
 **Outbound files** already exist as the `details` mechanism (§5.5): anything over 4096 characters goes
 as a document rather than a message.
@@ -3283,7 +3337,9 @@ mis-parsed verdict all produce a system that appears to work.
     worse than an error.
 36. **Attachment paths are safe and outside the worktree.** A document named `../../etc/passwd` lands
     in the session inbox under a sanitised name, and the announced path is inside
-    `$STATE\sessions\<slug>\inbox\`. Unit, table-driven over hostile filenames.
+    `$STATE\sessions\<slug>\inbox\`. Unit, table-driven over hostile filenames. **DONE 2026-08-05** -
+    `attachment-inbox.test.ts`'s `sanitizeAttachmentFilename`/`writeAttachmentToInbox` cases, including
+    a POSIX and a Windows traversal prefix.
 37. **Sessions survive Bridge death.** Spawn a session, kill the Bridge without cleanup, confirm the
     `claude` process is still alive and its channel server still running, then start a new Bridge and
     confirm it re-adopts per scenario 24. **Manual/integration, Phase 1** - this measures a ConPTY

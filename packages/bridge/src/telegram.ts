@@ -11,8 +11,25 @@ export interface TelegramMessage {
    * consumer so far. */
   date: number;
   /** Present on a voice note (recorded in Telegram's mic UI); a forwarded/uploaded audio file
-   * arrives as `message.audio` instead, which this project does not handle. */
+   * arrives as `message.audio` instead - see below, now handled via attachment-inbox.ts rather
+   * than transcription. */
   voice?: { file_id: string; duration: number };
+  /** One entry per resolution Telegram generated for an inbound photo, smallest to largest - the
+   * largest is what attachment-inbox.ts downloads. The caption (if any) travels on the message
+   * itself, not per-size. */
+  photo?: Array<{ file_id: string; file_size?: number; width: number; height: number }>;
+  /** An inbound document (PDF, docx, ...) - forwarded/uploaded as a file rather than rendered as
+   * a photo or played inline. */
+  document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  /** A forwarded/uploaded video file (not a photo, not the round "video note" bubble below). */
+  video?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  /** A forwarded/uploaded audio file - distinct from `voice` (recorded in-app, transcribed). */
+  audio?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  /** Telegram's round "video message" bubble - never carries a filename or mime type. */
+  video_note?: { file_id: string; file_size?: number };
+  /** §5.6: the one caption Telegram allows alongside a photo/document/video/audio in the same
+   * message - never present alongside plain `text` or `voice`. */
+  caption?: string;
 }
 
 export interface TelegramCallbackQuery {
