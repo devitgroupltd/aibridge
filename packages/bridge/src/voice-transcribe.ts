@@ -1,0 +1,132 @@
+import { execFile, spawn, type ChildProcess } from "node:child_process";
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+/**
+ * Self-hosted voice transcription (Whisper via whisper.cpp), chosen over a cloud API per the
+ * voice-input design decision - see the plan's changelog entry. Two things intentionally live
+ * here rather than being asserted as fact elsewhere:
+ *
+ * - whisper-server's `/inference` JSON response shape is documented only as "supports
+ *   `response_format=json`" (github.com/ggml-org/whisper.cpp examples/server) - the actual field
+ *   names were not independently confirmed against a live server before this shipped. Same
+ *   discipline as this project's own `tool_use_id`/`claude/channel` lessons: `parseWhisperServerResponse`
+ *   below is deliberately permissive (accepts a bare string body too) and throws with the raw body
+ *   on anything it doesn't recognise, rather than silently returning something wrong.
+ * - whisper-server does not document a `language` field in its response even with `language: "auto"`
+ *   requested - so no detected-language value is surfaced to the confirm card. If live verification
+ *   later shows one exists, surfacing it is a small addition here, not a redesign.
+ */
+
+export interface WhisperServerConfig {
+  whisperServerExe: string;
+  modelPath: string;
+  port: number;
+}
+
+export interface WhisperServerHandle {
+  stop(): void;
+}
+
+/**
+ * Supervises a long-lived whisper-server child process - the model (hundreds of MB to a few GB)
+ * loads once at startup and is reused for every voice note, the same rationale as the Bridge's PTY
+ * supervisor: reloading it per message would add several seconds of dead time to every single
+ * voice note. Restarts on unexpected exit with a fixed backoff; a deliberate `stop()` (Bridge
+ * shutdown) does not restart.
+ */
+export function startWhisperServer(cfg: WhisperServerConfig, log: (level: "INFO" | "WARN" | "ERROR", msg: string) => void): WhisperServerHandle {
+  let stopped = false;
+  let child: ChildProcess | null = null;
+  let restartTimer: ReturnType<typeof setTimeout> | null = null;
+
+  const launch = () => {
+    if (stopped) return;
+    child = spawn(cfg.whisperServerExe, ["-m", cfg.modelPath, "--port", String(cfg.port), "--host", "127.0.0.1"], {
+      stdio: "ignore",
+    });
+    child.on("exit", (code) => {
+      child = null;
+      if (stopped) return;
+      log("WARN", `whisper-server exited (code ${code}) - restarting in 3s`);
+      restartTimer = setTimeout(launch, 3000);
+    });
+    child.on("error", (err) => {
+      log("ERROR", `whisper-server failed to start: ${(err as Error).message}`);
+    });
+  };
+  launch();
+
+  return {
+    stop() {
+      stopped = true;
+      if (restartTimer) clearTimeout(restartTimer);
+      child?.kill();
+    },
+  };
+}
+
+/** Telegram voice notes arrive as Ogg/Opus; whisper.cpp expects 16kHz mono PCM. */
+export function convertOggToWav(ffmpegPath: string, oggPath: string, wavPath: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    execFile(ffmpegPath, ["-y", "-i", oggPath, "-ac", "1", "-ar", "16000", wavPath], (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+}
+
+export interface TranscribeResult {
+  text: string;
+}
+
+/** Parses whisper-server's `/inference` response body. See the module doc comment for why this
+ * is deliberately permissive rather than asserting one exact shape. */
+export function parseWhisperServerResponse(body: unknown): TranscribeResult {
+  if (typeof body === "string") {
+    const text = body.trim();
+    if (text.length === 0) throw new Error("whisper-server returned an empty transcript body");
+    return { text };
+  }
+  if (body && typeof body === "object" && "text" in body && typeof (body as { text: unknown }).text === "string") {
+    return { text: (body as { text: string }).text.trim() };
+  }
+  throw new Error(`unrecognised whisper-server response shape: ${JSON.stringify(body)}`);
+}
+
+/** POSTs a WAV file to the local whisper-server's `/inference` endpoint. `language: "auto"` per
+ * the voice-input design decision - voice notes may be in English, Russian, Ukrainian or
+ * Azerbaijani, so nothing here pins one language. */
+export async function transcribeWav(serverUrl: string, wavPath: string): Promise<TranscribeResult> {
+  const bytes = await fs.readFile(wavPath);
+  const form = new FormData();
+  form.append("file", new Blob([bytes], { type: "audio/wav" }), path.basename(wavPath));
+  form.append("response_format", "json");
+  form.append("language", "auto");
+  const res = await fetch(`${serverUrl}/inference`, { method: "POST", body: form });
+  if (!res.ok) {
+    throw new Error(`whisper-server /inference failed: ${res.status} ${res.statusText}`);
+  }
+  const contentType = res.headers.get("content-type") ?? "";
+  const body = contentType.includes("application/json") ? await res.json() : await res.text();
+  return parseWhisperServerResponse(body);
+}
+
+/**
+ * End-to-end: raw Ogg/Opus bytes (as downloaded from Telegram) -> transcript text. Writes to a
+ * per-call temp file pair under the OS temp dir and always cleans up, success or failure - a voice
+ * note's audio is exactly the kind of content that should not linger on disk after use.
+ */
+export async function transcribeVoiceNote(cfg: { ffmpegPath: string; serverUrl: string }, oggBytes: Uint8Array): Promise<TranscribeResult> {
+  const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-voice-"));
+  const oggPath = path.join(tmpDir, "in.ogg");
+  const wavPath = path.join(tmpDir, "out.wav");
+  try {
+    await fs.writeFile(oggPath, oggBytes);
+    await convertOggToWav(cfg.ffmpegPath, oggPath, wavPath);
+    return await transcribeWav(cfg.serverUrl, wavPath);
+  } finally {
+    await fs.rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
+}

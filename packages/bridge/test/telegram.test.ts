@@ -232,6 +232,35 @@ describe("TelegramClient", () => {
     }
   });
 
+  test("voice-input: getFile resolves a file_id, downloadFile fetches the CDN bytes at that path", async () => {
+    const stub = new StubTelegramServer();
+    const { baseUrl } = stub.start(0);
+    try {
+      const client = new TelegramClient("control-token", baseUrl);
+      const bytes = new Uint8Array([1, 2, 3, 4, 5]);
+      stub.presetFile("control-token", "voice-file-id-1", bytes);
+
+      const { file_path } = await client.getFile("voice-file-id-1");
+      expect(file_path).toBe("voice-file-id-1");
+
+      const downloaded = await client.downloadFile(file_path);
+      expect([...downloaded]).toEqual([1, 2, 3, 4, 5]);
+    } finally {
+      stub.stop();
+    }
+  });
+
+  test("downloadFile throws on a 404 (no such path registered)", async () => {
+    const stub = new StubTelegramServer();
+    const { baseUrl } = stub.start(0);
+    try {
+      const client = new TelegramClient("control-token", baseUrl);
+      await expect(client.downloadFile("nonexistent")).rejects.toThrow(/404/);
+    } finally {
+      stub.stop();
+    }
+  });
+
   test("§4.2's topic lifecycle: createForumTopic, editForumTopic (rename-once), closeForumTopic (/kill), deleteForumTopic (/rm)", async () => {
     const stub = new StubTelegramServer();
     const { baseUrl } = stub.start(0);

@@ -204,7 +204,70 @@ try {
     Add-Result 'bun install' 'FAILED' $_.Exception.Message
 }
 
-# --- 9. $STATE and secrets directories (§7.5) ---------------------------------------------------
+# --- 9. Voice input: ffmpeg + whisper.cpp (self-hosted transcription) -------------------------
+# Fully mechanical - nothing here needs a human, so it belongs in this script rather than a
+# separate one-off. Installs prerequisites only; does NOT flip VOICE_ENABLED=true in .env (see
+# step 10a below) - starting a new supervised child process on every Bridge boot is a decision
+# the operator should opt into deliberately, not something a re-run of this script silently turns on.
+Write-Step "Checking ffmpeg..."
+$ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
+if ($ffmpeg) {
+    Add-Result 'ffmpeg' 'OK' $ffmpeg.Source
+} else {
+    try {
+        winget install --id Gyan.FFmpeg --silent --accept-source-agreements --accept-package-agreements
+        Add-Result 'ffmpeg' 'INSTALLED' 'Restart your shell (or re-run this script) so PATH picks it up.'
+    } catch {
+        Add-Result 'ffmpeg' 'FAILED' $_.Exception.Message
+    }
+}
+
+Write-Step "Checking whisper.cpp (voice transcription)..."
+$voiceDir = Join-Path $state 'voice'
+$whisperZip = Join-Path $voiceDir 'whisper-bin-x64.zip'
+$whisperServerExe = Join-Path $voiceDir 'whisper-server.exe'
+# medium: ~5GB RAM at runtime, comfortably faster than realtime on CPU, meaningfully better
+# accuracy than small/base - see the voice-input design changelog entry for the full trade-off.
+# Bump to ggml-large-v3-turbo.bin (same URL pattern) later if this machine has GPU headroom to spare.
+$modelFile = Join-Path $voiceDir 'ggml-medium.bin'
+
+New-Item -ItemType Directory -Path $voiceDir -Force | Out-Null
+
+if (-not (Test-Path $whisperServerExe)) {
+    try {
+        Write-Host "Downloading whisper.cpp (whisper-bin-x64.zip)..." -ForegroundColor Yellow
+        Invoke-WebRequest -Uri 'https://github.com/ggml-org/whisper.cpp/releases/latest/download/whisper-bin-x64.zip' -OutFile $whisperZip
+        Expand-Archive -Path $whisperZip -DestinationPath $voiceDir -Force
+        Remove-Item $whisperZip -Force -ErrorAction SilentlyContinue
+        if (Test-Path $whisperServerExe) {
+            Add-Result 'whisper.cpp server' 'INSTALLED' $whisperServerExe
+        } else {
+            # Not independently confirmed which exact release asset bundles whisper-server.exe
+            # alongside whisper-cli.exe (§10.0-style discipline: don't assert an unverified shape) -
+            # if the release layout changed, this reports it instead of silently pointing at
+            # nothing. Check $voiceDir manually and adjust WHISPER_SERVER_EXE in .env if needed.
+            Add-Result 'whisper.cpp server' 'FAILED' "whisper-server.exe not found after extracting whisper-bin-x64.zip - check $voiceDir manually; the release layout may differ from what this script expects."
+        }
+    } catch {
+        Add-Result 'whisper.cpp server' 'FAILED' $_.Exception.Message
+    }
+} else {
+    Add-Result 'whisper.cpp server' 'OK' $whisperServerExe
+}
+
+if (-not (Test-Path $modelFile)) {
+    try {
+        Write-Host "Downloading the medium Whisper model (~1.5GB - this can take a while)..." -ForegroundColor Yellow
+        Invoke-WebRequest -Uri 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-medium.bin' -OutFile $modelFile
+        Add-Result 'whisper model (medium)' 'DOWNLOADED' "$modelFile ($([math]::Round((Get-Item $modelFile).Length / 1MB)) MB)"
+    } catch {
+        Add-Result 'whisper model (medium)' 'FAILED' $_.Exception.Message
+    }
+} else {
+    Add-Result 'whisper model (medium)' 'OK' $modelFile
+}
+
+# --- 10. $STATE and secrets directories (§7.5) ---------------------------------------------------
 Write-Step "Checking state/secrets directories..."
 New-Item -ItemType Directory -Path (Join-Path $state 'sessions') -Force | Out-Null
 Add-Result 'State dir' 'OK' $state
@@ -223,7 +286,7 @@ if ($envExisted) {
 $envBefore = [ordered]@{}
 foreach ($k in $envValues.Keys) { $envBefore[$k] = $envValues[$k] }
 
-# --- 9a. Guided Telegram setup (P-2) - prompts for whatever's still missing, walks through the
+# --- 10a. Guided Telegram setup (P-2) - prompts for whatever's still missing, walks through the
 # manual @BotFather/supergroup steps first since nothing here can be scripted, then offers to
 # auto-detect the chat id (the one value with no UI anywhere that just shows it to you) via a live
 # getUpdates call once both tokens are known. Only asks for what's missing - a second run with a
@@ -293,7 +356,7 @@ SUPERGROUP_CHAT_ID=$($envValues['SUPERGROUP_CHAT_ID'])
 "@ | Set-Content -Path $envFile -Encoding utf8
 }
 
-# --- 10. repos.toml, seeded with this repo itself (§7.5) -----------------------------------------
+# --- 11. repos.toml, seeded with this repo itself (§7.5) -----------------------------------------
 Write-Step "Checking repos.toml..."
 $reposToml = Join-Path $state 'repos.toml'
 if (-not (Test-Path $reposToml)) {
@@ -309,7 +372,7 @@ model = "sonnet"
     Add-Result 'repos.toml' 'OK' $reposToml
 }
 
-# --- 11. Claude Code version pin (§12 P-4) -------------------------------------------------------
+# --- 12. Claude Code version pin (§12 P-4) -------------------------------------------------------
 Write-Step "Checking Claude Code version..."
 $claude = Get-Command claude -ErrorAction SilentlyContinue
 if ($claude) {
@@ -336,6 +399,9 @@ $manual = @(
 )
 if (-not ($envValues['CONTROL_BOT_TOKEN'] -and $envValues['FEED_BOT_TOKEN'] -and $envValues['SUPERGROUP_CHAT_ID'])) {
     $manual += "Telegram secrets: fill in the remaining blank value(s) in $envFile - re-run this script and it will prompt for just those."
+}
+if (Test-Path $whisperServerExe) {
+    $manual += "Voice input: prerequisites are installed, but disabled by default. Add 'VOICE_ENABLED=true' to $envFile to turn it on (starts a supervised whisper-server process on every Bridge boot)."
 }
 Write-Host "== Still needs a human (cannot be scripted) ==" -ForegroundColor Yellow
 $manual | ForEach-Object { Write-Host "- $_" }

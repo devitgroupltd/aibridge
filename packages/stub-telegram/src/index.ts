@@ -18,6 +18,7 @@ export interface StubMessage {
   from?: { id: number; username?: string; first_name?: string };
   /** Unix seconds - mirrors the real Bot API field aibridge's §7.4 stale-inbound check reads. */
   date: number;
+  voice?: { file_id: string; duration: number };
 }
 
 export interface StubCallbackQuery {
@@ -51,6 +52,7 @@ export interface PushUpdateInput {
   /** Unix seconds - defaults to "now", override to simulate a backlog message that arrived while
    * the Bridge was offline (§7.4's stale-inbound path). */
   date?: number;
+  voice?: { file_id: string; duration: number };
 }
 
 export interface PushCallbackQueryInput {
@@ -79,6 +81,9 @@ interface TokenState {
   /** §5.4's 429 path (`force429`) - one-shot per queued entry, keyed by method, consumed in
    * FIFO order so a test can script "fail once, then succeed" without any real rate limiting. */
   forced429: Map<string, number[]>;
+  /** Voice-input's `getFile`/download path - content a test registered via `presetFile`, keyed by
+   * the `file_path` `getFile` will hand back for a given `file_id` (see `handleGetFile`). */
+  filesByPath: Map<string, Uint8Array>;
 }
 
 function jsonResponse(body: unknown, status = 200): Response {
@@ -104,6 +109,7 @@ export class StubTelegramServer {
         topics: new Map(),
         myCommands: [],
         forced429: new Map(),
+        filesByPath: new Map(),
       };
       this.tokens.set(token, state);
     }
@@ -122,11 +128,18 @@ export class StubTelegramServer {
         text: input.text,
         from: input.from,
         date: input.date ?? Math.floor(Date.now() / 1000),
+        voice: input.voice,
       },
     };
     state.pendingUpdates.push(update);
     const waiters = state.waiters.splice(0);
     for (const resolve of waiters) resolve();
+  }
+
+  /** Registers content `getFile`+`downloadFile` should hand back for `filePath` on `token`'s bot -
+   * voice-input's test double for what would otherwise be a real Telegram CDN round-trip. */
+  presetFile(token: string, filePath: string, content: Uint8Array): void {
+    this.stateFor(token).filesByPath.set(filePath, content);
   }
 
   /** Simulates an operator tapping an inline-keyboard button for `token`'s bot. */
@@ -239,6 +252,13 @@ export class StubTelegramServer {
     return jsonResponse({ ok: true, result: { message_id: messageId, chat: { id: chatId }, text } });
   }
 
+  /** `file_path` is just the `file_id` echoed back - a test registers content under that same
+   * string via `presetFile`, so it never has to invent a realistic-looking Telegram CDN path. */
+  private handleGetFile(body: Record<string, unknown>): Response {
+    const filePath = String(body.file_id ?? "");
+    return jsonResponse({ ok: true, result: { file_path: filePath } });
+  }
+
   private handleCreateForumTopic(state: TokenState, body: Record<string, unknown>): Response {
     const messageThreadId = state.nextTopicId++;
     state.topics.set(messageThreadId, { name: String(body.name ?? ""), closed: false, deleted: false });
@@ -268,6 +288,17 @@ export class StubTelegramServer {
 
   private async handleRequest(req: Request): Promise<Response> {
     const url = new URL(req.url);
+
+    // The file-CDN route (`downloadFile`) is a plain GET, not one of the `/bot<token>/<method>`
+    // JSON-RPC calls below - matched first since its path shape is otherwise indistinguishable.
+    const fileMatch = url.pathname.match(/^\/file\/bot([^/]+)\/(.+)$/);
+    if (fileMatch) {
+      const [, token, filePath] = fileMatch as [string, string, string];
+      const content = this.stateFor(token).filesByPath.get(filePath);
+      if (!content) return new Response("not found", { status: 404 });
+      return new Response(content);
+    }
+
     const match = url.pathname.match(/^\/bot([^/]+)\/([A-Za-z]+)$/);
     if (!match) return jsonResponse({ ok: false, description: "not found" }, 404);
 
@@ -299,6 +330,8 @@ export class StubTelegramServer {
         return jsonResponse({ ok: true, result: { id: 1, username: "stub_bot", is_bot: true } });
       case "getUpdates":
         return this.handleGetUpdates(state, body);
+      case "getFile":
+        return this.handleGetFile(body);
       case "sendMessage":
         return this.handleSendMessage(state, body);
       case "editMessageText":

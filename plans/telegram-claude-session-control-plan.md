@@ -1,7 +1,7 @@
 ---
-version: 0.41.0
+version: 0.42.0
 status: solid
-last_modified_utc: 2026-08-05T10:40:00Z
+last_modified_utc: 2026-08-05T13:15:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,39 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.42.0 (2026-08-05): voice input (§3.4) - record a voice note in Telegram instead of typing.
+    Researched first: Telegram's own Premium voice-to-text is a client-side feature never exposed
+    via the Bot API, so this is a new Bridge-owned pipeline. Self-hosted Whisper via whisper.cpp
+    was chosen over a cloud API (OpenAI/Groq, both viable, cheaper to operate) so no audio leaves
+    the machine. New telegram.ts methods getFile/downloadFile (plain CDN GET, not the JSON-RPC
+    surface parseTelegramResponse handles - stub-telegram gained presetFile + a /file/bot<token>/
+    route to test them for real rather than mocking fetch). New voice-transcribe.ts: startWhisperServer
+    supervises a long-lived whisper-server child (model loads once, reused per note - reloading it
+    per message would add several seconds of dead time); convertOggToWav shells to ffmpeg (16kHz
+    mono, what whisper.cpp expects); parseWhisperServerResponse is deliberately permissive (bare
+    string or {text}) since the real /inference response shape was not independently confirmed
+    against a live server, only that response_format=json and language=auto are accepted - flagged
+    as an open verification item, not asserted as fact, same discipline as §10.0/§6.5's payload-
+    shape findings. New voice-confirm.ts (VoiceConfirmRegistry, vc: callback namespace) mirrors
+    stale-confirm.ts exactly: a transcript is never dispatched directly, only replayed through
+    dispatchInboundMessage on a Send tap, because Whisper's accuracy varies a lot by language and
+    Azerbaijani (one of the four this needs: English/Russian/Ukrainian/Azerbaijani) benchmarks
+    meaningfully weaker than the other three. Re-record and Type-instead both just discard the
+    pending transcript, differing only in the follow-up text shown. index.ts wires message.voice
+    (previously silently dropped alongside every non-text message) into this path; the confirm
+    card sends through the existing feedGovernor P1 lane. New config.voice block, gated by
+    VOICE_ENABLED (default off) - starting a new supervised process on every boot is an operator
+    decision, not a default. setup-windows.ps1 gained a new mechanical step (ffmpeg + whisper-
+    server + the medium model, chosen for its speed/accuracy trade-off on a CPU-only box) but
+    deliberately does not flip VOICE_ENABLED itself, reported instead under 'still needs a human'.
+    20 new tests (voice-confirm.test.ts, voice-transcribe.test.ts, plus telegram.test.ts's
+    getFile/downloadFile cases) - the ffmpeg-dependent ones run for real against the ffmpeg binary
+    already on this dev machine rather than mocking child_process, matching this project's existing
+    preference for a real local double (stub-telegram) over mocking fetch. 504 tests pass
+    monorepo-wide, tsc --noEmit clean in every package. Not yet live-verified against a real
+    whisper-server (no binary/model downloaded on this machine yet - scripts/setup-windows.ps1's
+    voice step has not been run) - the response-shape caveat above is the concrete thing a live run
+    would either confirm or force a fix for."
   - "0.41.0 (2026-08-05): closed Phase 3's two named gaps. (1) The §5.5 `details` button: a
     per-turn `turnSeq` counter (feed-state.ts) plus a new details-button.ts encode/parse
     `d:<slug>:<turn>` callback_data; since a callback_query always routes back to whichever bot
@@ -1635,6 +1668,47 @@ the tool `mcp__aibridge__reply`. If that prompt is not pre-approved, the very fi
 in Telegram is a permission request for the mechanism that delivers permission requests. It works (the
 relay path is independent of the reply path) but it is confusing. Pre-approve `mcp__aibridge__reply` in the
 per-session settings baseline (§6.2).
+
+### 3.4 Voice input (added 0.42.0)
+
+The operator can record a voice note in Telegram instead of typing. Telegram gives a bot nothing for
+this - Premium's own voice-to-text transcription is a client-side feature for human Premium readers,
+never exposed via the Bot API, and explicitly disabled anywhere a bot's visibility would matter. So
+this is a Bridge-owned pipeline, not a toggle: `getFile` resolves the note's `file_id` to a CDN path,
+`downloadFile` fetches the raw Ogg/Opus bytes, `ffmpeg` converts to 16kHz mono WAV, and a Bridge-
+supervised **self-hosted Whisper** (`whisper.cpp`'s `whisper-server`, `medium` model, `language: auto`)
+transcribes it - chosen over a cloud API (OpenAI/Groq, both viable and cheaper to operate) specifically
+so no audio leaves the machine, at the cost of the setup surface described below.
+
+**Self-hosted means one long-lived process, not one call.** whisper-server loads its model once at
+startup and is reused for every voice note; spawning a fresh process per message would reload a
+multi-hundred-MB-to-multi-GB model file every time, adding several seconds of dead time to every single
+note. The Bridge supervises it exactly like the PTY supervisor - restart on unexpected exit, no restart
+on a deliberate shutdown.
+
+**The transcript is never dispatched directly.** Whisper's accuracy varies sharply by language - near
+English-level for well-resourced languages, meaningfully weaker for lower-resource ones. Of the four
+languages this needs to handle (English, Russian, Ukrainian, Azerbaijani), Azerbaijani is the one to
+watch: one FLEURS benchmark puts `large-v3` around 7% CER on Azerbaijani, worse than the other three.
+So every transcript is posted back as its own card - `🎤 <transcript text>` under a
+✅ Send / 🔁 Re-record / ✏️ I'll type instead keyboard (`voice-confirm.ts`) - and only a Send tap feeds it
+into `dispatchInboundMessage`, the exact same path a typed message takes. Re-record and Type-instead are
+both just "discard"; they differ only in which follow-up text is shown, matching `stale-confirm.ts`'s
+own registry/TTL/resolve-pops-and-checks shape (a card left untapped for more than 10 minutes goes
+cold, same reasoning as a forgotten stale-inbound confirm).
+
+**Response-shape caveat, stated rather than assumed:** whisper.cpp's `examples/server` docs confirm
+`/inference` accepts `response_format=json` and `language=auto`, but do not show an example response
+body. `parseWhisperServerResponse` (voice-transcribe.ts) is deliberately permissive - accepts a bare
+string body as well as `{text: ...}` - and throws naming the raw body on anything else, rather than
+asserting one shape as fact. Same discipline as §10.0's `claude/channel` and §6.5's `tool_use_id`
+findings: this needs a real payload capture against a live whisper-server before the permissive parser
+can be tightened, and is flagged here rather than closed as "confirmed."
+
+**Disabled by default.** `VOICE_ENABLED` in `.env` gates the whole feature (`config.voice.enabled`);
+`scripts/setup-windows.ps1` installs ffmpeg + whisper-server + the `medium` model as a mechanical setup
+step but does not flip the flag - starting a new supervised child process on every Bridge boot
+is a decision the operator opts into, not something a re-run of a setup script silently turns on.
 
 ---
 

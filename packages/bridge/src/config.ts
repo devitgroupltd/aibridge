@@ -37,6 +37,16 @@ export interface BridgeConfig {
     topicId: number;
     repoPath: string;
   };
+  /** Voice-input (self-hosted Whisper via whisper.cpp) - `enabled` is false unless
+   * `scripts/setup-windows.ps1`'s voice step has actually installed ffmpeg + whisper-server +
+   * a model, since none of that can be assumed present on a fresh machine. */
+  voice: {
+    enabled: boolean;
+    ffmpegPath: string;
+    whisperServerExe: string;
+    modelPath: string;
+    port: number;
+  };
 }
 
 const SECRETS_DIR = path.join(process.env.APPDATA ?? "", "aibridge");
@@ -61,6 +71,13 @@ export function loadConfig(envPath = path.join(SECRETS_DIR, ".env")): BridgeConf
       slug: parsed.PHASE1_SLUG || "test-session",
       topicId: Number(parsed.PHASE1_TOPIC_ID || "3"),
       repoPath: parsed.PHASE1_REPO_PATH || path.resolve(import.meta.dirname, "../../.."),
+    },
+    voice: {
+      enabled: parsed.VOICE_ENABLED === "true",
+      ffmpegPath: parsed.FFMPEG_PATH || "ffmpeg",
+      whisperServerExe: parsed.WHISPER_SERVER_EXE || path.join(STATE_DIR, "voice", "whisper-server.exe"),
+      modelPath: parsed.WHISPER_MODEL_PATH || path.join(STATE_DIR, "voice", "ggml-medium.bin"),
+      port: Number(parsed.WHISPER_SERVER_PORT || "8383"),
     },
   };
 }

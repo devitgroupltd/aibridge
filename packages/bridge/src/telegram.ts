@@ -10,6 +10,9 @@ export interface TelegramMessage {
    * a real message, per the Bot API. §7.4's stale-inbound check (`stale-inbound.ts`) is the only
    * consumer so far. */
   date: number;
+  /** Present on a voice note (recorded in Telegram's mic UI); a forwarded/uploaded audio file
+   * arrives as `message.audio` instead, which this project does not handle. */
+  voice?: { file_id: string; duration: number };
 }
 
 export interface TelegramCallbackQuery {
@@ -225,6 +228,27 @@ export class TelegramClient implements UpdatesSource {
     form.append("document", new Blob([content], { type: "text/plain" }), filename);
     const res = await fetch(this.url("sendDocument"), { method: "POST", body: form });
     return parseTelegramResponse(res, "sendDocument");
+  }
+
+  /** Resolves a `file_id` (e.g. a voice note's) to a `file_path` for use with `downloadFile`. */
+  async getFile(fileId: string): Promise<{ file_path: string }> {
+    const res = await fetch(this.url("getFile"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ file_id: fileId }),
+    });
+    return parseTelegramResponse(res, "getFile");
+  }
+
+  /** Downloads the raw bytes from Telegram's file CDN - a plain GET against `/file/bot<token>/...`,
+   * not one of the `/bot<token>/<method>` JSON RPC calls, so it does not go through
+   * `parseTelegramResponse`. */
+  async downloadFile(filePath: string): Promise<Uint8Array> {
+    const res = await fetch(`${this.baseUrl}/file/bot${this.token}/${filePath}`);
+    if (!res.ok) {
+      throw new Error(`Telegram file download failed: ${res.status} ${res.statusText}`);
+    }
+    return new Uint8Array(await res.arrayBuffer());
   }
 
   async setMyCommands(chatId: string | number, commands: readonly BotCommand[]): Promise<void> {

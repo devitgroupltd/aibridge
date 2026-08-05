@@ -29,6 +29,9 @@ import type { PendingFleetConfirm } from "./fleet-confirm.ts";
 import { formatStaleAge, isStaleInbound } from "./stale-inbound.ts";
 import { buildStaleConfirmKeyboard, resolveStaleConfirmCallback, StaleConfirmRegistry } from "./stale-confirm.ts";
 import type { PendingStaleConfirm } from "./stale-confirm.ts";
+import { buildVoiceConfirmKeyboard, resolveVoiceConfirmCallback, VoiceConfirmRegistry } from "./voice-confirm.ts";
+import type { PendingVoiceConfirm } from "./voice-confirm.ts";
+import { startWhisperServer, transcribeVoiceNote } from "./voice-transcribe.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import {
   botCommandList,
@@ -267,6 +270,11 @@ async function main(): Promise<void> {
   // permission prompt instead of executing on the same message (fleet-confirm.ts).
   const fleetConfirmRegistry = new FleetConfirmRegistry();
   const staleConfirmRegistry = new StaleConfirmRegistry();
+  // Voice input (self-hosted Whisper via whisper.cpp) - a transcribed voice note is never
+  // dispatched directly, only replayed from a tap on its own Send/Re-record/Type-instead card
+  // (voice-confirm.ts), same shape as the stale-inbound confirm above.
+  const voiceConfirmRegistry = new VoiceConfirmRegistry();
+  const voiceServer = config.voice.enabled ? startWhisperServer(config.voice, log) : null;
 
   function maybeSetState(slug: string, target: SessionState): void {
     const row = sessionStore.get(slug);
@@ -1086,6 +1094,44 @@ async function main(): Promise<void> {
     }
   }
 
+  /** Voice-input's own confirm-card path (voice-confirm.ts): downloads the voice note, transcribes
+   * it locally against the Bridge's own supervised whisper-server, and posts a Send/Re-record/
+   * Type-instead card - never dispatched directly. Whisper's accuracy varies a lot by language
+   * (Azerbaijani meaningfully weaker than English/Russian/Ukrainian per the voice-input design
+   * decision), so showing the transcript before it reaches a live session is load-bearing. */
+  async function handleVoiceMessage(voice: { file_id: string; duration: number }, threadId: number | undefined, messageId: number, from: string): Promise<void> {
+    if (!config.voice.enabled) {
+      confirmSessionCommand(threadId, "Voice input isn't set up on this Bridge yet - see scripts/setup-windows.ps1's voice step, then set VOICE_ENABLED=true.");
+      return;
+    }
+    try {
+      const { file_path } = await controlBot.getFile(voice.file_id);
+      const oggBytes = await controlBot.downloadFile(file_path);
+      const { text } = await transcribeVoiceNote(
+        { ffmpegPath: config.voice.ffmpegPath, serverUrl: `http://127.0.0.1:${config.voice.port}` },
+        oggBytes,
+      );
+      const id = randomUUID().slice(0, 8);
+      const preview = text.length > 0 ? text : "(nothing recognised - try again?)";
+      const sent = await feedGovernor.scheduleAsync("P1", () =>
+        controlBot.sendMessage(config.supergroupChatId, threadId, `🎤 ${preview}`, { inline_keyboard: buildVoiceConfirmKeyboard(id) }),
+      );
+      voiceConfirmRegistry.add({ id, threadId, messageId, transcript: text, from, confirmCardMessageId: sent.message_id });
+    } catch (err) {
+      log("WARN", `voice transcription failed: ${(err as Error).message}`);
+      confirmSessionCommand(threadId, "Couldn't transcribe that voice note - try again, or just type it.");
+    }
+  }
+
+  async function finalizeVoiceConfirmMessage(pending: PendingVoiceConfirm, text: string): Promise<void> {
+    if (!controlBot.editMessageText) return;
+    try {
+      await controlBot.editMessageText(config.supergroupChatId, pending.confirmCardMessageId, text, { inline_keyboard: [] });
+    } catch (err) {
+      log("WARN", `failed to finalize voice-confirm message: ${(err as Error).message}`);
+    }
+  }
+
   /** Runs after a `/kill --all`/`/rm --all` confirm tap - re-looks-up rows by slug rather than
    * trusting a snapshot from when the confirm card was posted, since a session can die or get
    * removed independently in the minutes between posting and the tap. */
@@ -1722,6 +1768,29 @@ async function main(): Promise<void> {
           return;
         }
 
+        // Voice input's own confirm keyboard (voice-confirm.ts) - "vc:", a fresh namespace
+        // alongside "sc:"/"fc:"/"d:". "Re-record" and "Type instead" both discard the transcript;
+        // they differ only in which follow-up text is shown, so both fall into the same finalize
+        // call below rather than needing separate registry/dispatch handling.
+        const voiceConfirmAction = callbackQuery.data ? resolveVoiceConfirmCallback(callbackQuery.data) : null;
+        if (voiceConfirmAction) {
+          const pending = voiceConfirmRegistry.resolve(voiceConfirmAction.id);
+          if (!pending) return;
+          if (voiceConfirmAction.action === "send") {
+            void finalizeVoiceConfirmMessage(pending, "✅ Sent.");
+            const pendingIsControl = isControlTopic(pending.threadId);
+            const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
+            dispatchInboundMessage(pending.messageId, pending.transcript, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from);
+            return;
+          }
+          const doneText =
+            voiceConfirmAction.action === "rerecord"
+              ? "🔁 Discarded - send another voice note whenever you're ready."
+              : "✏️ Discarded - go ahead and type it.";
+          void finalizeVoiceConfirmMessage(pending, doneText);
+          return;
+        }
+
         const model = callbackQuery.data ? resolveModelCallback(callbackQuery.data) : null;
         if (model) {
           if (currentSlug && threadId !== undefined) applyModelSwitch(currentSlug, threadId, model);
@@ -1776,7 +1845,7 @@ async function main(): Promise<void> {
       }
 
       const message = update.message;
-      if (!message?.text) return;
+      if (!message) return;
       if (String(message.chat.id) !== config.supergroupChatId) return;
 
       const threadId = message.message_thread_id;
@@ -1787,6 +1856,17 @@ async function main(): Promise<void> {
       if (!isControl && !route) return;
 
       const from = message.from?.username ?? message.from?.first_name ?? "unknown";
+
+      // Voice input - a recorded voice note, not a forwarded/uploaded audio file (message.audio,
+      // unhandled). Goes through its own confirm-card path (handleVoiceMessage), never the
+      // stale-inbound check below: staleness of the *card* (voice-confirm.ts's own TTL) is what
+      // matters, not staleness of when the note was recorded.
+      if (message.voice) {
+        void handleVoiceMessage(message.voice, threadId, message.message_id, from);
+        return;
+      }
+
+      if (!message.text) return;
 
       // §7.4: a backlog burst on resume (Telegram queues updates for 24h while the Bridge is
       // down/asleep) can replay a command typed long ago - confirm rather than act on anything
