@@ -41,6 +41,12 @@ function loadDatabaseCtor(): DatabaseCtor {
 }
 export type SessionState = "starting" | "idle" | "working" | "awaiting_input" | "quota_stopped" | "dead";
 
+/** §5.9's `/detail`: "compact" is today's 80-char one-liner/8-line-cap card; "full" wraps each
+ * line's untruncated input (and, if `feedVerbose`, its tool output) in a collapsed
+ * `<blockquote expandable>` instead - detail on demand, one tap away, without changing the card's
+ * default footprint. */
+export type FeedDetailLevel = "compact" | "full";
+
 export interface SessionRow {
   slug: string;
   topicId: number;
@@ -56,6 +62,13 @@ export interface SessionRow {
   /** §4.4's rename-once cap: flips true the first time the topic is renamed off its provisional
    * `/new`-prompt title, so a later Bridge restart or a second reply doesn't re-trigger it. */
   renamed: boolean;
+  /** §5.9's `/detail <compact|full>` - per session, defaults to "compact". */
+  feedDetail: FeedDetailLevel;
+  /** §5.9's `/verbose <on|off>` - independent of `feedDetail`: whether a tool's actual output
+   * (not just its input) is captured and shown, only visible at all once `feedDetail` is "full".
+   * Defaults off - real tool output can contain arbitrary file content (the same §8.2 concern
+   * that already governs `feedDetail`'s truncation), so showing it is opt-in, not the default. */
+  feedVerbose: boolean;
   createdUtc: string;
   lastEventUtc: string;
 }
@@ -73,6 +86,8 @@ interface SessionRowSql {
   turn_card_msg: number | null;
   paused: number;
   renamed: number;
+  feed_detail: string;
+  feed_verbose: number;
   created_utc: string;
   last_event_utc: string;
 }
@@ -91,6 +106,8 @@ function fromSql(row: SessionRowSql): SessionRow {
     turnCardMsg: row.turn_card_msg,
     paused: row.paused !== 0,
     renamed: row.renamed !== 0,
+    feedDetail: row.feed_detail === "full" ? "full" : "compact",
+    feedVerbose: row.feed_verbose !== 0,
     createdUtc: row.created_utc,
     lastEventUtc: row.last_event_utc,
   };
@@ -139,6 +156,8 @@ export class SessionStore {
         turn_card_msg  INTEGER,
         paused         INTEGER NOT NULL DEFAULT 0,
         renamed        INTEGER NOT NULL DEFAULT 0,
+        feed_detail    TEXT NOT NULL DEFAULT 'compact',
+        feed_verbose   INTEGER NOT NULL DEFAULT 0,
         created_utc    TEXT NOT NULL,
         last_event_utc TEXT NOT NULL
       );
@@ -158,14 +177,20 @@ export class SessionStore {
     if (!columns.has("renamed")) {
       this.db.exec("ALTER TABLE sessions ADD COLUMN renamed INTEGER NOT NULL DEFAULT 0;");
     }
+    if (!columns.has("feed_detail")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN feed_detail TEXT NOT NULL DEFAULT 'compact';");
+    }
+    if (!columns.has("feed_verbose")) {
+      this.db.exec("ALTER TABLE sessions ADD COLUMN feed_verbose INTEGER NOT NULL DEFAULT 0;");
+    }
   }
 
   insert(row: SessionRow): void {
     this.db
       .prepare(
         `INSERT INTO sessions
-         (slug, topic_id, session_id, worktree_path, branch, repo_path, model, pty_pid, state, turn_card_msg, paused, renamed, created_utc, last_event_utc)
-         VALUES ($slug, $topic_id, $session_id, $worktree_path, $branch, $repo_path, $model, $pty_pid, $state, $turn_card_msg, $paused, $renamed, $created_utc, $last_event_utc)`,
+         (slug, topic_id, session_id, worktree_path, branch, repo_path, model, pty_pid, state, turn_card_msg, paused, renamed, feed_detail, feed_verbose, created_utc, last_event_utc)
+         VALUES ($slug, $topic_id, $session_id, $worktree_path, $branch, $repo_path, $model, $pty_pid, $state, $turn_card_msg, $paused, $renamed, $feed_detail, $feed_verbose, $created_utc, $last_event_utc)`,
       )
       .run({
         $slug: row.slug,
@@ -180,6 +205,8 @@ export class SessionStore {
         $turn_card_msg: row.turnCardMsg,
         $paused: row.paused ? 1 : 0,
         $renamed: row.renamed ? 1 : 0,
+        $feed_detail: row.feedDetail,
+        $feed_verbose: row.feedVerbose ? 1 : 0,
         $created_utc: row.createdUtc,
         $last_event_utc: row.lastEventUtc,
       });
@@ -244,6 +271,14 @@ export class SessionStore {
 
   setRenamed(slug: string): void {
     this.db.prepare("UPDATE sessions SET renamed = 1 WHERE slug = $slug").run({ $slug: slug });
+  }
+
+  setFeedDetail(slug: string, level: FeedDetailLevel): void {
+    this.db.prepare("UPDATE sessions SET feed_detail = $level WHERE slug = $slug").run({ $level: level, $slug: slug });
+  }
+
+  setFeedVerbose(slug: string, verbose: boolean): void {
+    this.db.prepare("UPDATE sessions SET feed_verbose = $verbose WHERE slug = $slug").run({ $verbose: verbose ? 1 : 0, $slug: slug });
   }
 
   setPtyPid(slug: string, ptyPid: number): void {

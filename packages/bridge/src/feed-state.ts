@@ -7,6 +7,12 @@ export interface ActivityLine {
   summary: string;
   status: "running" | "done" | "failed";
   error?: string;
+  /** §5.9's `/detail full` data - the untruncated (well, `MAX_FULL_LEN`-capped) form of `summary`.
+   * Undefined for note lines (compaction, subagent boundaries), which have nothing more to show. */
+  fullInput?: string;
+  /** §5.9's `/verbose on` data - the tool's actual result, only ever populated once `tool_end`
+   * resolves the line (a still-`running` line has no output yet). */
+  output?: string;
 }
 
 export interface FeedState {
@@ -60,7 +66,7 @@ export function applyEvent(state: FeedState, event: FeedEvent, nowMs: number): F
     case "tool_start":
       return {
         ...state,
-        lines: [...state.lines, { toolUseId: event.toolUseId, summary: event.summary, status: "running" }],
+        lines: [...state.lines, { toolUseId: event.toolUseId, summary: event.summary, status: "running", fullInput: event.fullInput }],
       };
 
     case "tool_end":
@@ -69,7 +75,7 @@ export function applyEvent(state: FeedState, event: FeedEvent, nowMs: number): F
         lines: state.lines.map((line) =>
           line.toolUseId === event.toolUseId
             ? event.success
-              ? { ...line, status: "done" as const }
+              ? { ...line, status: "done" as const, output: event.output }
               : { ...line, status: "failed" as const, error: event.error }
             : line,
         ),

@@ -214,6 +214,8 @@ async function main(): Promise<void> {
       turnCardMsg: null,
       paused: false,
       renamed: false,
+      feedDetail: "compact",
+      feedVerbose: false,
       createdUtc: nowIso(),
       lastEventUtc: nowIso(),
     });
@@ -444,7 +446,8 @@ async function main(): Promise<void> {
       postDetailsButton(msg.slug, next.turnSeq);
     }
 
-    feedCoalescer.notify(msg.slug, renderCard(next, nowMs));
+    const feedSettings = row ? { detail: row.feedDetail, verbose: row.feedVerbose } : undefined;
+    feedCoalescer.notify(msg.slug, renderCard(next, nowMs, feedSettings));
   }
 
   // The deterministic half of `/new`'s first-write race (§4.5's dev-channels dialog is the other
@@ -1006,6 +1009,8 @@ async function main(): Promise<void> {
       turnCardMsg: null,
       paused: false,
       renamed: false,
+      feedDetail: "compact",
+      feedVerbose: false,
       createdUtc: nowIso(),
       lastEventUtc: nowIso(),
     });
@@ -1428,6 +1433,52 @@ async function main(): Promise<void> {
   }
 
   /**
+   * §5.9's `/detail [<slug>] [compact|full]`: how much of each tool call the feed card shows for
+   * this one session - "full" wraps each line's untruncated input in a `<blockquote expandable>`
+   * instead of the 80-char one-liner; no argument reports the current setting rather than
+   * changing anything, same "bare = status" convention as `/autostart`.
+   */
+  function handleDetailCommand(cmd: Extract<FleetCommand, { kind: "detail" }>, topicId: number | undefined, currentSlug: string | undefined): void {
+    const resolved = resolveTargetSlug(cmd.slug, currentSlug);
+    if ("error" in resolved) {
+      confirmSessionCommand(topicId, resolved.error);
+      return;
+    }
+    const { slug } = resolved;
+    if (!cmd.level) {
+      const row = sessionStore.get(slug) as NonNullable<ReturnType<typeof sessionStore.get>>;
+      confirmSessionCommand(topicId, `"${slug}" feed detail: ${row.feedDetail}.`);
+      return;
+    }
+    sessionStore.setFeedDetail(slug, cmd.level);
+    confirmSessionCommand(topicId, `"${slug}" feed detail set to ${cmd.level}.`);
+  }
+
+  /**
+   * §5.9's `/verbose [<slug>] [on|off]`: whether the feed also shows a tool's actual output, not
+   * just what it was asked to do - default off, since real tool output can carry arbitrary file
+   * content (the same §8.2 concern §5.3 already truncates for), and only visible at all once
+   * `/detail` is `full`.
+   */
+  function handleVerboseCommand(cmd: Extract<FleetCommand, { kind: "verbose" }>, topicId: number | undefined, currentSlug: string | undefined): void {
+    const resolved = resolveTargetSlug(cmd.slug, currentSlug);
+    if ("error" in resolved) {
+      confirmSessionCommand(topicId, resolved.error);
+      return;
+    }
+    const { slug } = resolved;
+    if (cmd.on === undefined) {
+      const row = sessionStore.get(slug) as NonNullable<ReturnType<typeof sessionStore.get>>;
+      confirmSessionCommand(topicId, `"${slug}" verbose tool output: ${row.feedVerbose ? "on" : "off"}.`);
+      return;
+    }
+    sessionStore.setFeedVerbose(slug, cmd.on);
+    const row = sessionStore.get(slug) as NonNullable<ReturnType<typeof sessionStore.get>>;
+    const noEffectNote = cmd.on && row.feedDetail !== "full" ? ` (no effect until /detail full is also set for "${slug}")` : "";
+    confirmSessionCommand(topicId, `"${slug}" verbose tool output set to ${cmd.on ? "on" : "off"}.${noEffectNote}`);
+  }
+
+  /**
    * §4.5.1's `/restart`: self-respawn, not an external supervisor. Every live session dies with
    * this process (§4.5's measurement) and comes back via `resumeSession`'s `claude --resume` path
    * once the successor's own startup reconciliation runs - the same cold-start cost as any other
@@ -1712,6 +1763,14 @@ async function main(): Promise<void> {
         void handleDeployCommand(threadId, fleetCmd.slug);
         return;
       }
+      if (fleetCmd.kind === "detail") {
+        handleDetailCommand(fleetCmd, threadId, currentSlug);
+        return;
+      }
+      if (fleetCmd.kind === "verbose") {
+        handleVerboseCommand(fleetCmd, threadId, currentSlug);
+        return;
+      }
       if (fleetCmd.kind === "settings") {
         handleSettingsCommand(threadId);
         return;
@@ -1923,7 +1982,8 @@ async function main(): Promise<void> {
         if (detailsAction) {
           const state = feedStates.get(detailsAction.slug);
           const stillCurrent = state && state.turnSeq === detailsAction.turnSeq;
-          const text = stillCurrent ? renderDetails(state) : "That turn has ended - its log is no longer available.";
+          const verboseDetails = sessionStore.get(detailsAction.slug)?.feedVerbose ?? false;
+          const text = stillCurrent ? renderDetails(state, verboseDetails) : "That turn has ended - its log is no longer available.";
           if (text.length <= 4096) {
             // renderDetails renders the same `<code>`/escaped-entity markup the turn card itself
             // uses (feed-renderer.ts) - needs "HTML" here or Telegram shows the literal tags.
@@ -1932,7 +1992,7 @@ async function main(): Promise<void> {
             // §5.5: "Diffs always go as documents" - the same reasoning applies to a details log
             // too long to fit in one message. Plain text, not renderDetails's HTML markup - a
             // document viewer has no HTML renderer to make that markup invisible.
-            const plainText = stillCurrent ? renderDetailsPlainText(state) : text;
+            const plainText = stillCurrent ? renderDetailsPlainText(state, verboseDetails) : text;
             feedGovernor
               .scheduleAsync("P1", () =>
                 controlBot.sendDocument(config.supergroupChatId, threadId, `${detailsAction.slug}-turn${detailsAction.turnSeq}-details.txt`, plainText),

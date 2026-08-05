@@ -1,7 +1,7 @@
 ---
-version: 0.50.0
+version: 0.51.0
 status: solid
-last_modified_utc: 2026-08-05T21:15:00Z
+last_modified_utc: 2026-08-05T22:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,25 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.51.0 (2026-08-05): added §5.10 - /detail [<slug>] [compact|full] and /verbose [<slug>]
+    [on|off], per session, both default off/compact. Telegram has supported
+    <blockquote expandable> natively since Bot API 7.3 - collapsed by default, one tap to open, no
+    button/callback needed - so /detail full wraps each tool line's untruncated input in one of
+    these instead of the 80-char one-liner §5.3 always used, and /verbose on additionally shows
+    the tool's actual output inside the same blockquote (kept as an independent switch, not folded
+    into /detail, since real tool output is data that was never going to Telegram at all - a
+    materially bigger §8.2 tradeoff than un-truncating input that was already being sent). fullInput
+    is free (PreToolUse already carries tool_input in full); output needed a new
+    summarizeToolResponse in hook-events.ts, explicitly flagged as doc-sourced only for every shape
+    except the one Stage 0's own 2026-08-03 live capture already confirmed (a Read call's
+    tool_response: { type: \"text\", file: { filePath, numLines } } - sitting in hook-events.test.ts
+    since Phase 3) - everything else degrades to \"no output shown\" rather than crashing or
+    guessing, per this project's own repeatedly-learned \"verify before trusting a hook payload\"
+    lesson (§2.4, §6.5). Card layout in full mode is size-driven (MAX_CARD_CHARS, 3800) rather than
+    the fixed 8-line cap, since each line is now unpredictably sized. New session-store columns
+    feed_detail/feed_verbose, migrated the ALTER TABLE way. 18 new tests, 607 pass monorepo-wide,
+    tsc --noEmit clean. Not yet live-verified against a real turn with either switch on - stated as
+    an open exit bar, matching §5.9's own."
   - "0.50.0 (2026-08-05): added §5.9 - /deploy <slug>, control-topic only: merges a session's own
     branch into its repo via git merge --ff-only, runs the same gate §9 already calls the test plan
     (bun test at the repo root, tsc --noEmit per package via discoverTypecheckedPackages), and rolls
@@ -2738,6 +2757,81 @@ a real self-deploy (that requires actually registering aibridge's own repo and r
 through the full loop) - the exit bar for calling this proven, not just built, is the same live
 walkthrough §9's own scenario list asks for everything else: a real session on aibridge's own repo
 fixing something, `/deploy`d, and the Bridge visibly coming back up on the new commit.
+
+### 5.10 Detail on demand: `/detail` and `/verbose`
+
+§5.3's turn card is deliberately terse - an 80-char one-liner per tool call, capped at 8 lines -
+because that's what stays readable glancing at a phone. The gap: sometimes the operator actually
+wants to see what a step *did*, the way VS Code's own Claude Code panel shows a collapsed
+IN/OUT card per tool call. Telegram has had exactly that primitive natively since Bot API 7.3:
+`<blockquote expandable>…</blockquote>` renders collapsed by default, one tap to open, no button/
+callback round-trip needed. This section is that primitive, wired to two independent per-session
+switches rather than a single "verbose mode":
+
+- **`/detail [<slug>] [compact|full]`** - default `compact` (today's exact card, byte-for-byte
+  unchanged for every session that never touches this). `full` wraps each line's *untruncated*
+  input - not just the 80-char summary, `hook-events.ts`'s new `fullToolInput` (same field
+  preference order as the compact `summarizeToolInput`, just without the cut, falling back to a
+  shallow dump of every string field for a tool shape neither matched, since "full" having *less*
+  than compact already gave would defeat the point) - in a collapsed blockquote under the same
+  always-visible summary line.
+- **`/verbose [<slug>] [on|off]`** - default `off`, independent of `/detail`. Whether the tool's
+  *actual result* - not just what it was asked to do - also appears inside that same blockquote.
+  Kept as its own switch rather than folded into `full` because it's a materially different §8.2
+  tradeoff: `fullInput` is data already flowing to Telegram in truncated form (this just stops
+  truncating it), while a tool's output is new data that was never going to Telegram at all -
+  arbitrary file contents, command stdout, anything the session touched. Off by default, and has
+  no visible effect until `/detail` is also `full` (there's no line to attach it to otherwise) -
+  the command's own confirmation says so rather than silently no-op'ing.
+
+Both take the same two forms every other session-scoped fleet command already does (`/pause`'s
+shape): bare from inside the session's own topic, or `<slug> <value>` from the control topic. A
+single token is resolved by checking whether it's a valid value (`compact`/`full`, `on`/`off`)
+first, since a slug can never collide with those exact words; a bare command with no value reports
+the current setting rather than changing anything (`/autostart`'s own "no argument = status"
+convention). Both settings persist per-session in `sessions.feed_detail`/`sessions.feed_verbose`
+(new columns, migrated the same `ALTER TABLE ... ADD COLUMN` way `renamed` was), so they survive a
+Bridge restart the same way `paused`/`model` already do.
+
+**Where the data actually comes from.** `PreToolUse` already carries `tool_input` in full (§5.1) -
+`fullInput` is free, no new hook capture needed. `output` is not: it depends on `PostToolUse`
+carrying a `tool_response` field, which - per this project's own repeatedly-learned lesson (§2.4's
+channel capability negotiation, §6.5's `tool_use_id`) - is trusted from Claude Code's public
+documentation only, **not yet independently live-verified** the way `PermissionRequest`'s payload
+was via Stage 0's spike. What *is* live-verified: Stage 0's own 2026-08-03 capture of a real
+`PostToolUse` for a `Read` call, sitting in `hook-events.test.ts` since Phase 3, already carries a
+`tool_response: { type: "text", file: { filePath, numLines } }` - confirming the field exists and
+giving one confirmed shape to key off; `summarizeToolResponse` handles that shape by name and
+degrades to "no output" (never a crash) for every other tool's guessed shape (`stdout`/`stderr` for
+Bash, `content`/`output`/`result`/`filePath` as a generic fallback) until each is checked the same
+way. This is shipped ahead of that check deliberately - the failure mode is "verbose shows nothing
+for some tools," not a wrong or dangerous answer - but should not be read as a completeness
+guarantee before a live pass confirms the other shapes.
+
+**Card layout in `full` mode is size-driven, not count-driven.** Compact's fixed 8-line cap doesn't
+carry over - each line is now a blockquote of unpredictable length, so `renderCard` walks the log
+from most recent backwards, keeping whatever fits under `MAX_CARD_CHARS` (3800, comfortably under
+Telegram's real 4096-UTF-16-unit cap with headroom for markup), and rolls the rest into the same
+"…and N earlier steps" counter compact mode already uses. The `details` button (§5.5) is
+unaffected in shape - one line per activity, same as always - but now shows each line's full input
+regardless of the session's own `/detail` setting (already an explicit tap, no reason to withhold
+it there) and appends output only when that session's `/verbose` is on.
+
+**RESOLVED, implemented 2026-08-05.** `session-store.ts` gained `feedDetail`/`feedVerbose` (default
+`"compact"`/`false`) plus `setFeedDetail`/`setFeedVerbose`. `hook-events.ts` gained `fullToolInput`
+and `summarizeToolResponse` (the latter explicitly flagged as doc-sourced, not live-verified, per
+above) and both `FeedEvent` variants carry the new fields. `feed-state.ts`'s `ActivityLine` carries
+`fullInput`/`output` alongside the existing `summary`. `feed-renderer.ts`'s `renderCard` takes an
+optional `FeedRenderSettings` (defaults to compact/off, so every pre-existing call site and test
+keeps its exact prior output byte-for-byte); `renderDetails`/`renderDetailsPlainText` take an
+optional `verbose` flag. `fleet-commands.ts` gained `/detail`/`/verbose` parsing (`parseSlugAndValue`,
+shared between them) plus help/command-list entries; `index.ts` gained `handleDetailCommand`/
+`handleVerboseCommand` and passes each session's own settings into `renderCard`/`renderDetails`/
+`renderDetailsPlainText` at their call sites. 18 new tests (`feed-renderer.test.ts`,
+`hook-events.test.ts`, `fleet-commands.test.ts`, `session-store.test.ts`), 607 tests pass
+monorepo-wide, `tsc --noEmit` clean across every package. Not yet live-verified against a real
+multi-tool turn with `/detail full`/`/verbose on` set - same open exit bar as §5.9's own closing
+note, stated rather than assumed.
 
 ---
 

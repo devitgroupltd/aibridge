@@ -32,6 +32,8 @@ export type FleetCommand =
   | { kind: "budget" }
   | { kind: "restart" }
   | { kind: "deploy"; slug: string }
+  | { kind: "detail"; slug?: string; level?: "compact" | "full" }
+  | { kind: "verbose"; slug?: string; on?: boolean }
   | { kind: "settings" }
   | { kind: "autostart"; action: "status" | "install" | "uninstall" }
   | { kind: "repos"; action: "list" }
@@ -60,6 +62,52 @@ function parseNew(rest: string): FleetCommand | null {
 function parseSlugArg(kind: "attach" | "pause" | "usage", rest: string): FleetCommand {
   const slug = rest.trim();
   return { kind, slug: slug.length > 0 ? slug : undefined };
+}
+
+/**
+ * Shared shape behind `/detail`/`/verbose` (§5.9): both take an optional `<slug>` (control-topic
+ * form, same as `/pause`) plus an optional value token - "bare from inside the session's own
+ * topic" and "with a slug from the control topic" are the same two forms every other
+ * `parseSlugArg`-style command already supports, this just also has a value to set.
+ *
+ * A single token is ambiguous between "the value, session-topic bare-set form" and "the slug,
+ * control-topic bare-report form" - resolved by checking `isValue` first, since the value's
+ * alphabet (`compact`/`full`, `on`/`off`) can never collide with a real slug (slugs are generated
+ * from the session's own prompt text and never land on one of these exact words by construction).
+ */
+function parseSlugAndValue<V extends string>(rest: string, isValue: (s: string) => s is V): { slug?: string; value?: V } | null {
+  const tokens = rest.trim().split(/\s+/).filter((t) => t.length > 0);
+  if (tokens.length === 0) return {};
+  if (tokens.length === 1) {
+    const [only] = tokens as [string];
+    return isValue(only) ? { value: only } : { slug: only };
+  }
+  if (tokens.length === 2) {
+    const [slug, value] = tokens as [string, string];
+    return isValue(value) ? { slug, value } : null;
+  }
+  return null;
+}
+
+function isDetailLevel(s: string): s is "compact" | "full" {
+  return s === "compact" || s === "full";
+}
+
+function isOnOff(s: string): s is "on" | "off" {
+  return s === "on" || s === "off";
+}
+
+/** `/detail [<slug>] [compact|full]` - see `parseSlugAndValue`'s note on the two supported forms. */
+function parseDetail(rest: string): FleetCommand | null {
+  const parsed = parseSlugAndValue(rest, isDetailLevel);
+  return parsed ? { kind: "detail", slug: parsed.slug, level: parsed.value } : null;
+}
+
+/** `/verbose [<slug>] [on|off]` - same shape as `parseDetail`. */
+function parseVerbose(rest: string): FleetCommand | null {
+  const parsed = parseSlugAndValue(rest, isOnOff);
+  if (!parsed) return null;
+  return { kind: "verbose", slug: parsed.slug, on: parsed.value === undefined ? undefined : parsed.value === "on" };
 }
 
 /** `/kill --all` requests fleet-confirm-gated (`index.ts`, fleet-confirm.ts) termination of every
@@ -190,7 +238,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
  * "for us, but invalid" split as `session-commands.ts`'s parser. */
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|deploy|settings|autostart|repos|voice)\b(.*)$/s);
+  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice)\b(.*)$/s);
   if (!match) return null;
   const [, cmd, rest] = match as [string, string, string];
   switch (cmd) {
@@ -206,6 +254,10 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       const slug = rest.trim();
       return slug.length > 0 ? { kind: "deploy", slug } : null;
     }
+    case "detail":
+      return parseDetail(rest);
+    case "verbose":
+      return parseVerbose(rest);
     case "settings":
       return { kind: "settings" };
     case "autostart":
@@ -441,6 +493,10 @@ export function renderHelp(): string {
     "  /restart - restart the Bridge daemon",
     "  /deploy <slug> - merge that session's branch into its repo, run tests, and (if the repo is",
     "    aibridge's own) restart the Bridge to pick up the fix (§5.9)",
+    "  /detail [<slug>] [compact|full] - how much of each tool call the feed card shows (default",
+    "    compact); bare from inside a session's own topic, or with <slug> from the control topic",
+    "  /verbose [<slug>] [on|off] - also show real tool output, not just what was asked for (default",
+    "    off, only visible once /detail is full)",
     "  /settings - registered repos + concurrency budget",
     "  /repos [list|add <name> [path|git-url] [--base <b>] [--model <m>]|rm <name>] - manage repos.toml",
     "  /autostart [status|install|uninstall] - manage the logon Task Scheduler entry",
@@ -477,6 +533,8 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "budget", description: "Fleet spend (5h/7d)" },
     { command: "restart", description: "Restart the Bridge daemon" },
     { command: "deploy", description: "Merge a session's branch and run tests: /deploy <slug> (restarts if it's aibridge's own repo)" },
+    { command: "detail", description: "Feed card detail level: /detail [<slug>] [compact|full]" },
+    { command: "verbose", description: "Show real tool output on the feed card: /verbose [<slug>] [on|off]" },
     { command: "settings", description: "Registered repos + concurrency budget" },
     { command: "repos", description: "Manage repos.toml: list|add <name> [path|git-url]|rm <name>" },
     { command: "autostart", description: "Manage the logon Task Scheduler entry: status|install|uninstall" },

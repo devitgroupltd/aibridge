@@ -16,6 +16,8 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     turnCardMsg: null,
     paused: false,
     renamed: false,
+    feedDetail: "compact",
+    feedVerbose: false,
     createdUtc: "2026-08-03T00:00:00.000Z",
     lastEventUtc: "2026-08-03T00:00:00.000Z",
     ...overrides,

@@ -83,6 +83,7 @@ describe("normalizeHookEvent", () => {
       toolUseId: "toolu_013YdioHZEuE1qfmPeqVKk1S",
       toolName: "Bash",
       summary: "Bash  echo spike-test",
+      fullInput: "$ echo spike-test",
     });
   });
 
@@ -92,14 +93,25 @@ describe("normalizeHookEvent", () => {
       toolUseId: "toolu_01JXhgBpNrpogaeYF3K4BjBr",
       toolName: "Read",
       summary: "Read  C:\\data\\projects\\aibridge\\.worktrees\\test-session\\package.json",
+      fullInput: "Read  C:\\data\\projects\\aibridge\\.worktrees\\test-session\\package.json",
     });
   });
 
-  test("PostToolUse resolves the matching tool_use_id as a success", () => {
+  test("PostToolUse resolves the matching tool_use_id as a success, and §5.9's verbose data comes from the live-captured Read tool_response shape", () => {
     expect(normalizeHookEvent("PostToolUse", POST_TOOL_USE)).toEqual({
       kind: "tool_end",
       toolUseId: "toolu_01JXhgBpNrpogaeYF3K4BjBr",
       success: true,
+      output: "package.json (15 lines)",
+    });
+  });
+
+  test("PostToolUse with no tool_response at all has no output, not a crash", () => {
+    expect(normalizeHookEvent("PostToolUse", { session_id: "x", hook_event_name: "PostToolUse", tool_use_id: "t1" })).toEqual({
+      kind: "tool_end",
+      toolUseId: "t1",
+      success: true,
+      output: undefined,
     });
   });
 
@@ -136,5 +148,39 @@ describe("normalizeHookEvent", () => {
   test("a tool event missing tool_use_id is dropped, not guessed", () => {
     expect(normalizeHookEvent("PreToolUse", { session_id: "x", tool_name: "Bash" })).toBeNull();
     expect(normalizeHookEvent("PostToolUse", { session_id: "x" })).toBeNull();
+  });
+
+  describe("§5.9's fullInput/output - not just the compact one-liner", () => {
+    test("PreToolUse's fullInput includes a Bash description Claude provided, not just the command", () => {
+      const withDescription = { ...PRE_TOOL_USE_BASH, tool_input: { command: "npm test", description: "Run the suite" } };
+      const event = normalizeHookEvent("PreToolUse", withDescription);
+      expect(event).toMatchObject({ kind: "tool_start", fullInput: "$ npm test" });
+    });
+
+    test("PostToolUse's tool_response.stdout/stderr (documented, not yet live-verified) becomes output", () => {
+      const event = normalizeHookEvent("PostToolUse", {
+        session_id: "x",
+        hook_event_name: "PostToolUse",
+        tool_use_id: "t1",
+        tool_response: { stdout: "line1\n", stderr: "warning: x" },
+      });
+      expect(event).toEqual({ kind: "tool_end", toolUseId: "t1", success: true, output: "line1\n\nwarning: x" });
+    });
+
+    test("PostToolUse with an unrecognised tool_response shape degrades to no output, not a crash", () => {
+      const event = normalizeHookEvent("PostToolUse", {
+        session_id: "x",
+        hook_event_name: "PostToolUse",
+        tool_use_id: "t1",
+        tool_response: { some: { deeply: { nested: "shape nobody guessed" } } },
+      });
+      expect(event).toEqual({ kind: "tool_end", toolUseId: "t1", success: true, output: undefined });
+    });
+
+    test("a very long fullInput/output is capped, not left unbounded", () => {
+      const longCommand = "x".repeat(3000);
+      const event = normalizeHookEvent("PreToolUse", { ...PRE_TOOL_USE_BASH, tool_input: { command: longCommand } });
+      expect((event as { fullInput: string }).fullInput.length).toBeLessThan(1600);
+    });
   });
 });

@@ -15,6 +15,8 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     turnCardMsg: null,
     paused: false,
     renamed: false,
+    feedDetail: "compact",
+    feedVerbose: false,
     createdUtc: "2026-08-03T00:00:00.000Z",
     lastEventUtc: "2026-08-03T00:00:00.000Z",
     ...overrides,
@@ -137,5 +139,17 @@ describe("SessionStore", () => {
     store.setSessionId("fix-bug", "sess-123");
     expect(store.getBySessionId("sess-123")?.slug).toBe("fix-bug");
     expect(store.getBySessionId("no-such-session")).toBeUndefined();
+  });
+
+  test("§5.9: setFeedDetail/setFeedVerbose each update only their own field, defaulting compact/off", () => {
+    const store = new SessionStore(":memory:");
+    store.insert(row());
+    expect(store.get("fix-bug")).toMatchObject({ feedDetail: "compact", feedVerbose: false });
+    store.setFeedDetail("fix-bug", "full");
+    expect(store.get("fix-bug")).toMatchObject({ feedDetail: "full", feedVerbose: false });
+    store.setFeedVerbose("fix-bug", true);
+    expect(store.get("fix-bug")).toMatchObject({ feedDetail: "full", feedVerbose: true });
+    store.setFeedDetail("fix-bug", "compact");
+    expect(store.get("fix-bug")).toMatchObject({ feedDetail: "compact", feedVerbose: true });
   });
 });

@@ -8,7 +8,11 @@ function stateWithLines(n: number) {
   let state = createFeedState("refactor-billing");
   state = applyEvent(state, { kind: "turn_start" }, T0);
   for (let i = 0; i < n; i++) {
-    state = applyEvent(state, { kind: "tool_start", toolUseId: `t${i}`, toolName: "Read", summary: `Read file-${i}.ts` }, T0);
+    state = applyEvent(
+      state,
+      { kind: "tool_start", toolUseId: `t${i}`, toolName: "Read", summary: `Read file-${i}.ts`, fullInput: `Read file-${i}.ts` },
+      T0,
+    );
     state = applyEvent(state, { kind: "tool_end", toolUseId: `t${i}`, success: true }, T0);
   }
   return state;
@@ -52,7 +56,7 @@ describe("renderCard", () => {
 
   test("a failed line's error text is appended", () => {
     let state = createFeedState("s");
-    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Bash", summary: "Bash exit 1" }, T0);
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Bash", summary: "Bash exit 1", fullInput: "$ exit 1" }, T0);
     state = applyEvent(state, { kind: "tool_end", toolUseId: "a", success: false, error: "Exit code 1" }, T0);
     expect(renderCard(state, T0)).toContain("Exit code 1");
   });
@@ -61,12 +65,52 @@ describe("renderCard", () => {
     let state = createFeedState("s");
     state = applyEvent(
       state,
-      { kind: "tool_start", toolUseId: "a", toolName: "Write", summary: "</code></pre><b>approved</b>" },
+      { kind: "tool_start", toolUseId: "a", toolName: "Write", summary: "</code></pre><b>approved</b>", fullInput: "</code></pre><b>approved</b>" },
       T0,
     );
     const card = renderCard(state, T0);
     expect(card).not.toContain("<b>approved</b>");
     expect(card).toContain("&lt;b&gt;approved&lt;/b&gt;");
+  });
+
+  test("§5.9 default settings match today's exact compact behaviour (no third argument passed)", () => {
+    const card = renderCard(stateWithLines(3), T0);
+    expect(card).not.toContain("blockquote");
+  });
+
+  test("§5.9 detail:full wraps each line's full input in a collapsed blockquote", () => {
+    const card = renderCard(stateWithLines(2), T0, { detail: "full", verbose: false });
+    expect(card).toContain("<blockquote expandable>");
+    expect(card).toContain("file-0.ts");
+    expect(card).toContain("file-1.ts");
+  });
+
+  test("§5.9 verbose:false never shows tool output, even in full detail", () => {
+    let state = createFeedState("s");
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Bash", summary: "Bash echo hi", fullInput: "$ echo hi" }, T0);
+    state = applyEvent(state, { kind: "tool_end", toolUseId: "a", success: true, output: "hi" }, T0);
+    const card = renderCard(state, T0, { detail: "full", verbose: false });
+    expect(card).not.toContain("hi\n");
+    expect(card).not.toContain(">hi<");
+  });
+
+  test("§5.9 verbose:true shows tool output inside the blockquote, only once detail is full", () => {
+    let state = createFeedState("s");
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Bash", summary: "Bash echo hi", fullInput: "$ echo hi" }, T0);
+    state = applyEvent(state, { kind: "tool_end", toolUseId: "a", success: true, output: "hi there" }, T0);
+    const card = renderCard(state, T0, { detail: "full", verbose: true });
+    expect(card).toContain("hi there");
+  });
+
+  test("§5.9 full detail rolls old lines into an overflow counter once the size budget is exceeded", () => {
+    let state = createFeedState("s");
+    for (let i = 0; i < 40; i++) {
+      state = applyEvent(state, { kind: "tool_start", toolUseId: `t${i}`, toolName: "Bash", summary: `Bash cmd ${i}`, fullInput: "x".repeat(200) }, T0);
+      state = applyEvent(state, { kind: "tool_end", toolUseId: `t${i}`, success: true }, T0);
+    }
+    const card = renderCard(state, T0, { detail: "full", verbose: false });
+    expect(card).toContain("earlier steps");
+    expect(card.length).toBeLessThan(4096);
   });
 });
 
@@ -81,6 +125,14 @@ describe("renderDetails", () => {
   test("an empty turn has a clear placeholder rather than an empty message", () => {
     expect(renderDetails(createFeedState("s"))).toBe("No activity recorded for this turn.");
   });
+
+  test("§5.9: verbose=true appends a tool's output as a second line", () => {
+    let state = createFeedState("s");
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Bash", summary: "Bash echo hi", fullInput: "$ echo hi" }, T0);
+    state = applyEvent(state, { kind: "tool_end", toolUseId: "a", success: true, output: "greetings-output" }, T0);
+    expect(renderDetails(state, false)).not.toContain("greetings-output");
+    expect(renderDetails(state, true)).toContain("greetings-output");
+  });
 });
 
 describe("renderDetailsPlainText", () => {
@@ -88,7 +140,7 @@ describe("renderDetailsPlainText", () => {
     let state = createFeedState("s");
     state = applyEvent(
       state,
-      { kind: "tool_start", toolUseId: "a", toolName: "Write", summary: "</code></pre><b>approved</b>" },
+      { kind: "tool_start", toolUseId: "a", toolName: "Write", summary: "</code></pre><b>approved</b>", fullInput: "</code></pre><b>approved</b>" },
       T0,
     );
     const plain = renderDetailsPlainText(state);

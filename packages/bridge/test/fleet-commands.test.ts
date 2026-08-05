@@ -167,6 +167,36 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/deploy   ")).toBeNull();
   });
 
+  test("/detail bare reports (no slug, no level)", () => {
+    expect(parseFleetCommand("/detail")).toEqual({ kind: "detail", slug: undefined, level: undefined });
+  });
+
+  test("/detail <level> sets, session-topic bare form", () => {
+    expect(parseFleetCommand("/detail full")).toEqual({ kind: "detail", slug: undefined, level: "full" });
+    expect(parseFleetCommand("/detail compact")).toEqual({ kind: "detail", slug: undefined, level: "compact" });
+  });
+
+  test("/detail <slug> reports that session, control-topic form", () => {
+    expect(parseFleetCommand("/detail fix-bug")).toEqual({ kind: "detail", slug: "fix-bug", level: undefined });
+  });
+
+  test("/detail <slug> <level> sets that session", () => {
+    expect(parseFleetCommand("/detail fix-bug full")).toEqual({ kind: "detail", slug: "fix-bug", level: "full" });
+  });
+
+  test("/detail with a bad level (as a two-token form) is invalid", () => {
+    expect(parseFleetCommand("/detail fix-bug bogus")).toBeNull();
+  });
+
+  test("/verbose follows the same shape as /detail, with on|off", () => {
+    expect(parseFleetCommand("/verbose")).toEqual({ kind: "verbose", slug: undefined, on: undefined });
+    expect(parseFleetCommand("/verbose on")).toEqual({ kind: "verbose", slug: undefined, on: true });
+    expect(parseFleetCommand("/verbose off")).toEqual({ kind: "verbose", slug: undefined, on: false });
+    expect(parseFleetCommand("/verbose fix-bug")).toEqual({ kind: "verbose", slug: "fix-bug", on: undefined });
+    expect(parseFleetCommand("/verbose fix-bug on")).toEqual({ kind: "verbose", slug: "fix-bug", on: true });
+    expect(parseFleetCommand("/verbose fix-bug bogus")).toBeNull();
+  });
+
   test("/settings takes no argument", () => {
     expect(parseFleetCommand("/settings")).toEqual({ kind: "settings" });
   });
@@ -280,7 +310,23 @@ describe("parseFleetCommand", () => {
 describe("renderHelp", () => {
   test("lists every fleet-scoped and session-scoped command", () => {
     const text = renderHelp();
-    for (const cmd of ["/new", "/ls", "/kill", "/rm", "/attach", "/pause", "/usage", "/budget", "/restart", "/deploy", "/settings", "/repos", "/autostart"]) {
+    for (const cmd of [
+      "/new",
+      "/ls",
+      "/kill",
+      "/rm",
+      "/attach",
+      "/pause",
+      "/usage",
+      "/budget",
+      "/restart",
+      "/deploy",
+      "/detail",
+      "/verbose",
+      "/settings",
+      "/repos",
+      "/autostart",
+    ]) {
       expect(text).toContain(cmd);
     }
     expect(text).toContain("/model <");
@@ -345,6 +391,8 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     turnCardMsg: null,
     paused: false,
     renamed: false,
+    feedDetail: "compact",
+    feedVerbose: false,
     createdUtc: "2026-08-03T00:00:00.000Z",
     lastEventUtc: "2026-08-03T00:00:00.000Z",
     ...overrides,

@@ -6,7 +6,7 @@ const T0 = 1_700_000_000_000;
 describe("applyEvent", () => {
   test("turn_start opens the turn and clears lines from the previous one", () => {
     let state = createFeedState("slug");
-    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Read", summary: "Read x" }, T0);
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Read", summary: "Read x", fullInput: "Read x" }, T0);
     state = applyEvent(state, { kind: "turn_start" }, T0 + 1000);
     expect(state.turnActive).toBe(true);
     expect(state.turnStartedAtMs).toBe(T0 + 1000);
@@ -15,24 +15,24 @@ describe("applyEvent", () => {
 
   test("tool_start appends a running line, tool_end resolves it by toolUseId", () => {
     let state = createFeedState("slug");
-    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Bash", summary: "Bash echo hi" }, T0);
-    expect(state.lines).toEqual([{ toolUseId: "a", summary: "Bash echo hi", status: "running" }]);
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Bash", summary: "Bash echo hi", fullInput: "$ echo hi" }, T0);
+    expect(state.lines).toEqual([{ toolUseId: "a", summary: "Bash echo hi", status: "running", fullInput: "$ echo hi" }]);
 
-    state = applyEvent(state, { kind: "tool_end", toolUseId: "a", success: true }, T0 + 10);
-    expect(state.lines).toEqual([{ toolUseId: "a", summary: "Bash echo hi", status: "done" }]);
+    state = applyEvent(state, { kind: "tool_end", toolUseId: "a", success: true, output: "hi" }, T0 + 10);
+    expect(state.lines).toEqual([{ toolUseId: "a", summary: "Bash echo hi", status: "done", fullInput: "$ echo hi", output: "hi" }]);
   });
 
   test("a failing tool_end carries the error onto the right line", () => {
     let state = createFeedState("slug");
-    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Bash", summary: "Bash exit 1" }, T0);
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Bash", summary: "Bash exit 1", fullInput: "$ exit 1" }, T0);
     state = applyEvent(state, { kind: "tool_end", toolUseId: "a", success: false, error: "Exit code 1" }, T0 + 10);
-    expect(state.lines).toEqual([{ toolUseId: "a", summary: "Bash exit 1", status: "failed", error: "Exit code 1" }]);
+    expect(state.lines).toEqual([{ toolUseId: "a", summary: "Bash exit 1", status: "failed", error: "Exit code 1", fullInput: "$ exit 1" }]);
   });
 
   test("two concurrent tool calls resolve independently by toolUseId", () => {
     let state = createFeedState("slug");
-    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Read", summary: "Read a" }, T0);
-    state = applyEvent(state, { kind: "tool_start", toolUseId: "b", toolName: "Read", summary: "Read b" }, T0);
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Read", summary: "Read a", fullInput: "Read a" }, T0);
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "b", toolName: "Read", summary: "Read b", fullInput: "Read b" }, T0);
     state = applyEvent(state, { kind: "tool_end", toolUseId: "b", success: true }, T0 + 5);
     expect(state.lines.find((l) => l.toolUseId === "a")?.status).toBe("running");
     expect(state.lines.find((l) => l.toolUseId === "b")?.status).toBe("done");
@@ -40,15 +40,15 @@ describe("applyEvent", () => {
 
   test("a tool_end for an unknown toolUseId is a no-op, not a crash", () => {
     let state = createFeedState("slug");
-    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Read", summary: "Read a" }, T0);
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Read", summary: "Read a", fullInput: "Read a" }, T0);
     state = applyEvent(state, { kind: "tool_end", toolUseId: "ghost", success: true }, T0 + 5);
-    expect(state.lines).toEqual([{ toolUseId: "a", summary: "Read a", status: "running" }]);
+    expect(state.lines).toEqual([{ toolUseId: "a", summary: "Read a", status: "running", fullInput: "Read a" }]);
   });
 
   test("turn_end closes the turn without touching the lines", () => {
     let state = createFeedState("slug");
     state = applyEvent(state, { kind: "turn_start" }, T0);
-    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Read", summary: "Read a" }, T0);
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Read", summary: "Read a", fullInput: "Read a" }, T0);
     state = applyEvent(state, { kind: "turn_end", success: true }, T0 + 100);
     expect(state.turnActive).toBe(false);
     expect(state.lines).toHaveLength(1);
@@ -59,7 +59,7 @@ describe("applyEvent", () => {
     expect(state.turnSeq).toBe(0);
     state = applyEvent(state, { kind: "turn_start" }, T0);
     expect(state.turnSeq).toBe(1);
-    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Read", summary: "Read a" }, T0);
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Read", summary: "Read a", fullInput: "Read a" }, T0);
     state = applyEvent(state, { kind: "turn_end", success: true }, T0 + 10);
     expect(state.turnSeq).toBe(1);
     state = applyEvent(state, { kind: "turn_start" }, T0 + 20);
