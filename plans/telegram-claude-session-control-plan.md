@@ -1,7 +1,7 @@
 ---
-version: 0.36.0
+version: 0.37.0
 status: solid
-last_modified_utc: 2026-08-05T06:15:00Z
+last_modified_utc: 2026-08-05T07:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,25 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.37.0 (2026-08-05): Added /about (new about.ts), a friendly capability overview distinct from
+    /help's exhaustive syntax reference - one-line blurb per feature area plus a 'more info' button
+    per topic that's too fiddly for one line (bulk /rm forms, /model|/mode|/effort, the
+    approve/deny/always permission buttons, /autostart, repo /commands|/skills), each button sending
+    a short worked-example message rather than growing the overview itself. Works from the control
+    topic or any session's own topic, listed in Telegram's native \"/\" autocomplete
+    (botCommandList) alongside the existing set, and mentioned from /help as the on-ramp for anyone
+    who hasn't read this plan. New §4.2 row; unit-tested (about.test.ts, 7 tests); tsc --noEmit and
+    the full bun test suite (388 tests) green. Live-verified against the real dev Bridge and caught
+    a real bug before it shipped: the first version of the 'about:' callback handler bailed out on
+    `threadId === undefined`, copying `resolveCommandAction`'s guard without noticing that guard's
+    own precondition (session-scoped buttons only) doesn't hold here - `/about`'s buttons are tapped
+    from the control topic's own default 'General' topic too, which legitimately carries no
+    `message_thread_id`, so every drill-down tap there was a silent no-op (spinner cleared, no
+    detail message, no log line - `sendMessage` never even got called). Fixed by dropping the guard
+    (sendMessage already accepts an undefined threadId, same as the /about dispatch path a few
+    lines above it), then re-verified live: overview renders with its keyboard from both the
+    control topic and a session's own topic, and a drill-down tap from each posts the right detail
+    text in both cases."
   - "0.36.0 (2026-08-05): Ran Phase 6a's own exit drill live (scenarios 24/37 under a real
     restart, not just their unit tests) - triggered a real permission prompt on
     give-me-a-unique-one-line's own topic (a Bash git-commit ask), killed the dev Bridge alone via
@@ -1619,6 +1638,7 @@ permission relay and feed renderer are all already scoped to a single Bridge pro
 
 | Command | Effect |
 |---|---|
+| `/about` | Friendly capability overview (control topic or a session's own topic) with a "more info" button per fiddly feature (bulk `/rm`, mode/effort, permission buttons, autostart, repo commands/skills) - the on-ramp `/help` deliberately isn't (§4.2, added 2026-08-05) |
 | `/new [--opus\|--haiku] <repo> <prompt>` | Create worktree, create topic, launch session, send prompt as first message. Sonnet unless overridden |
 | `/ls` | List live sessions: slug, state, worktree, branch, age, last activity, model, session cost and tokens (§5.7) |
 | `/budget` | Rolling 5-hour spend across the fleet, per-session breakdown, and the cap (§10.5) |

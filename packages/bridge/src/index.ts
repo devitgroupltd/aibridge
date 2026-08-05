@@ -6,6 +6,7 @@ import type * as pty from "node-pty";
 import type { ChannelMetaFields, HookEventMessage } from "@aibridge/protocol";
 import { renderChannelTag } from "@aibridge/protocol";
 import { resolveAskCallback, renderAskAnsweredCard, renderAskCancelledCard } from "./ask-callback.ts";
+import { ABOUT_TOPICS, buildAboutKeyboard, isAboutCommand, renderAbout, resolveAboutCallback } from "./about.ts";
 import { buildCreateArgs, buildDeleteArgs, buildQueryArgs, parseQueryOutput, renderAutostartStatus, TASK_NAME } from "./autostart.ts";
 import {
   buildCmdShimText,
@@ -1341,6 +1342,18 @@ async function main(): Promise<void> {
       return;
     }
 
+    // `/about`: the friendly capability overview (about.ts) - checked ahead of /help since it's
+    // the on-ramp `/help` deliberately isn't; works from either the control topic or a session's
+    // own topic, same as /help.
+    if (isAboutCommand(text)) {
+      controlBot
+        .sendMessage(config.supergroupChatId, threadId, renderAbout(), {
+          inline_keyboard: buildAboutKeyboard(),
+        })
+        .catch((err) => log("WARN", `sendMessage (/about) failed: ${(err as Error).message}`));
+      return;
+    }
+
     // "?" bare (no slash) is only treated as a help request from the control topic - inside a
     // session topic it's plausible real content meant for Claude (e.g. "?" as a shorthand
     // question), so only the unambiguous slash forms are recognised there.
@@ -1595,6 +1608,23 @@ async function main(): Promise<void> {
         const effort = callbackQuery.data ? resolveEffortCallback(callbackQuery.data) : null;
         if (effort) {
           if (currentSlug && threadId !== undefined) applyEffortSwitch(currentSlug, threadId, effort);
+          return;
+        }
+
+        // `/about`'s "more info" buttons ("about:") - a fresh namespace alongside "run:"/"perm:"/
+        // etc.; unlike those, there's nothing to resolve against a registry (every topic's text
+        // is static), so this just looks the id up and sends it. `/about` itself works from the
+        // control topic's own default ("General") topic, which carries no `message_thread_id` at
+        // all - unlike `resolveCommandAction`'s buttons (session-scoped only, so threadId is
+        // always defined there), threadId being undefined here is the normal case, not an error;
+        // `sendMessage` already accepts it the same way the `/about` dispatch path above does.
+        const aboutTopicId = callbackQuery.data ? resolveAboutCallback(callbackQuery.data) : null;
+        if (aboutTopicId) {
+          const topic = ABOUT_TOPICS[aboutTopicId];
+          if (!topic) return;
+          controlBot
+            .sendMessage(config.supergroupChatId, threadId, topic.details)
+            .catch((err) => log("WARN", `sendMessage (about detail) failed: ${(err as Error).message}`));
           return;
         }
 

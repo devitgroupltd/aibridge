@@ -259,6 +259,7 @@ export function renderSettings(repos: readonly RepoEntry[], concurrency: { curre
 export function renderHelp(): string {
   return [
     "Fleet commands (control topic; also /help, /?, /h, or bare ? here):",
+    "  /about - what this bot can do, with examples (start here if you're new)",
     "  /new [--model] <repo> <prompt> - start a new session",
     "  /ls - list sessions",
     "  /kill [<slug>|--all] - stop a session (or all, confirm-gated)",
@@ -291,6 +292,7 @@ export function renderHelp(): string {
  * the text parser already sends, rather than being filtered out by Telegram itself. */
 export function botCommandList(): { command: string; description: string }[] {
   return [
+    { command: "about", description: "What this bot can do, with examples" },
     { command: "new", description: "Start a new session: /new [--model] <repo> <prompt>" },
     { command: "ls", description: "List sessions" },
     { command: "kill", description: "Stop a session: /kill [<slug>|--all]" },
