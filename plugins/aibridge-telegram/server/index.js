@@ -14271,7 +14271,15 @@ var server = new Server({ name: "aibridge", version: "0.1.0" }, {
     'Messages from the operator arrive as <channel source="aibridge" topic_id="..." msg_id="...">.',
     "To answer the operator, call the reply tool and pass back the topic_id from the tag.",
     "Reply as you would in a terminal: the operator is reading on a phone, so be brief.",
-    "Do not narrate tool use in replies; the operator already sees a live activity feed."
+    "Do not narrate tool use in replies; the operator already sees a live activity feed.",
+    "To show the operator a screenshot: for a web page, use the playwright MCP tools (already",
+    `registered) - browser_take_screenshot saves into ${process.env.AIBRIDGE_PLAYWRIGHT_SHARED_DIR ?? "<AIBRIDGE_PLAYWRIGHT_SHARED_DIR>"},`,
+    "a directory shared with every other session on this repo, so move (Bash mv) the file into",
+    `${process.env.AIBRIDGE_OUTBOX_DIR ?? "<AIBRIDGE_OUTBOX_DIR>"} before calling send_file - send_file only accepts`,
+    "paths inside that directory. For a desktop app or the whole screen instead, run",
+    `${process.env.AIBRIDGE_SCREENSHOT_SCRIPT ?? "<AIBRIDGE_SCREENSHOT_SCRIPT>"} via Bash with -Out <a path already`,
+    "inside AIBRIDGE_OUTBOX_DIR> (and optionally -WindowTitle) - no move needed, it writes there directly.",
+    "Either way, then call send_file with that topic_id and the file's path."
   ].join(" ")
 });
 server.setRequestHandler(ListToolsRequestSchema, async () => ({
@@ -14287,26 +14295,57 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
         required: ["topic_id", "text"]
       }
+    },
+    {
+      name: "send_file",
+      description: "Send a file (e.g. a screenshot) already saved under $AIBRIDGE_OUTBOX_DIR to the operator's Telegram topic, as a photo or document.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          topic_id: { type: "string" },
+          path: { type: "string", description: "Absolute path under $AIBRIDGE_OUTBOX_DIR." },
+          caption: { type: "string" }
+        },
+        required: ["topic_id", "path"]
+      }
     }
   ]
 }));
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  if (request.params.name !== "reply") {
-    throw new Error(`unknown tool "${request.params.name}"`);
-  }
   const args = request.params.arguments;
-  if (typeof args?.topic_id !== "string" || typeof args?.text !== "string") {
-    throw new Error("reply requires { topic_id: string, text: string }");
+  if (request.params.name === "reply") {
+    if (typeof args?.topic_id !== "string" || typeof args?.text !== "string") {
+      throw new Error("reply requires { topic_id: string, text: string }");
+    }
+    const msg = {
+      v: PROTOCOL_VERSION,
+      type: "reply",
+      slug,
+      topic_id: args.topic_id,
+      text: args.text
+    };
+    pipe2.send(msg);
+    return { content: [{ type: "text", text: "sent" }] };
   }
-  const msg = {
-    v: PROTOCOL_VERSION,
-    type: "reply",
-    slug,
-    topic_id: args.topic_id,
-    text: args.text
-  };
-  pipe2.send(msg);
-  return { content: [{ type: "text", text: "sent" }] };
+  if (request.params.name === "send_file") {
+    if (typeof args?.topic_id !== "string" || typeof args?.path !== "string") {
+      throw new Error("send_file requires { topic_id: string, path: string, caption?: string }");
+    }
+    if (args.caption !== undefined && typeof args.caption !== "string") {
+      throw new Error("send_file's caption, if given, must be a string");
+    }
+    const msg = {
+      v: PROTOCOL_VERSION,
+      type: "send_file",
+      slug,
+      topic_id: args.topic_id,
+      path: args.path,
+      ...args.caption !== undefined ? { caption: args.caption } : {}
+    };
+    pipe2.send(msg);
+    return { content: [{ type: "text", text: "sent" }] };
+  }
+  throw new Error(`unknown tool "${request.params.name}"`);
 });
 async function forwardInbound(msg) {
   const meta3 = buildMeta(msg.meta);

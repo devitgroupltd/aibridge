@@ -1,7 +1,7 @@
 ---
-version: 0.51.1
+version: 0.52.0
 status: solid
-last_modified_utc: 2026-08-05T22:30:00Z
+last_modified_utc: 2026-08-05T23:15:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,27 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.52.0 (2026-08-05): started on §10.1's plugin cutover (the last item Phase 5's exit note left
+    open) after the operator added {marketplace: devitgroup-plugins, plugin: aibridge-telegram} to
+    the org's real allowedChannelPlugins in claude.ai's managed settings. Two real gaps found before
+    any live test, both real enough to stop for: (1) the plugin's committed server/index.js bundle
+    (scripts/build-plugin.sh's output) was stale by over a day relative to packages/channel-server/
+    src - rebuilt (54 lines changed in the diff, so this was a genuine drift, not a no-op) and the
+    build script itself is unchanged, just never re-run after 0.25.0. (2) plugin.json is one static
+    file shared by every worktree with no per-session env block, so AIBRIDGE_OUTBOX_DIR/
+    AIBRIDGE_SCREENSHOT_SCRIPT/AIBRIDGE_PLAYWRIGHT_SHARED_DIR - all currently set per-session on the
+    .mcp.json registration in server:aibridge mode - would be unset for any session launched via the
+    plugin, silently degrading §5.8's send_file/screenshot tools to placeholder-text mode with no
+    error anywhere, rather than the AIBRIDGE_SLUG-missing case resolve-slug.ts already handles.
+    Not fixed yet - needs the channel server to derive an outbox convention from the resolved slug
+    instead of trusting an env var that plugin mode can't supply, a real design change, not a config
+    tweak. session-launcher.ts changed to support both launch modes side by side, gated behind an
+    explicit AIBRIDGE_CHANNEL_MODE=plugin env toggle rather than flipping the default - unset (the
+    default) is byte-for-byte the existing --dangerously-load-development-channels server:aibridge
+    path, so no currently-running or newly-launched session is affected by this entry at all. bun
+    test (572 pass, packages/bridge) and tsc --noEmit clean. Not yet live-tested under either mode
+    change - the send_file/screenshot gap above is why: testing plugin mode live before it's fixed
+    would exercise a launch path with a known silent-degradation bug in it on purpose."
   - "0.51.1 (2026-08-05): live-verified both §5.9's /deploy and §5.10's /detail+/verbose against
     the real dev Bridge, closing the exit bar each section's 0.50.0/0.51.0 entry left open. /deploy:
     a real trivial commit on test-session's branch, merged via a real /deploy test-session from the
@@ -4497,10 +4518,15 @@ item 3 is moot until §7.6.
   half, not just its unit test; `/budget`/`/ls`'s cost column confirmed live against real tracked
   spend; the plugin marketplace/install/launch chain confirmed live). The endurance run itself is now
   also done and verified against real per-session output, not just fleet-command state (0.31.0).
-  Whether to cut the fleet's actual launch path over from
+  ~~Whether to cut the fleet's actual launch path over from
   `--dangerously-load-development-channels server:aibridge` to the plugin form remains a separate
-  decision, deliberately left open rather than made unasked (see the 0.25.0 changelog entry) - the
-  one thing left open in this phase.
+  decision, deliberately left open rather than made unasked (see the 0.25.0 changelog entry).~~
+  **In progress (0.52.0):** the operator opted in and set the org's real `allowedChannelPlugins`.
+  Two real gaps were found before any live test (a stale plugin bundle, now rebuilt; §5.8's
+  send_file/screenshot tools silently losing their env vars under the plugin's static `plugin.json`
+  - not yet fixed). `session-launcher.ts` now supports both modes side by side behind an explicit
+  `AIBRIDGE_CHANNEL_MODE=plugin` toggle, default unchanged. **Still the one thing left open in this
+  phase** - the send_file/screenshot gap has to close before a live test is safe to run.
 
 ### Phase 6 - hardening, and the WSL2 migration
 

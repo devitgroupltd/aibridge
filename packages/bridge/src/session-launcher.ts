@@ -192,9 +192,23 @@ export function stripAnsi(text: string): string {
  * the bottom status bar text that's the last thing the splash sequence renders, proving the REPL
  * prompt is actually live and accepting input.
  */
-function autoConfirmDevChannelsDialog(ptyProcess: pty.IPty, log: LogFn): Promise<void> {
+/**
+ * §10.1's escape hatch, gated behind `AIBRIDGE_CHANNEL_MODE=plugin` rather than a default flip:
+ * once the org's `allowedChannelPlugins` allowlist carries this plugin, `--channels
+ * plugin:<name>@<marketplace>` resolves without the dev flag at all, so *neither* startup dialog
+ * `autoConfirmDevChannelsDialog` waits for below actually fires - not the dev-channels warning
+ * (there's no dev flag to warn about) and not the "New MCP server found" consent dialog (there's
+ * no `.mcp.json` registration in this mode; the plugin's `mcpServers` block replaces it). Kept as
+ * an explicit env toggle, not the default, until a real `/new` under this mode is live-verified -
+ * flipping the default before that would move every session onto an unverified path at once.
+ */
+function isPluginChannelMode(): boolean {
+  return process.env.AIBRIDGE_CHANNEL_MODE === "plugin";
+}
+
+function autoConfirmDevChannelsDialog(ptyProcess: pty.IPty, log: LogFn, skipDialogs: boolean): Promise<void> {
   return new Promise((resolve) => {
-    let stage: "dialogs" | "prompt" | "done" = "dialogs";
+    let stage: "dialogs" | "prompt" | "done" = skipDialogs ? "prompt" : "dialogs";
     let rawBuffer = "";
     // A sequence that never completes (unexpected CLI version, `--resume` skipping straight past
     // both dialogs to a differently-rendered prompt, etc.) must not wedge every caller waiting on
@@ -285,35 +299,46 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   );
 
   const debugLogFile = process.env.AIBRIDGE_DEBUG_LOG_FILE;
-  const { changed } = ensureMcpJsonRegistration(worktreePath, {
-    command: resolveBunExecutable(),
-    args: ["run", opts.channelServerEntryPath],
-    // Claude Code spawns a registered MCP server as its own child process, not as a child of the
-    // claude.exe PTY - it does not inherit AIBRIDGE_SLUG/AIBRIDGE_TOPIC from ptyEnv() just because
-    // claude.exe itself has them. Without this, the channel server throws on its own AIBRIDGE_SLUG
-    // guard before it ever opens the pipe, which also happens to be before its log() helper even
-    // exists - so the crash produces no debug-log line and surfaces only as Claude Code's own
-    // generic "server:aibridge - no MCP server configured with that name" channel-load warning.
-    env: {
-      AIBRIDGE_SLUG: opts.slug,
-      AIBRIDGE_TOPIC: String(opts.topicId),
-      // §5.8: read by the channel server's own instructions text so Claude is told the real
-      // absolute path, not a placeholder - same "own env, not inherited" reasoning as the two
-      // vars above.
-      AIBRIDGE_OUTBOX_DIR: outboxPath,
-      AIBRIDGE_SCREENSHOT_SCRIPT: resolveScreenshotScriptPath(),
-      AIBRIDGE_PLAYWRIGHT_SHARED_DIR: playwrightSharedPath,
-      // Claude Code does not surface an MCP server's stderr anywhere visible, so this is the only
-      // way to observe the channel server's own log lines during manual verification (Stage 7).
-      ...(debugLogFile ? { AIBRIDGE_DEBUG_LOG_FILE: debugLogFile } : {}),
-    },
-  });
-  log(
-    "INFO",
-    changed
-      ? `registered aibridge channel server in ${worktreePath}\\.mcp.json`
-      : `channel server already registered in ${worktreePath}\\.mcp.json`,
-  );
+  const pluginMode = isPluginChannelMode();
+  // §10.1: the plugin's own `mcpServers` block (plugin.json) is what registers the channel server
+  // in plugin mode - a `.mcp.json` entry would be a second, conflicting registration of the same
+  // server name, not a harmless no-op. AIBRIDGE_SLUG/AIBRIDGE_TOPIC/etc. can't ride along on a
+  // per-session `.mcp.json` env block here the way `server:aibridge` mode does, since plugin.json
+  // is one static file shared by every worktree - `resolve-slug.ts` (channel-server package) is
+  // what recovers the slug from `CLAUDE_PROJECT_DIR` instead in this mode.
+  if (!pluginMode) {
+    const { changed } = ensureMcpJsonRegistration(worktreePath, {
+      command: resolveBunExecutable(),
+      args: ["run", opts.channelServerEntryPath],
+      // Claude Code spawns a registered MCP server as its own child process, not as a child of the
+      // claude.exe PTY - it does not inherit AIBRIDGE_SLUG/AIBRIDGE_TOPIC from ptyEnv() just because
+      // claude.exe itself has them. Without this, the channel server throws on its own AIBRIDGE_SLUG
+      // guard before it ever opens the pipe, which also happens to be before its log() helper even
+      // exists - so the crash produces no debug-log line and surfaces only as Claude Code's own
+      // generic "server:aibridge - no MCP server configured with that name" channel-load warning.
+      env: {
+        AIBRIDGE_SLUG: opts.slug,
+        AIBRIDGE_TOPIC: String(opts.topicId),
+        // §5.8: read by the channel server's own instructions text so Claude is told the real
+        // absolute path, not a placeholder - same "own env, not inherited" reasoning as the two
+        // vars above.
+        AIBRIDGE_OUTBOX_DIR: outboxPath,
+        AIBRIDGE_SCREENSHOT_SCRIPT: resolveScreenshotScriptPath(),
+        AIBRIDGE_PLAYWRIGHT_SHARED_DIR: playwrightSharedPath,
+        // Claude Code does not surface an MCP server's stderr anywhere visible, so this is the only
+        // way to observe the channel server's own log lines during manual verification (Stage 7).
+        ...(debugLogFile ? { AIBRIDGE_DEBUG_LOG_FILE: debugLogFile } : {}),
+      },
+    });
+    log(
+      "INFO",
+      changed
+        ? `registered aibridge channel server in ${worktreePath}\\.mcp.json`
+        : `channel server already registered in ${worktreePath}\\.mcp.json`,
+    );
+  } else {
+    log("INFO", `plugin channel mode - skipping .mcp.json registration for ${worktreePath}`);
+  }
 
   // §6.2/§5.1: written fresh on every launch, before the process is spawned - same ordering
   // requirement as the .mcp.json/.claude.json registrations above. Resolving the hook client
@@ -325,8 +350,9 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   const ptyProcess = pty.spawn(
     resolveClaudeExecutable(),
     [
-      "--dangerously-load-development-channels",
-      "server:aibridge",
+      ...(pluginMode
+        ? ["--channels", "plugin:aibridge-telegram@devitgroup-plugins"]
+        : ["--dangerously-load-development-channels", "server:aibridge"]),
       "--model",
       opts.model ?? "sonnet",
       "--settings",
@@ -363,7 +389,7 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   // even seeing the prompt `/new` sent it. That is the automation §10.1/§9's own comment named as
   // "the Phase 5 supervisor's" job; this is it. The pre-selected option is always "I am using this
   // for local development" (confirmed live), so a bare Enter is the correct answer every time.
-  const ready = autoConfirmDevChannelsDialog(ptyProcess, log);
+  const ready = autoConfirmDevChannelsDialog(ptyProcess, log, pluginMode);
 
   if (process.env.AIBRIDGE_DEBUG_PTY_LOG === "1") {
     ptyProcess.onData((data) => log("INFO", `[pty:${opts.slug}] ${JSON.stringify(stripAnsi(data))}`));
