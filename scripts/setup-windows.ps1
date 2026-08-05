@@ -225,7 +225,11 @@ if ($ffmpeg) {
 Write-Step "Checking whisper.cpp (voice transcription)..."
 $voiceDir = Join-Path $state 'voice'
 $whisperZip = Join-Path $voiceDir 'whisper-bin-x64.zip'
-$whisperServerExe = Join-Path $voiceDir 'whisper-server.exe'
+# Live-verified 2026-08-05: whisper-bin-x64.zip extracts into a Release\ subfolder (its own zip
+# structure, not flat), containing whisper-server.exe alongside its required ggml*.dll/whisper.dll/
+# SDL2.dll - all of which need to stay siblings of the exe for Windows DLL loading, so this points
+# INTO Release\ rather than moving the exe back out to $voiceDir's own root.
+$whisperServerExe = Join-Path $voiceDir 'Release\whisper-server.exe'
 # medium: ~5GB RAM at runtime, comfortably faster than realtime on CPU, meaningfully better
 # accuracy than small/base - see the voice-input design changelog entry for the full trade-off.
 # Bump to ggml-large-v3-turbo.bin (same URL pattern) later if this machine has GPU headroom to spare.
@@ -242,11 +246,10 @@ if (-not (Test-Path $whisperServerExe)) {
         if (Test-Path $whisperServerExe) {
             Add-Result 'whisper.cpp server' 'INSTALLED' $whisperServerExe
         } else {
-            # Not independently confirmed which exact release asset bundles whisper-server.exe
-            # alongside whisper-cli.exe (§10.0-style discipline: don't assert an unverified shape) -
-            # if the release layout changed, this reports it instead of silently pointing at
-            # nothing. Check $voiceDir manually and adjust WHISPER_SERVER_EXE in .env if needed.
-            Add-Result 'whisper.cpp server' 'FAILED' "whisper-server.exe not found after extracting whisper-bin-x64.zip - check $voiceDir manually; the release layout may differ from what this script expects."
+            # Live-verified 2026-08-05 at Release\whisper-server.exe (see the $whisperServerExe
+            # comment above) - this branch means a future whisper.cpp release changed its own zip
+            # layout, not that the exe/DLL bundling assumption itself was ever wrong.
+            Add-Result 'whisper.cpp server' 'FAILED' "whisper-server.exe not found at $whisperServerExe after extracting whisper-bin-x64.zip - check $voiceDir manually; a newer whisper.cpp release may have changed its own zip layout."
         }
     } catch {
         Add-Result 'whisper.cpp server' 'FAILED' $_.Exception.Message

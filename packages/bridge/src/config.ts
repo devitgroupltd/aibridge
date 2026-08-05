@@ -78,7 +78,9 @@ export function loadConfig(envPath = path.join(SECRETS_DIR, ".env")): BridgeConf
       // if the setup step hasn't installed the binary/model yet). Set VOICE_ENABLED=false to opt out.
       enabled: parsed.VOICE_ENABLED !== "false",
       ffmpegPath: parsed.FFMPEG_PATH || "ffmpeg",
-      whisperServerExe: parsed.WHISPER_SERVER_EXE || path.join(STATE_DIR, "voice", "whisper-server.exe"),
+      // Live-verified 2026-08-05: whisper-bin-x64.zip extracts into its own Release\ subfolder,
+      // not flat - see setup-windows.ps1's matching comment.
+      whisperServerExe: parsed.WHISPER_SERVER_EXE || path.join(STATE_DIR, "voice", "Release", "whisper-server.exe"),
       modelPath: parsed.WHISPER_MODEL_PATH || path.join(STATE_DIR, "voice", "ggml-medium.bin"),
       port: Number(parsed.WHISPER_SERVER_PORT || "8383"),
     },

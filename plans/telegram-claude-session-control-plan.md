@@ -1,7 +1,7 @@
 ---
-version: 0.43.0
+version: 0.44.0
 status: solid
-last_modified_utc: 2026-08-05T13:45:00Z
+last_modified_utc: 2026-08-05T14:30:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,20 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.44.0 (2026-08-05): first real run of scripts/setup-windows.ps1's voice step surfaced a real
+    bug: whisper-bin-x64.zip extracts into its own Release\\ subfolder, not flat, so the assumed
+    whisperServerExe path (<voice dir>\\whisper-server.exe) never matched what actually landed on
+    disk - 'whisper.cpp server FAILED' on the live run, even though the zip and exe were both fine.
+    Fixed in both setup-windows.ps1 and config.ts's default path (<voice dir>\\Release\\
+    whisper-server.exe, where the exe's required ggml*.dll/whisper.dll/SDL2.dll siblings also live).
+    While fixing it, resolved 0.42.0's other open item for real rather than leaving it flagged:
+    started the actual whisper-server.exe with the downloaded medium model, hit /inference directly
+    over curl with a synthetic tone clip (got back {\"text\":\" (beep)\\n\"}), then ran
+    transcribeVoiceNote itself - the real Bridge code, Ogg bytes -> ffmpeg -> this same live server -
+    end to end ({text: \"(bell chimes)\"}). Confirms the assumed {text: string} shape exactly, no
+    language field even with language=auto requested. voice-transcribe.ts's permissive bare-string
+    fallback is now defensive code for a future whisper.cpp version, not an open question about the
+    current one."
   - "0.43.0 (2026-08-05): voice input now defaults to enabled (§3.4 revised), reversing 0.42.0's
     disabled-by-default choice - discussed live: the operator pointed out a flag nobody would
     remember to flip is friction with no real safety payoff here (unlike the git-push SSH key,
@@ -1710,13 +1724,25 @@ both just "discard"; they differ only in which follow-up text is shown, matching
 own registry/TTL/resolve-pops-and-checks shape (a card left untapped for more than 10 minutes goes
 cold, same reasoning as a forgotten stale-inbound confirm).
 
-**Response-shape caveat, stated rather than assumed:** whisper.cpp's `examples/server` docs confirm
-`/inference` accepts `response_format=json` and `language=auto`, but do not show an example response
-body. `parseWhisperServerResponse` (voice-transcribe.ts) is deliberately permissive - accepts a bare
-string body as well as `{text: ...}` - and throws naming the raw body on anything else, rather than
-asserting one shape as fact. Same discipline as §10.0's `claude/channel` and §6.5's `tool_use_id`
-findings: this needs a real payload capture against a live whisper-server before the permissive parser
-can be tightened, and is flagged here rather than closed as "confirmed."
+**Response shape: RESOLVED, live-verified 2026-08-05.** whisper.cpp's `examples/server` docs never
+showed an example `/inference` response body, only that `response_format=json`/`language=auto` are
+accepted, so this shipped with a deliberately permissive `parseWhisperServerResponse` rather than an
+assumed shape - same discipline as §10.0's `claude/channel` and §6.5's `tool_use_id` findings. Settled
+by running the real binary end to end on this machine: `whisper-server.exe -m ggml-medium.bin --port
+8383` against a synthetic tone clip returned `{"text":" (beep)\n"}` over `curl`, and
+`transcribeVoiceNote` (the actual Bridge code, Ogg bytes -> ffmpeg -> this same live server) returned
+`{text: "(bell chimes)"}` end to end. Confirms exactly the assumed `{text: string}` shape, a single
+field, no `language` key even with `language=auto` requested - the permissive bare-string fallback in
+`parseWhisperServerResponse` stays as defensive code for a future whisper.cpp version, not because the
+current shape is still in doubt.
+
+**whisper-bin-x64.zip's own layout, also live-verified 2026-08-05:** it extracts into a `Release\`
+subfolder (its own zip structure), not flat into whatever directory it's expanded into -
+`whisper-server.exe` lives at `<voice dir>\Release\whisper-server.exe`, alongside the `ggml*.dll`/
+`whisper.dll`/`SDL2.dll` files it needs as siblings for Windows DLL loading to find them.
+`setup-windows.ps1` and `config.ts`'s default `whisperServerExe` path were both fixed to point there
+after the first real run surfaced this (the zip had extracted correctly; the script's assumed flat
+path just didn't match it).
 
 **Enabled by default (revised in 0.43.0).** `VOICE_ENABLED` in `.env` gates the whole feature
 (`config.voice.enabled`), and defaults to on - set it to `false` to opt out. This only stays safe
