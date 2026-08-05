@@ -14,6 +14,10 @@ const execFileAsync = promisify(execFile);
  * here goes through an injectable `CommandRunner` (mirrors the injected-clock convention already
  * used by rate-governor.ts) so the merge/gate/rollback logic is unit-testable without a real repo
  * or a real `bun test` run.
+ *
+ * Live-verified 2026-08-05: a trivial commit on this exact test-session branch was merged into
+ * the real running dev Bridge's own checkout via a real `/deploy test-session` from Telegram,
+ * the gate ran for real, and the self-respawn brought the Bridge back up with this comment live.
  */
 export interface CommandResult {
   status: number;
