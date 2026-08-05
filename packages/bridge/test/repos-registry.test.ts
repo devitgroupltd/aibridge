@@ -1,8 +1,18 @@
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { describe, expect, test } from "bun:test";
-import { addRepoEntry, parseReposToml, removeRepoEntry, ReposRegistry, serializeReposToml } from "../src/repos-registry.ts";
+import {
+  addRepoEntry,
+  cloneRepo,
+  inferDefaultRepoPath,
+  isGitUrl,
+  parseReposToml,
+  removeRepoEntry,
+  ReposRegistry,
+  serializeReposToml,
+} from "../src/repos-registry.ts";
 
 /** A throwaway dir with a `.git` marker - the minimum `addRepoEntry`'s existence check accepts. */
 function makeFakeRepoDir(): string {
@@ -88,6 +98,76 @@ describe("serializeReposToml", () => {
 
   test("rejects a value containing a double quote", () => {
     expect(() => serializeReposToml([{ name: "a", path: 'c:\\has"quote' }])).toThrow(/double quote/);
+  });
+});
+
+describe("isGitUrl", () => {
+  test("recognises scheme URLs", () => {
+    expect(isGitUrl("https://github.com/example/repo.git")).toBe(true);
+    expect(isGitUrl("https://github.com/example/repo")).toBe(true);
+    expect(isGitUrl("git://example.com/repo.git")).toBe(true);
+    expect(isGitUrl("ssh://git@example.com/repo.git")).toBe(true);
+  });
+
+  test("recognises scp-style git@host:path", () => {
+    expect(isGitUrl("git@github.com:example/repo.git")).toBe(true);
+  });
+
+  test("recognises a bare .git suffix with no scheme", () => {
+    expect(isGitUrl("example.com/repo.git")).toBe(true);
+  });
+
+  test("rejects Windows and POSIX local paths", () => {
+    expect(isGitUrl("c:\\data\\projects\\aibridge")).toBe(false);
+    expect(isGitUrl("C:\\data\\projects\\aibridge")).toBe(false);
+    expect(isGitUrl("/home/user/repo")).toBe(false);
+  });
+});
+
+describe("inferDefaultRepoPath", () => {
+  test("returns null with no existing repos to infer from", () => {
+    expect(inferDefaultRepoPath([], "new")).toBeNull();
+  });
+
+  test("infers <shared parent>/<name> when every repo already shares one parent", () => {
+    const existing = [
+      { name: "a", path: "c:\\data\\projects\\a" },
+      { name: "b", path: "c:\\data\\projects\\b", base: "main" },
+    ];
+    expect(inferDefaultRepoPath(existing, "new")).toBe(path.join("c:\\data\\projects", "new"));
+  });
+
+  test("returns null when existing repos don't share a parent", () => {
+    const existing = [
+      { name: "a", path: "c:\\data\\projects\\a" },
+      { name: "b", path: "d:\\elsewhere\\b" },
+    ];
+    expect(inferDefaultRepoPath(existing, "new")).toBeNull();
+  });
+});
+
+describe("cloneRepo", () => {
+  test("clones a local repo path (used here as a stand-in remote) into destPath", () => {
+    const source = makeFakeRepoDir();
+    // `git clone` a bare `.git`-marker-only dir isn't a real repo clone target - make it a real one.
+    execFileSync("git", ["init", "--quiet"], { cwd: source });
+    execFileSync("git", ["-c", "user.email=t@t.com", "-c", "user.name=t", "commit", "--allow-empty", "-m", "init", "--quiet"], {
+      cwd: source,
+    });
+    const dest = path.join(mkdtempSync(path.join(tmpdir(), "aibridge-clonedest-")), "cloned");
+    try {
+      cloneRepo(source, dest);
+      expect(existsSync(path.join(dest, ".git"))).toBe(true);
+    } finally {
+      rmSync(source, { recursive: true, force: true });
+      rmSync(path.dirname(dest), { recursive: true, force: true });
+    }
+  });
+
+  test("surfaces git's own stderr on failure", () => {
+    const dest = path.join(mkdtempSync(path.join(tmpdir(), "aibridge-clonefail-")), "cloned");
+    expect(() => cloneRepo("Z:\\nowhere\\not-a-repo", dest)).toThrow(/git clone failed/);
+    rmSync(path.dirname(dest), { recursive: true, force: true });
   });
 });
 

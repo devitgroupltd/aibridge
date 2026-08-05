@@ -1,7 +1,7 @@
 ---
-version: 0.38.0
+version: 0.39.0
 status: solid
-last_modified_utc: 2026-08-05T07:20:00Z
+last_modified_utc: 2026-08-05T07:55:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,27 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.39.0 (2026-08-05): /repos add's <path> argument made optional and/or a clone source, answering
+    the owner's follow-up on the 0.38.0 work below. repos-registry.ts gained isGitUrl (scheme URLs,
+    scp-style git@host:path, or a bare ...git suffix - a Windows drive path never matches, no @ before
+    its colon and no .git suffix), inferDefaultRepoPath (returns <shared parent>\<name> only when every
+    already-registered repo's path shares one parent dirname, else null - deliberately doesn't guess
+    across disagreeing parents), and cloneRepo (execFileSync git clone, optional --branch, surfaces
+    git's own stderr near-verbatim on failure rather than re-wrapping it). index.ts's handleReposCommand
+    resolves the add path before calling addRepoEntry: a git URL is cloned into the inferred (or
+    --base-branched) destination first, an omitted path is inferred outright, and either failure path
+    (can't infer, clone fails) never touches repos.toml. parseRepos's add branch no longer requires a
+    path token, and only consumes a bare non---prefixed token as the path so a flag placed right after
+    the name (/repos add foo --base main) isn't swallowed as a bogus path. Unit tests for isGitUrl,
+    inferDefaultRepoPath, and cloneRepo (real git init + clone against a temp dir, plus a failure-path
+    check), and updated parseRepos/renderReposList tests for the new optional-path shape. Live-verified
+    against the real dev Bridge: /repos add inferred-test (no path, one existing repo registered)
+    inferred and registered c:\data\projects\inferred-test correctly; /repos add hello-world
+    https://github.com/octocat/Hello-World.git cloned the real public repo into the inferred
+    c:\data\projects\hello-world and registered it, confirmed present on disk with a real .git; /repos
+    rm on both round-tripped repos.toml back to its original single-entry contents; /repos add badclone
+    <nonexistent GitHub URL> surfaced git's own 'Repository not found' error with no directory left
+    behind and no registry write."
   - "0.38.0 (2026-08-05): §7.5's repos.toml registry is confirmed not auto-discovered (no folder scan,
     no GitHub API) - clarified to the owner, then made mutable from Telegram: /repos [list] (same
     listing /settings already showed, now with an add/rm usage hint), /repos add <name> <path>
@@ -1674,7 +1695,7 @@ permission relay and feed renderer are all already scoped to a single Bridge pro
 | `/pause <slug>` | Stop pushing feed updates for that topic (replies and prompts still flow) |
 | `/restart` | Fleet-scoped, control topic only. Self-respawns the Bridge process to pick up a code change. Kills every live session with it (§4.5); Phase 5 scope, see §4.5.1 |
 | `/settings` | Fleet-scoped, control topic only. Read-only card: registered repos from `repos.toml` and the current/cap weighted concurrency budget (§10.5). Phase 6a scope |
-| `/repos [list\|add <name> <path> [--base <b>] [--model <m>]\|rm <name>]` | Fleet-scoped, control topic only. Mutates §7.5's registry from Telegram instead of only by hand-editing `repos.toml` - `add` validates the name, rejects a duplicate, and checks the path exists and looks like a git repo/worktree (a `.git` entry present) before writing; `rm` only edits the file, any existing worktree/session for that repo is left alone. `reposRegistry` is reloaded in place after either, so the very next `/new` sees the change with no Bridge restart. Added 2026-08-05 |
+| `/repos [list\|add <name> [<path>\|<git-url>] [--base <b>] [--model <m>]\|rm <name>]` | Fleet-scoped, control topic only. Mutates §7.5's registry from Telegram instead of only by hand-editing `repos.toml` - `add` validates the name, rejects a duplicate, and checks the path exists and looks like a git repo/worktree (a `.git` entry present) before writing; `rm` only edits the file, any existing worktree/session for that repo is left alone. `reposRegistry` is reloaded in place after either, so the very next `/new` sees the change with no Bridge restart. `add`'s path argument is optional and/or a clone source: if every already-registered repo shares one parent folder, an omitted path is inferred as `<that parent>\<name>`; if the argument is a git URL instead of a local path, it's `git clone`d into that same inferred (or `--base`-branched) destination before registering - `git clone`'s own stderr surfaces verbatim on failure, and nothing is written to `repos.toml` unless the clone succeeds. Added 2026-08-05; path inference/clone-by-URL added 2026-08-05 |
 | `/autostart [status\|install\|uninstall]` | Fleet-scoped, control topic only. Manages the §7.2 Task Scheduler entry via `schtasks.exe` - `install` registers a logon-trigger task under the operator's own account (no admin rights needed); no argument defaults to `status`. Phase 6a scope |
 
 Session-scoped commands live in the session's own topic, so `/kill` with no argument inside a session

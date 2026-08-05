@@ -55,7 +55,15 @@ import { sweepExpiredPermissions } from "./permission-registry.ts";
 import { listClaudeProcesses } from "./process-scan.ts";
 import { reconcile } from "./reconciliation.ts";
 import { isTopicDeleted } from "./topic-probe.ts";
-import { addRepoEntry, loadReposRegistry, removeRepoEntry, type ReposRegistry } from "./repos-registry.ts";
+import {
+  addRepoEntry,
+  cloneRepo,
+  inferDefaultRepoPath,
+  isGitUrl,
+  loadReposRegistry,
+  removeRepoEntry,
+  type ReposRegistry,
+} from "./repos-registry.ts";
 import { launchSession, resolveBunExecutable, stripAnsi } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
 import { RateGovernor } from "./rate-governor.ts";
@@ -1224,11 +1232,18 @@ async function main(): Promise<void> {
       .catch((err) => log("WARN", `sendMessage (/settings) failed: ${(err as Error).message}`));
   }
 
-  /** `/repos [list|add <name> <path> [--base <b>] [--model <m>]|rm <name>]`: §7.5's registry, now
-   * mutable from Telegram (`repos-registry.ts` owns the file I/O and validation) instead of only by
-   * hand-editing repos.toml. Control-topic only, same reasoning as `/settings`/`/budget` - the
-   * registry is fleet-wide, not scoped to any one session's topic. `add`/`rm` reload `reposRegistry`
-   * in place so the very next `/new` sees the change without a Bridge restart. */
+  /** `/repos [list|add <name> [path|git-url] [--base <b>] [--model <m>]|rm <name>]`: §7.5's
+   * registry, now mutable from Telegram (`repos-registry.ts` owns the file I/O and validation)
+   * instead of only by hand-editing repos.toml. Control-topic only, same reasoning as
+   * `/settings`/`/budget` - the registry is fleet-wide, not scoped to any one session's topic.
+   * `add`/`rm` reload `reposRegistry` in place so the very next `/new` sees the change without a
+   * Bridge restart.
+   *
+   * `add`'s path argument is resolved here, ahead of `addRepoEntry`'s own local-path checks: a git
+   * URL (`isGitUrl`) is cloned first (`cloneRepo`) into an inferred destination, and an omitted path
+   * is inferred outright (`inferDefaultRepoPath`) - both only when every already-registered repo
+   * shares one parent folder, per the operator's own §7.5 ask; otherwise this asks for an explicit
+   * path rather than guessing. */
   function handleReposCommand(cmd: Extract<FleetCommand, { kind: "repos" }>, topicId: number | undefined): void {
     if (!isControlTopic(topicId)) {
       confirmSessionCommand(topicId, "/repos only works from the control topic.");
@@ -1242,9 +1257,28 @@ async function main(): Promise<void> {
     }
     try {
       if (cmd.action === "add") {
-        addRepoEntry(reposTomlPath, { name: cmd.name, path: cmd.path, base: cmd.base, model: cmd.model });
+        const existing = reposRegistry?.all() ?? [];
+        const givenUrl = cmd.path && isGitUrl(cmd.path) ? cmd.path : undefined;
+        let repoPath = givenUrl ? undefined : cmd.path;
+        if (!repoPath) {
+          repoPath = inferDefaultRepoPath(existing, cmd.name) ?? undefined;
+          if (!repoPath) {
+            confirmSessionCommand(
+              topicId,
+              `/repos add ${cmd.name}: no path given and none could be inferred (need at least one repo already registered, all sharing one parent folder) - specify a path or git URL explicitly.`,
+            );
+            return;
+          }
+        }
+        if (givenUrl) {
+          cloneRepo(givenUrl, repoPath, cmd.base);
+        }
+        addRepoEntry(reposTomlPath, { name: cmd.name, path: repoPath, base: cmd.base, model: cmd.model });
         reposRegistry = loadReposRegistry(reposTomlPath);
-        confirmSessionCommand(topicId, `Registered "${cmd.name}" -> ${cmd.path} (§7.5). /new ${cmd.name} <prompt> now works.`);
+        confirmSessionCommand(
+          topicId,
+          `${givenUrl ? `Cloned ${givenUrl} -> ${repoPath} and r` : "R"}egistered "${cmd.name}" -> ${repoPath} (§7.5). /new ${cmd.name} <prompt> now works.`,
+        );
         return;
       }
       removeRepoEntry(reposTomlPath, cmd.name);

@@ -1,3 +1,4 @@
+import { execFileSync } from "node:child_process";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
@@ -121,6 +122,44 @@ export function serializeReposToml(entries: readonly RepoEntry[]): string {
       return lines.join("\n");
     })
     .join("\n\n") + (entries.length > 0 ? "\n" : "");
+}
+
+/** scheme URLs (`https://`, `git://`, `ssh://`), scp-style `user@host:path`, or a bare `...repo.git`
+ * - distinguishes a clone source from a local filesystem path in `/repos add <name> <path-or-url>`.
+ * A Windows drive path (`C:\...`) never matches: no `@` before its colon, and no `.git` suffix. */
+const GIT_URL_RE = /^(https?:\/\/|git:\/\/|ssh:\/\/|[\w.-]+@[\w.-]+:)/i;
+
+export function isGitUrl(value: string): boolean {
+  return GIT_URL_RE.test(value) || /\.git\/?$/i.test(value);
+}
+
+/**
+ * §7.5's "if not provided, suggest one" ask: when every already-registered repo lives directly
+ * under the same parent folder, `/repos add <name>` (no path) or `/repos add <name> <url>` (clone)
+ * can infer `<that shared parent>\<name>` instead of requiring an explicit path every time. Returns
+ * `null` (caller must fall back to asking for an explicit path/`--dest`) when there are no repos yet
+ * to infer from, or when their parents don't already agree.
+ */
+export function inferDefaultRepoPath(existing: readonly RepoEntry[], name: string): string | null {
+  if (existing.length === 0) return null;
+  const parents = new Set(existing.map((e) => path.dirname(e.path)));
+  if (parents.size !== 1) return null;
+  const [parent] = parents;
+  return path.join(parent as string, name);
+}
+
+/** `/repos add <name> <url>`'s clone step - runs before `addRepoEntry`'s own checks, so a clone
+ * failure (bad URL, network, `destPath` already occupied) never touches repos.toml. `git clone`'s
+ * own stderr is already operator-legible ("repository not found", "already exists and is not an
+ * empty directory", ...) so it's surfaced close to verbatim rather than re-wrapped. */
+export function cloneRepo(url: string, destPath: string, branch?: string): void {
+  const args = ["clone", ...(branch ? ["--branch", branch] : []), url, destPath];
+  try {
+    execFileSync("git", args, { stdio: "pipe" });
+  } catch (err) {
+    const stderr = (err as { stderr?: Buffer | string }).stderr?.toString().trim();
+    throw new Error(`git clone failed: ${stderr || (err as Error).message}`);
+  }
 }
 
 /**

@@ -212,8 +212,40 @@ describe("parseFleetCommand", () => {
     });
   });
 
-  test("/repos add with a missing name or path is invalid", () => {
-    expect(parseFleetCommand("/repos add seowrite")).toBeNull();
+  test("/repos add with no path leaves it undefined for index.ts to infer", () => {
+    expect(parseFleetCommand("/repos add seowrite")).toEqual({
+      kind: "repos",
+      action: "add",
+      name: "seowrite",
+      path: undefined,
+      base: undefined,
+      model: undefined,
+    });
+  });
+
+  test("/repos add with no path but flags right after the name doesn't swallow a flag as the path", () => {
+    expect(parseFleetCommand("/repos add seowrite --base main")).toEqual({
+      kind: "repos",
+      action: "add",
+      name: "seowrite",
+      path: undefined,
+      base: "main",
+      model: undefined,
+    });
+  });
+
+  test("/repos add with a git URL as the path", () => {
+    expect(parseFleetCommand("/repos add seowrite https://github.com/example/seowrite.git")).toEqual({
+      kind: "repos",
+      action: "add",
+      name: "seowrite",
+      path: "https://github.com/example/seowrite.git",
+      base: undefined,
+      model: undefined,
+    });
+  });
+
+  test("/repos add with a missing name is invalid", () => {
     expect(parseFleetCommand("/repos add")).toBeNull();
   });
 
@@ -280,7 +312,7 @@ describe("renderReposList", () => {
     expect(text).toContain("Registered repos (2):");
     expect(text).toContain("seowrite -&gt; c:\\data\\projects\\seowrite (base: main, default model: sonnet)");
     expect(text).toContain("aibridge -&gt; c:\\data\\projects\\aibridge");
-    expect(text).toContain("/repos add &lt;name&gt; &lt;path&gt;");
+    expect(text).toContain("/repos add &lt;name&gt; [path|git-url]");
     expect(text).toContain("/repos rm &lt;name&gt;");
   });
 

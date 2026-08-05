@@ -34,7 +34,7 @@ export type FleetCommand =
   | { kind: "settings" }
   | { kind: "autostart"; action: "status" | "install" | "uninstall" }
   | { kind: "repos"; action: "list" }
-  | { kind: "repos"; action: "add"; name: string; path: string; base?: string; model?: string }
+  | { kind: "repos"; action: "add"; name: string; path?: string; base?: string; model?: string }
   | { kind: "repos"; action: "rm"; name: string };
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
@@ -91,12 +91,19 @@ function parseAutostart(rest: string): FleetCommand | null {
 }
 
 /**
- * `/repos [list]` / `/repos add <name> <path> [--base <branch>] [--model <model>]` / `/repos rm|remove
- * <name>` - §7.5's registry, made mutable from Telegram (`repos-registry.ts`'s `addRepoEntry`/
- * `removeRepoEntry`) instead of only by hand-editing the file. Bare `/repos` and `/repos list` are the
- * same as `/repos` itself is already the read path - `list` exists only so a typed-out form matches
- * `add`/`rm`'s shape. Neither `<name>` nor `<path>` accept embedded spaces, same "no quoting" convention
- * as every other fleet command's arguments (e.g. `/new`'s `<repo>` token).
+ * `/repos [list]` / `/repos add <name> [<path>|<git-url>] [--base <branch>] [--model <model>]` /
+ * `/repos rm|remove <name>` - §7.5's registry, made mutable from Telegram (`repos-registry.ts`'s
+ * `addRepoEntry`/`removeRepoEntry`) instead of only by hand-editing the file. Bare `/repos` and
+ * `/repos list` are the same as `/repos` itself is already the read path - `list` exists only so a
+ * typed-out form matches `add`/`rm`'s shape. Neither `<name>` nor `<path>` accept embedded spaces,
+ * same "no quoting" convention as every other fleet command's arguments (e.g. `/new`'s `<repo>`
+ * token).
+ *
+ * `<path>` is optional - `index.ts`'s `handleReposCommand` fills it in (`inferDefaultRepoPath`) when
+ * every already-registered repo shares one parent folder, or clones it first (`cloneRepo`) when the
+ * token is a git URL (`isGitUrl`) rather than a local path. This parser only has to tell "no path
+ * given" apart from "a flag came right after the name" (`/repos add foo --base main`), which is why
+ * a leading `--` token is never consumed as the path.
  */
 function parseRepos(rest: string): FleetCommand | null {
   const tokens = rest.trim().split(/\s+/).filter((t) => t.length > 0);
@@ -104,8 +111,8 @@ function parseRepos(rest: string): FleetCommand | null {
   if (sub === "list") return { kind: "repos", action: "list" };
   if (sub === "add") {
     const name = tokens.shift();
-    const repoPath = tokens.shift();
-    if (!name || !repoPath) return null;
+    if (!name) return null;
+    const repoPath = tokens.length > 0 && !tokens[0]?.startsWith("--") ? tokens.shift() : undefined;
     let base: string | undefined;
     let model: string | undefined;
     for (let i = 0; i < tokens.length; i++) {
@@ -308,7 +315,7 @@ export function renderReposList(repos: readonly RepoEntry[]): string {
   }
   lines.push(
     "",
-    "/repos add <name> <path> [--base <branch>] [--model <model>] - register a repo already cloned on this machine",
+    "/repos add <name> [path|git-url] [--base <branch>] [--model <model>] - register an already-cloned repo, clone a URL, or (if every repo above shares one parent folder) omit the path to reuse it",
     "/repos rm <name> - unregister one (leaves any existing worktree/session alone)",
   );
   return escapeForFeed(lines.join("\n"));
@@ -333,7 +340,7 @@ export function renderHelp(): string {
     "  /budget - fleet spend (5h/7d)",
     "  /restart - restart the Bridge daemon",
     "  /settings - registered repos + concurrency budget",
-    "  /repos [list|add <name> <path> [--base <b>] [--model <m>]|rm <name>] - manage repos.toml",
+    "  /repos [list|add <name> [path|git-url] [--base <b>] [--model <m>]|rm <name>] - manage repos.toml",
     "  /autostart [status|install|uninstall] - manage the logon Task Scheduler entry",
     "",
     "Session commands (inside a session's own topic):",
@@ -367,7 +374,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "budget", description: "Fleet spend (5h/7d)" },
     { command: "restart", description: "Restart the Bridge daemon" },
     { command: "settings", description: "Registered repos + concurrency budget" },
-    { command: "repos", description: "Manage repos.toml: list|add <name> <path>|rm <name>" },
+    { command: "repos", description: "Manage repos.toml: list|add <name> [path|git-url]|rm <name>" },
     { command: "autostart", description: "Manage the logon Task Scheduler entry: status|install|uninstall" },
     { command: "help", description: "Show the full command list" },
     { command: "model", description: `Set model: /model <${MODELS.join("|")}>` },
