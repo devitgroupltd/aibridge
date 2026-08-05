@@ -1,7 +1,7 @@
 ---
-version: 0.37.0
+version: 0.37.1
 status: solid
-last_modified_utc: 2026-08-05T07:00:00Z
+last_modified_utc: 2026-08-05T07:15:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,12 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.37.1 (2026-08-05): Clarified /about's autostart blurb/details after the owner flagged it as
+    ambiguous - \"log in to this machine\" read as either the phone/laptop reading Telegram or the
+    machine the Bridge actually runs on. Reworded to name the Windows PC/server the Bridge is
+    installed on explicitly and say outright that the Telegram client's own device has nothing to
+    autostart. Live-verified: tapped the button again post-restart and confirmed the new wording
+    renders."
   - "0.37.0 (2026-08-05): Added /about (new about.ts), a friendly capability overview distinct from
     /help's exhaustive syntax reference - one-line blurb per feature area plus a 'more info' button
     per topic that's too fiddly for one line (bulk /rm forms, /model|/mode|/effort, the

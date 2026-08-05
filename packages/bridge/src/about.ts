@@ -82,10 +82,12 @@ export const ABOUT_TOPICS: Record<string, { label: string; blurb: string; detail
   },
   autostart: {
     label: "Autostart on logon",
-    blurb: "Have the Bridge launch itself automatically when you log in to this machine.",
+    blurb: "Have the Bridge launch itself automatically when you log in to the Windows machine it runs on.",
     details: [
+      "This is about the machine running the Bridge daemon itself (the Windows PC/server it's installed on) - not the phone or laptop you're reading Telegram from, which has nothing to autostart.",
+      "",
       "/autostart (no argument) - show whether the logon task is currently installed.",
-      "/autostart install - register a Task Scheduler entry that starts the Bridge on your next logon (no admin rights needed).",
+      "/autostart install - register a Task Scheduler entry that starts the Bridge on your next logon to that machine (no admin rights needed).",
       "/autostart uninstall - remove it.",
       "",
       "This only affects whether the Bridge starts automatically - it doesn't touch any running session.",
