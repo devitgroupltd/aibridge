@@ -1,4 +1,5 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import path from "node:path";
 
 /**
  * §7.5's repo registry: a minimal TOML subset (`[name]` sections, `key = "value"`/`key = 'value'`
@@ -88,6 +89,79 @@ export class ReposRegistry {
   names(): string[] {
     return [...this.byName.keys()];
   }
+
+  /** Every entry, in registration order - the `/repos`/`/settings` listing form; both used to
+   * rebuild this list by hand from `names()`/`get()` before this existed. */
+  all(): RepoEntry[] {
+    return [...this.byName.values()];
+  }
+}
+
+/** Same `[A-Za-z0-9_-]+` a `[section]` header accepts (`SECTION_RE`) - re-checked here so
+ * `/repos add` rejects a bad name before it ever reaches `parseReposToml`/the file on disk. */
+export function isValidRepoName(name: string): boolean {
+  return /^[A-Za-z0-9_-]+$/.test(name);
+}
+
+function quote(field: string, value: string): string {
+  if (value.includes('"') || /[\r\n]/.test(value)) {
+    throw new Error(`repos.toml ${field} "${value}" can't contain a double quote or newline`);
+  }
+  return `"${value}"`;
+}
+
+/** The inverse of `parseReposToml` - round-trips through the same `[name]`/`key = "value"` subset,
+ * so a file this writes parses back to the same entries. */
+export function serializeReposToml(entries: readonly RepoEntry[]): string {
+  return entries
+    .map((e) => {
+      const lines = [`[${e.name}]`, `path = ${quote("path", e.path)}`];
+      if (e.base) lines.push(`base = ${quote("base", e.base)}`);
+      if (e.model) lines.push(`model = ${quote("model", e.model)}`);
+      return lines.join("\n");
+    })
+    .join("\n\n") + (entries.length > 0 ? "\n" : "");
+}
+
+/**
+ * `/repos add`'s write path (§7.5's registry made mutable from Telegram instead of only by hand):
+ * validates the name, rejects a duplicate, checks the path exists and looks like a git repo/worktree
+ * (a `.git` entry present - a file for a worktree, a directory for a full clone, `existsSync` covers
+ * both), then rewrites the whole file. A missing repos.toml is treated as an empty registry rather
+ * than an error, so `/repos add` also works as the very first registration.
+ */
+export function addRepoEntry(reposTomlPath: string, entry: RepoEntry): void {
+  if (!isValidRepoName(entry.name)) {
+    throw new Error(`repo name "${entry.name}" must match [A-Za-z0-9_-]+`);
+  }
+  let existing: RepoEntry[] = [];
+  try {
+    existing = parseReposToml(readFileSync(reposTomlPath, "utf8"));
+  } catch {
+    // No repos.toml yet - /repos add creates it fresh.
+  }
+  if (existing.some((e) => e.name === entry.name)) {
+    throw new Error(`repo "${entry.name}" is already registered`);
+  }
+  if (!existsSync(entry.path)) {
+    throw new Error(`path "${entry.path}" does not exist on this machine`);
+  }
+  if (!existsSync(path.join(entry.path, ".git"))) {
+    throw new Error(`"${entry.path}" doesn't look like a git repo or worktree (no .git found)`);
+  }
+  writeFileSync(reposTomlPath, serializeReposToml([...existing, entry]), "utf8");
+}
+
+/** `/repos rm`'s write path - rejects an unknown name rather than silently no-oping, same "for us,
+ * but invalid" discipline as `fleet-commands.ts`'s parsers. Only edits repos.toml; any worktree
+ * already cut for a session against this repo is untouched (§7.5 - removing a project registration
+ * doesn't retroactively touch running sessions). */
+export function removeRepoEntry(reposTomlPath: string, name: string): void {
+  const existing = parseReposToml(readFileSync(reposTomlPath, "utf8"));
+  if (!existing.some((e) => e.name === name)) {
+    throw new Error(`repo "${name}" is not registered`);
+  }
+  writeFileSync(reposTomlPath, serializeReposToml(existing.filter((e) => e.name !== name)), "utf8");
 }
 
 /** Throws naming the file, not a generic ENOENT, since a missing registry means every `/new` fails

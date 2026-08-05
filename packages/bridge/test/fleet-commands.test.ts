@@ -8,9 +8,11 @@ import {
   renderBudget,
   renderHelp,
   renderLsTable,
+  renderReposList,
   renderSettings,
   stripBotMention,
 } from "../src/fleet-commands.ts";
+import type { RepoEntry } from "../src/repos-registry.ts";
 import type { SessionRow } from "../src/session-store.ts";
 
 describe("isHelpCommand", () => {
@@ -175,6 +177,60 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/autostart bogus")).toBeNull();
   });
 
+  test("/repos with no argument, or 'list', means list", () => {
+    expect(parseFleetCommand("/repos")).toEqual({ kind: "repos", action: "list" });
+    expect(parseFleetCommand("/repos list")).toEqual({ kind: "repos", action: "list" });
+  });
+
+  test("/repos add with name and path only", () => {
+    expect(parseFleetCommand("/repos add seowrite c:\\data\\projects\\seowrite")).toEqual({
+      kind: "repos",
+      action: "add",
+      name: "seowrite",
+      path: "c:\\data\\projects\\seowrite",
+      base: undefined,
+      model: undefined,
+    });
+  });
+
+  test("/repos add with --base and --model, in either order", () => {
+    expect(parseFleetCommand("/repos add seowrite /repos/seowrite --base main --model opus")).toEqual({
+      kind: "repos",
+      action: "add",
+      name: "seowrite",
+      path: "/repos/seowrite",
+      base: "main",
+      model: "opus",
+    });
+    expect(parseFleetCommand("/repos add seowrite /repos/seowrite --model opus --base main")).toEqual({
+      kind: "repos",
+      action: "add",
+      name: "seowrite",
+      path: "/repos/seowrite",
+      base: "main",
+      model: "opus",
+    });
+  });
+
+  test("/repos add with a missing name or path is invalid", () => {
+    expect(parseFleetCommand("/repos add seowrite")).toBeNull();
+    expect(parseFleetCommand("/repos add")).toBeNull();
+  });
+
+  test("/repos add rejects an unrecognised flag rather than silently dropping it", () => {
+    expect(parseFleetCommand("/repos add seowrite /repos/seowrite --bogus x")).toBeNull();
+  });
+
+  test("/repos rm and /repos remove are synonyms", () => {
+    expect(parseFleetCommand("/repos rm seowrite")).toEqual({ kind: "repos", action: "rm", name: "seowrite" });
+    expect(parseFleetCommand("/repos remove seowrite")).toEqual({ kind: "repos", action: "rm", name: "seowrite" });
+  });
+
+  test("/repos rm with no name, or an unknown subcommand, is invalid", () => {
+    expect(parseFleetCommand("/repos rm")).toBeNull();
+    expect(parseFleetCommand("/repos bogus")).toBeNull();
+  });
+
   test("returns null for anything that isn't one of these commands", () => {
     expect(parseFleetCommand("/model opus")).toBeNull();
     expect(parseFleetCommand("hello")).toBeNull();
@@ -185,7 +241,7 @@ describe("parseFleetCommand", () => {
 describe("renderHelp", () => {
   test("lists every fleet-scoped and session-scoped command", () => {
     const text = renderHelp();
-    for (const cmd of ["/new", "/ls", "/kill", "/rm", "/attach", "/pause", "/usage", "/budget", "/restart", "/settings", "/autostart"]) {
+    for (const cmd of ["/new", "/ls", "/kill", "/rm", "/attach", "/pause", "/usage", "/budget", "/restart", "/settings", "/repos", "/autostart"]) {
       expect(text).toContain(cmd);
     }
     expect(text).toContain("/model <");
@@ -211,6 +267,28 @@ describe("renderSettings", () => {
 
   test("an empty registry says so instead of an empty list", () => {
     expect(renderSettings([], { current: 0, cap: 4 })).toContain("(none - add one to repos.toml, §7.5)");
+  });
+});
+
+describe("renderReposList", () => {
+  test("lists every repo with its base/model extras and the add/rm usage hint", () => {
+    const repos: RepoEntry[] = [
+      { name: "seowrite", path: "c:\\data\\projects\\seowrite", base: "main", model: "sonnet" },
+      { name: "aibridge", path: "c:\\data\\projects\\aibridge" },
+    ];
+    const text = renderReposList(repos);
+    expect(text).toContain("Registered repos (2):");
+    expect(text).toContain("seowrite -&gt; c:\\data\\projects\\seowrite (base: main, default model: sonnet)");
+    expect(text).toContain("aibridge -&gt; c:\\data\\projects\\aibridge");
+    expect(text).toContain("/repos add &lt;name&gt; &lt;path&gt;");
+    expect(text).toContain("/repos rm &lt;name&gt;");
+  });
+
+  test("an empty registry says so and still shows the usage hint", () => {
+    const text = renderReposList([]);
+    expect(text).toContain("Registered repos (0):");
+    expect(text).toContain("none yet - /repos add");
+    expect(text).toContain("/repos rm &lt;name&gt;");
   });
 });
 

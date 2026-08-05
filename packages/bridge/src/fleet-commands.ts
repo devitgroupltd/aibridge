@@ -32,7 +32,10 @@ export type FleetCommand =
   | { kind: "budget" }
   | { kind: "restart" }
   | { kind: "settings" }
-  | { kind: "autostart"; action: "status" | "install" | "uninstall" };
+  | { kind: "autostart"; action: "status" | "install" | "uninstall" }
+  | { kind: "repos"; action: "list" }
+  | { kind: "repos"; action: "add"; name: string; path: string; base?: string; model?: string }
+  | { kind: "repos"; action: "rm"; name: string };
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
 
@@ -85,6 +88,43 @@ function parseAutostart(rest: string): FleetCommand | null {
   const action = trimmed.length === 0 ? "status" : trimmed;
   if (action !== "status" && action !== "install" && action !== "uninstall") return null;
   return { kind: "autostart", action };
+}
+
+/**
+ * `/repos [list]` / `/repos add <name> <path> [--base <branch>] [--model <model>]` / `/repos rm|remove
+ * <name>` - §7.5's registry, made mutable from Telegram (`repos-registry.ts`'s `addRepoEntry`/
+ * `removeRepoEntry`) instead of only by hand-editing the file. Bare `/repos` and `/repos list` are the
+ * same as `/repos` itself is already the read path - `list` exists only so a typed-out form matches
+ * `add`/`rm`'s shape. Neither `<name>` nor `<path>` accept embedded spaces, same "no quoting" convention
+ * as every other fleet command's arguments (e.g. `/new`'s `<repo>` token).
+ */
+function parseRepos(rest: string): FleetCommand | null {
+  const tokens = rest.trim().split(/\s+/).filter((t) => t.length > 0);
+  const sub = tokens.length === 0 ? "list" : tokens.shift();
+  if (sub === "list") return { kind: "repos", action: "list" };
+  if (sub === "add") {
+    const name = tokens.shift();
+    const repoPath = tokens.shift();
+    if (!name || !repoPath) return null;
+    let base: string | undefined;
+    let model: string | undefined;
+    for (let i = 0; i < tokens.length; i++) {
+      if (tokens[i] === "--base" && tokens[i + 1]) {
+        base = tokens[++i];
+      } else if (tokens[i] === "--model" && tokens[i + 1]) {
+        model = tokens[++i];
+      } else {
+        return null;
+      }
+    }
+    return { kind: "repos", action: "add", name, path: repoPath, base, model };
+  }
+  if (sub === "rm" || sub === "remove") {
+    const name = tokens.shift();
+    if (!name || tokens.length > 0) return null;
+    return { kind: "repos", action: "rm", name };
+  }
+  return null;
 }
 
 /**
@@ -141,7 +181,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
  * "for us, but invalid" split as `session-commands.ts`'s parser. */
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|settings|autostart)\b(.*)$/s);
+  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|settings|autostart|repos)\b(.*)$/s);
   if (!match) return null;
   const [, cmd, rest] = match as [string, string, string];
   switch (cmd) {
@@ -157,6 +197,8 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return { kind: "settings" };
     case "autostart":
       return parseAutostart(rest);
+    case "repos":
+      return parseRepos(rest);
     case "rm":
       return parseRm(rest);
     case "kill":
@@ -251,6 +293,27 @@ export function renderSettings(repos: readonly RepoEntry[], concurrency: { curre
   return escapeForFeed(lines.join("\n"));
 }
 
+/** `/repos [list]`: same registry `/settings` already shows a slice of, but as its own dedicated
+ * command with a usage hint for `add`/`rm` underneath - `/settings` stays read-only (§7.5's original
+ * "editing repos.toml is the only way in" model), this is the mutate-from-Telegram surface. */
+export function renderReposList(repos: readonly RepoEntry[]): string {
+  const lines = [`Registered repos (${repos.length}):`];
+  if (repos.length === 0) {
+    lines.push("  (none yet - /repos add <name> <path> to register one)");
+  } else {
+    for (const r of repos) {
+      const extras = [r.base ? `base: ${r.base}` : null, r.model ? `default model: ${r.model}` : null].filter((x) => x !== null);
+      lines.push(`  ${r.name} -> ${r.path}${extras.length > 0 ? ` (${extras.join(", ")})` : ""}`);
+    }
+  }
+  lines.push(
+    "",
+    "/repos add <name> <path> [--base <branch>] [--model <model>] - register a repo already cloned on this machine",
+    "/repos rm <name> - unregister one (leaves any existing worktree/session alone)",
+  );
+  return escapeForFeed(lines.join("\n"));
+}
+
 /** `/help`: the fixed fleet- and session-scoped command reference, plain text (no `parse_mode`,
  * unlike the other render functions here - the `/help` call site sends it alongside the
  * built-in/category button keyboard, not in place of it). `/commands`/`/skills` are the
@@ -270,6 +333,7 @@ export function renderHelp(): string {
     "  /budget - fleet spend (5h/7d)",
     "  /restart - restart the Bridge daemon",
     "  /settings - registered repos + concurrency budget",
+    "  /repos [list|add <name> <path> [--base <b>] [--model <m>]|rm <name>] - manage repos.toml",
     "  /autostart [status|install|uninstall] - manage the logon Task Scheduler entry",
     "",
     "Session commands (inside a session's own topic):",
@@ -303,6 +367,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "budget", description: "Fleet spend (5h/7d)" },
     { command: "restart", description: "Restart the Bridge daemon" },
     { command: "settings", description: "Registered repos + concurrency budget" },
+    { command: "repos", description: "Manage repos.toml: list|add <name> <path>|rm <name>" },
     { command: "autostart", description: "Manage the logon Task Scheduler entry: status|install|uninstall" },
     { command: "help", description: "Show the full command list" },
     { command: "model", description: `Set model: /model <${MODELS.join("|")}>` },

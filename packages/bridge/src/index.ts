@@ -39,6 +39,7 @@ import {
   renderBudget,
   renderHelp,
   renderLsTable,
+  renderReposList,
   renderSettings,
   stripBotMention,
 } from "./fleet-commands.ts";
@@ -54,7 +55,7 @@ import { sweepExpiredPermissions } from "./permission-registry.ts";
 import { listClaudeProcesses } from "./process-scan.ts";
 import { reconcile } from "./reconciliation.ts";
 import { isTopicDeleted } from "./topic-probe.ts";
-import { loadReposRegistry, type RepoEntry, type ReposRegistry } from "./repos-registry.ts";
+import { addRepoEntry, loadReposRegistry, removeRepoEntry, type ReposRegistry } from "./repos-registry.ts";
 import { launchSession, resolveBunExecutable, stripAnsi } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
 import { RateGovernor } from "./rate-governor.ts";
@@ -231,9 +232,10 @@ async function main(): Promise<void> {
 
   // §7.5: an unregistered/missing repos.toml disables /new rather than crashing the whole Bridge -
   // every other session (including the Phase 1 hardcoded one) works fine without it.
+  const reposTomlPath = process.env.AIBRIDGE_REPOS_TOML ?? path.join(STATE_DIR, "repos.toml");
   let reposRegistry: ReposRegistry | undefined;
   try {
-    reposRegistry = loadReposRegistry(process.env.AIBRIDGE_REPOS_TOML ?? path.join(STATE_DIR, "repos.toml"));
+    reposRegistry = loadReposRegistry(reposTomlPath);
   } catch (err) {
     log("WARN", (err as Error).message);
   }
@@ -1213,12 +1215,44 @@ async function main(): Promise<void> {
       confirmSessionCommand(topicId, "/settings only works from the control topic.");
       return;
     }
-    const repos: RepoEntry[] = reposRegistry
-      ? reposRegistry.names().map((name) => reposRegistry?.get(name)).filter((r): r is RepoEntry => r !== undefined)
-      : [];
     controlBot
-      .sendMessage(config.supergroupChatId, topicId, renderSettings(repos, { current: currentUnits(sessionStore.all()), cap: WEIGHTED_CAP }))
+      .sendMessage(
+        config.supergroupChatId,
+        topicId,
+        renderSettings(reposRegistry?.all() ?? [], { current: currentUnits(sessionStore.all()), cap: WEIGHTED_CAP }),
+      )
       .catch((err) => log("WARN", `sendMessage (/settings) failed: ${(err as Error).message}`));
+  }
+
+  /** `/repos [list|add <name> <path> [--base <b>] [--model <m>]|rm <name>]`: §7.5's registry, now
+   * mutable from Telegram (`repos-registry.ts` owns the file I/O and validation) instead of only by
+   * hand-editing repos.toml. Control-topic only, same reasoning as `/settings`/`/budget` - the
+   * registry is fleet-wide, not scoped to any one session's topic. `add`/`rm` reload `reposRegistry`
+   * in place so the very next `/new` sees the change without a Bridge restart. */
+  function handleReposCommand(cmd: Extract<FleetCommand, { kind: "repos" }>, topicId: number | undefined): void {
+    if (!isControlTopic(topicId)) {
+      confirmSessionCommand(topicId, "/repos only works from the control topic.");
+      return;
+    }
+    if (cmd.action === "list") {
+      controlBot
+        .sendMessage(config.supergroupChatId, topicId, renderReposList(reposRegistry?.all() ?? []))
+        .catch((err) => log("WARN", `sendMessage (/repos) failed: ${(err as Error).message}`));
+      return;
+    }
+    try {
+      if (cmd.action === "add") {
+        addRepoEntry(reposTomlPath, { name: cmd.name, path: cmd.path, base: cmd.base, model: cmd.model });
+        reposRegistry = loadReposRegistry(reposTomlPath);
+        confirmSessionCommand(topicId, `Registered "${cmd.name}" -> ${cmd.path} (§7.5). /new ${cmd.name} <prompt> now works.`);
+        return;
+      }
+      removeRepoEntry(reposTomlPath, cmd.name);
+      reposRegistry = loadReposRegistry(reposTomlPath);
+      confirmSessionCommand(topicId, `Unregistered "${cmd.name}" - any existing worktree/session for it is untouched.`);
+    } catch (err) {
+      confirmSessionCommand(topicId, `/repos ${cmd.action} failed: ${(err as Error).message}`);
+    }
   }
 
   /** Wraps `schtasks.exe` (built into Windows, no extra dependency) - `/Query` against an
@@ -1336,6 +1370,10 @@ async function main(): Promise<void> {
       }
       if (fleetCmd.kind === "autostart") {
         void handleAutostartCommand(fleetCmd, threadId);
+        return;
+      }
+      if (fleetCmd.kind === "repos") {
+        handleReposCommand(fleetCmd, threadId);
         return;
       }
       handlePauseCommand(fleetCmd, threadId, currentSlug);

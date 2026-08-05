@@ -1,7 +1,7 @@
 ---
-version: 0.37.1
+version: 0.38.0
 status: solid
-last_modified_utc: 2026-08-05T07:15:00Z
+last_modified_utc: 2026-08-05T07:20:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,22 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.38.0 (2026-08-05): §7.5's repos.toml registry is confirmed not auto-discovered (no folder scan,
+    no GitHub API) - clarified to the owner, then made mutable from Telegram: /repos [list] (same
+    listing /settings already showed, now with an add/rm usage hint), /repos add <name> <path>
+    [--base <b>] [--model <m>] (validates the name against [A-Za-z0-9_-]+, rejects a duplicate, checks
+    the path exists and has a .git entry before writing), /repos rm <name> (rejects an unknown name;
+    only edits the file, leaves any existing worktree/session alone). repos-registry.ts gained
+    serializeReposToml/addRepoEntry/removeRepoEntry (round-trips through the existing parser) and an
+    all() accessor (also used to de-duplicate /settings' own ad-hoc names()+get() reconstruction).
+    index.ts reloads reposRegistry in place after either mutation, so /new sees a just-added repo with
+    no Bridge restart. Unit tests for the new parser branches, the render function, and every
+    repos-registry write path (missing file, append, invalid name, duplicate, missing path, path
+    without .git, remove, remove-unknown). Live-verified against the real dev Bridge: /repos listed
+    the one registered repo with the add/rm hint; /repos add testrepo <path> registered it and the
+    confirmation named the new /new form; /repos rm testrepo removed it and repos.toml round-tripped
+    back to its original single-entry contents; /repos add aibridge <bad path> correctly surfaced the
+    'already registered' rejection before touching the file."
   - "0.37.1 (2026-08-05): Clarified /about's autostart blurb/details after the owner flagged it as
     ambiguous - \"log in to this machine\" read as either the phone/laptop reading Telegram or the
     machine the Bridge actually runs on. Reworded to name the Windows PC/server the Bridge is
@@ -1658,6 +1674,7 @@ permission relay and feed renderer are all already scoped to a single Bridge pro
 | `/pause <slug>` | Stop pushing feed updates for that topic (replies and prompts still flow) |
 | `/restart` | Fleet-scoped, control topic only. Self-respawns the Bridge process to pick up a code change. Kills every live session with it (§4.5); Phase 5 scope, see §4.5.1 |
 | `/settings` | Fleet-scoped, control topic only. Read-only card: registered repos from `repos.toml` and the current/cap weighted concurrency budget (§10.5). Phase 6a scope |
+| `/repos [list\|add <name> <path> [--base <b>] [--model <m>]\|rm <name>]` | Fleet-scoped, control topic only. Mutates §7.5's registry from Telegram instead of only by hand-editing `repos.toml` - `add` validates the name, rejects a duplicate, and checks the path exists and looks like a git repo/worktree (a `.git` entry present) before writing; `rm` only edits the file, any existing worktree/session for that repo is left alone. `reposRegistry` is reloaded in place after either, so the very next `/new` sees the change with no Bridge restart. Added 2026-08-05 |
 | `/autostart [status\|install\|uninstall]` | Fleet-scoped, control topic only. Manages the §7.2 Task Scheduler entry via `schtasks.exe` - `install` registers a logon-trigger task under the operator's own account (no admin rights needed); no argument defaults to `status`. Phase 6a scope |
 
 Session-scoped commands live in the session's own topic, so `/kill` with no argument inside a session
