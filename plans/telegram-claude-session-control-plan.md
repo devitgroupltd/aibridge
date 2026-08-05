@@ -1,7 +1,7 @@
 ---
-version: 0.42.0
+version: 0.43.0
 status: solid
-last_modified_utc: 2026-08-05T13:15:00Z
+last_modified_utc: 2026-08-05T13:45:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,19 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.43.0 (2026-08-05): voice input now defaults to enabled (§3.4 revised), reversing 0.42.0's
+    disabled-by-default choice - discussed live: the operator pointed out a flag nobody would
+    remember to flip is friction with no real safety payoff here (unlike the git-push SSH key,
+    this only ever starts a local child process). Made safe by fixing the actual risk instead of
+    keeping the flag: startWhisperServer now checks existsSync on both the binary and model path
+    before spawning anything, and returns a one-time WARN no-op handle if either is missing,
+    rather than spawning a nonexistent exe and retry-looping every 3s forever - which is exactly
+    what VOICE_ENABLED=true would have hit on this machine right now, where the model had been
+    downloaded but whisper-server.exe had not. config.ts flipped to enabled unless VOICE_ENABLED
+    is explicitly 'false'. setup-windows.ps1's manual-steps report and this doc's §3.4 updated to
+    match - running the setup step is what actually turns transcription on in practice now, not a
+    separate .env edit. 3 new tests (config.test.ts's loadConfig defaults, voice-transcribe.test.ts's
+    missing-binary no-op case) - 508 tests pass monorepo-wide, tsc --noEmit clean."
   - "0.42.0 (2026-08-05): voice input (§3.4) - record a voice note in Telegram instead of typing.
     Researched first: Telegram's own Premium voice-to-text is a client-side feature never exposed
     via the Bot API, so this is a new Bridge-owned pipeline. Self-hosted Whisper via whisper.cpp
@@ -1705,10 +1718,13 @@ asserting one shape as fact. Same discipline as §10.0's `claude/channel` and §
 findings: this needs a real payload capture against a live whisper-server before the permissive parser
 can be tightened, and is flagged here rather than closed as "confirmed."
 
-**Disabled by default.** `VOICE_ENABLED` in `.env` gates the whole feature (`config.voice.enabled`);
-`scripts/setup-windows.ps1` installs ffmpeg + whisper-server + the `medium` model as a mechanical setup
-step but does not flip the flag - starting a new supervised child process on every Bridge boot
-is a decision the operator opts into, not something a re-run of a setup script silently turns on.
+**Enabled by default (revised in 0.43.0).** `VOICE_ENABLED` in `.env` gates the whole feature
+(`config.voice.enabled`), and defaults to on - set it to `false` to opt out. This only stays safe
+because `startWhisperServer` checks for the binary and model file first: on a machine where
+`scripts/setup-windows.ps1`'s voice step hasn't run yet, it logs one `WARN` and returns a no-op
+handle instead of spawning a nonexistent process and retry-looping every 3s forever. Running the
+setup step is what actually turns transcription on in practice, not a separate `.env` edit -
+`VOICE_ENABLED=false` exists only for an operator who wants to suppress the warning entirely.
 
 ---
 

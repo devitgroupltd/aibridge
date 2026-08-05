@@ -206,9 +206,9 @@ try {
 
 # --- 9. Voice input: ffmpeg + whisper.cpp (self-hosted transcription) -------------------------
 # Fully mechanical - nothing here needs a human, so it belongs in this script rather than a
-# separate one-off. Installs prerequisites only; does NOT flip VOICE_ENABLED=true in .env (see
-# step 10a below) - starting a new supervised child process on every Bridge boot is a decision
-# the operator should opt into deliberately, not something a re-run of this script silently turns on.
+# separate one-off. Voice input itself defaults to enabled (config.ts) - startWhisperServer warns
+# once and no-ops rather than crash-looping if these prerequisites aren't installed yet, so running
+# this step is what actually turns transcription on, not a separate .env edit.
 Write-Step "Checking ffmpeg..."
 $ffmpeg = Get-Command ffmpeg -ErrorAction SilentlyContinue
 if ($ffmpeg) {
@@ -400,8 +400,8 @@ $manual = @(
 if (-not ($envValues['CONTROL_BOT_TOKEN'] -and $envValues['FEED_BOT_TOKEN'] -and $envValues['SUPERGROUP_CHAT_ID'])) {
     $manual += "Telegram secrets: fill in the remaining blank value(s) in $envFile - re-run this script and it will prompt for just those."
 }
-if (Test-Path $whisperServerExe) {
-    $manual += "Voice input: prerequisites are installed, but disabled by default. Add 'VOICE_ENABLED=true' to $envFile to turn it on (starts a supervised whisper-server process on every Bridge boot)."
+if (-not (Test-Path $whisperServerExe)) {
+    $manual += "Voice input: enabled by default, but whisper-server.exe wasn't installed above (see the 'whisper.cpp server' result) - the Bridge will warn once and skip it until this is fixed. Set VOICE_ENABLED=false in $envFile to silence the warning instead."
 }
 Write-Host "== Still needs a human (cannot be scripted) ==" -ForegroundColor Yellow
 $manual | ForEach-Object { Write-Host "- $_" }

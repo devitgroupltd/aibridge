@@ -6,9 +6,24 @@ import path from "node:path";
 import {
   convertOggToWav,
   parseWhisperServerResponse,
+  startWhisperServer,
   transcribeVoiceNote,
   transcribeWav,
 } from "../src/voice-transcribe.ts";
+
+describe("startWhisperServer", () => {
+  test("a missing binary/model warns once and no-ops, rather than spawning and crash-looping - voice input now defaults to enabled without assuming setup has run", () => {
+    const logs: Array<{ level: string; msg: string }> = [];
+    const handle = startWhisperServer(
+      { whisperServerExe: "C:\\definitely\\does\\not\\exist\\whisper-server.exe", modelPath: "C:\\definitely\\does\\not\\exist\\model.bin", port: 8383 },
+      (level, msg) => logs.push({ level, msg }),
+    );
+    expect(logs).toHaveLength(1);
+    expect(logs[0]?.level).toBe("WARN");
+    expect(logs[0]?.msg).toContain("isn't installed yet");
+    expect(() => handle.stop()).not.toThrow();
+  });
+});
 
 describe("parseWhisperServerResponse", () => {
   test("reads the documented {text: ...} shape", () => {

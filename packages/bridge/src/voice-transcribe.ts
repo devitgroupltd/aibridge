@@ -1,5 +1,5 @@
 import { execFile, spawn, type ChildProcess } from "node:child_process";
-import { promises as fs } from "node:fs";
+import { existsSync, promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -40,6 +40,17 @@ export function startWhisperServer(cfg: WhisperServerConfig, log: (level: "INFO"
   let stopped = false;
   let child: ChildProcess | null = null;
   let restartTimer: ReturnType<typeof setTimeout> | null = null;
+
+  // Voice input can default to enabled (see the voice-input design decision) without assuming
+  // the setup step has actually been run on this machine - a missing binary/model is reported
+  // once and left alone, not retried every 3s forever the way a real crash-after-starting is.
+  if (!existsSync(cfg.whisperServerExe) || !existsSync(cfg.modelPath)) {
+    log(
+      "WARN",
+      `voice input is enabled but whisper-server/model isn't installed yet (looked for ${cfg.whisperServerExe} and ${cfg.modelPath}) - run scripts/setup-windows.ps1's voice step, or set VOICE_ENABLED=false to silence this.`,
+    );
+    return { stop() {} };
+  }
 
   const launch = () => {
     if (stopped) return;

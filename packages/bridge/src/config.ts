@@ -73,7 +73,10 @@ export function loadConfig(envPath = path.join(SECRETS_DIR, ".env")): BridgeConf
       repoPath: parsed.PHASE1_REPO_PATH || path.resolve(import.meta.dirname, "../../.."),
     },
     voice: {
-      enabled: parsed.VOICE_ENABLED === "true",
+      // Defaults to enabled (unlike a real risk like the git-push SSH key, this is just a local
+      // child process - startWhisperServer itself no-ops with a one-time WARN, not a crash loop,
+      // if the setup step hasn't installed the binary/model yet). Set VOICE_ENABLED=false to opt out.
+      enabled: parsed.VOICE_ENABLED !== "false",
       ffmpegPath: parsed.FFMPEG_PATH || "ffmpeg",
       whisperServerExe: parsed.WHISPER_SERVER_EXE || path.join(STATE_DIR, "voice", "whisper-server.exe"),
       modelPath: parsed.WHISPER_MODEL_PATH || path.join(STATE_DIR, "voice", "ggml-medium.bin"),
