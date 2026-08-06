@@ -44,6 +44,18 @@ import {
 } from "./attachment-inbox.ts";
 import type { AttachmentKind } from "./attachment-inbox.ts";
 import { buildVoiceModelKeyboard, listAvailableVoiceModels, resolveVoiceModelCallback } from "./voice-model.ts";
+import {
+  BrowseRegistry,
+  buildDirKeyboard,
+  buildFileActionKeyboard,
+  buildHitsKeyboard,
+  parseBrowseCommand,
+  parseFindCommand,
+  renderDirText,
+  renderHitsText,
+  resolveBrowseCallback,
+} from "./browse-nav.ts";
+import { listDirectory, MAX_SEND_BYTES, prepareFileForSend, readForPreview, resolveGithubLink, searchWorktree } from "./worktree-fs.ts";
 import { FeedCoalescer } from "./feed-coalescer.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
@@ -349,6 +361,10 @@ async function main(): Promise<void> {
   // nl-router.ts's destructive-command confirm gate (nl-confirm.ts) - own registry, same
   // add/resolve-pops-and-checks-TTL shape as fleetConfirmRegistry/voiceConfirmRegistry above.
   const nlConfirmRegistry = new NlConfirmRegistry();
+  // `/browse`/`/find`'s own id-per-row registry (browse-nav.ts) - unlike the confirm registries
+  // above, entries here are non-consuming (a folder's Prev/Next can be tapped repeatedly) and never
+  // store a messageId - a tap edits whichever message it came from, read straight off the callback.
+  const browseRegistry = new BrowseRegistry();
   const voiceServer = config.voice.enabled ? startWhisperServer(config.voice, log) : null;
 
   function maybeSetState(slug: string, target: SessionState): void {
@@ -578,6 +594,7 @@ async function main(): Promise<void> {
       pipeHandle.finalizePermissionMessage,
       (err) => log("WARN", `failed to mark permission request as expired: ${err.message}`),
     );
+    browseRegistry.sweep();
 
     // §6.4: past the 3540s ceiling, cancel rather than let the hook's own 3600s timeout expire
     // silently - the operator sees an explicit "cancelled" card and Claude sees a `deny` it can
@@ -1869,6 +1886,41 @@ async function main(): Promise<void> {
     controlBot.sendMessage(config.supergroupChatId, threadId, text).catch((err) => log("WARN", `sendMessage (/skills) failed: ${(err as Error).message}`));
   }
 
+  /** `/browse [<path>]` - session-scoped only, same as `sendCommandsListCard`. An invalid/escaping
+   * `path` argument (worktree-fs.ts's `resolveWorktreeRelPath` rejects it) is reported, not silently
+   * clamped to the root. */
+  function sendBrowseCard(threadId: number | undefined, route: ReturnType<typeof routing.getByTopicId>, requestedPath: string): void {
+    if (!route) {
+      confirmSessionCommand(threadId, "File browsing is session-scoped - send /browse inside a session's own topic.");
+      return;
+    }
+    const listing = listDirectory(route.worktreePath, requestedPath);
+    if (!listing) {
+      confirmSessionCommand(threadId, `Can't browse "${requestedPath || "/"}" - it doesn't exist, or is outside this session's worktree.`);
+      return;
+    }
+    controlBot
+      .sendMessage(config.supergroupChatId, threadId, renderDirText(listing), { inline_keyboard: buildDirKeyboard(browseRegistry, route.slug, listing) })
+      .catch((err) => log("WARN", `sendMessage (/browse) failed: ${(err as Error).message}`));
+  }
+
+  /** `/find <query>` - session-scoped only. The hit set is a snapshot taken now, stored once in
+   * `browseRegistry` (kind "hitset") and paged from that snapshot rather than re-searched per page -
+   * see browse-nav.ts's own doc comment on `buildHitsKeyboard` for why. */
+  function sendFindCard(threadId: number | undefined, route: ReturnType<typeof routing.getByTopicId>, query: string): void {
+    if (!route) {
+      confirmSessionCommand(threadId, "File search is session-scoped - send /find inside a session's own topic.");
+      return;
+    }
+    const result = searchWorktree(route.worktreePath, query);
+    const hitsetId = browseRegistry.add(route.slug, { kind: "hitset", query, ...result });
+    controlBot
+      .sendMessage(config.supergroupChatId, threadId, renderHitsText(query, result, 0), {
+        inline_keyboard: buildHitsKeyboard(browseRegistry, route.slug, hitsetId, result.hits, 0),
+      })
+      .catch((err) => log("WARN", `sendMessage (/find) failed: ${(err as Error).message}`));
+  }
+
   /** Short human-readable label for an NL-matched command's confirm card and its finalize message
    * - not exhaustive-per-field (e.g. `/new`'s prompt text isn't echoed back), just enough for the
    * operator to recognise what they're about to approve. */
@@ -2173,6 +2225,21 @@ async function main(): Promise<void> {
       return;
     }
 
+    // `/browse [<path>]`/`/find <query>` - the Telegram file browser/search (browse-nav.ts,
+    // worktree-fs.ts). Session-scoped only, same reasoning as /commands/skills above: there's no
+    // worktree to browse without a route. Bridge-native, not a Claude tool call - see worktree-fs.ts's
+    // own doc comment for why it carries its own independent path-containment logic.
+    const browseCmd = parseBrowseCommand(text);
+    if (browseCmd) {
+      sendBrowseCard(threadId, route, browseCmd.path);
+      return;
+    }
+    const findCmd = parseFindCommand(text);
+    if (findCmd) {
+      sendFindCard(threadId, route, findCmd.query);
+      return;
+    }
+
     // A bare /model, /mode or /effort (no argument to act on) surfaces a button per option
     // instead of falling through to the ordinary inbound-message path, where it would just
     // arrive as plain chat text and get answered conversationally rather than switching
@@ -2389,6 +2456,88 @@ async function main(): Promise<void> {
             return;
           }
           void executeFleetConfirm(pending);
+          return;
+        }
+
+        // `/browse`/`/find`'s own navigation - "br:"/"bf:"/"bv:"/"bs:", four fresh namespaces
+        // (browse-nav.ts). Edits whichever message the tap came from (telegram.ts's own doc
+        // comment on why `message_id` is read straight off the callback here, unlike every other
+        // flow above), so a missing `message_id` (an old/mocked client) is a silent no-op.
+        const browseAction = callbackQuery.data ? resolveBrowseCallback(callbackQuery.data) : null;
+        if (browseAction) {
+          const browseMessageId = callbackQuery.message?.message_id;
+          if (browseMessageId === undefined) return;
+          browseRegistry.sweep();
+          const stored = browseRegistry.get(browseAction.id);
+          if (!stored) {
+            controlBot
+              .editMessageText?.(config.supergroupChatId, browseMessageId, "This browse session has expired - run /browse or /find again.", { inline_keyboard: [] })
+              .catch((err) => log("WARN", `failed to finalize expired browse message: ${(err as Error).message}`));
+            return;
+          }
+          const worktreePath = routing.get(stored.slug)?.worktreePath;
+          if (!worktreePath) return; // the session behind this id is gone
+
+          if (browseAction.kind === "dir" && stored.entry.kind === "dir") {
+            const listing = listDirectory(worktreePath, stored.entry.relPath, browseAction.page);
+            const text = listing ? renderDirText(listing) : "That folder no longer exists.";
+            const keyboard = listing ? buildDirKeyboard(browseRegistry, stored.slug, listing) : [];
+            controlBot
+              .editMessageText?.(config.supergroupChatId, browseMessageId, text, { inline_keyboard: keyboard })
+              .catch((err) => log("WARN", `editMessageText (browse dir) failed: ${(err as Error).message}`));
+            return;
+          }
+
+          if (browseAction.kind === "file_menu" && stored.entry.kind === "file") {
+            const githubUrl = resolveGithubLink(worktreePath, stored.entry.relPath);
+            controlBot
+              .editMessageText?.(config.supergroupChatId, browseMessageId, `📄 /${stored.entry.relPath}`, {
+                inline_keyboard: buildFileActionKeyboard(browseAction.id, githubUrl),
+              })
+              .catch((err) => log("WARN", `editMessageText (browse file menu) failed: ${(err as Error).message}`));
+            return;
+          }
+
+          if (browseAction.kind === "file_action" && stored.entry.kind === "file") {
+            if (browseAction.action === "view") {
+              const preview = readForPreview(worktreePath, stored.entry.relPath, stored.entry.matchLine);
+              // No parse_mode here - preview.text is arbitrary, unescaped file content, and both
+              // Telegram's Markdown and HTML modes would try to interpret stray backticks/`<`/`&`
+              // in it as real formatting (feed-escape.ts exists precisely because that's unsafe
+              // without escaping first). Plain text only.
+              const text = !preview
+                ? "That file no longer exists."
+                : preview.tooLarge
+                  ? "That file is too large to preview here - try Send file instead."
+                  : preview.binary
+                    ? "That looks like a binary file - use Send file instead."
+                    : `${preview.text}${preview.truncated ? "\n(truncated)" : ""}`;
+              const githubUrl = resolveGithubLink(worktreePath, stored.entry.relPath);
+              controlBot
+                .editMessageText?.(config.supergroupChatId, browseMessageId, text, { inline_keyboard: buildFileActionKeyboard(browseAction.id, githubUrl) })
+                .catch((err) => log("WARN", `editMessageText (browse view) failed: ${(err as Error).message}`));
+            } else {
+              const prep = prepareFileForSend(worktreePath, stored.entry.relPath);
+              if (!prep) {
+                confirmSessionCommand(threadId, "That file no longer exists.");
+              } else if (prep.tooLarge) {
+                confirmSessionCommand(threadId, `"${prep.filename}" is too large to send here (over ${Math.round(MAX_SEND_BYTES / (1024 * 1024))}MB).`);
+              } else if (controlBot.sendDocumentFile) {
+                controlBot
+                  .sendDocumentFile(config.supergroupChatId, threadId, prep.filename, prep.bytes)
+                  .catch((err) => log("WARN", `sendDocumentFile (browse send) failed: ${(err as Error).message}`));
+              }
+            }
+            return;
+          }
+
+          if (browseAction.kind === "hits" && stored.entry.kind === "hitset") {
+            controlBot
+              .editMessageText?.(config.supergroupChatId, browseMessageId, renderHitsText(stored.entry.query, stored.entry, browseAction.page), {
+                inline_keyboard: buildHitsKeyboard(browseRegistry, stored.slug, browseAction.id, stored.entry.hits, browseAction.page),
+              })
+              .catch((err) => log("WARN", `editMessageText (browse hits) failed: ${(err as Error).message}`));
+          }
           return;
         }
 

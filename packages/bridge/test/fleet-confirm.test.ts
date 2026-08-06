@@ -75,7 +75,7 @@ describe("resolveFleetConfirmCallback", () => {
 describe("buildFleetConfirmKeyboard", () => {
   test("builds a yes/cancel row matching resolveFleetConfirmCallback's own encoding", () => {
     const keyboard = buildFleetConfirmKeyboard("rm", "abcde123");
-    const flat = keyboard.flat().map((btn) => btn.callback_data);
+    const flat = keyboard.flat().map((btn) => btn.callback_data!);
     for (const data of flat) {
       expect(resolveFleetConfirmCallback(data)).not.toBeNull();
     }

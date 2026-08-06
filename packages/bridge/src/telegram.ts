@@ -35,7 +35,13 @@ export interface TelegramMessage {
 export interface TelegramCallbackQuery {
   id: string;
   data?: string;
-  message?: { chat: { id: number }; message_thread_id?: number };
+  // `message_id` added for browse-nav.ts's folder/find navigation: every other callback flow edits a
+  // message via an id it stored itself in its own registry (fleet-confirm.ts, permission-registry.ts,
+  // ...), but a `/browse` tap edits *whichever* message the tap came from - there's no registry entry
+  // per rendered message to look it up in, since one id is minted per row, not per message. Reading
+  // it straight off the callback avoids threading a messageId through every registry entry just for
+  // this one feature.
+  message?: { chat: { id: number }; message_thread_id?: number; message_id?: number };
 }
 
 export interface TelegramUpdate {
@@ -46,7 +52,12 @@ export interface TelegramUpdate {
 
 export interface InlineKeyboardButton {
   text: string;
-  callback_data: string;
+  // Exactly one of these two per Telegram's own API contract. `url` added for browse-nav.ts's
+  // best-effort GitHub link button - a real "opens in browser" button needs no round-trip through
+  // the Bridge at all, unlike every other button here, which is why it's the one case that doesn't
+  // need a callback_data namespace of its own.
+  callback_data?: string;
+  url?: string;
 }
 
 export interface InlineKeyboardMarkup {

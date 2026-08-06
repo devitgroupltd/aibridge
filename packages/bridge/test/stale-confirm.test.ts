@@ -77,7 +77,7 @@ describe("resolveStaleConfirmCallback", () => {
 describe("buildStaleConfirmKeyboard", () => {
   test("builds a yes/no row matching resolveStaleConfirmCallback's own encoding", () => {
     const keyboard = buildStaleConfirmKeyboard("abcde123");
-    const flat = keyboard.flat().map((btn) => btn.callback_data);
+    const flat = keyboard.flat().map((btn) => btn.callback_data!);
     for (const data of flat) {
       expect(resolveStaleConfirmCallback(data)).not.toBeNull();
     }

@@ -70,7 +70,7 @@ describe("resolveNlConfirmCallback", () => {
 describe("buildNlConfirmKeyboard", () => {
   test("builds a run/stop-asking/cancel stack matching resolveNlConfirmCallback's own encoding", () => {
     const keyboard = buildNlConfirmKeyboard("abcde123");
-    const flat = keyboard.flat().map((btn) => btn.callback_data);
+    const flat = keyboard.flat().map((btn) => btn.callback_data!);
     for (const data of flat) {
       expect(resolveNlConfirmCallback(data)).not.toBeNull();
     }

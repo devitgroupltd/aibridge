@@ -26,7 +26,7 @@ describe("buildAskKeyboard", () => {
     ]);
     for (const row of keyboard) {
       for (const button of row) {
-        expect(resolveAskCallback(button.callback_data)).not.toBeNull();
+        expect(resolveAskCallback(button.callback_data!)).not.toBeNull();
       }
     }
   });

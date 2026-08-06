@@ -78,7 +78,7 @@ describe("resolveVoiceConfirmCallback", () => {
 describe("buildVoiceConfirmKeyboard", () => {
   test("builds send/send-and-stop-asking/re-record/type/cancel buttons matching resolveVoiceConfirmCallback's own encoding", () => {
     const keyboard = buildVoiceConfirmKeyboard("abcde123");
-    const flat = keyboard.flat().map((btn) => btn.callback_data);
+    const flat = keyboard.flat().map((btn) => btn.callback_data!);
     for (const data of flat) {
       expect(resolveVoiceConfirmCallback(data)).not.toBeNull();
     }

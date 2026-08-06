@@ -1,7 +1,7 @@
 ---
-version: 0.64.0
+version: 0.65.0
 status: solid
-last_modified_utc: 2026-08-06T18:00:00Z
+last_modified_utc: 2026-08-06T19:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,24 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.65.0 (2026-08-06): New §3.6, `/browse [<path>]`/`/find <query>` - a Total-Commander-style file
+    browser/search over a session's own worktree from Telegram (`worktree-fs.ts`, `browse-nav.ts`).
+    Session-scoped only, Bridge-native (not a Claude tool call), with its own independent path-
+    containment (`resolveWorktreeRelPath` - `path.resolve` + `startsWith` + a `realpathSync` symlink-
+    escape check) and secret-filename denylist, entirely separate from §6.2's Claude-facing `deny`
+    rules, which never bind this feature. Per the operator's explicit choices: GitHub links are
+    secondary/best-effort only (only shown when the file has no uncommitted changes and the commit is
+    pushed - GitHub can't reflect a worktree's live state otherwise), `👁 View`/`📄 Send file` are the
+    primary path and both read live off disk, and a local file-server-behind-a-tunnel alternative was
+    scoped out entirely (new §11 rows) as unneeded infra given those two. One real gap caught and
+    closed before shipping: `📄 Send file` now scrubs text-shaped files through `secret-scrub.ts` in
+    memory first (the filename denylist alone would have let a secret embedded in a plausibly-named
+    text file - `config.json`, `backup.sql` - through unscrubbed on that path, since raw bytes bypass
+    `👁 View`'s own scrubbing entirely). `telegram.ts` gained an optional `url` field on
+    `InlineKeyboardButton` (the GitHub link is a real browser-opening button, not a callback round-
+    trip) and a `message_id` field on `TelegramCallbackQuery` (`/browse` edits whichever message a tap
+    came from, rather than threading a `messageId` through every minted registry entry the way every
+    other confirm flow does). 686 tests pass (up from 673)."
   - "0.64.0 (2026-08-06): Two cheap mitigations for §8.3's 'no OS-enforced containment before
     Phase 6b' gap, shipped instead of the heavier Windows-native restricted-token sandbox that idea
     was weighed against (parked in §11 with the trigger for building it later). First,
@@ -2254,6 +2272,66 @@ empty/unrecognised transcript always shows the card regardless of the setting, s
 useful to auto-send. This is a separate toggle from `/assist`/`nl_confirm_enabled` - one gates whether
 a *destructive fleet command matched from NL text* asks first, the other gates whether a *transcribed
 voice note* is sent at all - deliberately not folded together despite the similar shape.
+
+### 3.6 File browser + search (added 0.65.0)
+
+`/browse [<path>]` and `/find <query>` - a Total-Commander-style way to look inside a session's own
+worktree from Telegram without spending a Claude turn on pure navigation. Session-scoped only, hard-
+scoped to that session's own worktree root - no control-topic or cross-repo variant. Bridge-native, not
+a Claude tool call: `worktree-fs.ts` carries its own independent path-containment and secret-filename
+denylist rather than relying on `settings.ts`'s Claude-facing `deny` rules (§6.2), which never bind this
+feature at all.
+
+**Containment (`worktree-fs.ts`).** `resolveWorktreeRelPath` mirrors §5.8's `resolveOutboxPath`
+(`path.resolve` + `startsWith(dir + sep)`), extended with a `realpathSync` check so a symlink/junction
+inside the worktree that points outside it is also rejected, not just a `../` in the request - a
+crafted traversal path is refused outright, never clamped to the root. `.git` and common generated/
+vendor directories (`node_modules`, `dist`, `build`, `target`, `bin`, `obj`, `.venv`) are never listed,
+walked, or searched. Filenames shaped like `.env`/`.env.*`/`*.pem`/`*.key`/`id_rsa*`/`*.pfx` are hidden
+from every listing and search result and rejected outright from view/send, independently of §6.2's own
+`Read(.env)`/`Read(~/**)` rules - this feature never goes through Claude's permission engine, so it
+needs its own copy of that judgment call.
+
+**View vs. send vs. GitHub.** Per the operator's explicit choice: GitHub links are secondary/best-
+effort, not the primary way to see a file - GitHub only ever reflects what's been pushed, and a
+worktree routinely has uncommitted or unpushed changes GitHub never sees. `👁 View` (a scrubbed inline
+excerpt, windowed around the matched line for a content-search hit rather than truncated from the top -
+truncating from the top would frequently cut the actual match out of what's shown) and `📄 Send file`
+(the exact current bytes) both read live off disk and are always accurate; `🔗 GitHub` is only offered
+when `resolveGithubLink` confirms the file has no uncommitted changes and the current commit is already
+on the remote, and is a real Telegram link button (`url`, not `callback_data` - telegram.ts's
+`InlineKeyboardButton` gained an optional `url` field for this, the one button in this codebase that
+opens a browser directly with no round-trip through the Bridge). A deliberately deferred alternative -
+a local file server behind a tunnel (Tailscale Funnel/ngrok) so an unpushed file could open in a browser
+too - was scoped out (§11): new internet-facing surface and setup cost that view/send already make
+unnecessary for "give me the current file."
+
+**Send-side secret scrubbing (the one gap caught before shipping).** The filename denylist above only
+filters by *name* - a secret embedded in a plausibly-named text file (`config.json`, `backup.sql`, ...)
+would otherwise reach Telegram completely unscrubbed on the send path, since raw bytes bypass the
+`👁 View` action's scrubbing entirely. `prepareFileForSend` closes this: text-shaped files are passed
+through `secret-scrub.ts` in memory before being handed to `sendDocumentFile`; genuine binaries (images,
+archives, compiled output) send as-is, since text-pattern scrubbing doesn't apply to them - the filename
+denylist remains the only defence for that narrower case, the same residual-gap shape §8.2/§8.3 already
+document elsewhere in this plan.
+
+**Navigation (`browse-nav.ts`).** Same registry pattern as §6.3's `PermissionRegistry`/§4.2's
+`FleetConfirmRegistry` - a `Map<id, entry>` with a 30-minute TTL, ids minted via `randomUUID().slice(0,
+8)` - with two deliberate differences: `get()` is non-consuming (a folder's Prev/Next can be tapped
+repeatedly before its TTL runs out, unlike a one-shot confirm), and no entry stores a `messageId` - a
+tap edits whichever message it came from, read straight off `callback_query.message.message_id`
+(`telegram.ts` gained that field for this) rather than looked up from a registry entry per rendered
+message. Four callback namespaces, one id minted per row: `br:<id>:<page>` (folder listing, `..` and
+Prev/Next), `bf:<id>` (a file row's action menu), `bv:<id>:<view|send>` (the action itself), `bs:<id>:
+<page>` (paging a `/find` result set - a snapshot taken at search time, not re-run per page, so a
+result list can't shift under the operator mid-browse).
+
+**Search (`searchWorktree`).** Filename substring match (a plain recursive walk) plus content match via
+a spawned `rg`, both filtered by the same exclusion rule as listing. If `rg` isn't spawnable (`ENOENT` -
+it's allow-listed for *Claude's own* bash tool in `settings.ts`, no guarantee this Bridge-native code
+has it on `PATH`), this degrades to filename-only results and says so (`contentSearchSkipped: true`)
+rather than throwing - the same "fail open" posture as `nl-router.ts`/`secret-scrub.ts`. Capped (20
+hits) with an explicit `truncated` flag shown to the operator, never a silent drop.
 
 ---
 
@@ -4538,6 +4616,8 @@ fragile coupling this plan avoids elsewhere. Accepted, and revisit if Anthropic 
 | The OS sandbox, before Phase 6 | Not a choice: unsupported on native Windows (§6.7) | §7.6 is the migration, written as a checklist |
 | Reconfirming stale replayed messages | Today a Bridge restart replays every Telegram update queued while it was down (offset-persisted, §4.5.1) with no "still relevant?" check - a stale destructive control-topic command could re-fire on boot. Speculative: no incident has actually happened yet, and the real risk is narrow (destructive control-topic commands only; stale session-topic chat replay is harmless) | Compare a replayed update's Telegram `date` to the Bridge's own start time; if it queued while down, route control-topic exact commands through the existing confirm-card infra (`nl-confirm.ts`'s pattern) instead of auto-executing. Leave session-topic free text untouched |
 | A Windows-native OS-enforced sandbox (restricted process token + per-worktree ACLs) | §8.3's "no OS-enforced containment before Phase 6b" gap (a subprocess Claude writes reads any file the operator can, `deny` rules bind only Claude's own tools) already has a planned fix - the §7.6 WSL2 migration's kernel sandbox. Building a parallel Windows-native mechanism now (spawn each session's PTY under a restricted token via `CreateProcessAsUser`, with NTFS ACLs scoping read/write to that session's own worktree) would duplicate that work and likely get thrown away at the Phase 6 cutover. The two cheap, non-duplicative mitigations - broadened `~/**` deny rules (§6.2) and output-side secret scrubbing on every `reply`/`send_file` (§8.2) - ship instead; see 2026-08-06's changelog entry | Build this only if the Phase 6/WSL2 migration stalls or is rejected outright and OS-enforced containment is still wanted - it is the Windows-native fallback for that gap, not a step on the way to WSL2 |
+| A local file-server + tunnel (Tailscale Funnel/ngrok) so §3.6's `/browse`/`/find` could open an unpushed file in a real browser | New internet-facing surface and setup cost, for a case §3.6's `👁 View` (scrubbed inline excerpt) and `📄 Send file` (exact current bytes) already cover - "give me the current file" doesn't need a browser, and `🔗 GitHub` already covers the pushed-and-clean case with a real link button | Revisit if GitHub-link coverage turns out to be hit often enough in practice that document delivery starts feeling like a workaround, not if it's merely requested once |
+| Control-topic or cross-repo variant of `/browse`/`/find` | Out of scope per the operator's explicit choice when §3.6 was designed - every other Bridge-native file access in this plan stays session-worktree-scoped, and a control-topic variant would need its own `resolveWorktreeRelPath`-style root check against `repos.toml`'s checkout path instead | If ever wanted, build it as a genuinely separate containment root, not a relaxation of the session-scoped one |
 
 **The zero-build alternative, stated plainly.** [Remote Control](https://code.claude.com/docs/en/remote-control)
 already delivers most of this today with no code: `claude remote-control --spawn worktree --capacity 32`

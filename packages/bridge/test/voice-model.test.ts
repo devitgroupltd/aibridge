@@ -43,7 +43,7 @@ describe("buildVoiceModelKeyboard / resolveVoiceModelCallback", () => {
     const keyboard = buildVoiceModelKeyboard(["small", "medium"], "small");
     const flat = keyboard.flat();
     expect(flat).toHaveLength(2);
-    expect(flat.map((btn) => resolveVoiceModelCallback(btn.callback_data))).toEqual(["small", "medium"]);
+    expect(flat.map((btn) => resolveVoiceModelCallback(btn.callback_data!))).toEqual(["small", "medium"]);
   });
 
   test("the current model's button is checkmarked, others are plain", () => {

@@ -566,6 +566,8 @@ export function renderHelp(): string {
     `  /effort <${EFFORTS.join("|")}>`,
     "  /commands [<term>] - list this project's .claude/commands",
     "  /skills [<term>] - list this project's .claude/skills",
+    "  /browse [<path>] - browse this session's worktree, tap folders/files to navigate",
+    "  /find <query> - search filenames + file content in this session's worktree",
     "",
     "Built-in passthrough is below - tap a button, or type /compact or /clear directly:",
   ].join("\n");
@@ -606,6 +608,8 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "effort", description: `Set effort: /effort <${EFFORTS.join("|")}>` },
     { command: "commands", description: "List this project's .claude/commands: /commands [<term>]" },
     { command: "skills", description: "List this project's .claude/skills: /skills [<term>]" },
+    { command: "browse", description: "Browse this session's worktree: /browse [<path>]" },
+    { command: "find", description: "Search filenames + content in this session's worktree: /find <query>" },
     { command: "compact", description: "Compact the session's conversation" },
     { command: "clear", description: "Clear the session's conversation" },
   ];

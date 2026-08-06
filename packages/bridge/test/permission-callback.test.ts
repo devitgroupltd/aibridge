@@ -22,7 +22,7 @@ describe("resolvePermCallback", () => {
 describe("buildPermissionKeyboard", () => {
   test("builds an allow/deny row and an always row, matching resolvePermCallback's own encoding", () => {
     const keyboard = buildPermissionKeyboard("abcde");
-    const flat = keyboard.flat().map((btn) => btn.callback_data);
+    const flat = keyboard.flat().map((btn) => btn.callback_data!);
     for (const data of flat) {
       expect(resolvePermCallback(data)).not.toBeNull();
     }
