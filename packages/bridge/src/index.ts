@@ -741,6 +741,11 @@ async function main(): Promise<void> {
 
   if (process.env.AIBRIDGE_SKIP_LAUNCH !== "1") {
     await runStartupReconciliation();
+    // Unconditional, unlike reportOrphanProcesses'/reapRowsWithDeletedTopics' own messages above
+    // (which only post when there's something to report) - /restart's own "...once it's back up"
+    // message otherwise has no matching confirmation, so there was no way to tell a clean restart
+    // (nothing to reconcile, nothing posted) apart from one that's still coming up or crashed.
+    confirmSessionCommand(undefined, "✅ Bridge is back up.");
   }
 
   let seq = 0;

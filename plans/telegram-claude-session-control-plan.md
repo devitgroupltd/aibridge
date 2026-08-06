@@ -1,7 +1,7 @@
 ---
-version: 0.62.0
+version: 0.63.0
 status: solid
-last_modified_utc: 2026-08-06T16:30:00Z
+last_modified_utc: 2026-08-06T17:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,15 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.63.0 (2026-08-06): /restart (§4.5.1) had a confirmation for 'restarting now' but nothing for
+    'back up now' - `runStartupReconciliation`'s own messages only post when there's an orphaned
+    process or a deleted-topic session to report, so a clean restart posted nothing at all, and the
+    operator had no way to tell 'back up' apart from 'still coming up' or 'crashed on relaunch' short
+    of trying a command and seeing if it answered. Fixed with one unconditional '✅ Bridge is back up.'
+    sent right after startup reconciliation completes, every successful start (restart or cold), not
+    gated on anything being found. No test coverage needed/added - this path only runs when
+    AIBRIDGE_SKIP_LAUNCH isn't set, which every existing test already sets to skip it; 665 tests still
+    pass unchanged."
   - "0.62.0 (2026-08-06): Voice-note confirm card (voice-confirm.ts) can now be skipped entirely, per
     operator request after two live observations. First: no equivalent of /assist's 'don't ask again'
     existed for the voice Send/Re-record/Type-instead card itself, so a new `voice_confirm_enabled`
@@ -2600,6 +2609,14 @@ its own `process.argv` (`spawn(process.execPath, process.argv.slice(1), { detach
 `/restart` is not a special code path, it is an operator-initiated instance of exactly the event §4.5
 above already measured (scenario 37) and reconciles for. No extra design is owed to it beyond making it
 reachable from a command instead of only from a crash or a manual `Stop-Process`.
+
+**"Back up" confirmation (0.63.0).** The pre-restart message ("Restarting the Bridge now... once it's
+back up") had no matching post-restart one - `runStartupReconciliation`'s own two messages
+(`reportOrphanProcesses`/`reapRowsWithDeletedTopics`) only post when there's actually something to
+report, so a clean restart with nothing to reconcile posted nothing at all, leaving no way to tell "back
+up" apart from "still coming up" or "crashed on relaunch" from Telegram alone. Fixed with one
+unconditional "✅ Bridge is back up." sent right after `runStartupReconciliation()` completes, every
+successful startup (restart or cold), not gated on anything being found.
 
 **The honest Phase 1 caveat, stated plainly rather than glossed:** §4.5's measurement means `/restart`
 kills every live session along with the Bridge, and Phase 1 has no persisted `session_id` (that is
