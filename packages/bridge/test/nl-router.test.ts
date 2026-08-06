@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { botCommandList } from "../src/fleet-commands.ts";
 import { mapRouterOutput, ROUTER_KINDS } from "../src/nl-router.ts";
 
 const CONTROL: { isControl: true; hasSession: false } = { isControl: true, hasSession: false };
@@ -45,6 +46,34 @@ describe("ROUTER_KINDS completeness", () => {
     for (const kind of ["help", "about", "commands", "skills", "builtin", "browse", "find"]) {
       expect(kinds.includes(kind)).toBe(true);
     }
+  });
+
+  /**
+   * The two lists above are hand-copied - useful as a readable spec, but neither would fail if a
+   * *future* new command were added to `botCommandList()` (fleet-commands.ts, the single real
+   * source of every command this bot recognises - it drives Telegram's own "/" autocomplete) and
+   * simply forgotten in `nl-router.ts`, since a hand-copied list drifts in lockstep with the very
+   * mistake it's meant to catch. This test is sourced from `botCommandList()` directly, so it's the
+   * one that actually would have failed on the day `/browse`/`/find` shipped without a router entry.
+   * `COMMAND_TO_ROUTER_KIND` covers the few real renames: `/model`/`/mode`/`/effort` map to a
+   * `session_*`-prefixed kind (avoids a schema field collision with `/new`'s own `model`), and
+   * `/compact`/`/clear` both map to the single `builtin` kind (their distinction is `builtinName`,
+   * a field, not a separate `kind`).
+   */
+  const COMMAND_TO_ROUTER_KIND: Record<string, string> = {
+    model: "session_model",
+    mode: "session_mode",
+    effort: "session_effort",
+    compact: "builtin",
+    clear: "builtin",
+  };
+
+  test("every command in botCommandList() (Telegram's own autocomplete source) maps to a known router kind", () => {
+    const kinds: readonly string[] = ROUTER_KINDS;
+    const missing = botCommandList()
+      .map((c) => c.command)
+      .filter((command) => !kinds.includes(COMMAND_TO_ROUTER_KIND[command] ?? command));
+    expect(missing).toEqual([]);
   });
 });
 

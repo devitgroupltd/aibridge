@@ -1,7 +1,7 @@
 ---
-version: 0.66.0
+version: 0.67.0
 status: solid
-last_modified_utc: 2026-08-06T20:00:00Z
+last_modified_utc: 2026-08-06T21:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,22 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.67.0 (2026-08-06): Two more fixes from the same live session. (1) `nl-router.test.ts`'s two
+    ROUTER_KINDS-completeness checks were both hand-copied literal lists - neither would have failed
+    the day `/browse`/`/find` shipped without a router entry, since a hand-copied list drifts in
+    lockstep with the very mistake it exists to catch. Added a third check sourced from
+    `botCommandList()` (fleet-commands.ts, the single real list driving Telegram's own \"/\"
+    autocomplete) instead - a future command added there and forgotten in `nl-router.ts` now fails
+    this test directly, no hand-copying required. (2) Mobile keyboards' \"smart punctuation\" was
+    observed live turning a typed `--` into a single en/em/figure dash (–/—/‒) - `/rm —all`
+    silently fell through to the ordinary single-slug form instead of the bulk-all filter, no error,
+    just the wrong command (`/kill`/`/rm`/`/repos add`/`/new`'s `--flag` arguments were all affected).
+    Fixed with `fleet-commands.ts`'s new `normalizeDashFlags`, applied to every fleet command's `rest`
+    right after the `/command` match - safe there specifically because that regex only ever matches
+    text already recognised as one of these fixed commands, unlike a general chat message forwarded to
+    a session, which never runs through this function and could legitimately contain a real em dash in
+    prose. 2 new fleet-commands tests, 1 new nl-router test. 691 bridge-package tests pass (up from
+    688)."
   - "0.66.0 (2026-08-06): Closed a gap in 0.65.0's own delivery, caught live: a voice note (\"give me a
     file package.json\"), sent in the control topic, fell through to fleet-commands' generic
     'Unrecognised control-topic command' fallback instead of either running `/find` or reporting

@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildLsDetail,
   isHelpCommand,
+  normalizeDashFlags,
   parseCommandsQuery,
   parseFleetCommand,
   parseSkillsQuery,
@@ -15,6 +16,16 @@ import {
 } from "../src/fleet-commands.ts";
 import type { RepoEntry } from "../src/repos-registry.ts";
 import type { SessionRow } from "../src/session-store.ts";
+
+describe("normalizeDashFlags", () => {
+  test("rewrites en/em/figure dashes back to --, leaving ordinary ASCII hyphens alone", () => {
+    expect(normalizeDashFlags("–all")).toBe("--all");
+    expect(normalizeDashFlags("—all")).toBe("--all");
+    expect(normalizeDashFlags("‒all")).toBe("--all");
+    expect(normalizeDashFlags("--all")).toBe("--all");
+    expect(normalizeDashFlags("--prefix say-hello")).toBe("--prefix say-hello");
+  });
+});
 
 describe("isHelpCommand", () => {
   test("recognises /help, /?, /h", () => {
@@ -155,6 +166,22 @@ describe("parseFleetCommand", () => {
 
   test("/rm --all requests the bulk all-row filter", () => {
     expect(parseFleetCommand("/rm --all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
+  });
+
+  test("a mobile keyboard's autocorrected dash (en/em/figure) in place of -- is normalized before parsing", () => {
+    expect(parseFleetCommand("/kill –all")).toEqual({ kind: "kill", all: true });
+    expect(parseFleetCommand("/rm —all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
+    expect(parseFleetCommand("/rm ‒dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
+    expect(parseFleetCommand("/rm —prefix say-hello")).toEqual({ kind: "rm", bulk: { mode: "prefix", prefix: "say-hello" } });
+    expect(parseFleetCommand("/repos add seowrite –base main —model opus")).toEqual({
+      kind: "repos",
+      action: "add",
+      name: "seowrite",
+      path: undefined,
+      base: "main",
+      model: "opus",
+    });
+    expect(parseFleetCommand("/new –opus seowrite fix it")).toEqual({ kind: "new", repo: "seowrite", prompt: "fix it", model: "opus" });
   });
 
   test("/restart takes no argument", () => {

@@ -46,6 +46,20 @@ export type FleetCommand =
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
 
+/**
+ * Mobile keyboards' "smart punctuation"/autocorrect commonly rewrites a typed `--` into a single
+ * en dash (–, U+2013), em dash (—, U+2014), or figure dash (‒, U+2012) mid-message - live-observed
+ * 2026-08-06 (a phone keyboard did this, not Telegram's own client, which passes typed text through
+ * unchanged). Every `--flag` this codebase parses (`/kill --all`, `/rm --all|--dead|--prefix`,
+ * `/repos add ... --base|--model`, `/new --opus|...`) only ever means the ASCII double-hyphen, so
+ * normalising back before parsing is always safe *here* - unlike a general chat message forwarded
+ * to a session, which never runs through this function at all and could legitimately contain a real
+ * em dash in prose.
+ */
+export function normalizeDashFlags(text: string): string {
+  return text.replace(/[‒–—]/g, "--");
+}
+
 /** `/new [--opus|--haiku|--fable|--sonnet] <repo> <prompt...>` - the flag, if present, must come
  * immediately after `/new`, matching the plan's own `[--opus|--haiku] <repo> <prompt>` ordering. */
 function parseNew(rest: string): FleetCommand | null {
@@ -281,7 +295,8 @@ export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
   const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router)\b(.*)$/s);
   if (!match) return null;
-  const [, cmd, rest] = match as [string, string, string];
+  const [, cmd, rawRest] = match as [string, string, string];
+  const rest = normalizeDashFlags(rawRest);
   switch (cmd) {
     case "new":
       return parseNew(rest);
