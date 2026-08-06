@@ -77,12 +77,45 @@ export class FeedCoalescer {
     this.opts.onFlush(slug, text);
   }
 
-  /** For session teardown - drops any armed timer without flushing. */
+  /** For session teardown - drops any armed timer without flushing, and forgets every per-slug
+   * entry. Forgetting matters as much as the timer: a slug is derived from a prompt's first words
+   * (`slug.ts`), so a later session can legitimately be handed the same one and would otherwise
+   * inherit the removed session's dedupe state and have its first identical render skipped. */
   cancel(slug: string): void {
     const handle = this.pendingTimers.get(slug);
     if (handle !== undefined) {
       this.clearTimeoutFn(handle);
       this.pendingTimers.delete(slug);
     }
+    this.forget(slug);
+  }
+
+  /** Turn boundary (§5.3: one card per turn). The next turn posts a *new* message, so the
+   * "unchanged since the last frame sent" skip must not carry across it - the first render of turn
+   * N+1 is frequently byte-identical to the last render of turn N (same header, same first step),
+   * and skipping it would leave the new card empty until something else changed.
+   *
+   * Flushes any armed timer *first*, into the outgoing turn's own card. Without that, a render
+   * pending when the turn ended would instead fire after the boundary and carry the *new* turn's
+   * text, leaving the old card permanently missing everything after its last flush. */
+  reset(slug: string): void {
+    const armed = this.pendingTimers.get(slug);
+    if (armed !== undefined) {
+      this.clearTimeoutFn(armed);
+      this.pendingTimers.delete(slug);
+      this.flush(slug);
+    }
+    // `lastSentText` and `latestText` only - `lastSentAtMs` deliberately survives, so §5.4's
+    // `max(3s, 3s × sessions)` interval still governs the new turn's first send. Clearing it too would
+    // make every turn boundary an ungated immediate send, defeating the per-session budget this class
+    // exists to enforce.
+    this.lastSentText.delete(slug);
+    this.latestText.delete(slug);
+  }
+
+  private forget(slug: string): void {
+    this.lastSentText.delete(slug);
+    this.lastSentAtMs.delete(slug);
+    this.latestText.delete(slug);
   }
 }

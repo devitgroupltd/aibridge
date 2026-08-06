@@ -33,6 +33,24 @@ const RULES: ScrubRule[] = [
   // "...PASSWORD=..." line - the generic catch-all for the class of thing Read(.env) already
   // denies at the source; this is what still catches it if a subprocess read the file instead.
   { tag: "env-assignment", pattern: /\b[A-Z][A-Z0-9_]*(?:KEY|SECRET|TOKEN|PASSWORD)[A-Z0-9_]*\s*=\s*\S+/g },
+  // A credential embedded in a URI (`postgres://user:pw@host/db`, `https://x:token@host/...`). Keys
+  // on the *shape of the value* rather than on a well-behaved variable name, which is what the
+  // env-assignment rule above cannot do: the single most likely real leak here is a
+  // `DATABASE_URL=`/`REDIS_URL=` line, and neither identifier contains KEY/SECRET/TOKEN/PASSWORD.
+  { tag: "uri-credentials", pattern: /\b[a-z][a-z0-9+.\-]*:\/\/[^\s:@/]+:[^\s@/]+@/gi },
+  // This fleet's own most sensitive credential: a Telegram bot token. Whoever holds it owns the
+  // control bot, i.e. every session in the fleet - and the Bridge's own `.env` is the one file most
+  // likely to be read back "just to check the config".
+  { tag: "telegram-bot-token", pattern: /\b\d{8,10}:AA[\w-]{30,}/g },
+  // Anthropic and OpenAI-style API keys, and Slack's tokens - all fixed-prefix, low false-positive,
+  // and all plausible contents of a repo's own .env that a subprocess could quote back.
+  { tag: "api-key", pattern: /\bsk-(?:ant-)?[A-Za-z0-9_-]{20,}/g },
+  { tag: "slack-token", pattern: /\bxox[abpsr]-[A-Za-z0-9-]{10,}/g },
+  // A PEM block whose closing marker hasn't arrived (or landed in a different reply): the
+  // private-key rule above needs both ends, so a key split across two messages matched neither
+  // half and both went out verbatim. A BEGIN marker alone is already unambiguous enough to redact
+  // the rest of the text from that point.
+  { tag: "private-key-start", pattern: /-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*/g },
 ];
 
 export interface ScrubResult {

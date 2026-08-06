@@ -1,6 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
+  botCommandList,
   buildLsDetail,
+  isKnownCommandText,
   isHelpCommand,
   normalizeDashFlags,
   parseCommandsQuery,
@@ -649,5 +651,42 @@ describe("renderAttach", () => {
     const text = renderAttach(row(), "</pre><b>pwned</b>");
     expect(text).not.toContain("<b>pwned</b>");
     expect(text).toContain("&lt;/pre&gt;&lt;b&gt;pwned&lt;/b&gt;");
+  });
+});
+
+/**
+ * The inbound gate for a topic with no route and no session row uses this instead of a bare "starts
+ * with /" check: anything unrecognised there falls through to the NL router and spends an LLM call
+ * (on the `cli` backend, ~20-30k tokens) answering something no session can act on. Keyed off
+ * `botCommandList()` so it can't drift from the real command set.
+ */
+describe("isKnownCommandText", () => {
+  test("recognises every command the bot actually advertises", () => {
+    for (const { command } of botCommandList()) {
+      expect(isKnownCommandText(`/${command}`)).toBe(true);
+      expect(isKnownCommandText(`/${command} with args`)).toBe(true);
+    }
+  });
+
+  test("tolerates Telegram's @botname suffix and a phone keyboard's capitalisation", () => {
+    expect(isKnownCommandText("/ls@aibridge_control_bot")).toBe(true);
+    expect(isKnownCommandText("/Ls")).toBe(true);
+    expect(isKnownCommandText("  /ls  ")).toBe(true);
+  });
+
+  test("rejects free text, a bare slash, and an unrecognised slash-word", () => {
+    expect(isKnownCommandText("just talking in this topic")).toBe(false);
+    expect(isKnownCommandText("/")).toBe(false);
+    expect(isKnownCommandText("/not-a-real-command")).toBe(false);
+    expect(isKnownCommandText("hello /ls")).toBe(false); // not the first token
+    expect(isKnownCommandText(undefined)).toBe(false);
+    expect(isKnownCommandText("")).toBe(false);
+  });
+
+  test("a path-looking string is not mistaken for a command", () => {
+    // Git Bash's own MSYS path conversion turns "/ls" into "C:/Program Files/Git/ls" - and a session
+    // topic legitimately carries absolute paths in prose.
+    expect(isKnownCommandText("/usr/local/bin/thing")).toBe(false);
+    expect(isKnownCommandText("C:/Program Files/Git/ls")).toBe(false);
   });
 });

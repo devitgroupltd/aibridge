@@ -10,6 +10,24 @@ import type { ProcessInfo } from "./orphan-scan.ts";
  * empty result just means orphan-detection finds nothing that pass, which is the safe direction to
  * fail in (this never drives an automatic kill - see `orphan-scan.ts`).
  */
+/**
+ * Split out for direct unit testing (§9's "silent-wrong" bar): `ConvertTo-Json` emits a bare object
+ * rather than an array when exactly one process matches, and a wrong pid here is shown to an operator
+ * who may act on it by killing something. A shape this doesn't recognise yields no entry rather than
+ * an entry with a garbage pid.
+ */
+export function parseProcessList(stdout: string): ProcessInfo[] {
+  try {
+    const parsed: unknown = JSON.parse(stdout);
+    const list = Array.isArray(parsed) ? parsed : [parsed];
+    return list
+      .filter((p): p is { ProcessId: number; CommandLine?: string } => typeof p === "object" && p !== null && typeof (p as { ProcessId?: unknown }).ProcessId === "number")
+      .map((p) => ({ pid: p.ProcessId, commandLine: typeof p.CommandLine === "string" ? p.CommandLine : "" }));
+  } catch {
+    return [];
+  }
+}
+
 export function listClaudeProcesses(): Promise<ProcessInfo[]> {
   return new Promise((resolve) => {
     execFile(
@@ -20,23 +38,18 @@ export function listClaudeProcesses(): Promise<ProcessInfo[]> {
         "-Command",
         "Get-CimInstance Win32_Process -Filter \"Name='claude.exe'\" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress",
       ],
-      { windowsHide: true },
+      // A timeout, because "always resolves to []" was only true for *errors*, not for a hang - and
+      // this promise is awaited by `runStartupReconciliation` before `startPolling` is ever reached.
+      // A wedged WMI service (a real, known Windows condition) meant `Get-CimInstance` never
+      // returned, so no session was resumed, Telegram was never polled, and nothing in the log said
+      // why. Orphan reporting is advisory; the Bridge coming up is not.
+      { windowsHide: true, timeout: 10_000, killSignal: "SIGKILL" },
       (err, stdout) => {
         if (err || !stdout || stdout.trim().length === 0) {
           resolve([]);
           return;
         }
-        try {
-          const parsed: unknown = JSON.parse(stdout);
-          const list = Array.isArray(parsed) ? parsed : [parsed];
-          resolve(
-            list
-              .filter((p): p is { ProcessId: number; CommandLine?: string } => typeof p === "object" && p !== null && "ProcessId" in p)
-              .map((p) => ({ pid: p.ProcessId, commandLine: p.CommandLine ?? "" })),
-          );
-        } catch {
-          resolve([]);
-        }
+        resolve(parseProcessList(stdout));
       },
     );
   });

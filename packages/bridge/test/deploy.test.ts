@@ -8,6 +8,7 @@ import {
   deployBranch,
   deployMarkerPath,
   discoverTypecheckedPackages,
+  foundNoTests,
   DEPLOY_CRASH_LOOP_THRESHOLD_MS,
   isDeployMarkerStale,
   isSelfRepo,
@@ -106,6 +107,48 @@ describe("runGate", () => {
     expect(result.ok).toBe(false);
     expect(result.output).toContain("type error");
     expect(calls).toHaveLength(2);
+  });
+
+  /**
+   * §7.5 allows registering *any* repo, so `/deploy` can land on one with no Bun tests at all. Verified
+   * against the pinned toolchain that `bun test` with zero matching files exits **1**, so the gate
+   * already refuses - the risk was never a false pass, only that bun's "0 test files matching ..."
+   * reads as a tooling error rather than a verdict. This pins both halves: still a failure, and now it
+   * says which kind.
+   */
+  test("a repo with no test files fails the gate, and the message says that's why", async () => {
+    const { run } = scriptedRunner([{ status: 1, stdout: "", stderr: "error: 0 test files matching were found" }]);
+    const result = await runGate("C:\\repo", ["C:\\repo\\packages\\a"], run);
+    expect(result.ok).toBe(false);
+    expect(result.output).toMatch(/no test files/i);
+  });
+
+  test("an ordinary test failure is not dressed up as a missing-tests message", async () => {
+    const { run } = scriptedRunner([{ status: 1, stdout: "3 pass\n1 fail", stderr: "" }]);
+    const result = await runGate("C:\\repo", [], run);
+    expect(result.ok).toBe(false);
+    expect(result.output).toContain("1 fail");
+    expect(result.output).not.toMatch(/no test files/i);
+  });
+
+  test("a repo with real tests and no typechecked packages passes", async () => {
+    const { run } = scriptedRunner([{ status: 0, stdout: "42 pass\n0 fail", stderr: "" }]);
+    const result = await runGate("C:\\repo", [], run);
+    expect(result.ok).toBe(true);
+  });
+});
+
+describe("foundNoTests", () => {
+  test("recognises bun's own zero-test line on either stream", () => {
+    expect(foundNoTests("", 'error: 0 test files matching "x" were found')).toBe(true);
+    expect(foundNoTests("0 test file matching", "")).toBe(true);
+  });
+
+  test("does not fire on a real run", () => {
+    expect(foundNoTests("42 pass\n0 fail", "")).toBe(false);
+    expect(foundNoTests("", "")).toBe(false);
+    // "0 fail" is not "0 test files".
+    expect(foundNoTests("730 pass\n0 fail\nRan 730 tests across 59 files.", "")).toBe(false);
   });
 });
 

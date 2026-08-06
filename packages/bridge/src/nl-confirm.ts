@@ -1,5 +1,5 @@
 import type { FleetCommand } from "./fleet-commands.ts";
-import { monotonicNowMs } from "./monotonic-clock.ts";
+import { ConfirmRegistry, type ConfirmRegistryOptions } from "./confirm-registry.ts";
 import type { RouterAction } from "./nl-router.ts";
 import type { SessionCommand } from "./session-commands.ts";
 import type { InlineKeyboardButton } from "./telegram.ts";
@@ -31,33 +31,14 @@ export interface PendingNlConfirm {
  * destructive command off a half-remembered tap. */
 const DEFAULT_TTL_MS = 3 * 60 * 1000;
 
-export interface NlConfirmRegistryOptions {
-  ttlMs?: number;
-  now?: () => number;
-}
+/** TTL + clock injection, both from `ConfirmRegistry` - this registry adds nothing of its own. */
+export type NlConfirmRegistryOptions = ConfirmRegistryOptions;
 
-export class NlConfirmRegistry {
-  private readonly pending = new Map<string, PendingNlConfirm>();
-  private readonly ttlMs: number;
-  private readonly now: () => number;
-
+/** `add`/`take`/`resolve`/`takeExpired` all come from `ConfirmRegistry` - see that module for why
+ * the four confirm registries share one implementation rather than four identical copies. */
+export class NlConfirmRegistry extends ConfirmRegistry<PendingNlConfirm> {
   constructor(opts: NlConfirmRegistryOptions = {}) {
-    this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
-    this.now = opts.now ?? monotonicNowMs;
-  }
-
-  add(entry: Omit<PendingNlConfirm, "createdAt">): void {
-    this.pending.set(entry.id, { ...entry, createdAt: this.now() });
-  }
-
-  /** An unknown or expired id is a no-op, not a crash - a stale/duplicate tap is expected, same as
-   * every other resolve-a-tap path in this codebase. */
-  resolve(id: string): PendingNlConfirm | undefined {
-    const entry = this.pending.get(id);
-    if (!entry) return undefined;
-    this.pending.delete(id);
-    if (this.now() - entry.createdAt > this.ttlMs) return undefined;
-    return entry;
+    super(DEFAULT_TTL_MS, opts);
   }
 }
 

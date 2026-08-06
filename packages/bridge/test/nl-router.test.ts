@@ -236,6 +236,14 @@ describe("mapRouterOutput - one case per kind", () => {
       command: { kind: "mode", mode: "plan" },
       destructive: false,
     });
+    // ...but `mode auto` is: it fires the Shift+Tab keystrokes that leave the session running every
+    // tool call with no approval card, i.e. decision 3's whole permission model switched off. "stop
+    // asking me for permission on this one" is a very plausible match for it, so it must confirm.
+    expect(mapRouterOutput({ kind: "session_mode", mode: "auto" }, SESSION)).toEqual({
+      matched: true,
+      command: { kind: "mode", mode: "auto" },
+      destructive: true,
+    });
     expect(mapRouterOutput({ kind: "session_effort", effort: "high" }, SESSION)).toEqual({
       matched: true,
       command: { kind: "effort", effort: "high" },
@@ -250,16 +258,26 @@ describe("mapRouterOutput - one case per kind", () => {
   });
 
   test("assist and router: their own status/on/off and status/api/cli enums", () => {
-    expect(mapRouterOutput({ kind: "assist", assistAction: "off" }, CONTROL)).toEqual({ matched: true, command: { kind: "assist", action: "off" }, destructive: false });
+    // `assist off` is destructive by design: it removes the confirm card from every *subsequent*
+    // destructive NL match, so an unconfirmed match that disables confirmation is self-propagating.
+    expect(mapRouterOutput({ kind: "assist", assistAction: "off" }, CONTROL)).toEqual({ matched: true, command: { kind: "assist", action: "off" }, destructive: true });
+    expect(mapRouterOutput({ kind: "assist", assistAction: "on" }, CONTROL)).toEqual({ matched: true, command: { kind: "assist", action: "on" }, destructive: false });
     expect(mapRouterOutput({ kind: "assist", assistAction: "bogus" }, CONTROL)).toEqual({ matched: false });
     expect(mapRouterOutput({ kind: "router", routerAction: "api" }, CONTROL)).toEqual({ matched: true, command: { kind: "router", action: "api" }, destructive: false });
     expect(mapRouterOutput({ kind: "router", routerAction: "bogus" }, CONTROL)).toEqual({ matched: false });
   });
 
-  test("voiceconfirm: its own status/on/off enum, never destructive", () => {
+  test("voiceconfirm: its own status/on/off enum; turning it off is gated like any other guard", () => {
+    // Same reasoning as `assist off` above - switching a review step off is at least as consequential
+    // as the thing it reviews, and "don't keep asking me" is an easy accidental NL match.
     expect(mapRouterOutput({ kind: "voiceconfirm", voiceConfirmAction: "off" }, CONTROL)).toEqual({
       matched: true,
       command: { kind: "voiceconfirm", action: "off" },
+      destructive: true,
+    });
+    expect(mapRouterOutput({ kind: "voiceconfirm", voiceConfirmAction: "on" }, CONTROL)).toEqual({
+      matched: true,
+      command: { kind: "voiceconfirm", action: "on" },
       destructive: false,
     });
     expect(mapRouterOutput({ kind: "voiceconfirm", voiceConfirmAction: "bogus" }, CONTROL)).toEqual({ matched: false });

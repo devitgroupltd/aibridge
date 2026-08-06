@@ -16,7 +16,7 @@
  * import index.ts's helpers directly), `log()` degrades to console-only - never a behavior change for
  * anything that doesn't opt in.
  */
-import { appendFileSync, renameSync, rmSync, statSync } from "node:fs";
+import { appendFileSync, mkdirSync, renameSync, rmSync, statSync } from "node:fs";
 import path from "node:path";
 
 export type LogLevel = "INFO" | "WARN" | "ERROR";
@@ -27,8 +27,18 @@ const MAX_LOG_BYTES = 10 * 1024 * 1024;
 
 let logFilePath: string | null = null;
 
-/** Call once at startup. Idempotent - a second call just repoints the sink (used by tests). */
+/** Call once at startup. Idempotent - a second call just repoints the sink (used by tests). Creates
+ * `stateDir` if it isn't there: on a fresh machine (or before `config.ts` has created anything)
+ * every `appendFileSync` below would otherwise throw ENOENT and be swallowed by the best-effort
+ * catch, defeating this module's entire purpose precisely on the first boot - the run most likely to
+ * be the one that fails. */
 export function initFileLogging(stateDir: string): void {
+  try {
+    mkdirSync(stateDir, { recursive: true });
+  } catch {
+    // Still set the path - if the directory turns up later (config.ts creates it too), logging starts
+    // working on its own rather than staying permanently disabled by one early failure.
+  }
   logFilePath = path.join(stateDir, "bridge.log");
 }
 

@@ -81,6 +81,12 @@ export interface GateResult {
   output: string;
 }
 
+/** Bun's own "there was nothing to run" line, which it prints on stderr while still exiting 0 -
+ * matched on text because there is no distinguishable exit code for it. */
+export function foundNoTests(stdout: string, stderr: string): boolean {
+  return /0 test files? matching/i.test(`${stdout}\n${stderr}`);
+}
+
 /** The same gate `§9` already asks for by hand: `bun test` once at the repo root (covers every
  * workspace in one run), then `tsc --noEmit` per package that declares it. Stops at the first
  * failure - `output` always includes whichever command actually failed, never silently truncated
@@ -88,7 +94,17 @@ export interface GateResult {
 export async function runGate(repoRoot: string, packageDirs: readonly string[], run: CommandRunner = defaultRunner): Promise<GateResult> {
   const testResult = await run("bun", ["test"], repoRoot);
   const parts = [`$ bun test\n${testResult.stdout}${testResult.stderr}`];
-  if (testResult.status !== 0) return { ok: false, output: parts.join("\n\n") };
+  if (testResult.status !== 0) {
+    // A repo with no test files at all already fails here - verified against the pinned toolchain:
+    // `bun test` with zero matching files exits **1**, not 0. §7.5 allows registering any repo, so
+    // that is the right outcome (§5.9's gate can't vouch for something it never ran), but bun's own
+    // "0 test files matching ..." message reads like a tooling error rather than a gate verdict, so
+    // say which it is.
+    const why = foundNoTests(testResult.stdout, testResult.stderr)
+      ? `\n\nThis repo has no test files, so there was nothing for the gate to run - it can't vouch for this branch. Add tests, or merge it by hand.`
+      : "";
+    return { ok: false, output: `${parts.join("\n\n")}${why}` };
+  }
 
   for (const dir of packageDirs) {
     const tc = await run("bun", ["run", "typecheck"], dir);

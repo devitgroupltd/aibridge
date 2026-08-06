@@ -1,7 +1,7 @@
 ---
-version: 0.74.0
+version: 0.75.0
 status: solid
-last_modified_utc: 2026-08-07T05:00:00Z
+last_modified_utc: 2026-08-07T07:30:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,121 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.75.0 (2026-08-07): a full critique-and-fix sweep of packages/bridge/src (~11k lines, 59 files),
+    run as three review rounds - the first over the whole package, the second and third adversarially
+    over the fixes themselves, which is where a third of the real findings came from. ~30 defects fixed;
+    the ones worth knowing about, because each was silent rather than loud:
+    (a) **/diff's compare link 404'd on the first use of every session.** `git branch -r --contains`
+    prints `origin/HEAD -> origin/main` first on any real *clone*, so first-line parsing returned the
+    literal string 'HEAD -> origin/main' as the base ref. The existing test fixture built its remote
+    with `remote add` + push, which never creates that symref, so nothing caught it. Now
+    `git for-each-ref --format=%(refname:strip=3)`; verified directly against a real session worktree
+    (old: 'HEAD -> origin/main', new: 'main').
+    (b) **`ensureWorktree` force-deleted unmerged work.** `git branch -D` on a name collision - and
+    slugs come from a prompt's first five words, so two similar prompts weeks apart collide and the
+    'stale husk' is a finished session's real unpushed commits. Now `-d` (which refuses) plus §2.3's
+    `-<id>` suffix taken to the next free number; `ensureWorktree` returns the branch it actually cut.
+    It also verified only that the *directory* existed, so a `/rm` whose removal lost the Windows lock
+    race could hand the freed slug to a `/new` against a different repo and run it in the old repo's
+    checkout - now `assertWorktreeBelongsTo` checks `--git-common-dir`.
+    (c) **`/clear` marked a live session dead, permanently.** It fires `SessionEnd(reason: 'clear')`
+    then a fresh `SessionStart`; `dead` is terminal, so the follow-up was dropped silently and a
+    working session showed dead in /ls, stopped counting toward the budget, was refused a resume, had
+    its pid reported as an orphan, and would be killed by `/rm --dead`. `stateForHookEvent` now takes
+    the reason.
+    (d) **The permission terminal-race heuristic paired on `(slug, toolName)` only**, so any second
+    call to the same tool consumed a pending card - editing it to '✅ Allowed (answered at terminal)'
+    for an approval never given, and (worse) deleting the entry so the expiry sweep could no longer
+    send the compensating deny, wedging the session forever. Now requires an input match, via
+    `toolInputMatches` - which has to *parse* `input_preview` rather than substring-search it, since
+    the preview is JSON-encoded and every Windows path in it is backslash-escaped. Round two caught
+    that: the first version of this fix would have disabled the whole path on this host.
+    (e) **A message to an unrouted topic was dropped outright**, which made §4.5.2's own recovery
+    instruction ('send /rm in that topic') impossible to follow and silently swallowed /help - and
+    means the live diagnosis recorded in 0.69.0/0.70.0 couldn't distinguish 'dead Bot-API thread' from
+    'never dispatched'. Known commands now dispatch there (matched against `botCommandList()` so free
+    text still can't spend an LLM call), and §4.3's 'this session has ended' now also answers from the
+    row, which is what a killed session's topic has after a restart.
+    (f) **§7.4's staleness gate sat *after* every media branch**, so an attachment queued while the
+    laptop slept was downloaded into the worktree and announced to the live session - captioned, in
+    §7.4's own example, 'yes, push it'. Gate hoisted above all content branches; voice notes stay the
+    one deliberate exemption *except* with `/voiceconfirm off`, where that justification disappears.
+    (g) **A reply over 4096 chars was lost entirely**, leaving a permanent '🤔 Thinking...' in the
+    topic: Telegram 400s, which the governor can't retry its way out of, and the placeholder was
+    already consumed. Now chunked (`splitForTelegram`, surrogate-safe).
+    (h) **`reply`/`send_file` trusted a model-supplied `topic_id`**, so a stale or injected channel tag
+    could deliver one session's output - and §4.4's rename-once - into another's topic. Destination is
+    now derived from the routing table for the sending slug.
+    (i) **`resolveOutboxPath` trusted the slug too**, which `pipe-server.ts` also takes from the
+    message: a slug of `mine/../victim` built another session's outbox and passed containment against
+    it. Plus realpath (a `mklink /J` junction read through it) and case-insensitive comparison (a
+    lowercase drive letter false-rejected a legitimate file, log-only, so nothing arrived and nothing
+    said why).
+    (j) **A crashed session with a stale `session_id` relaunched about once a second, forever**, each
+    cycle pushing two never-dropped P1 sends into an unbounded queue draining at 20/min. Now backoff
+    plus a 3-attempt cap, then `dead` with a notice.
+    (k) **A deferred PTY write could kill the whole daemon.** `node-pty`'s `write()` throws
+    synchronously on a closed ConPTY, and several writers are timer-deferred - the throw escaped the
+    `setTimeout` callback into the module-scope `uncaughtException` handler and its `process.exit(1)`,
+    taking every other session with it. Guarded at the single `setPtyWrite` closure.
+    (l) **`/deploy`'s self-respawn used the raw detached spawn** that autostart.ts documents as
+    guaranteed-to-die under Task Scheduler's Job Object - so on an autostart-installed host a
+    *successful* deploy took the Bridge down permanently, and the rollback path then did it again on
+    the next manual start. All three sites now share `respawnSelfAndExit`.
+    (m) **The feed card was one message per session, not per turn** (§5.3/§5.4), so each turn
+    overwrote the previous turn's record and the 'live' card sat buried above newer messages; a
+    permanent edit failure also killed a session's feed silently for the process's lifetime. Both
+    fixed - and round three caught that the first version of the per-turn fix cleared the cached
+    message id *before* flushing, re-creating the same overwrite it was removing.
+    (n) **Queued control-bot work could park indefinitely.** `drainControl` deferred on an empty or
+    429-paused bucket while owning no timer, and `pump()` was never called in production - so a 429 on
+    the last send before an idle stretch left a requeued *permission card* parked, and nothing for
+    that session would ever schedule again. The governor now arms its own wake (one shared timer, at
+    the end of the pause), and `retry_after` is clamped. The typing indicator was also ~15 ungoverned
+    control-bot calls per minute per active turn, invisible to the accounting deciding whether a
+    permission card could be sent.
+    (o) **NDJSON framing corrupted any multi-byte character split across a chunk** (`toString('utf8')`
+    per chunk → U+FFFD inside otherwise-valid JSON, no throw, no log - and this operator's text is
+    routinely Cyrillic/emoji), **and one malformed line discarded every good message in the same
+    chunk**, up to and including a hook's `hello`+`ask` pair. StringDecoder, per-line parsing, and a
+    line-length cap so a peer that never sends a newline can't OOM the daemon.
+    (p) **Four secret-shaped gaps**: `Read(.env)` is an exact name that never matched `.env.production`
+    while `Bash(cat *)` is pre-approved, and the scrubber's env-assignment rule keys on the
+    *identifier*, so `DATABASE_URL=postgres://user:pw@host/db` passed both layers. Deny list broadened;
+    scrubber gained URI credentials, Telegram bot tokens, `sk-`/`xox`-prefixed keys, and a
+    BEGIN-marker-only rule for a PEM block split across two messages.
+    (q) **`/repos add` deleted the whole registry** if repos.toml had one bad hand-edited line - any
+    parse failure was treated as 'no registry yet' and the file rewritten from empty, reported as
+    success. Now only ENOENT. `serializeReposToml` also emitted invalid TOML for every Windows path
+    (`\\d` is an illegal escape in a basic string) - now literal strings.
+    Also: `/usage` twice in flight left the second request never resolving; `/commands <name> [args]`
+    was documented in three places and unreachable (dispatch order, which a parser unit test cannot
+    catch); four byte-identical confirm registries collapsed onto one `ConfirmRegistry`, which is what
+    made 'an expired card's buttons silently do nothing' (§6.5's own stated failure mode) and 'nothing
+    ever swept them' one fix each rather than four; `nl-router`'s `isDestructive` now covers the
+    commands that *disable* the confirm gates (`mode auto`, `assist off`, `voiceconfirm off` - 'stop
+    asking me for permission' is a very plausible NL match for switching decision 3's model off);
+    `process-scan` had no timeout while being awaited before `startPolling`, so a wedged WMI stopped
+    the Bridge from ever coming up; `logger.ts` never created `$STATE`, defeating its own purpose on
+    the first boot; the hook client could truncate an `AskUserQuestion` answer (Node's stdout is async
+    for pipes on Windows, and it exited without flushing).
+    Two findings were investigated and *rejected* rather than fixed, recorded so they aren't
+    relitigated: `runGate` does not false-pass a repo with no tests (`bun test` with zero test files
+    exits 1, verified on the pinned toolchain - the first-round finding was wrong, and the fix written
+    for it was dead code, since reverted to only clarifying the message); and `postDetailsButton` was
+    never mis-accounted - `feedGovernor` owns both buckets, and P1 is the control one.
+    One live lesson worth carrying: the whole batch passed `bun test` while the Bridge could not boot
+    at all, because a TS constructor parameter property in the new framing code is rejected by
+    `node --experimental-strip-types` - the trap rate-governor.ts and feed-coalescer.ts both already
+    carry a note about. Only the dev-Bridge restart caught it. §9's convention should be read as
+    including 'restart the daemon' before believing a green suite.
+    Test count 725 -> 817 in packages/bridge plus 15 in packages/protocol; every fix that could be
+    pinned by a unit test is (new confirm-registry, process-scan, telegram-split test files; new cases
+    in worktree, worktree-fs, permission-registry, feed-coalescer, rate-governor, secret-scrub,
+    settings, repos-registry, deploy, stale-inbound, logger, session-state-transitions,
+    fleet-commands, framing). `tsc --noEmit` clean apart from the same 2 pre-existing unrelated
+    errors. Live-verified after each round: dev Bridge restarts clean, /ls answers through the real
+    Telegram client, and /diff's base-ref resolution checked directly against a live worktree."
   - "0.74.0 (2026-08-07): closed the two real gaps left after a 'what's left to implement/fix' pass
     (excluding §13's manual-check-only items). (1) §7.2's autostart logging gap, found live while
     writing the README in 0.34.0 and left unfixed since - a Task Scheduler launch captured no

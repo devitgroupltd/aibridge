@@ -30,10 +30,34 @@ describe("log", () => {
     expect(contents).toContain("WARN world");
   });
 
+  // The gap that defeated this module's entire purpose exactly when it mattered: on a fresh machine
+  // (or before config.ts has created anything) `stateDir` doesn't exist, so every appendFileSync threw
+  // ENOENT and was swallowed by the best-effort catch. The first boot is the one most likely to fail,
+  // and it was the one guaranteed to have no log.
+  test("creates a missing stateDir so the very first boot still gets a log file", () => {
+    const parent = mkdtempSync(path.join(os.tmpdir(), "aibridge-logger-fresh-"));
+    stateDir = path.join(parent, "does", "not", "exist", "yet");
+    initFileLogging(stateDir);
+
+    log("INFO", "first boot");
+
+    const contents = readFileSync(path.join(stateDir, "bridge.log"), "utf8");
+    expect(contents).toContain("INFO first boot");
+    stateDir = parent; // afterEach cleans the whole tree
+  });
+
   test("a logging failure (unwritable stateDir) never throws out of log()", () => {
-    // A path that doesn't exist and won't be created - appendFileSync's own ENOENT.
-    initFileLogging(path.join(os.tmpdir(), "aibridge-logger-does-not-exist", "nested"));
+    // `initFileLogging` now creates a missing directory, so a merely-absent path no longer exercises
+    // this - it has to be a path that cannot exist at all. A directory under a *file* is one:
+    // mkdir fails with ENOTDIR/EEXIST and the subsequent append fails too.
+    stateDir = mkdtempSync(path.join(os.tmpdir(), "aibridge-logger-unwritable-"));
+    const blockingFile = path.join(stateDir, "not-a-dir");
+    writeFileSync(blockingFile, "i am a file\n");
+
+    initFileLogging(path.join(blockingFile, "nested"));
+
     expect(() => log("ERROR", "should degrade silently")).not.toThrow();
+    expect(existsSync(path.join(blockingFile, "nested", "bridge.log"))).toBe(false);
   });
 });
 

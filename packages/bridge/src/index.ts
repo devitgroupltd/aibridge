@@ -62,7 +62,7 @@ import { buildDiffReview, cleanupDiffRefs } from "./diff-review.ts";
 import { FeedCoalescer } from "./feed-coalescer.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
-import { formatStaleAge, isStaleInbound } from "./stale-inbound.ts";
+import { formatStaleAge, hasAttachment, isStaleInbound } from "./stale-inbound.ts";
 import { buildStaleConfirmKeyboard, resolveStaleConfirmCallback, StaleConfirmRegistry } from "./stale-confirm.ts";
 import type { PendingStaleConfirm } from "./stale-confirm.ts";
 import { buildVoiceConfirmKeyboard, resolveVoiceConfirmCallback, VoiceConfirmRegistry } from "./voice-confirm.ts";
@@ -76,6 +76,7 @@ import { SettingsStore } from "./settings-store.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import {
   botCommandList,
+  isKnownCommandText,
   isHelpCommand,
   buildLsDetail,
   parseCommandsQuery,
@@ -136,11 +137,21 @@ import { formatUsagePanel } from "./usage-panel.ts";
 import { isValidTransition, SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
 import { slugFromPrompt, uniqueSlug } from "./slug.ts";
 import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
-import { startPolling, TelegramClient, validateTokens } from "./telegram.ts";
+import { isPermanentEditFailure, startPolling, TelegramClient, validateTokens } from "./telegram.ts";
 import { loadOffset, saveOffset } from "./telegram-offset.ts";
 import { createThinkingPlaceholder } from "./thinking-placeholder.ts";
 import { createTypingIndicator } from "./typing-indicator.ts";
 import { removeWorktree } from "./worktree.ts";
+
+/** Backoff before each automatic `claude --resume` after an unexpected exit, indexed by consecutive
+ * attempt. A genuine one-off crash resumes near-instantly (the first entry); a session that cannot
+ * possibly come back (stale `session_id`, a repo whose worktree is gone) slows down instead of
+ * spinning. */
+const RESUME_BACKOFF_MS = [1000, 15_000, 60_000] as const;
+
+/** After this many consecutive immediate exits the row is marked `dead` and the operator is told,
+ * rather than relaunching forever. */
+const MAX_CONSECUTIVE_RESUME_ATTEMPTS = 3;
 
 // §7.2's Task Scheduler stdout/stderr gap (logger.ts's own doc comment has the full story): a
 // launch that predates `main()` itself getting to run - a bad env file, a throw during module
@@ -195,8 +206,7 @@ async function main(): Promise<void> {
         } catch (err) {
           log("WARN", `failed to send deploy-rollback notice: ${(err as Error).message}`);
         }
-        spawn(process.execPath, process.argv.slice(1), { detached: true, stdio: "ignore" }).unref();
-        process.exit(0);
+        await respawnSelfAndExit();
       } else {
         log("ERROR", `deploy rollback itself failed (${reset.stderr || reset.stdout}) - continuing this boot on whatever commit is on disk`);
       }
@@ -354,6 +364,9 @@ async function main(): Promise<void> {
   }
 
   const ptyProcessBySlug = new Map<string, pty.IPty>();
+  /** Consecutive immediate-exit resume attempts per slug, reset the moment a resumed session proves
+   * it is actually alive (its first hook event). Guards `handleUnexpectedExit`'s relaunch loop. */
+  const resumeAttempts = new Map<string, number>();
   // `sendChannelText`'s own lost-Enter detector (found 2026-08-04, see the 0.27.0 changelog entry):
   // the last time each session's PTY produced *any* output, so a write that never gets a single
   // further onData event within the check window is treated as "the trailing \r never submitted"
@@ -390,7 +403,18 @@ async function main(): Promise<void> {
   // topic - so the message-based placeholder covers desktop, and the reply landing is what stops
   // (or, for the placeholder, edits away) both of them.
   const typingIndicator = createTypingIndicator({
-    send: (topicId) => controlBot.sendChatAction(config.supergroupChatId, Number(topicId), "typing"),
+    // On the *feed* bot, through the governor's droppable P2 lane. §5.4 point 2 is explicit that
+    // every API method counts against its token's budget, and one active turn fires this ~15 times
+    // a minute - as an ungoverned direct call on the control bot it was invisible to the very
+    // accounting that decides whether a permission card can be sent, so real 429s landed on P0
+    // cards while the governor believed the budget was free. Charging it to the feed bucket is only
+    // honest if it *is* feed-bot traffic, hence the token swap too; the feed bot is already this
+    // topic's "here's what's happening" identity, and a missed typing frame is worth nothing once
+    // the next one is due - exactly the P2 contract.
+    send: (topicId) => {
+      feedGovernor.schedule("P2", () => feedBot.sendChatAction(config.supergroupChatId, Number(topicId), "typing"));
+      return Promise.resolve();
+    },
     log: (level, message) => log(level, message),
   });
   const thinkingPlaceholder = createThinkingPlaceholder({
@@ -420,7 +444,21 @@ async function main(): Promise<void> {
         if (!route) return;
         const existingMessageId = feedMessageIds.get(slug);
         if (existingMessageId !== undefined && feedBot.editMessageText) {
-          await feedBot.editMessageText(config.supergroupChatId, existingMessageId, text, undefined, "HTML");
+          try {
+            await feedBot.editMessageText(config.supergroupChatId, existingMessageId, text, undefined, "HTML");
+          } catch (err) {
+            // A per-message permanent failure has to invalidate the cached id, or the feed for this
+            // session is dead for the rest of the process's life: the P2 lane swallows rejections,
+            // so every later flush edited the same unusable message, silently, forever. Dropping
+            // the id makes the next flush post a fresh card instead. (Reachable by deleting the
+            // card by hand, and by Telegram's 48h edit window on a long-lived session.)
+            if (isPermanentEditFailure(err)) {
+              feedMessageIds.delete(slug);
+              log("WARN", `feed card for "${slug}" is no longer editable (${(err as Error).message}) - a fresh card will be posted`);
+              return;
+            }
+            throw err;
+          }
         } else {
           const sent = await feedBot.sendMessage(config.supergroupChatId, route.topicId, text, undefined, "HTML");
           feedMessageIds.set(slug, sent.message_id);
@@ -465,6 +503,9 @@ async function main(): Promise<void> {
     if (row && row.sessionId !== msg.session_id) {
       sessionStore.setSessionId(msg.slug, msg.session_id);
     }
+    // A hook firing is the only proof a (re)launched session actually got far enough to run - so
+    // it, not a successful spawn, is what clears the consecutive-immediate-exit counter.
+    resumeAttempts.delete(msg.slug);
 
     // §6.5's terminal-race fix (§13 check 4): if the operator answers Claude Code's own terminal
     // prompt instead of tapping the Telegram card, there is no protocol event saying so - the
@@ -473,8 +514,15 @@ async function main(): Promise<void> {
     // nothing pending to match), so it's folded into the same lookup rather than special-cased.
     if (msg.hook_event_name === "PostToolUse" || msg.hook_event_name === "PostToolUseFailure" || msg.hook_event_name === "PermissionDenied") {
       const toolName = typeof msg.payload.tool_name === "string" ? msg.payload.tool_name : undefined;
-      const resolved = toolName ? pipeHandle.permissionRegistry.resolveByToolMatch(msg.slug, toolName) : undefined;
+      // The tool *input* is what makes this a match rather than a guess - see `resolveByToolMatch`
+      // and `toolInputMatches` on what pairing by tool name alone did, and on why the comparison has
+      // to parse the preview rather than substring-search it.
+      const resolved = toolName ? pipeHandle.permissionRegistry.resolveByToolMatch(msg.slug, toolName, msg.payload.tool_input) : undefined;
       if (resolved) {
+        // The card is only half of it: the channel server's permission call is still blocked, and
+        // nothing else will unblock it now that the entry is out of the registry (the expiry sweep
+        // can no longer see it). Send the verdict the operator's own terminal answer implies.
+        pipeHandle.sendVerdict(resolved.slug, resolved.requestId, msg.hook_event_name === "PermissionDenied" ? "deny" : "allow");
         const behaviorLabel = msg.hook_event_name === "PermissionDenied" ? "⛔ Denied" : "✅ Allowed";
         pipeHandle
           .finalizePermissionMessage(resolved.messageId, `${behaviorLabel}: ${resolved.toolName} (answered at terminal)`)
@@ -484,7 +532,7 @@ async function main(): Promise<void> {
 
     // §4.3's state table, the hook-driven half (the permission/ask half is wired via
     // onAwaitingInput/maybeSetState below) - a stale/duplicate event is a silent no-op, not an error.
-    const targetState = stateForHookEvent(msg.hook_event_name);
+    const targetState = stateForHookEvent(msg.hook_event_name, typeof msg.payload.reason === "string" ? msg.payload.reason : undefined);
     if (targetState) maybeSetState(msg.slug, targetState);
 
     const event = normalizeHookEvent(msg.hook_event_name, msg.payload);
@@ -503,6 +551,20 @@ async function main(): Promise<void> {
     feedStates.set(msg.slug, next);
 
     if (event.kind === "turn_start") {
+      // §5.3/§5.4 are explicit that the card is *one message per turn*, edited in place - so a new
+      // turn must start a new message. Without this the id set on the session's very first flush
+      // was reused forever: turn 2 overwrote turn 1's record of what happened, and by turn 6 the
+      // "live" card was buried above dozens of newer messages, since Telegram never repositions an
+      // edited message. (`postDetailsButton` below already posts a fresh anchor per turn - the two
+      // were out of step.)
+      // Order matters, and getting it backwards undoes the whole fix. `reset` flushes any render that
+      // was still armed when the turn ended, and that flush runs *synchronously* (the P2 lane invokes
+      // its callback inline, and the callback reads `feedMessageIds` before its first await). So the
+      // outgoing turn's last frame has to be able to still find its own card id - clear the id first
+      // and that final frame gets posted as a brand-new message, leaving turn N frozen at an earlier
+      // frame and turn N+1 editing turn N's final content. Flush into the old card, *then* forget it.
+      feedCoalescer.reset(msg.slug);
+      feedMessageIds.delete(msg.slug);
       const promptCount = promptsInLastHour(next, nowMs);
       if (promptCount > PROMPTS_PER_HOUR_WARN_THRESHOLD) {
         log("WARN", `session "${msg.slug}" started ${promptCount} turns in the last hour - check whether its allowlist has grown too broad (§10.4.1)`);
@@ -540,8 +602,11 @@ async function main(): Promise<void> {
 
   // `/usage` (§4.2, added 2026-08-04): a slug can have at most one pending capture at a time - a
   // second `/usage` for the same slug while one is already in flight would garble both buffers, so
-  // `requestUsagePanel` below overwrites rather than queuing, same "last request wins" simplicity as
-  // the channel-connected waiter above.
+  // a concurrent request is refused up front (see `requestUsagePanel`). It used to *overwrite* the
+  // waiter, which was not the "last request wins" the comment claimed: the first request's timer
+  // resolved the first promise with the second request's buffer and then deleted the map entry, so
+  // the second promise never settled at all - `/usage` simply never replied, and the awaiting frame
+  // leaked.
   const usageWaiters = new Map<string, { buffer: string; check: () => void }>();
 
   /** Writes `/usage` into `slug`'s own PTY (a local TUI overlay - never reaches the model, so it
@@ -556,6 +621,10 @@ async function main(): Promise<void> {
       const write = routing.getPtyWrite(slug);
       if (!write) {
         resolve(`No live PTY for "${slug}" to query.`);
+        return;
+      }
+      if (usageWaiters.has(slug)) {
+        resolve(`A /usage capture for "${slug}" is already in flight - the reply to that one is on its way.`);
         return;
       }
       const finish = (state: { buffer: string }) => {
@@ -621,6 +690,15 @@ async function main(): Promise<void> {
       (err) => log("WARN", `failed to mark permission request as expired: ${err.message}`),
     );
     browseRegistry.sweep();
+
+    // §6.5's "a stale button must not look tappable and silently do nothing", applied to the four
+    // operator-confirm cards too: past their TTL, strip the keyboard and say so. Doubles as the
+    // sweep these four never had - entries used to be dropped only by a tap, so an untapped card
+    // (and its whole replay payload) leaked for the lifetime of the daemon.
+    for (const entry of nlConfirmRegistry.takeExpired()) void markConfirmCardExpired(entry.messageId);
+    for (const entry of fleetConfirmRegistry.takeExpired()) void markConfirmCardExpired(entry.messageId);
+    for (const entry of staleConfirmRegistry.takeExpired()) void markConfirmCardExpired(entry.confirmCardMessageId);
+    for (const entry of voiceConfirmRegistry.takeExpired()) void markConfirmCardExpired(entry.confirmCardMessageId);
 
     // §6.4: past the 3540s ceiling, cancel rather than let the hook's own 3600s timeout expire
     // silently - the operator sees an explicit "cancelled" card and Claude sees a `deny` it can
@@ -890,7 +968,20 @@ async function main(): Promise<void> {
    * plumbing, the `ptyProcessBySlug` liveness map, and the supervisor's crash detector. Shared by
    * the Phase 1 launch, `/new`, and every `resumeSession` relaunch so the three don't drift. */
   function wireSession(slug: string, ptyProcess: pty.IPty, topicId: number): void {
-    routing.setPtyWrite(slug, (text) => ptyProcess.write(text));
+    // Guarded at the one place every writer goes through. `node-pty`'s `write()` throws
+    // *synchronously* once the ConPTY socket has closed, and several writers here are deferred by a
+    // timer (the submit-confirmation retry ~3s later, `/effort`'s follow-up `\r`, `/usage`'s Esc) -
+    // a session exiting inside that window threw out of a `setTimeout` callback, which no
+    // try/catch covers, straight into the module-scope `uncaughtException` handler and its
+    // `process.exit(1)`. One stale keystroke took down the whole daemon and every other session
+    // with it; under the log-on autostart trigger, nothing restarts it until the next logon.
+    routing.setPtyWrite(slug, (text) => {
+      try {
+        ptyProcess.write(text);
+      } catch (err) {
+        log("WARN", `write to session "${slug}" dropped - its PTY is gone: ${(err as Error).message}`);
+      }
+    });
     ptyProcess.onData((data) => {
       // An onData event alone is too loose a signal - confirmed live 2026-08-04 that a wedged
       // session still periodically emits ANSI-only chunks (cursor blink, resize repaint) with no
@@ -924,8 +1015,29 @@ async function main(): Promise<void> {
     routing.clearPtyWrite(slug);
     const row = sessionStore.get(slug);
     if (!row || row.state === "dead") return;
-    log("WARN", `session "${slug}" exited unexpectedly (code ${exitCode}) - attempting an automatic resume`);
-    confirmSessionCommand(topicId, `⚠️ Session "${slug}" exited unexpectedly. Attempting to resume it automatically...`);
+    // An immediate re-exit is the dangerous case, not a one-off crash: a stale `session_id` makes
+    // `claude --resume` fail instantly ("No conversation found with session ID: ..." - observed for
+    // three sessions at once), and since `launchSession` itself succeeds, nothing self-limits. The
+    // old code relaunched about once a second forever, each cycle pushing two never-dropped P1
+    // sends into the governor's unbounded queue while ~20/min drain: an unbounded queue, unbounded
+    // memory, and a topic flooded indefinitely. The "SessionEnd marks it dead" self-heal doesn't
+    // apply here, because `claude` dies before any hook fires.
+    const attempts = (resumeAttempts.get(slug) ?? 0) + 1;
+    resumeAttempts.set(slug, attempts);
+    if (attempts > MAX_CONSECUTIVE_RESUME_ATTEMPTS) {
+      sessionStore.setState(slug, "dead", nowIso());
+      resumeAttempts.delete(slug);
+      log("ERROR", `session "${slug}" exited immediately ${attempts} times in a row - marking it dead instead of resuming again`);
+      confirmSessionCommand(
+        topicId,
+        `⚠️ Session "${slug}" exited immediately ${attempts} times in a row (last code ${exitCode}) - giving up on automatic resume. Worktree preserved at ${row.worktreePath}; /rm to clear it.`,
+      );
+      return;
+    }
+    const delayMs = RESUME_BACKOFF_MS[Math.min(attempts - 1, RESUME_BACKOFF_MS.length - 1)]!;
+    log("WARN", `session "${slug}" exited unexpectedly (code ${exitCode}) - resume attempt ${attempts} in ${delayMs}ms`);
+    confirmSessionCommand(topicId, `⚠️ Session "${slug}" exited unexpectedly. Attempting to resume it automatically (attempt ${attempts})...`);
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
     await resumeSession(row);
   }
 
@@ -1231,13 +1343,43 @@ async function main(): Promise<void> {
     }
   }
 
-  async function finalizeFleetConfirmMessage(pending: PendingFleetConfirm, text: string): Promise<void> {
+  /** The one "this card is settled" edit: replace its text, strip its keyboard. Every confirm card
+   * (fleet, NL, stale, voice) finalizes identically - four copies of this differing only in which
+   * field held the message id was pure duplication. */
+  async function finalizeCard(messageId: number, text: string): Promise<void> {
     if (!controlBot.editMessageText) return;
     try {
-      await controlBot.editMessageText(config.supergroupChatId, pending.messageId, text, { inline_keyboard: [] });
+      // Through the control governor's P1 lane, not a direct call. §5.4 counts every method against
+      // the token, and the expiry sweep below can produce a *burst*: one stale-confirm card per
+      // backlog message after an overnight sleep means ~200 of these come due in the same tick. Fired
+      // directly they would all 429 - invisibly to the governor, whose bucket would still believe the
+      // budget was free when the next P0 permission card went out.
+      await feedGovernor.scheduleAsync("P1", async () => {
+        try {
+          await controlBot.editMessageText!(config.supergroupChatId, messageId, text, { inline_keyboard: [] });
+        } catch (err) {
+          // Swallowed *inside* the lane deliberately: P1 retries three times with backoff, and a
+          // message that can never be edited again (the operator deleted it, or it aged out of
+          // Telegram's 48h edit window) would spend four control-bucket tokens per card. A sweep burst
+          // of 200 expired cards would then burn ~40 minutes of the 20/min budget on failures that
+          // cannot succeed, delaying real replies. Transient errors still get their retries.
+          if (!isPermanentEditFailure(err)) throw err;
+          log("WARN", `confirm card ${messageId} is no longer editable - leaving it as-is`);
+        }
+      });
     } catch (err) {
-      log("WARN", `failed to finalize fleet-confirm message: ${(err as Error).message}`);
+      log("WARN", `failed to finalize a confirm card: ${(err as Error).message}`);
     }
+  }
+
+  /** What the sweep (and a tap that lost the race to it) leaves behind, so an expired card reads as
+   * expired instead of as a button that does nothing. */
+  function markConfirmCardExpired(messageId: number): Promise<void> {
+    return finalizeCard(messageId, "⌛ This confirmation expired - send it again if you still want it.");
+  }
+
+  async function finalizeFleetConfirmMessage(pending: PendingFleetConfirm, text: string): Promise<void> {
+    await finalizeCard(pending.messageId, text);
   }
 
   /** §7.4's stale-inbound path: posts the "received while offline, still want this?" card instead
@@ -1256,13 +1398,14 @@ async function main(): Promise<void> {
     }
   }
 
+  /** §7.4 for the media paths: say so and stop, rather than landing a hours-old file in the
+   * worktree and announcing it to a live session as if it had just arrived. */
+  function notifyStaleAttachment(threadId: number | undefined, ageLabel: string): void {
+    confirmSessionCommand(threadId, `⏳ An attachment arrived while offline (${ageLabel}) - not delivered. Re-send it if you still want it.`);
+  }
+
   async function finalizeStaleConfirmMessage(pending: PendingStaleConfirm, text: string): Promise<void> {
-    if (!controlBot.editMessageText) return;
-    try {
-      await controlBot.editMessageText(config.supergroupChatId, pending.confirmCardMessageId, text, { inline_keyboard: [] });
-    } catch (err) {
-      log("WARN", `failed to finalize stale-confirm message: ${(err as Error).message}`);
-    }
+    await finalizeCard(pending.confirmCardMessageId, text);
   }
 
   /** Voice-input's own confirm-card path (voice-confirm.ts): downloads the voice note, transcribes
@@ -1276,7 +1419,7 @@ async function main(): Promise<void> {
    * turn, and observed live the same way (an 8s voice note with no feedback at all reads as
    * "did this even work?"). Same fix: post a "🎤 Transcribing..." placeholder immediately, then
    * edit that same message into the real confirm card - one message per voice note, not two. */
-  async function handleVoiceMessage(voice: { file_id: string; duration: number }, threadId: number | undefined, messageId: number, from: string): Promise<void> {
+  async function handleVoiceMessage(voice: { file_id: string; duration: number }, threadId: number | undefined, messageId: number, from: string, messageDate: number): Promise<void> {
     if (!config.voice.enabled) {
       confirmSessionCommand(threadId, "Voice input isn't set up on this Bridge yet - see scripts/setup-windows.ps1's voice step, then set VOICE_ENABLED=true.");
       return;
@@ -1297,7 +1440,11 @@ async function main(): Promise<void> {
       const preview = text.length > 0 ? text : "(nothing recognised - try again?)";
       // An empty transcript always still shows the card, even with confirmation off - there's
       // nothing useful to auto-send, and re-record/type-instead are the only sensible next steps.
-      if (voiceConfirmEnabled || text.length === 0) {
+      // A *stale* note does the same: voice is exempt from §7.4's gate only because the confirm
+      // card is itself the review step, so with confirmation off that justification disappears and
+      // a note recorded hours ago would otherwise auto-send into a live session.
+      const staleNote = isStaleInbound(messageDate, Date.now());
+      if (voiceConfirmEnabled || text.length === 0 || staleNote) {
         const id = randomUUID().slice(0, 8);
         if (controlBot.editMessageText) {
           await feedGovernor.scheduleAsync("P1", () =>
@@ -1380,12 +1527,7 @@ async function main(): Promise<void> {
    * "Discarded" tap actually applied to; losing it made the finalized message unreadable on its
    * own (live-reported: a "✅ Sent." card with no way to see what was sent). */
   async function finalizeVoiceConfirmMessage(pending: PendingVoiceConfirm, statusLine: string): Promise<void> {
-    if (!controlBot.editMessageText) return;
-    try {
-      await controlBot.editMessageText(config.supergroupChatId, pending.confirmCardMessageId, `🎤 ${pending.transcript}\n\n${statusLine}`, { inline_keyboard: [] });
-    } catch (err) {
-      log("WARN", `failed to finalize voice-confirm message: ${(err as Error).message}`);
-    }
+    await finalizeCard(pending.confirmCardMessageId, `🎤 ${pending.transcript}\n\n${statusLine}`);
   }
 
   /** Runs after a `/kill --all`/`/rm --all` confirm tap - re-looks-up rows by slug rather than
@@ -1663,12 +1805,23 @@ async function main(): Promise<void> {
       log("WARN", `failed to send /restart confirmation: ${(err as Error).message}`);
     }
     log("INFO", "/restart requested - relaunching and exiting");
-    // A raw detached spawn is killed instantly if this process is itself a Task-Scheduler-launched
-    // task (Windows Job Object containment - see buildRunArgs's own note) - re-run the same registered
-    // task instead when it exists, so the successor is a fresh, independent Task Scheduler action
-    // rather than a doomed child of this one. Only reachable when /autostart install has been run;
-    // falls back to the direct spawn otherwise, which is correct for a manually-started dev Bridge
-    // where there is no job to escape in the first place.
+    await respawnSelfAndExit();
+  }
+
+  /**
+   * The only correct way for this process to replace itself. A raw detached spawn is killed
+   * instantly if this process is itself a Task-Scheduler-launched task (Windows Job Object
+   * containment - see `buildRunArgs`' own note, live-verified 2026-08-06), so re-run the registered
+   * task instead when one exists: the successor is then a fresh, independent Task Scheduler action
+   * rather than a doomed child of this one. Falls back to the direct spawn otherwise, which is
+   * correct for a manually-started dev Bridge where there is no job to escape.
+   *
+   * Shared by all three self-respawn sites (`/restart`, `/deploy`'s self-repo restart, and the
+   * stale-deploy rollback at boot). The latter two used the raw spawn directly, so on an
+   * autostart-installed host a successful `/deploy` took the Bridge down permanently - and the
+   * rollback path then did it again on the next manual start, immediately after rolling back.
+   */
+  async function respawnSelfAndExit(): Promise<never> {
     const ranViaTask = !(await runSchtasks(buildRunArgs())).failed;
     if (!ranViaTask) {
       spawn(process.execPath, process.argv.slice(1), { detached: true, stdio: "ignore" }).unref();
@@ -1745,9 +1898,8 @@ async function main(): Promise<void> {
     } catch (err) {
       log("WARN", `failed to send /deploy restart notice: ${(err as Error).message}`);
     }
-    log("INFO", "/deploy: self-repo, spawning detached successor and exiting");
-    spawn(process.execPath, process.argv.slice(1), { detached: true, stdio: "ignore" }).unref();
-    process.exit(0);
+    log("INFO", "/deploy: self-repo, respawning and exiting");
+    await respawnSelfAndExit();
   }
 
   /** `/settings`: control-topic only, same reasoning as `/budget` - repos.toml and the weighted
@@ -2141,12 +2293,7 @@ async function main(): Promise<void> {
   }
 
   async function finalizeNlConfirmMessage(pending: PendingNlConfirm, text: string): Promise<void> {
-    if (!controlBot.editMessageText) return;
-    try {
-      await controlBot.editMessageText(config.supergroupChatId, pending.messageId, text, { inline_keyboard: [] });
-    } catch (err) {
-      log("WARN", `failed to finalize NL-confirm message: ${(err as Error).message}`);
-    }
+    await finalizeCard(pending.messageId, text);
   }
 
   /**
@@ -2356,6 +2503,19 @@ async function main(): Promise<void> {
     // has no worktree to read commands/skills from.
     const commandsQuery = parseCommandsQuery(text);
     if (commandsQuery) {
+      // `/commands <name> [args]` is documented in three places (commands.ts, about.ts, and its own
+      // unit test) as a synonym for `/cmd <name> [args]`, but this list-filter branch matched first
+      // and greedily, so the invocation form was unreachable: `/commands review/pre-push --staged`
+      // answered `No repo commands matched "review/pre-push --staged"` instead of running it. Only a
+      // *real* command name takes the invocation path; anything else is still a list filter, so
+      // `/commands review` keeps working as a search. (The unit test passed throughout because it
+      // exercised the parser in isolation - reachability is a dispatch-order property, not a parser
+      // one.)
+      const asInvocation = commandsQuery.term ? parseCmdInvocation(`/cmd ${commandsQuery.term}`) : null;
+      if (route && asInvocation && listRepoCommands(route.worktreePath).includes(asInvocation.name)) {
+        sendChannelText(route.slug, route.topicId, buildCmdShimText(asInvocation.name, asInvocation.args), String(messageId), from);
+        return;
+      }
       sendCommandsListCard(threadId, route, commandsQuery.term);
       return;
     }
@@ -2433,6 +2593,18 @@ async function main(): Promise<void> {
     if (isBuiltinPassthroughCommand(builtinName)) {
       if (currentSlug) sendRaw(currentSlug, text);
       return;
+    }
+
+    // §4.3's "a message to a `dead` row's topic is acknowledged, not silently dropped", for the case
+    // the check further down cannot reach: reconciliation only re-routes non-`dead` rows, so after any
+    // restart a killed session's topic has a row but no route, and `currentSlug` is undefined here.
+    // Answering from the row keeps the contract holding across a restart instead of only before one.
+    if (!currentSlug && !isControl && threadId !== undefined) {
+      const deadRow = sessionStore.getByTopicId(threadId);
+      if (deadRow?.state === "dead") {
+        confirmSessionCommand(threadId, "This session has ended.");
+        return;
+      }
     }
 
     if (!currentSlug || threadId === undefined) {
@@ -2593,8 +2765,17 @@ async function main(): Promise<void> {
         // namespace, checked alongside "perm:" since both gate a destructive action behind a tap.
         const fleetConfirmAction = callbackQuery.data ? resolveFleetConfirmCallback(callbackQuery.data) : null;
         if (fleetConfirmAction) {
-          const pending = fleetConfirmRegistry.resolve(fleetConfirmAction.id);
-          if (!pending || pending.kind !== fleetConfirmAction.kind) return;
+          // `take`, not `resolve`: an expired card has to *say* it expired. `answerCallbackQuery`
+          // above already cleared the spinner, so returning silently here left the operator with a
+          // tap that visibly did nothing - §6.5's stated failure mode.
+          const fleetTaken = fleetConfirmRegistry.take(fleetConfirmAction.id);
+          if (!fleetTaken) return;
+          if (fleetTaken.expired) {
+            void markConfirmCardExpired(fleetTaken.entry.messageId);
+            return;
+          }
+          const pending = fleetTaken.entry;
+          if (pending.kind !== fleetConfirmAction.kind) return;
           if (!fleetConfirmAction.confirmed) {
             void finalizeFleetConfirmMessage(pending, "Cancelled - nothing was changed.");
             return;
@@ -2693,8 +2874,13 @@ async function main(): Promise<void> {
         // until `/assist on` turns it back on.
         const nlConfirmAction = callbackQuery.data ? resolveNlConfirmCallback(callbackQuery.data) : null;
         if (nlConfirmAction) {
-          const pending = nlConfirmRegistry.resolve(nlConfirmAction.id);
-          if (!pending) return;
+          const nlTaken = nlConfirmRegistry.take(nlConfirmAction.id);
+          if (!nlTaken) return;
+          if (nlTaken.expired) {
+            void markConfirmCardExpired(nlTaken.entry.messageId);
+            return;
+          }
+          const pending = nlTaken.entry;
           if (nlConfirmAction.action === "cancel") {
             void finalizeNlConfirmMessage(pending, "❌ Cancelled - nothing was changed.");
             return;
@@ -2717,8 +2903,13 @@ async function main(): Promise<void> {
         // unrecognised/dead currentSlug the same way a live message would.
         const staleConfirmAction = callbackQuery.data ? resolveStaleConfirmCallback(callbackQuery.data) : null;
         if (staleConfirmAction) {
-          const pending = staleConfirmRegistry.resolve(staleConfirmAction.id);
-          if (!pending) return;
+          const staleTaken = staleConfirmRegistry.take(staleConfirmAction.id);
+          if (!staleTaken) return;
+          if (staleTaken.expired) {
+            void markConfirmCardExpired(staleTaken.entry.confirmCardMessageId);
+            return;
+          }
+          const pending = staleTaken.entry;
           if (!staleConfirmAction.confirmed) {
             void finalizeStaleConfirmMessage(pending, "Cancelled - not actioned.");
             return;
@@ -2738,8 +2929,13 @@ async function main(): Promise<void> {
         // before sending, the typeable equivalent being `/voiceconfirm off`.
         const voiceConfirmAction = callbackQuery.data ? resolveVoiceConfirmCallback(callbackQuery.data) : null;
         if (voiceConfirmAction) {
-          const pending = voiceConfirmRegistry.resolve(voiceConfirmAction.id);
-          if (!pending) return;
+          const voiceTaken = voiceConfirmRegistry.take(voiceConfirmAction.id);
+          if (!voiceTaken) return;
+          if (voiceTaken.expired) {
+            void markConfirmCardExpired(voiceTaken.entry.confirmCardMessageId);
+            return;
+          }
+          const pending = voiceTaken.entry;
           if (voiceConfirmAction.action === "send" || voiceConfirmAction.action === "send_and_stop_asking") {
             if (voiceConfirmAction.action === "send_and_stop_asking") {
               voiceConfirmEnabled = false;
@@ -2834,17 +3030,59 @@ async function main(): Promise<void> {
       const isControl = isControlTopic(threadId);
       const route = threadId !== undefined ? routing.getByTopicId(threadId) : undefined;
       const currentSlug = route?.slug;
-      // Neither the control topic nor a topic this Bridge recognises as a session - ignore.
-      if (!isControl && !route) return;
+      // A topic with no *live route* may still be a topic this Bridge knows about: a `dead` row's
+      // topic (reconciliation only re-routes non-dead rows, so every `/kill`ed session's topic
+      // loses its route on the next restart), or an orphaned topic whose row is gone entirely -
+      // §4.5.2's own recovery instruction is for the operator to send `/rm` *in that topic*.
+      // Dropping those outright made that instruction impossible to follow and silently swallowed
+      // `/help` too, which is also what made the live diagnosis of §4.5.2 ambiguous: an unanswered
+      // command there was indistinguishable from a dead Bot-API thread.
+      // An *unrouted* topic gets explicit slash commands dispatched (so `/rm` and `/help` work
+      // there) but not free text - including a topic whose row is only `dead`. Without that
+      // narrowing, ordinary chatter in an unrelated forum topic, or a reply typed into a killed
+      // session's topic, would fall through to the NL router and spend an LLM call answering
+      // something no session can act on anyway.
+      // A *known* command specifically, not merely a leading "/": anything else in an unrouted topic
+      // would fall through to the NL router and spend an LLM call answering something no session can
+      // act on. A topic this Bridge still has a row for is let through regardless of shape, so §4.3's
+      // "this session has ended" acknowledgement can fire there.
+      const knownRow = threadId !== undefined ? sessionStore.getByTopicId(threadId) : undefined;
+      if (!isControl && !route && knownRow === undefined && !isKnownCommandText(message.text)) return;
 
       const from = message.from?.username ?? message.from?.first_name ?? "unknown";
 
+      // §7.4, checked before *any* content branch below. It used to sit after the media handlers,
+      // so every attachment path bypassed it: a document queued while the laptop slept, captioned
+      // "yes, push it", was downloaded into the worktree and written straight into the live PTY on
+      // resume - the exact surprise §7.4 exists to prevent, quoted almost word for word there.
+      // Voice notes remain the one deliberate exception (their own confirm card, below).
+      const nowMs = Date.now();
+      // Only content this Bridge would actually act on is gated. Without that narrowing the `else`
+      // branch below fired for every *service* message too (forum_topic_created/_edited,
+      // pinned_message, new_chat_members) and for stickers/polls/locations, all of which previously
+      // fell through to `if (!message.text) return` - so a backlog replay after downtime posted a
+      // spurious "an attachment arrived while offline" notice for each one.
+      const hasActionableContent = message.text !== undefined || hasAttachment(message);
+      if (hasActionableContent && !message.voice && isStaleInbound(message.date, nowMs)) {
+        if (message.text !== undefined) {
+          void postStaleConfirm(threadId, message.message_id, message.text, from, formatStaleAge(message.date, nowMs));
+        } else {
+          // An attachment gets a plain notice rather than a replayable confirm card: replaying one
+          // would mean holding its `file_id` and re-running the download later, and a re-send from
+          // the phone is both cheaper and unambiguous. The point is that it isn't silently landed
+          // in the worktree and announced to a live session.
+          void notifyStaleAttachment(threadId, formatStaleAge(message.date, nowMs));
+        }
+        return;
+      }
+
       // Voice input - a recorded voice note, not a forwarded/uploaded audio file (message.audio,
-      // unhandled). Goes through its own confirm-card path (handleVoiceMessage), never the
-      // stale-inbound check below: staleness of the *card* (voice-confirm.ts's own TTL) is what
-      // matters, not staleness of when the note was recorded.
+      // unhandled). Goes through its own confirm-card path (handleVoiceMessage), and is the one
+      // deliberate exemption from the §7.4 gate above: staleness of the *card* (voice-confirm.ts's
+      // own TTL) is what matters, not staleness of when the note was recorded, because nothing
+      // reaches the session until the operator taps Send on a transcript they can read.
       if (message.voice) {
-        void handleVoiceMessage(message.voice, threadId, message.message_id, from);
+        void handleVoiceMessage(message.voice, threadId, message.message_id, from, message.date);
         return;
       }
 
@@ -2881,17 +3119,8 @@ async function main(): Promise<void> {
 
       if (!message.text) return;
 
-      // §7.4: a backlog burst on resume (Telegram queues updates for 24h while the Bridge is
-      // down/asleep) can replay a command typed long ago - confirm rather than act on anything
-      // older than 30 minutes, exactly as an operator would want "yes, push it" treated after
-      // finding it hours later. Checked before any command parsing so nothing below ever sees a
-      // stale message directly.
-      const nowMs = Date.now();
-      if (isStaleInbound(message.date, nowMs)) {
-        void postStaleConfirm(threadId, message.message_id, message.text, from, formatStaleAge(message.date, nowMs));
-        return;
-      }
-
+      // §7.4's gate already ran above, before any content branch - nothing below ever sees a stale
+      // message.
       void dispatchInboundMessage(message.message_id, message.text, threadId, isControl, route, currentSlug, from);
     },
     onError: (err) => {

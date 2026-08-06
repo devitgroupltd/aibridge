@@ -1,4 +1,4 @@
-import { monotonicNowMs } from "./monotonic-clock.ts";
+import { ConfirmRegistry, type ConfirmRegistryOptions } from "./confirm-registry.ts";
 import type { InlineKeyboardButton } from "./telegram.ts";
 
 /**
@@ -31,36 +31,12 @@ export interface PendingStaleConfirm {
  * whole feature exists to prevent, just moved one step later if the TTL were too generous. */
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 
-export interface StaleConfirmRegistryOptions {
-  ttlMs?: number;
-  /** Clock injection for expiry tests - never `Date.now()` directly in the class body, and
-   * defaults to `monotonicNowMs` (§7.4): this only ever computes a duration, and a wall clock is
-   * the wrong tool for that across a sleep. */
-  now?: () => number;
-}
+/** TTL + clock injection, both from `ConfirmRegistry` - this registry adds nothing of its own. */
+export type StaleConfirmRegistryOptions = ConfirmRegistryOptions;
 
-export class StaleConfirmRegistry {
-  private readonly pending = new Map<string, PendingStaleConfirm>();
-  private readonly ttlMs: number;
-  private readonly now: () => number;
-
+export class StaleConfirmRegistry extends ConfirmRegistry<PendingStaleConfirm> {
   constructor(opts: StaleConfirmRegistryOptions = {}) {
-    this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
-    this.now = opts.now ?? monotonicNowMs;
-  }
-
-  add(entry: Omit<PendingStaleConfirm, "createdAt">): void {
-    this.pending.set(entry.id, { ...entry, createdAt: this.now() });
-  }
-
-  /** An unknown or expired id is a no-op, not a crash - same discipline as every other
-   * resolve-a-tap path in this codebase (a stale/duplicate tap on this very card is expected). */
-  resolve(id: string): PendingStaleConfirm | undefined {
-    const entry = this.pending.get(id);
-    if (!entry) return undefined;
-    this.pending.delete(id);
-    if (this.now() - entry.createdAt > this.ttlMs) return undefined;
-    return entry;
+    super(DEFAULT_TTL_MS, opts);
   }
 }
 

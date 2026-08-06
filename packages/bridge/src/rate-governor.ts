@@ -22,6 +22,22 @@ export class RateLimitedError extends Error {
   }
 }
 
+/** §5.4 says to honour `retry_after` exactly, but a bucket paused on an unbounded number taken
+ * straight off the wire is a bucket that may never resume - a garbled or hostile `retry_after` of
+ * 10^9 would mute the fleet for the process's lifetime. One hour is longer than any real Telegram
+ * flood-wait and still finite; a non-finite or negative value falls back to one second. */
+const MAX_RETRY_AFTER_MS = 60 * 60 * 1000;
+
+/** How soon to re-check a queue the bucket couldn't afford. Short enough that a refilled token is
+ * spent promptly (the control bucket refills continuously, ~one token every 3s at 20/min), long
+ * enough not to spin. */
+const DRAIN_RETRY_MS = 1000;
+
+export function clampRetryAfterMs(retryAfterSec: number): number {
+  if (!Number.isFinite(retryAfterSec) || retryAfterSec <= 0) return 1000;
+  return Math.min(retryAfterSec * 1000, MAX_RETRY_AFTER_MS);
+}
+
 /** A classic continuous-refill token bucket: `capacity` tokens available per `refillIntervalMs`,
  * refilling smoothly rather than in one lump at the interval boundary (so "20/minute" doesn't
  * mean "all 20 the instant a new minute starts"). `pauseFor` implements the 429 handling - while
@@ -67,6 +83,12 @@ class TokenBucket {
   pauseFor(ms: number): void {
     this.pausedUntilMs = Math.max(this.pausedUntilMs, this.now() + ms);
   }
+
+  /** How long this bucket stays paused, or 0 if it isn't - lets the governor schedule one wake at the
+   * end of a 429 pause instead of polling through it. */
+  pausedForMs(): number {
+    return Math.max(0, this.pausedUntilMs - this.now());
+  }
 }
 
 interface ControlTask {
@@ -90,6 +112,9 @@ export interface RateGovernorOptions {
   /** Injectable so `runControlTask`'s backoff schedule (1s/2s/4s, §5.4) is fake-clock-testable
    * rather than a real wall-clock wait. */
   setTimeoutFn?: (fn: () => void, ms: number) => unknown;
+  /** Paired with `setTimeoutFn` so the self-arming drain retry can be cancelled by `pump()`; tests
+   * inject both together. */
+  clearTimeoutFn?: (handle: unknown) => void;
   log?: LogFn;
 }
 
@@ -107,9 +132,12 @@ export class RateGovernor {
   private readonly p0Queue: ControlTask[] = [];
   private readonly p1Queue: ControlTask[] = [];
   private readonly setTimeoutFn: (fn: () => void, ms: number) => unknown;
+  private readonly clearTimeoutFn: (handle: unknown) => void;
+  private drainRetryTimer: unknown;
   private readonly log: LogFn;
   private readonly now: () => number;
   private p2DroppedCount = 0;
+  private drainRetryTimerArmed = false;
   /** Rolling window of recent P2 outcomes, pruned to the last 60s on every read/write - backs
    * `p2PressureExceeded()` (§5.4 point 4: "if P2 drops exceed 50% over a 60s window"). */
   private readonly p2Outcomes: Array<{ atMs: number; dropped: boolean }> = [];
@@ -121,6 +149,7 @@ export class RateGovernor {
     this.controlBucket = new TokenBucket(capacity, refillIntervalMs, now);
     this.feedBucket = new TokenBucket(capacity, refillIntervalMs, now);
     this.setTimeoutFn = opts.setTimeoutFn ?? ((fn, ms) => setTimeout(fn, ms));
+    this.clearTimeoutFn = opts.clearTimeoutFn ?? ((handle) => clearTimeout(handle as NodeJS.Timeout));
     this.log = opts.log ?? (() => {});
     this.now = now;
   }
@@ -165,7 +194,7 @@ export class RateGovernor {
     this.recordP2Outcome(false);
     fn().catch((err) => {
       if (err instanceof RateLimitedError) {
-        this.feedBucket.pauseFor(err.retryAfterSec * 1000);
+        this.feedBucket.pauseFor(clampRetryAfterMs(err.retryAfterSec));
       }
       // Never retried, success or failure (§5.4): a newer frame supersedes a dropped one anyway.
     });
@@ -205,18 +234,52 @@ export class RateGovernor {
     queueMicrotask(() => this.drainControl());
   }
 
-  /** Drains whatever P0/P1 work the control bucket can currently afford, P0 first. Call again
-   * after advancing time (production: a real interval; tests: manually) to pick up anything a
-   * 429 pause or an empty bucket deferred. */
+  /** Drains whatever P0/P1 work the control bucket can currently afford, P0 first. The governor
+   * arms its own retry timers now (see `armDrainRetry`), so production no longer depends on an
+   * external interval calling this; tests still call it to drain deterministically after advancing
+   * their injected clock. */
   pump(): void {
+    // Cancel the pending wake rather than only clearing the flag - otherwise it fires later against a
+    // cleared flag and the next `armDrainRetry` adds a second concurrent timer, quietly breaking the
+    // "at most one" invariant below (harmless in effect, since `drainControl` is idempotent, but it
+    // would make that invariant untestable).
+    if (this.drainRetryTimer !== undefined) {
+      this.clearTimeoutFn(this.drainRetryTimer);
+      this.drainRetryTimer = undefined;
+    }
+    this.drainRetryTimerArmed = false;
     this.drainControl();
+  }
+
+  /** At most one retry timer in flight - a queue of 200 deferred tasks must not become 200 timers,
+   * and while the bucket is *paused* by a 429 there is no point waking every second for what may be
+   * up to an hour (`clampRetryAfterMs`), so the wake is scheduled for when the pause actually ends. */
+  private armDrainRetry(): void {
+    if (this.drainRetryTimerArmed) return;
+    this.drainRetryTimerArmed = true;
+    const pausedForMs = this.controlBucket.pausedForMs();
+    this.drainRetryTimer = this.setTimeoutFn(
+      () => {
+        this.drainRetryTimer = undefined;
+        this.drainRetryTimerArmed = false;
+        this.drainControl();
+      },
+      pausedForMs > 0 ? pausedForMs + 50 : DRAIN_RETRY_MS,
+    );
   }
 
   private drainControl(): void {
     for (;;) {
       const task = this.p0Queue[0] ?? this.p1Queue[0];
       if (!task) return;
-      if (!this.controlBucket.tryTake()) return;
+      if (!this.controlBucket.tryTake()) {
+        // The bucket is empty (or paused) but work is still queued - nothing else is guaranteed to
+        // come along and re-drain it, so own the retry. Without this, a burst that exhausts the
+        // 20/min budget leaves the overflow parked until the operator happens to trigger another
+        // send: buttons keep spinning on the phone even though tokens refilled seconds later.
+        this.armDrainRetry();
+        return;
+      }
       if (this.p0Queue[0] === task) this.p0Queue.shift();
       else this.p1Queue.shift();
       void this.runControlTask(task);
@@ -229,10 +292,18 @@ export class RateGovernor {
       task.resolve(result);
     } catch (err) {
       if (err instanceof RateLimitedError) {
-        this.controlBucket.pauseFor(err.retryAfterSec * 1000);
+        const pauseMs = clampRetryAfterMs(err.retryAfterSec);
+        this.controlBucket.pauseFor(pauseMs);
         // Re-queued ahead of newer work, retry budget untouched - a 429 is the bucket's fault,
         // not this task's, so it shouldn't spend one of the task's 3 retries.
         (task.lane === "P0" ? this.p0Queue : this.p1Queue).unshift(task);
+        // ...and a wake armed for the end of the pause. Without this, the only things that ever
+        // re-drain are a *new* `enqueueControl` and the non-429 retry path - so a 429 on the last
+        // send before an idle stretch leaves the requeued task parked indefinitely. When that task is
+        // the permission card a session is blocked waiting on, nothing else will ever call
+        // `schedule()` for that session, and the fleet deadlocks until the §6.5 sweep or a restart.
+        // `armDrainRetry` (not a bare `setTimeout`) so a burst of 429s shares one wake.
+        this.armDrainRetry();
         return;
       }
       if (task.retriesLeft > 0) {

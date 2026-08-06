@@ -69,14 +69,30 @@ export class PermissionRegistry {
    * deep-equal tool_input)`, but `PermissionRequest` carries neither `session_id` nor structured
    * `tool_input` (only a text `input_preview`, §6.5's own measured-payload finding) - `slug` already
    * identifies the one session a request came from just as uniquely here (one `claude` process per
-   * slug), so this pairs on `(slug, toolName)` instead. Ties resolve oldest-first, matching the
-   * plan's own note that two byte-identical concurrent calls are indistinguishable to the operator
-   * too, so arrival order is correct rather than a compromise.
+   * slug), so this pairs on `(slug, toolName)` **plus an input match**. Ties resolve oldest-first,
+   * matching the plan's own note that two byte-identical concurrent calls are indistinguishable to
+   * the operator too, so arrival order is correct rather than a compromise.
+   *
+   * The input match is not optional, and dropping it was a real bug rather than a simplification:
+   * pairing on the tool *name* alone meant any second call to the same tool consumed the pending
+   * entry. A session with a card up for `Bash(rm -rf build)` that then ran the pre-approved
+   * `Bash(git status)` had its card edited to "✅ Allowed ... (answered at terminal)" - an approval
+   * the operator never gave - and, worse, the entry was deleted without any verdict being sent, so
+   * `sweepExpiredPermissions` (the *only* thing that ever sends the compensating `deny`) could no
+   * longer fire for it and the session waited forever.
+   *
+   * `PermissionRequest` carries no structured `tool_input`, but its `inputPreview` is the complete
+   * JSON tool input per §6.5's own measured payload, so the hook's own `tool_input` can be compared
+   * against it - see `toolInputMatches` for why that comparison has to parse the preview rather than
+   * substring-search it. A payload with no `tool_input` at all gets `undefined` rather than a
+   * name-only match.
    */
-  resolveByToolMatch(slug: string, toolName: string): PendingPermissionRequest | undefined {
+  resolveByToolMatch(slug: string, toolName: string, toolInput: unknown): PendingPermissionRequest | undefined {
+    if (toolInput === undefined || toolInput === null) return undefined;
     let oldest: PendingPermissionRequest | undefined;
     for (const entry of this.pending.values()) {
       if (entry.slug !== slug || entry.toolName !== toolName) continue;
+      if (!toolInputMatches(entry.inputPreview, toolInput)) continue;
       if (!oldest || entry.createdAt < oldest.createdAt) oldest = entry;
     }
     if (oldest) this.pending.delete(oldest.requestId);
@@ -98,6 +114,71 @@ export class PermissionRegistry {
   remove(requestId: string): void {
     this.pending.delete(requestId);
   }
+}
+
+/**
+ * Does a hook's `tool_input` describe the same call as a pending request's `inputPreview`?
+ *
+ * The preview is a **JSON-encoded** string (§6.5's measured payload; `rule-derivation.ts` `JSON.parse`s
+ * it too), so comparing a decoded field value against it as a substring silently fails for any value
+ * JSON escapes - which on this host is *most* of them: every Windows path contains backslashes
+ * (`C:\data\...` is `C:\\data\\...` inside the preview) and any command with a quote in it is escaped
+ * the same way. Parsing the preview first is what makes the comparison actually work; the substring
+ * path survives only as a fallback for a preview that isn't JSON at all.
+ *
+ * Comparison is by *identifying field* rather than deep equality, because the preview and the hook
+ * payload legitimately differ in the rest (a `Write`'s `content` may be elided in one and present in
+ * the other). Where no identifying field exists - `Task`, `TodoWrite`, an `mcp__*` tool - it falls back
+ * to comparing the whole shape, so those tools still get a terminal-answer match instead of none.
+ */
+export function toolInputMatches(inputPreview: string, toolInput: unknown): boolean {
+  if (typeof toolInput !== "object" || toolInput === null) return false;
+  const actual = toolInput as Record<string, unknown>;
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(inputPreview);
+  } catch {
+    // Not JSON after all - fall back to containment, but against the *escaped* form as well as the
+    // raw one. Comparing only the raw value here would reproduce the bug this function exists to fix
+    // for exactly the payloads that matter (any Windows path, any quoted command).
+    const signature = identifyingValue(actual);
+    if (signature === undefined) return false;
+    const escaped = JSON.stringify(signature).slice(1, -1);
+    return inputPreview.includes(signature) || inputPreview.includes(escaped);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return false;
+  const expected = parsed as Record<string, unknown>;
+
+  // Compare *every* identifying field either side carries, not just the first one found: picking one
+  // by priority order lets the two sides choose different keys when their payloads carry different
+  // subsets (a `Grep` preview with only `pattern` against a hook payload with `pattern` *and* `path`),
+  // which reads as a mismatch for what is plainly the same call.
+  const shared = IDENTIFYING_KEYS.filter((key) => typeof expected[key] === "string" || typeof actual[key] === "string");
+  if (shared.length > 0) {
+    return shared.every((key) => expected[key] === actual[key]);
+  }
+
+  // No identifying field at all (`Task`, `TodoWrite`, an `mcp__*` tool): compare the whole shape. Key
+  // sets must match too - comparing only the preview's keys would let a hook payload that is a strict
+  // superset of it match, which is a wrong card finalized and a wrong verdict sent.
+  const expectedKeys = Object.keys(expected).sort();
+  const actualKeys = Object.keys(actual).sort();
+  if (expectedKeys.length === 0 || expectedKeys.join(" ") !== actualKeys.join(" ")) return false;
+  return expectedKeys.every((key) => JSON.stringify(expected[key]) === JSON.stringify(actual[key]));
+}
+
+/** The fields that distinguish one call to a tool from another. */
+const IDENTIFYING_KEYS = ["command", "file_path", "notebook_path", "pattern", "path", "url", "query"] as const;
+
+/** The first identifying field present - only used on the non-JSON fallback path, where there is no
+ * structure to compare field by field. */
+function identifyingValue(input: Record<string, unknown>): string | undefined {
+  for (const key of IDENTIFYING_KEYS) {
+    const value = input[key];
+    if (typeof value === "string" && value.length > 0) return value;
+  }
+  return undefined;
 }
 
 /**

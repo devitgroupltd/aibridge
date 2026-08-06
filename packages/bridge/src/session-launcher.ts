@@ -230,9 +230,12 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   const log = opts.log ?? (() => {});
   const worktreesRoot = opts.worktreesRoot ?? "C:\\data\\worktrees";
   const worktreePath = path.join(worktreesRoot, opts.slug);
-  const branch = `claude/${opts.slug}-1`;
-
-  ensureWorktree(opts.repoPath, worktreePath, branch);
+  // §2.3's `claude/<slug>-<id>`: `-1` is only the *preferred* name. `ensureWorktree` returns the
+  // branch it actually cut, which differs when a leftover branch of that name still carries
+  // unmerged work (it takes the next free id rather than destroying it) or when an existing
+  // worktree is being readopted on whatever branch it is already on - so the returned row must
+  // record that, not the guess.
+  const branch = ensureWorktree(opts.repoPath, worktreePath, `claude/${opts.slug}-1`);
   log("INFO", `worktree ready at ${worktreePath} (${branch})`);
 
   // §9 scenario 28: this registration must be written before the process is spawned.

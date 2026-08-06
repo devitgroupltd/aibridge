@@ -42,6 +42,30 @@ describe("generateSettings", () => {
     expect(settings.permissions.allow).not.toContain("Bash(git push *)");
   });
 
+  /**
+   * §8.2, and a two-layer blind spot rather than one gap: `Read(.env)` is a gitignore-style *exact*
+   * name, so it never matched `.env.production`/`.env.local`, and `Read(~/**)` doesn't help because the
+   * worktree lives outside `~`. With `Bash(cat *)` pre-approved, `cat .env.production` ran with no
+   * prompt at all - and a `DATABASE_URL=postgres://u:pw@host/db` line quoted back from it also slipped
+   * past `secret-scrub.ts`'s env-assignment rule. `worktree-fs.ts` already hides this exact set from
+   * `/browse`, so the permission baseline was the odd one out.
+   */
+  test("denies .env variants and key material, not just a bare .env", () => {
+    for (const rule of ["Read(.env)", "Read(.env.*)", "Read(*.pem)", "Read(*.key)", "Read(*.pfx)", "Read(id_rsa*)"]) {
+      expect(settings.permissions.deny).toContain(rule);
+    }
+  });
+
+  test("denies edits to .env variants too, not only reads", () => {
+    expect(settings.permissions.deny).toContain("Edit(.env)");
+    expect(settings.permissions.deny).toContain("Edit(.env.*)");
+  });
+
+  // The other half of the pair: this only holds *because* the deny rules above cover the variants.
+  test("Bash(cat *) is pre-approved, which is exactly why the deny list has to name every secret shape", () => {
+    expect(settings.permissions.allow).toContain("Bash(cat *)");
+  });
+
   // §9 scenario 12: path rules use safe anchors and canonical tool names.
   test("every path-shaped rule is home-anchored, // absolute, or a bare gitignore-style name - never a single leading slash", () => {
     const allRules = [...settings.permissions.deny, ...settings.permissions.ask, ...settings.permissions.allow];

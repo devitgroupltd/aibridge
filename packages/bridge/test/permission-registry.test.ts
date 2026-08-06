@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { PermissionRegistry, sweepExpiredPermissions } from "../src/permission-registry.ts";
+import { PermissionRegistry, sweepExpiredPermissions, toolInputMatches } from "../src/permission-registry.ts";
 
 function entry(overrides: Partial<Parameters<PermissionRegistry["add"]>[0]> = {}) {
   return {
@@ -135,48 +135,162 @@ describe("PermissionRegistry", () => {
   // §13 check 4 / §6.5's "answered at the terminal" heuristic: no protocol event says a pending
   // prompt was resolved elsewhere, so a matching PostToolUse/PermissionDenied is the only signal.
   describe("resolveByToolMatch", () => {
-    test("matches by (slug, toolName) and removes the entry", () => {
+    test("matches by (slug, toolName) plus an input match, and removes the entry", () => {
       const registry = new PermissionRegistry();
-      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Write" }));
+      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Write", inputPreview: '{ "file_path": "src/a.ts" }' }));
 
-      const resolved = registry.resolveByToolMatch("session-a", "Write");
+      const resolved = registry.resolveByToolMatch("session-a", "Write", { file_path: "src/a.ts" });
       expect(resolved?.requestId).toBe("aaaaa");
       expect(registry.get("aaaaa")).toBeUndefined();
     });
 
     test("does not match a different session with the same tool", () => {
       const registry = new PermissionRegistry();
-      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Write" }));
+      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Write", inputPreview: '{ "file_path": "src/a.ts" }' }));
 
-      expect(registry.resolveByToolMatch("session-b", "Write")).toBeUndefined();
+      expect(registry.resolveByToolMatch("session-b", "Write", { file_path: "src/a.ts" })).toBeUndefined();
       expect(registry.get("aaaaa")).toBeDefined();
     });
 
     test("does not match the same session with a different tool", () => {
       const registry = new PermissionRegistry();
-      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Write" }));
+      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Write", inputPreview: '{ "file_path": "src/a.ts" }' }));
 
-      expect(registry.resolveByToolMatch("session-a", "Bash")).toBeUndefined();
+      expect(registry.resolveByToolMatch("session-a", "Bash", { file_path: "src/a.ts" })).toBeUndefined();
       expect(registry.get("aaaaa")).toBeDefined();
     });
 
-    test("two concurrent matches for the same (slug, toolName) resolve oldest first", () => {
+    // The bug this argument exists for: an unrelated same-tool call used to consume the pending
+    // entry, editing the card to "✅ Allowed (answered at terminal)" for an approval the operator
+    // never gave - and deleting the entry meant the expiry sweep could no longer send the
+    // compensating deny, so the session waited forever.
+    test("an unrelated call to the same tool does not consume the pending entry", () => {
+      const registry = new PermissionRegistry();
+      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Bash", inputPreview: '{ "command": "rm -rf build" }' }));
+
+      expect(registry.resolveByToolMatch("session-a", "Bash", { command: "git status" })).toBeUndefined();
+      expect(registry.get("aaaaa")).toBeDefined();
+    });
+
+    // Without an input there is nothing to match on, so "cannot confirm" must not become "matches".
+    test("a hook payload carrying no usable tool_input never matches", () => {
+      const registry = new PermissionRegistry();
+      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Bash" }));
+
+      expect(registry.resolveByToolMatch("session-a", "Bash", undefined)).toBeUndefined();
+      expect(registry.resolveByToolMatch("session-a", "Bash", null)).toBeUndefined();
+      expect(registry.get("aaaaa")).toBeDefined();
+    });
+
+    test("two concurrent identical calls for the same (slug, toolName) resolve oldest first", () => {
       let now = 0;
       const registry = new PermissionRegistry({ now: () => now });
-      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Write" }));
+      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Write", inputPreview: '{ "file_path": "src/a.ts" }' }));
       now = 100;
-      registry.add(entry({ requestId: "bbbbb", slug: "session-a", toolName: "Write" }));
+      registry.add(entry({ requestId: "bbbbb", slug: "session-a", toolName: "Write", inputPreview: '{ "file_path": "src/a.ts" }' }));
 
-      const first = registry.resolveByToolMatch("session-a", "Write");
+      const first = registry.resolveByToolMatch("session-a", "Write", { file_path: "src/a.ts" });
       expect(first?.requestId).toBe("aaaaa");
-      const second = registry.resolveByToolMatch("session-a", "Write");
+      const second = registry.resolveByToolMatch("session-a", "Write", { file_path: "src/a.ts" });
       expect(second?.requestId).toBe("bbbbb");
     });
 
     test("an unknown (slug, toolName) pair returns undefined without throwing", () => {
       const registry = new PermissionRegistry();
-      expect(() => registry.resolveByToolMatch("no-such-session", "Bash")).not.toThrow();
-      expect(registry.resolveByToolMatch("no-such-session", "Bash")).toBeUndefined();
+      expect(() => registry.resolveByToolMatch("no-such-session", "Bash", { command: "echo hi" })).not.toThrow();
+      expect(registry.resolveByToolMatch("no-such-session", "Bash", { command: "echo hi" })).toBeUndefined();
     });
+  });
+
+  describe("toolInputMatches", () => {
+    /**
+     * The regression that a forward-slash-only test suite hid completely. `inputPreview` is
+     * JSON-*encoded*, so a decoded field value is not a substring of it whenever JSON escapes
+     * anything - which on this host is most of the time: every Windows path contains backslashes, and
+     * `C:\data\x` inside the preview is `C:\\data\\x`. A substring comparison therefore never
+     * matched a real `Write`/`Edit`/`Read` on Windows, silently killing the whole terminal-answer path
+     * and leaving those sessions blocked until the 30-minute sweep denied them.
+     */
+    test("matches a Windows path through the preview's JSON escaping", () => {
+      const filePath = String.raw`C:\data\worktrees\billing\src\api\a.ts`;
+      const preview = JSON.stringify({ file_path: filePath, content: "x" });
+      // Guard the guard: the preview really does contain doubled backslashes, so a naive
+      // `preview.includes(filePath)` is false - which is exactly what used to happen.
+      expect(preview.includes(filePath)).toBe(false);
+
+      expect(toolInputMatches(preview, { file_path: filePath })).toBe(true);
+      expect(toolInputMatches(preview, { file_path: String.raw`C:\data\worktrees\billing\src\api\b.ts` })).toBe(false);
+    });
+
+    test("matches a command containing quotes", () => {
+      const command = 'echo "hi there" > out.txt';
+      expect(toolInputMatches(JSON.stringify({ command }), { command })).toBe(true);
+      expect(toolInputMatches(JSON.stringify({ command }), { command: 'echo "bye" > out.txt' })).toBe(false);
+    });
+
+    test("ignores fields that legitimately differ between the preview and the hook payload", () => {
+      // A Write's `content` may be elided in one and present in the other - only the identifying
+      // field decides.
+      const preview = JSON.stringify({ file_path: "src/a.ts" });
+      expect(toolInputMatches(preview, { file_path: "src/a.ts", content: "a very long body" })).toBe(true);
+    });
+
+    test("falls back to whole-shape comparison for a tool with no identifying field", () => {
+      // Task/TodoWrite/mcp__* tools have no command/file_path - a name-only match there was the
+      // original bug, and returning `false` unconditionally would leave them permanently unmatchable.
+      const preview = JSON.stringify({ subagent_type: "Explore", description: "find X" });
+      expect(toolInputMatches(preview, { subagent_type: "Explore", description: "find X" })).toBe(true);
+      expect(toolInputMatches(preview, { subagent_type: "Explore", description: "find Y" })).toBe(false);
+    });
+
+    test("a preview that isn't JSON at all still matches by containment rather than failing shut", () => {
+      expect(toolInputMatches("Bash: git status", { command: "git status" })).toBe(true);
+      expect(toolInputMatches("Bash: git status", { command: "rm -rf build" })).toBe(false);
+    });
+
+    test("never matches a non-object input, an empty preview object, or a scalar", () => {
+      expect(toolInputMatches("{}", {})).toBe(false);
+      expect(toolInputMatches('{"file_path":"a"}', "a string" as never)).toBe(false);
+      expect(toolInputMatches("42", { command: "x" })).toBe(false);
+    });
+  });
+});
+
+/**
+ * False-*positive* protection, which matters more than the false-negative case: a wrong match edits a
+ * card to "✅ Allowed (answered at terminal)" for an approval the operator never gave, *and* sends a
+ * verdict letting the call through.
+ */
+describe("toolInputMatches - cannot match two different calls", () => {
+  test("a hook payload that is a strict superset of a field-less preview does not match", () => {
+    const preview = JSON.stringify({ bash_id: "a" });
+    expect(toolInputMatches(preview, { bash_id: "a" })).toBe(true);
+    expect(toolInputMatches(preview, { bash_id: "a", filter: "error" })).toBe(false);
+  });
+
+  test("an empty preview object never matches anything", () => {
+    expect(toolInputMatches("{}", {})).toBe(false);
+    expect(toolInputMatches("{}", { command: "rm -rf /" })).toBe(false);
+  });
+
+  test("an array payload or preview never matches", () => {
+    expect(toolInputMatches("[1,2,3]", { command: "x" })).toBe(false);
+    expect(toolInputMatches('{"command":"x"}', ["x"] as never)).toBe(false);
+  });
+
+  // The two sides legitimately carry different subsets, so picking one identifying key by priority
+  // would let them choose *different* keys and read as a mismatch for plainly the same call.
+  test("compares every identifying field either side carries, not just the first", () => {
+    const preview = JSON.stringify({ pattern: "**/*.ts" });
+    expect(toolInputMatches(preview, { pattern: "**/*.ts", path: "src" })).toBe(false);
+    expect(toolInputMatches(JSON.stringify({ pattern: "**/*.ts", path: "src" }), { pattern: "**/*.ts", path: "src" })).toBe(true);
+    expect(toolInputMatches(JSON.stringify({ pattern: "**/*.ts", path: "src" }), { pattern: "**/*.ts", path: "test" })).toBe(false);
+  });
+
+  test("the non-JSON fallback also compares against the escaped form", () => {
+    // Otherwise the fallback is dead weight exactly where it matters - any Windows path.
+    const filePath = String.raw`C:\data\x\a.ts`;
+    const escapedPreview = `Write: {"file_path":"${filePath.split("\\").join("\\\\")}"} <-- not valid JSON`;
+    expect(toolInputMatches(escapedPreview, { file_path: filePath })).toBe(true);
   });
 });

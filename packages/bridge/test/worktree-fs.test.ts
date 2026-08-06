@@ -1,8 +1,10 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import {
+  findRemoteBranchContaining,
   isSecretShaped,
   listDirectory,
   looksBinary,
@@ -352,6 +354,83 @@ describe("resolveGithubLink", () => {
       expect(resolveGithubLink(root, "README.md")).toBeNull();
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("findRemoteBranchContaining", () => {
+  test("returns null when nothing is pushed (or there's no repo at all)", () => {
+    const root = makeFixture();
+    try {
+      expect(findRemoteBranchContaining(root, "HEAD")).toBeNull();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  /**
+   * The regression that made `/diff`'s compare link 404 on its first use in every session. A real
+   * `git clone` creates an `origin/HEAD` symref, and `git branch -r --contains` prints it *first*, as
+   * `origin/HEAD -> origin/main`. First-line parsing therefore returned the literal string
+   * `"HEAD -> origin/main"`, which `diff-review.ts` used as the base ref - producing a compare URL
+   * with a space in it. Nothing threw; the button just led to a 404. The existing `diff-review` fixture
+   * builds `origin` with `remote add` + push, which never creates that symref, so only a *cloned*
+   * fixture reproduces it.
+   */
+  test("ignores the origin/HEAD symref a real clone creates and returns a usable branch name", () => {
+    const upstream = mkdtempSync(path.join(os.tmpdir(), "aibridge-wfs-upstream-"));
+    const clone = mkdtempSync(path.join(os.tmpdir(), "aibridge-wfs-clone-"));
+    try {
+      const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, stdio: "pipe" });
+      git(upstream, "init", "--bare", "-b", "main");
+
+      const seed = mkdtempSync(path.join(os.tmpdir(), "aibridge-wfs-seed-"));
+      git(seed, "init", "-b", "main");
+      git(seed, "config", "user.email", "test@example.com");
+      git(seed, "config", "user.name", "Test");
+      writeFileSync(path.join(seed, "README.md"), "hello\n");
+      git(seed, "add", "README.md");
+      git(seed, "commit", "-m", "initial");
+      git(seed, "remote", "add", "origin", upstream);
+      git(seed, "push", "origin", "main");
+      rmSync(seed, { recursive: true, force: true });
+
+      rmSync(clone, { recursive: true, force: true });
+      execFileSync("git", ["clone", upstream, clone], { stdio: "pipe" });
+
+      // Sanity-check the condition this test exists for is actually present in the fixture.
+      const raw = execFileSync("git", ["branch", "-r", "--contains", "HEAD"], { cwd: clone, encoding: "utf8" });
+      expect(raw.split("\n")[0]).toContain("->");
+
+      const branch = findRemoteBranchContaining(clone, "HEAD");
+      expect(branch).toBe("main");
+      expect(branch).not.toContain("->");
+      expect(branch).not.toContain(" ");
+    } finally {
+      rmSync(upstream, { recursive: true, force: true });
+      rmSync(clone, { recursive: true, force: true });
+    }
+  });
+
+  test("keeps slashes inside a branch name rather than truncating at the first one", () => {
+    const upstream = mkdtempSync(path.join(os.tmpdir(), "aibridge-wfs-upstream2-"));
+    const repo = mkdtempSync(path.join(os.tmpdir(), "aibridge-wfs-repo2-"));
+    try {
+      const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, stdio: "pipe" });
+      git(upstream, "init", "--bare", "-b", "main");
+      git(repo, "init", "-b", "feature/nested-name");
+      git(repo, "config", "user.email", "test@example.com");
+      git(repo, "config", "user.name", "Test");
+      writeFileSync(path.join(repo, "a.txt"), "a\n");
+      git(repo, "add", "a.txt");
+      git(repo, "commit", "-m", "initial");
+      git(repo, "remote", "add", "origin", upstream);
+      git(repo, "push", "origin", "feature/nested-name");
+
+      expect(findRemoteBranchContaining(repo, "HEAD")).toBe("feature/nested-name");
+    } finally {
+      rmSync(upstream, { recursive: true, force: true });
+      rmSync(repo, { recursive: true, force: true });
     }
   });
 });

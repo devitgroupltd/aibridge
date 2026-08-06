@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { RateGovernor, RateLimitedError } from "../src/rate-governor.ts";
+import { clampRetryAfterMs, RateGovernor, RateLimitedError } from "../src/rate-governor.ts";
 
 interface FakeTimer {
   fireAt: number;
@@ -294,5 +294,89 @@ describe("RateGovernor", () => {
       clock.advance(60_001); // every one of those 4 outcomes is now outside the window
       expect(governor.p2PressureExceeded()).toBe(false); // back below the minimum sample count
     });
+  });
+});
+
+/**
+ * The queue used to defer on a time-based condition without owning a timer for it: `drainControl`
+ * returned on an empty/paused bucket, and the 429 branch requeued the task with no timer at all. The
+ * only things that ever re-drained were a *new* `enqueueControl` and the non-429 retry path, and
+ * every existing test above hides that by calling `pump()` by hand.
+ *
+ * Concretely: a 429 on the last send before an idle stretch parks the requeued task indefinitely -
+ * and when that task is the permission card a session is blocked waiting on, nothing for that session
+ * will ever call `schedule()` again. The fleet deadlocks until the §6.5 sweep or a restart.
+ */
+describe("RateGovernor self-rearming (no external pump)", () => {
+  test("a task deferred by an empty bucket drains itself once tokens refill", async () => {
+    const clock = makeClock(0);
+    const governor = new RateGovernor({ capacity: 1, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+
+    governor.schedule("P0", async () => {}); // takes the only token
+    let deferredRan = false;
+    governor.schedule("P0", async () => {
+      deferredRan = true;
+    });
+    await flushMicrotasks();
+    expect(deferredRan).toBe(false);
+
+    // No pump() call here - that is the whole point. Only time passes.
+    clock.advance(60_000);
+    await flushMicrotasks();
+    expect(deferredRan).toBe(true);
+  });
+
+  test("a 429'd P0 card is retried on its own after the retry_after window, with no new work arriving", async () => {
+    const clock = makeClock(0);
+    const governor = new RateGovernor({ capacity: 20, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+
+    let attempts = 0;
+    const done = governor.scheduleAsync("P0", async () => {
+      attempts += 1;
+      if (attempts === 1) throw new RateLimitedError(3);
+      return "delivered";
+    });
+    await flushMicrotasks();
+    expect(attempts).toBe(1);
+
+    clock.advance(3100);
+    await flushMicrotasks();
+    expect(attempts).toBe(2);
+    expect(await done).toBe("delivered");
+  });
+
+  test("many deferred tasks share one retry timer rather than arming one each", async () => {
+    const clock = makeClock(0);
+    let timersArmed = 0;
+    const countingSetTimeout = (fn: () => void, ms: number): unknown => {
+      timersArmed += 1;
+      return clock.setTimeoutFn(fn, ms);
+    };
+    const governor = new RateGovernor({ capacity: 1, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: countingSetTimeout });
+
+    governor.schedule("P0", async () => {}); // takes the only token
+    for (let i = 0; i < 50; i++) governor.schedule("P1", async () => {});
+    await flushMicrotasks();
+
+    // One shared drain-retry timer, not 50.
+    expect(timersArmed).toBe(1);
+  });
+});
+
+describe("clampRetryAfterMs", () => {
+  // §5.4 says honour retry_after exactly, but a bucket paused on an unbounded number taken straight
+  // off the wire may never resume - a garbled retry_after of 10^9 would mute the fleet for the
+  // process's lifetime, silently.
+  test("passes a realistic retry_after through unchanged", () => {
+    expect(clampRetryAfterMs(5)).toBe(5000);
+    expect(clampRetryAfterMs(30)).toBe(30_000);
+  });
+
+  test("caps an absurd value at one hour and floors a nonsensical one at a second", () => {
+    expect(clampRetryAfterMs(1_000_000_000)).toBe(60 * 60 * 1000);
+    expect(clampRetryAfterMs(0)).toBe(1000);
+    expect(clampRetryAfterMs(-5)).toBe(1000);
+    expect(clampRetryAfterMs(Number.NaN)).toBe(1000);
+    expect(clampRetryAfterMs(Number.POSITIVE_INFINITY)).toBe(1000);
   });
 });

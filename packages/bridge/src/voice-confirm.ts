@@ -1,4 +1,4 @@
-import { monotonicNowMs } from "./monotonic-clock.ts";
+import { ConfirmRegistry, type ConfirmRegistryOptions } from "./confirm-registry.ts";
 import type { InlineKeyboardButton } from "./telegram.ts";
 
 /**
@@ -27,35 +27,12 @@ export interface PendingVoiceConfirm {
  * `stale-confirm.ts`'s own TTL. */
 const DEFAULT_TTL_MS = 10 * 60 * 1000;
 
-export interface VoiceConfirmRegistryOptions {
-  ttlMs?: number;
-  /** Clock injection for expiry tests - defaults to `monotonicNowMs` (§7.4): this only ever
-   * computes a duration, never a wall-clock timestamp. */
-  now?: () => number;
-}
+/** TTL + clock injection, both from `ConfirmRegistry` - this registry adds nothing of its own. */
+export type VoiceConfirmRegistryOptions = ConfirmRegistryOptions;
 
-export class VoiceConfirmRegistry {
-  private readonly pending = new Map<string, PendingVoiceConfirm>();
-  private readonly ttlMs: number;
-  private readonly now: () => number;
-
+export class VoiceConfirmRegistry extends ConfirmRegistry<PendingVoiceConfirm> {
   constructor(opts: VoiceConfirmRegistryOptions = {}) {
-    this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
-    this.now = opts.now ?? monotonicNowMs;
-  }
-
-  add(entry: Omit<PendingVoiceConfirm, "createdAt">): void {
-    this.pending.set(entry.id, { ...entry, createdAt: this.now() });
-  }
-
-  /** An unknown or expired id is a no-op, not a crash - same discipline as every other
-   * resolve-a-tap path in this codebase (a stale/duplicate tap on this very card is expected). */
-  resolve(id: string): PendingVoiceConfirm | undefined {
-    const entry = this.pending.get(id);
-    if (!entry) return undefined;
-    this.pending.delete(id);
-    if (this.now() - entry.createdAt > this.ttlMs) return undefined;
-    return entry;
+    super(DEFAULT_TTL_MS, opts);
   }
 }
 

@@ -206,6 +206,21 @@ async function parseTelegramResponse<T>(res: Response, method: string): Promise<
  * Minimal Bot API client for one token. §12 P-2: the Bridge validates both tokens with `getMe`
  * at startup, before the poller registers or any session launches - see `validateTokens` below.
  */
+/**
+ * Telegram 400s that mean "this specific message can never be edited again", as distinct from a
+ * transient failure worth retrying. Matched on the message text because the Bot API returns all of
+ * them as a plain 400 with no machine-readable code.
+ *
+ * §9's silent-wrong bar squarely: the feed card's flush uses this to decide whether to *invalidate*
+ * its cached `message_id`. Classifying a permanent failure as transient leaves the feed for that
+ * session silently dead for the life of the process (the P2 lane swallows rejections); classifying a
+ * transient one as permanent posts a duplicate card. Neither crashes, so only a test catches it.
+ */
+export function isPermanentEditFailure(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return /message to edit not found|message can't be edited|MESSAGE_ID_INVALID|message thread not found/i.test(message);
+}
+
 export class TelegramClient implements UpdatesSource {
   private readonly token: string;
   private readonly baseUrl: string;

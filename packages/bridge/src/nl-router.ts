@@ -64,6 +64,16 @@ function isDestructive(command: FleetCommand | SessionCommand | RouterAction): b
   if (command.kind === "rm") return command.bulk?.mode !== "all";
   if (command.kind === "restart" || command.kind === "deploy") return true;
   if (command.kind === "repos" && command.action === "rm") return true;
+  // Turning a guard *off* is at least as destructive as the actions it guards, and these are the
+  // easiest of all commands to trigger by accident from natural language: "stop asking me for
+  // permission on this one" is a very plausible match for `mode auto`, which fires the Shift+Tab
+  // keystrokes and leaves that session running every tool call with no approval card at all -
+  // decision 3's whole allowlist+button-escalation model, switched off by one fuzzy guess. `assist
+  // off` and `voiceconfirm off` are the same shape one level up: they remove the confirm card from
+  // *every subsequent* destructive match, so an unconfirmed match that disables confirmation is
+  // self-propagating.
+  if (command.kind === "mode" && command.mode === "auto") return true;
+  if ((command.kind === "assist" || command.kind === "voiceconfirm") && command.action === "off") return true;
   return false;
 }
 

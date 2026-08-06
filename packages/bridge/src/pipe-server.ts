@@ -1,4 +1,4 @@
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
 import path from "node:path";
 import net from "node:net";
 import { DEFAULT_PIPE_PATH, encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protocol";
@@ -102,6 +102,52 @@ export interface PipeServerHandle {
  * and `reply` (forward to the control bot in the session's topic); anything else is logged and
  * ignored rather than dropping the connection (§9 scenario 34 - version-skew tolerance).
  */
+/** Telegram's own limit is 4096 UTF-16 code units per message; the headroom absorbs the entity
+ * expansion Telegram counts after parsing. */
+const TELEGRAM_TEXT_LIMIT = 3900;
+
+/** Telegram rejects a `sendDocument` over 50MB outright, so reading a larger file into memory only
+ * to have the upload 400 (three times, once per retry) is pure waste. */
+const MAX_SEND_FILE_BYTES = 50 * 1024 * 1024;
+
+/** Splits at line boundaries where it can, mid-line only when a single line is itself too long.
+ * Returns `[]` for text that is empty or whitespace-only - Telegram 400s on that too. */
+export function splitForTelegram(text: string, limit = TELEGRAM_TEXT_LIMIT): string[] {
+  if (text.trim().length === 0) return [];
+  if (text.length <= limit) return [text];
+  const chunks: string[] = [];
+  let current = "";
+  for (const line of text.split("\n")) {
+    let rest = line;
+    // A single line longer than the whole budget can't be kept intact - hard-split it.
+    while (rest.length > limit) {
+      if (current.length > 0) {
+        chunks.push(current);
+        current = "";
+      }
+      // Back off one code unit if the cut would land between a surrogate pair, which would otherwise
+      // send a lone surrogate (Telegram counts UTF-16 code units, so a limit boundary lands there for
+      // any emoji-heavy line).
+      const cut = isHighSurrogate(rest.charCodeAt(limit - 1)) ? limit - 1 : limit;
+      chunks.push(rest.slice(0, cut));
+      rest = rest.slice(cut);
+    }
+    const candidate = current.length === 0 ? rest : `${current}\n${rest}`;
+    if (candidate.length > limit) {
+      chunks.push(current);
+      current = rest;
+    } else {
+      current = candidate;
+    }
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks.filter((c) => c.length > 0);
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
 export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
   const pipePath = opts.pipePath ?? DEFAULT_PIPE_PATH;
   const log = opts.log ?? (() => {});
@@ -123,6 +169,31 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     return opts.governor ? opts.governor.scheduleAsync("P1", fn) : fn();
   }
 
+  /**
+   * The destination topic is derived from the *slug*, never taken from the message. `topic_id` is
+   * an argument the model fills in ("pass back the topic_id from the tag"), so a session that read
+   * a file containing a channel-tag-shaped string - or just a confused model reusing a stale tag -
+   * could otherwise deliver its reply, its files, and §4.4's rename-once into another session's
+   * topic. The routing table is the only thing that knows where a slug's messages belong.
+   */
+  function topicFor(slug: string, claimed: string, what: string): number | undefined {
+    const route = opts.routing.get(slug);
+    if (route) {
+      if (String(route.topicId) !== String(claimed)) {
+        log("WARN", `${what} for slug "${slug}" named topic ${claimed} but its route is topic ${route.topicId} - using the route`);
+      }
+      return route.topicId;
+    }
+    // No route yet (the Phase 1 hardcoded slot, or a session mid-`/new`): fall back to the claimed
+    // id, but never to `NaN` - `Number("abc")` would otherwise reach the Bot API as a bad thread.
+    const parsed = Number(claimed);
+    if (!Number.isFinite(parsed)) {
+      log("WARN", `${what} for slug "${slug}" dropped - no route and "${claimed}" is not a topic id`);
+      return undefined;
+    }
+    return parsed;
+  }
+
   async function handleReply(msg: ReplyMessage): Promise<void> {
     try {
       // Last-line-of-defence, not a substitute for §6.2's Read/Edit deny rules: those stop Claude's
@@ -133,13 +204,33 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       if (triggered.length > 0) {
         log("WARN", `redacted ${triggered.join(", ")} from a reply for slug "${msg.slug}" before sending to Telegram`);
       }
-      const placeholderId = await opts.thinkingPlaceholder?.consume(msg.topic_id);
-      if (placeholderId !== undefined && opts.controlBot.editMessageText) {
-        await p1(() => opts.controlBot.editMessageText!(opts.chatId, placeholderId, text));
-      } else {
-        await p1(() => opts.controlBot.sendMessage(opts.chatId, Number(msg.topic_id), text));
+      const topicId = topicFor(msg.slug, msg.topic_id, "reply");
+      if (topicId === undefined) return;
+      // Telegram rejects both an empty message and one over 4096 code units with a 400, which the
+      // governor cannot retry its way out of - and since the placeholder is consumed either way,
+      // the failure used to leave a permanent "🤔 Thinking..." and no answer at all in the topic.
+      const chunks = splitForTelegram(text);
+      if (chunks.length === 0) {
+        log("WARN", `reply for slug "${msg.slug}" was empty after scrubbing - nothing to send`);
+        return;
       }
-      opts.onReplySent?.(msg.topic_id, text);
+      // Both of these are keyed by topic too, and both must use the *routed* topic rather than the
+      // claimed one. `consume` pops a placeholder by topic and the branch below edits it by
+      // `message_id` - an edit ignores the topic entirely - so a claimed-but-wrong topic would have
+      // written this session's reply into another session's "🤔 Thinking..." message, leaving that
+      // session's turn permanently unfinished. `onReplySent` drives §4.4's rename-once, so the same
+      // mismatch would have retitled the wrong topic and consumed its one rename.
+      const routedTopic = String(topicId);
+      const placeholderId = await opts.thinkingPlaceholder?.consume(routedTopic);
+      if (placeholderId !== undefined && opts.controlBot.editMessageText) {
+        await p1(() => opts.controlBot.editMessageText!(opts.chatId, placeholderId, chunks[0]!));
+      } else {
+        await p1(() => opts.controlBot.sendMessage(opts.chatId, topicId, chunks[0]!));
+      }
+      for (const chunk of chunks.slice(1)) {
+        await p1(() => opts.controlBot.sendMessage(opts.chatId, topicId, chunk));
+      }
+      opts.onReplySent?.(routedTopic, text);
     } catch (err) {
       log("ERROR", `failed to deliver reply for slug "${msg.slug}": ${(err as Error).message}`);
     }
@@ -167,7 +258,14 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       log("WARN", `send_file for slug "${msg.slug}" rejected - "${resolved}" does not exist`);
       return;
     }
+    const topicId = topicFor(msg.slug, msg.topic_id, "send_file");
+    if (topicId === undefined) return;
     try {
+      const size = statSync(resolved).size;
+      if (size > MAX_SEND_FILE_BYTES) {
+        log("WARN", `send_file for slug "${msg.slug}" rejected - "${resolved}" is ${size} bytes, over Telegram's 50MB limit`);
+        return;
+      }
       const bytes = readFileSync(resolved);
       const filename = path.basename(resolved);
       const asPhoto = isImagePath(filename);
@@ -183,10 +281,10 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
         }
       }
       if (asPhoto && opts.controlBot.sendPhotoFile) {
-        await p1(() => opts.controlBot.sendPhotoFile!(opts.chatId, Number(msg.topic_id), filename, bytes, caption));
+        await p1(() => opts.controlBot.sendPhotoFile!(opts.chatId, topicId, filename, bytes, caption));
         log("INFO", `sent "${filename}" (${bytes.length} bytes) as a photo for slug "${msg.slug}"`);
       } else if (opts.controlBot.sendDocumentFile) {
-        await p1(() => opts.controlBot.sendDocumentFile!(opts.chatId, Number(msg.topic_id), filename, bytes, caption));
+        await p1(() => opts.controlBot.sendDocumentFile!(opts.chatId, topicId, filename, bytes, caption));
         log("INFO", `sent "${filename}" (${bytes.length} bytes) as a document for slug "${msg.slug}"`);
       } else {
         log("WARN", `send_file for slug "${msg.slug}" dropped - control bot has no file-sending method`);
@@ -323,14 +421,21 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
   }
 
   const server = net.createServer((socket) => {
-    const decoder = new NdjsonDecoder();
+    // One corrupt line is logged and skipped individually; the well-formed messages sharing its
+    // chunk still get handled (a hook's `hello`+`ask` pair arriving alongside one is otherwise lost
+    // and Claude blocks for the full hour).
+    const decoder = new NdjsonDecoder((line, err) => {
+      log("ERROR", `skipping malformed message on pipe (${(err as Error).message}): ${line.slice(0, 200)}`);
+    });
 
     socket.on("data", (chunk) => {
       let messages: Message[];
       try {
         messages = decoder.push(chunk);
       } catch (err) {
-        log("ERROR", `malformed message on pipe: ${(err as Error).message}`);
+        // Only the line-length guard reaches here now - the peer is not speaking the protocol.
+        log("ERROR", `pipe framing violation, dropping connection: ${(err as Error).message}`);
+        socket.destroy();
         return;
       }
       for (const msg of messages) {
@@ -358,6 +463,16 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
 
   server.on("error", (err) => {
     log("ERROR", `pipe server error: ${(err as Error).message}`);
+    // A pipe we could not bind is not a degraded Bridge, it is a mute one: every channel server
+    // and every hook client connects here, so the whole fleet loses its permission cards, its
+    // replies and its feed while the process keeps running and looks healthy. The usual cause is a
+    // second Bridge already holding the pipe (`MultipleInstances = Parallel` on the logon task
+    // permits that for `/restart`'s handover), and the correct outcome there is for the loser to
+    // die loudly rather than shadow the winner.
+    if ((err as NodeJS.ErrnoException).code === "EADDRINUSE") {
+      log("ERROR", `another Bridge already owns ${pipePath} - exiting rather than running without a pipe`);
+      process.exit(1);
+    }
   });
 
   server.listen(pipePath, () => {

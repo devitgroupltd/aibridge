@@ -104,11 +104,27 @@ export function isValidRepoName(name: string): boolean {
   return /^[A-Za-z0-9_-]+$/.test(name);
 }
 
+/** Single-quoted TOML *literal* strings, not basic (double-quoted) ones. Every value written here is
+ * a Windows path, and `"C:\data\projects\aibridge"` is not valid TOML - `\d` is an illegal escape,
+ * so anything holding this file to the real spec (an editor, a linter, a future swap to a real TOML
+ * library) rejects a file this module wrote itself. A literal string takes no escapes at all, which
+ * is exactly right for backslashes. */
 function quote(field: string, value: string): string {
-  if (value.includes('"') || /[\r\n]/.test(value)) {
-    throw new Error(`repos.toml ${field} "${value}" can't contain a double quote or newline`);
+  if (/[\r\n]/.test(value)) {
+    throw new Error(`repos.toml ${field} "${value}" can't contain a newline`);
   }
-  return `"${value}"`;
+  // A literal string can't escape its own delimiter, and an apostrophe in a path is perfectly legal on
+  // Windows (`C:\Users\Tom O'Neil\repos\x`) - unlike `"`, which Windows forbids in a filename. So that
+  // one case falls back to the double-quoted form this file used before, matching how `parseValue`
+  // (and every hand-written registry) already treats it: delimiters stripped, contents taken
+  // literally. Only a value containing *both* quote characters has nowhere left to go.
+  if (value.includes("'")) {
+    if (value.includes('"')) {
+      throw new Error(`repos.toml ${field} "${value}" can't contain both a single and a double quote`);
+    }
+    return `"${value}"`;
+  }
+  return `'${value}'`;
 }
 
 /** The inverse of `parseReposToml` - round-trips through the same `[name]`/`key = "value"` subset,
@@ -176,8 +192,15 @@ export function addRepoEntry(reposTomlPath: string, entry: RepoEntry): void {
   let existing: RepoEntry[] = [];
   try {
     existing = parseReposToml(readFileSync(reposTomlPath, "utf8"));
-  } catch {
-    // No repos.toml yet - /repos add creates it fresh.
+  } catch (err) {
+    // *Only* "no repos.toml yet" is recoverable here, and it has to be distinguished by errno
+    // rather than by "something threw". Swallowing a parse error instead meant a single bad
+    // hand-edited line (README tells the operator to edit this file by hand) turned the next
+    // `/repos add` into a full rewrite from an empty list: every other registration silently
+    // deleted, reported as a success.
+    if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
+      throw new Error(`refusing to rewrite repos.toml - it exists but could not be parsed (${(err as Error).message}). Fix the file by hand first.`);
+    }
   }
   if (existing.some((e) => e.name === entry.name)) {
     throw new Error(`repo "${entry.name}" is already registered`);

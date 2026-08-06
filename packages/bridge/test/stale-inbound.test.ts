@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { formatStaleAge, isStaleInbound, STALE_INBOUND_THRESHOLD_MS } from "../src/stale-inbound.ts";
+import { formatStaleAge, isStaleInbound, STALE_INBOUND_THRESHOLD_MS, hasAttachment } from "../src/stale-inbound.ts";
 
 describe("isStaleInbound (§7.4)", () => {
   test("a message sent seconds ago is not stale", () => {
@@ -57,5 +57,36 @@ describe("formatStaleAge", () => {
     const nowMs = 1_000_000_000_000;
     const messageDateSec = Math.floor(nowMs / 1000) + 5;
     expect(formatStaleAge(messageDateSec, nowMs)).toBe("0m ago");
+  });
+});
+
+/**
+ * The staleness gate runs before every per-kind handler in `index.ts`, so it has to tell "content I
+ * would have acted on" apart from a Telegram service message. Getting that wrong is silent-wrong in a
+ * user-visible way: a backlog replay after downtime posts a spurious "an attachment arrived while
+ * offline" notice for every topic Telegram re-announces.
+ */
+describe("hasAttachment", () => {
+  test("recognises each media kind §5.6's handlers actually land in the inbox", () => {
+    expect(hasAttachment({ photo: [{}, {}] })).toBe(true);
+    expect(hasAttachment({ document: {} })).toBe(true);
+    expect(hasAttachment({ video: {} })).toBe(true);
+    expect(hasAttachment({ audio: {} })).toBe(true);
+    expect(hasAttachment({ video_note: {} })).toBe(true);
+  });
+
+  test("an empty photo array is not an attachment", () => {
+    // Telegram sends one entry per resolution; an empty array carries nothing to download.
+    expect(hasAttachment({ photo: [] })).toBe(false);
+  });
+
+  test("service messages and unhandled kinds are not attachments", () => {
+    // These previously fell through to `if (!message.text) return` and must keep doing so.
+    expect(hasAttachment({})).toBe(false);
+    expect(hasAttachment({ forum_topic_created: {} } as never)).toBe(false);
+    expect(hasAttachment({ pinned_message: {} } as never)).toBe(false);
+    expect(hasAttachment({ new_chat_members: [{}] } as never)).toBe(false);
+    expect(hasAttachment({ sticker: {} } as never)).toBe(false);
+    expect(hasAttachment({ poll: {} } as never)).toBe(false);
   });
 });

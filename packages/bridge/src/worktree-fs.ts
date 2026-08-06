@@ -361,11 +361,24 @@ export function parseGithubOwnerRepo(worktreeRoot: string): { owner: string; rep
 export function findRemoteBranchContaining(worktreeRoot: string, sha: string): string | null {
   const root = path.resolve(worktreeRoot);
   try {
-    const containing = execFileSync("git", ["branch", "-r", "--contains", sha], { cwd: root, encoding: "utf8" }).trim();
-    if (containing.length === 0) return null;
-    const first = containing.split("\n")[0]?.trim().replace(/^\*\s*/, "") ?? "";
-    const slash = first.indexOf("/");
-    return slash === -1 ? first : first.slice(slash + 1);
+    // `for-each-ref`, not `branch -r --contains`: the latter's *human* output puts the
+    // `origin/HEAD -> origin/main` symref alias first on any real `git clone` (a `remote add` +
+    // push fixture never creates that symref, which is why this went unnoticed), so first-line
+    // parsing returned the literal string "HEAD -> origin/main" and `/diff` built a compare URL
+    // with a space in it that 404s. `refname:strip=3` drops `refs/remotes/origin/`, keeping any
+    // slashes inside the branch name itself (`feature/x`) intact.
+    const out = execFileSync("git", ["for-each-ref", "--contains", sha, "--format=%(refname:strip=3)", "refs/remotes/origin"], {
+      cwd: root,
+      encoding: "utf8",
+    }).trim();
+    if (out.length === 0) return null;
+    for (const line of out.split("\n")) {
+      const name = line.trim();
+      // `refs/remotes/origin/HEAD` strips to a bare "HEAD" - the symref alias, not a real branch.
+      if (name.length === 0 || name === "HEAD") continue;
+      return name;
+    }
+    return null;
   } catch {
     return null;
   }

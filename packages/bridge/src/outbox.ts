@@ -11,7 +11,7 @@
  * Mixing them would let a `send_file` call exfiltrate whatever the operator last uploaded, not
  * just what Claude itself wrote.
  */
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 /** Extensions Telegram will render inline as a photo via `sendPhoto` rather than a generic
@@ -70,8 +70,34 @@ export function ensurePlaywrightSharedDir(stateDir: string): string {
  * untrusted content read earlier in the same session), never trusted the way an inbox path is.
  */
 export function resolveOutboxPath(stateDir: string, slug: string, requestedPath: string): string | null {
-  const dir = path.resolve(outboxDir(stateDir, slug));
-  const resolved = path.resolve(requestedPath);
-  if (resolved !== dir && !resolved.startsWith(dir + path.sep)) return null;
+  // The slug is as untrusted as the path: `pipe-server.ts` takes it from the `send_file` message
+  // itself, and nothing binds a pipe connection to one slug, so a `slug` of `mine/../victim` would
+  // otherwise build a *different session's* outbox directory and pass the containment check
+  // against it. Slugs are `slug.ts`-shaped by construction; anything else is not a slug.
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(slug)) return null;
+  const dir = realpathOrResolve(outboxDir(stateDir, slug));
+  // `realpath` before the containment check, not just `resolve`: an unprivileged `mklink /J`
+  // junction (or a symlink) placed inside the outbox otherwise resolves to a path that is
+  // *textually* inside it while reading through to anywhere on disk.
+  const resolved = realpathOrResolve(requestedPath);
+  if (!isInside(dir, resolved)) return null;
   return resolved;
+}
+
+/** Falls back to `resolve` when the path doesn't exist yet - a missing file is the caller's own
+ * `existsSync` check to report, not something to silently turn into a containment rejection. */
+function realpathOrResolve(p: string): string {
+  try {
+    return realpathSync.native(path.resolve(p));
+  } catch {
+    return path.resolve(p);
+  }
+}
+
+/** Windows compares paths case-insensitively, so a plain `startsWith` false-rejects an outbox path
+ * that differs only in drive-letter or directory case - which Claude writes routinely. */
+function isInside(dir: string, candidate: string): boolean {
+  const a = process.platform === "win32" ? dir.toLowerCase() : dir;
+  const b = process.platform === "win32" ? candidate.toLowerCase() : candidate;
+  return b === a || b.startsWith(a + path.sep);
 }

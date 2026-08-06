@@ -24,6 +24,33 @@ export function isStaleInbound(messageDateUnixSec: number, nowMs: number, thresh
   return nowMs - messageDateUnixSec * 1000 > thresholdMs;
 }
 
+/**
+ * Does this message carry media the Bridge would land in a session's inbox (§5.6)? The staleness gate
+ * has to know, because it runs *before* the per-kind handlers and must distinguish "content I would
+ * have acted on" from a Telegram service message (`forum_topic_created`, `pinned_message`,
+ * `new_chat_members`) or an unhandled kind (sticker, poll, location). Those used to fall through to
+ * `if (!message.text) return` and must keep doing so - otherwise a backlog replay posts a spurious
+ * "an attachment arrived while offline" notice for every topic Telegram re-announces.
+ *
+ * Deliberately the same field list `index.ts`'s handlers branch on, kept here so it is testable
+ * alongside the age check it gates.
+ */
+export function hasAttachment(message: {
+  photo?: unknown[];
+  document?: unknown;
+  video?: unknown;
+  audio?: unknown;
+  video_note?: unknown;
+}): boolean {
+  return (
+    (Array.isArray(message.photo) && message.photo.length > 0) ||
+    message.document !== undefined ||
+    message.video !== undefined ||
+    message.audio !== undefined ||
+    message.video_note !== undefined
+  );
+}
+
 /** For the confirm card's own text - "received while offline (42m ago)" reads better than raw ms. */
 export function formatStaleAge(messageDateUnixSec: number, nowMs: number): string {
   const ageMs = Math.max(0, nowMs - messageDateUnixSec * 1000);

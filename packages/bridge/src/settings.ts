@@ -104,7 +104,22 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         "Bash(git push --force *)",
         "Bash(curl * | sh)",
         "Bash(curl * | bash)",
+        // `.env` alone is a gitignore-style *exact* name - it does not match `.env.production`,
+        // `.env.local` or any other real-world variant, and `Read(~/**)` below doesn't help because
+        // the worktree is outside `~`. With `Bash(cat *)` pre-approved, `cat .env.production` ran
+        // with no prompt at all, and a `DATABASE_URL=postgres://user:pw@host/db` line quoted back
+        // from it also slipped past `secret-scrub.ts`'s env-assignment rule (which keys on
+        // KEY|SECRET|TOKEN|PASSWORD in the *identifier*) - two independent layers with the same blind
+        // spot. `worktree-fs.ts` already hides this exact set from `/browse`; this is the permission
+        // baseline catching up to it.
         "Read(.env)",
+        "Read(.env.*)",
+        "Read(*.pem)",
+        "Read(*.key)",
+        "Read(*.pfx)",
+        "Read(id_rsa*)",
+        "Edit(.env)",
+        "Edit(.env.*)",
         // Broadened from just ~/.ssh and ~/.aws to the whole home directory: the operator's
         // worktree lives under c:\data\worktrees\<slug>, entirely outside ~, so denying all of ~
         // costs a session nothing it needs and closes every other secret-shaped file under

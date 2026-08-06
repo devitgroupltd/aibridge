@@ -96,8 +96,30 @@ describe("serializeReposToml", () => {
     expect(serializeReposToml([])).toBe("");
   });
 
-  test("rejects a value containing a double quote", () => {
-    expect(() => serializeReposToml([{ name: "a", path: 'c:\\has"quote' }])).toThrow(/double quote/);
+  // Single-quoted TOML *literal* strings, because every value here is a Windows path and
+  // `path = "C:\data\x"` is not valid TOML - `\d` is an illegal escape in a basic string, so a file
+  // this module wrote itself was rejected by anything holding it to the real spec.
+  test("emits literal (single-quoted) strings so backslashes need no escaping", () => {
+    expect(serializeReposToml([{ name: "a", path: "c:\\data\\projects\\a" }])).toBe("[a]\npath = 'c:\\data\\projects\\a'\n");
+  });
+
+  // An apostrophe in a path is perfectly legal on Windows (`C:\Users\Tom O'Neil\repos\x`), unlike `"`
+  // which Windows forbids in a filename - so it must not be a hard rejection. A literal string can't
+  // escape its own delimiter, so that one case falls back to the double-quoted form, which
+  // `parseValue` reads back identically.
+  test("falls back to a double-quoted string for a path containing an apostrophe, and round-trips", () => {
+    const entries = [{ name: "a", path: "c:\\Users\\Tom O'Neil\\repos\\x" }];
+    const serialized = serializeReposToml(entries);
+    expect(serialized).toBe("[a]\npath = \"c:\\Users\\Tom O'Neil\\repos\\x\"\n");
+    expect(parseReposToml(serialized)).toEqual(entries);
+  });
+
+  test("rejects only a value with nowhere left to go - both quote characters at once", () => {
+    expect(() => serializeReposToml([{ name: "a", path: `c:\\has'both"quotes` }])).toThrow(/both a single and a double quote/);
+  });
+
+  test("rejects a newline, which no single-line TOML value can carry", () => {
+    expect(() => serializeReposToml([{ name: "a", path: "c:\\has\nnewline" }])).toThrow(/newline/);
   });
 });
 
@@ -187,6 +209,26 @@ describe("addRepoEntry / removeRepoEntry", () => {
       const repoDir = makeFakeRepoDir();
       addRepoEntry(tomlPath, { name: "fresh", path: repoDir });
       expect(parseReposToml(readFileSync(tomlPath, "utf8"))).toEqual([{ name: "fresh", path: repoDir }]);
+      rmSync(repoDir, { recursive: true, force: true });
+    });
+  });
+
+  /**
+   * The data-loss case. `addRepoEntry` treated *any* parse failure as "no registry yet" and then
+   * rewrote the whole file from an empty list. README explicitly tells the operator to hand-edit this
+   * file, so one bad line (an unquoted path, say) meant the next `/repos add` silently deleted every
+   * other registration - and reported success. "Absent" and "corrupt" have to be different answers.
+   */
+  test("refuses to rewrite a repos.toml it could not parse, rather than replacing it", () => {
+    withTempToml((tomlPath) => {
+      const corrupt = "[existing]\npath = C:\\unquoted\\path\n";
+      writeFileSync(tomlPath, corrupt);
+      const repoDir = makeFakeRepoDir();
+
+      expect(() => addRepoEntry(tomlPath, { name: "new", path: repoDir })).toThrow(/could not be parsed/);
+      // Crucially: the original file is still there, untouched.
+      expect(readFileSync(tomlPath, "utf8")).toBe(corrupt);
+
       rmSync(repoDir, { recursive: true, force: true });
     });
   });

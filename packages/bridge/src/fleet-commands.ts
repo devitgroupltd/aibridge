@@ -598,6 +598,23 @@ export function renderHelp(): string {
  * scopes), so this single list necessarily includes both fleet- and session-scoped commands together
  * - a suggestion tapped from the wrong topic just falls through to the existing wrong-topic rejection
  * the text parser already sends, rather than being filtered out by Telegram itself. */
+/**
+ * Is this text an invocation of a command this bot actually recognises? Keyed off `botCommandList()`
+ * so it can't drift from the real command set (the same source `nl-router.ts`'s coverage test uses).
+ *
+ * Used by the inbound gate for a topic with no route and no session row: a leading "/" alone is not
+ * enough there, because anything unrecognised would fall through to the NL router and spend an LLM
+ * call on a topic nothing can act on. Tolerates Telegram's `@botname` suffix and mixed case, both of
+ * which a phone keyboard produces routinely.
+ */
+export function isKnownCommandText(text: string | undefined): boolean {
+  const first = (text ?? "").trim().split(/\s+/)[0] ?? "";
+  const match = /^\/([A-Za-z0-9_]+)(?:@\S+)?$/.exec(first);
+  if (!match) return false;
+  const name = (match[1] ?? "").toLowerCase();
+  return botCommandList().some((c) => c.command === name);
+}
+
 export function botCommandList(): { command: string; description: string }[] {
   return [
     { command: "about", description: "What this bot can do, with examples" },

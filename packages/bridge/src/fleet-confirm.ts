@@ -1,4 +1,4 @@
-import { monotonicNowMs } from "./monotonic-clock.ts";
+import { ConfirmRegistry, type ConfirmRegistryOptions } from "./confirm-registry.ts";
 import type { InlineKeyboardButton } from "./telegram.ts";
 
 export type FleetConfirmKind = "kill" | "rm" | "rm-topic";
@@ -16,13 +16,8 @@ export interface PendingFleetConfirm {
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
 
-export interface FleetConfirmRegistryOptions {
-  ttlMs?: number;
-  /** Clock injection for expiry tests - never `Date.now()` directly in the class body, and
-   * defaults to `monotonicNowMs` (§7.4): this only ever computes a duration, and a wall clock is
-   * the wrong tool for that across a sleep. */
-  now?: () => number;
-}
+/** TTL + clock injection, both from `ConfirmRegistry` - this registry adds nothing of its own. */
+export type FleetConfirmRegistryOptions = ConfirmRegistryOptions;
 
 /**
  * Confirmation registry for `/kill --all`, `/rm --all` (§4.2), and `rm-topic` (§4.5.2 - a bare
@@ -35,28 +30,9 @@ export interface FleetConfirmRegistryOptions {
  * fast rather than stay armed to fire a fleet-wide kill/remove (or a topic delete) on a late,
  * half-remembered tap.
  */
-export class FleetConfirmRegistry {
-  private readonly pending = new Map<string, PendingFleetConfirm>();
-  private readonly ttlMs: number;
-  private readonly now: () => number;
-
+export class FleetConfirmRegistry extends ConfirmRegistry<PendingFleetConfirm> {
   constructor(opts: FleetConfirmRegistryOptions = {}) {
-    this.ttlMs = opts.ttlMs ?? DEFAULT_TTL_MS;
-    this.now = opts.now ?? monotonicNowMs;
-  }
-
-  add(entry: Omit<PendingFleetConfirm, "createdAt">): void {
-    this.pending.set(entry.id, { ...entry, createdAt: this.now() });
-  }
-
-  /** An unknown or expired id is a no-op, not a crash - a stale/duplicate tap is expected, same as
-   * resolvePermCallback's handling in permission-registry.ts. */
-  resolve(id: string): PendingFleetConfirm | undefined {
-    const entry = this.pending.get(id);
-    if (!entry) return undefined;
-    this.pending.delete(id);
-    if (this.now() - entry.createdAt > this.ttlMs) return undefined;
-    return entry;
+    super(DEFAULT_TTL_MS, opts);
   }
 }
 
