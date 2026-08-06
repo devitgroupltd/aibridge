@@ -1,7 +1,7 @@
 ---
-version: 0.68.0
+version: 0.69.0
 status: solid
-last_modified_utc: 2026-08-06T23:00:00Z
+last_modified_utc: 2026-08-06T23:45:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,35 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.69.0 (2026-08-06): §13 check 6 ('rate storm') automated end to end via a new
+    `scripts/telegram-automation/rate-storm-check.js` - three throwaway `/new` sessions plus the
+    existing idle `test-session` (four Sonnet units, exactly `WEIGHTED_CAP`), one ending in a real
+    ask-gated git commit, no human interaction required. The positive half of the check held: `/ls`
+    answered in a consistent ~2.5s across five rounds while all three fresh sessions were genuinely
+    mid-turn. But the run then found a real, unplanned bug: the live Bridge process went completely
+    silent - no crash, no log line, `Responding: true`, near-zero CPU (blocked on network I/O, not a
+    spin) - and stayed that way for 14+ minutes until force-killed. Root cause: every Telegram call in
+    `telegram.ts` used a bare `fetch` with no client-side timeout; `getUpdates`'s own `timeout` param
+    only bounds Telegram's *server-side* long-poll, not a stalled connection. Node/Bun's `fetch` pools
+    connections per origin, and both bot tokens hit the same origin (`api.telegram.org`) - one
+    indefinitely-stalled request (most plausibly one of the `closeForumTopic` calls that had just
+    returned `TOPIC_ID_INVALID`, or the request right after it) exhausts that pool and silently wedges
+    every *other* outbound call too, including `getUpdates` itself and a plain `/ls` reply - exactly
+    what was observed. Fixed: every `fetch` call in `telegram.ts` now goes through a new
+    `fetchWithTimeout` helper (`AbortController` + a fixed budget - 20s for plain JSON calls, 60s for
+    multipart file transfer, `timeoutSec + 10` seconds for `getUpdates`), turning a stalled socket into
+    a loud, bounded, retriable `Error` instead of an unbounded hang. 2 new tests (a real stalled-TCP-
+    server case confirming the timeout actually fires, plus a fast-path case confirming normal calls are
+    unaffected) - 695 bridge-package tests pass (up from 693). Two smaller bugs the same storm surfaced,
+    both already recovered from live and not yet independently fixed: (1) `git worktree remove --force`
+    hit Windows `Permission denied` for all three throwaway sessions immediately after reconciliation
+    respawned them - a file-lock race between the freshly-spawned `claude.exe` and the delete attempt,
+    worktree dirs swept manually this time; (2) `closeForumTopic`/`deleteForumTopic` returned
+    `TOPIC_ID_INVALID` for topics only ~8 minutes old (not just long-lived orphans as §4.5.2 documents) -
+    turned out harmless, a hard client reload showed the topics were actually gone, so this is the same
+    known Bot-API flakiness at smaller scale, not a new failure mode. §13 check 6 can now be considered
+    exercised (automated, not manual) - the P0-responsiveness claim held; the hang it incidentally found
+    is fixed. Check 4 (terminal race) remains open, not yet automated."
   - "0.68.0 (2026-08-06): Closed §4.5.2's orphaned-topic gap, found the same day: `/rm --all` correctly
     removed the one session still in the `sessions` table (querying `aibridge.db` via `bun:sqlite` in
     readonly mode confirmed 0 rows left afterward), but two other Telegram topics stayed visible with
@@ -5143,8 +5172,12 @@ Manual checks that automated tests cannot cover, run at the end of Phase 6a, and
    own `.githooks/pre-push` catches it. (c) and (d) are the ones most likely to regress silently. A
    registered repo with no equivalent guard hook has no (a)/(b)/(d) to verify - only (c), the `ask`
    rule, applies universally.
-6. **Rate storm.** Four sessions on tool-heavy tasks simultaneously. Permission prompts still arrive
-   promptly on the control bot; only feed frames degrade.
+6. ~~**Rate storm.** Four sessions on tool-heavy tasks simultaneously. Permission prompts still arrive
+   promptly on the control bot; only feed frames degrade.~~ **Done (0.69.0), automated rather than
+   manual** - see that changelog entry. `/ls` held a consistent ~2.5s across five rounds while three
+   fresh sessions were genuinely mid-turn; the run also incidentally found and led to fixing a real
+   bug (every Telegram call lacked a client-side timeout, letting one stalled connection wedge the
+   whole outbound pool silently) - a good example of what this check is for.
 7. **Sandbox holds.** Ask a session to read the fleet SSH private key two ways: with `cat`, which the
    permission layer refuses, and with a throwaway Python script, which only the sandbox refuses.
    **On Windows this check is expected to FAIL on the second path and that is not a bug** - it is

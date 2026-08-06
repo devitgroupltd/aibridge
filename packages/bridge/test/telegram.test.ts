@@ -1,7 +1,8 @@
+import { createServer } from "node:net";
 import { describe, expect, test } from "bun:test";
 import { StubTelegramServer } from "@aibridge/stub-telegram";
 import { RateLimitedError } from "../src/rate-governor.ts";
-import { startPolling, TelegramClient, validateTokens } from "../src/telegram.ts";
+import { fetchWithTimeout, startPolling, TelegramClient, validateTokens } from "../src/telegram.ts";
 import type { GetMeSource, TelegramUpdate, UpdatesSource } from "../src/telegram.ts";
 
 function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -15,6 +16,40 @@ function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
     tick();
   });
 }
+
+describe("fetchWithTimeout", () => {
+  // Found live 2026-08-06: every Telegram call used a bare `fetch` with no client-side timeout,
+  // so one stalled connection could wedge the whole per-origin connection pool - including
+  // `getUpdates` and every other outbound call - with the Bridge process staying alive and
+  // "Responding" the entire time. This spins a real TCP server that accepts the connection and
+  // then never writes a response, the exact shape of a stalled socket, and checks the timeout
+  // actually fires rather than hanging forever.
+  test("rejects with a named timeout instead of hanging on a stalled connection", async () => {
+    const server = createServer((socket) => {
+      // Deliberately never write a response or close the socket.
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as { port: number }).port;
+
+    try {
+      await expect(fetchWithTimeout(`http://127.0.0.1:${port}/`, {}, 200)).rejects.toThrow(/timed out after 200ms/);
+    } finally {
+      server.close();
+    }
+  });
+
+  test("a fast server resolves normally, unaffected by the timeout budget", async () => {
+    const stub = new StubTelegramServer();
+    const { baseUrl } = stub.start(0);
+    try {
+      const res = await fetchWithTimeout(`${baseUrl}/botcontrol-token/getMe`, {}, 5000);
+      expect(res.ok).toBe(true);
+    } finally {
+      stub.stop();
+    }
+  });
+});
 
 describe("validateTokens", () => {
   test("passes when both tokens resolve", async () => {

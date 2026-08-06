@@ -147,6 +147,41 @@ export interface ForumTopicSource {
   deleteForumTopic(chatId: string | number, messageThreadId: number): Promise<void>;
 }
 
+/** Plain JSON RPC calls (sendMessage, closeForumTopic, ...) get this; `getUpdates`'s long-poll and
+ * the multipart file methods use their own, longer budgets below. */
+const DEFAULT_TIMEOUT_MS = 20_000;
+
+/** Multipart uploads/downloads (`sendDocument`, `sendPhotoFile`, `downloadFile`, ...) can
+ * legitimately take longer than a plain JSON call over a slow connection. */
+const FILE_TIMEOUT_MS = 60_000;
+
+/**
+ * Found live 2026-08-06 during a rate-storm exercise: every call below used a bare `fetch` with no
+ * client-side timeout at all - `getUpdates`'s own `timeout` param only tells Telegram's server how
+ * long to hold the long-poll open, it does nothing if the underlying connection itself stalls. Node/
+ * Bun's `fetch` pools connections per origin, and every method here (both bot tokens) hits the same
+ * origin (`api.telegram.org`) - one indefinitely-stalled request with no timeout exhausts that pool
+ * and silently wedges every *other* outbound call to Telegram too, including `getUpdates` itself and
+ * a plain `/ls` reply, with the Bridge process staying alive and "Responding" throughout (blocked on
+ * network I/O, not compute) - confirmed live: the control bot and feed bot both went completely
+ * silent at once, with no crash and no log line, and only cleared once the process was killed.
+ * `AbortController` here turns that into a loud, bounded, retriable failure instead.
+ */
+export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err) {
+    if (controller.signal.aborted) {
+      throw new Error(`Telegram request timed out after ${timeoutMs}ms: ${url}`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function parseTelegramResponse<T>(res: Response, method: string): Promise<T> {
   const body = (await res.json()) as {
     ok: boolean;
@@ -185,16 +220,22 @@ export class TelegramClient implements UpdatesSource {
   }
 
   async getMe(): Promise<{ id: number; username: string }> {
-    const res = await fetch(this.url("getMe"));
+    const res = await fetchWithTimeout(this.url("getMe"), {}, DEFAULT_TIMEOUT_MS);
     return parseTelegramResponse(res, "getMe");
   }
 
   async getUpdates(offset: number, timeoutSec: number): Promise<TelegramUpdate[]> {
-    const res = await fetch(this.url("getUpdates"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ offset, timeout: timeoutSec }),
-    });
+    // The client-side budget must comfortably outlast Telegram's own server-side long-poll
+    // (`timeoutSec`) - 10s of slack for the round trip itself, not a race against it.
+    const res = await fetchWithTimeout(
+      this.url("getUpdates"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ offset, timeout: timeoutSec }),
+      },
+      (timeoutSec + 10) * 1000,
+    );
     return parseTelegramResponse(res, "getUpdates");
   }
 
@@ -205,27 +246,35 @@ export class TelegramClient implements UpdatesSource {
     replyMarkup?: InlineKeyboardMarkup,
     parseMode?: "HTML",
   ): Promise<{ message_id: number }> {
-    const res = await fetch(this.url("sendMessage"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        message_thread_id: messageThreadId,
-        text,
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-        ...(parseMode ? { parse_mode: parseMode } : {}),
-      }),
-    });
+    const res = await fetchWithTimeout(
+      this.url("sendMessage"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_thread_id: messageThreadId,
+          text,
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+          ...(parseMode ? { parse_mode: parseMode } : {}),
+        }),
+      },
+      DEFAULT_TIMEOUT_MS,
+    );
     return parseTelegramResponse(res, "sendMessage");
   }
 
   /** Must be called for every `callback_query` update, or the tapped button spins forever on mobile. */
   async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
-    const res = await fetch(this.url("answerCallbackQuery"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ callback_query_id: callbackQueryId, ...(text ? { text } : {}) }),
-    });
+    const res = await fetchWithTimeout(
+      this.url("answerCallbackQuery"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ callback_query_id: callbackQueryId, ...(text ? { text } : {}) }),
+      },
+      DEFAULT_TIMEOUT_MS,
+    );
     await parseTelegramResponse(res, "answerCallbackQuery");
   }
 
@@ -234,11 +283,15 @@ export class TelegramClient implements UpdatesSource {
     messageThreadId: number | undefined,
     action: string,
   ): Promise<void> {
-    const res = await fetch(this.url("sendChatAction"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId, action }),
-    });
+    const res = await fetchWithTimeout(
+      this.url("sendChatAction"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId, action }),
+      },
+      DEFAULT_TIMEOUT_MS,
+    );
     await parseTelegramResponse(res, "sendChatAction");
   }
 
@@ -249,26 +302,34 @@ export class TelegramClient implements UpdatesSource {
     replyMarkup?: InlineKeyboardMarkup,
     parseMode?: "HTML",
   ): Promise<void> {
-    const res = await fetch(this.url("editMessageText"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({
-        chat_id: chatId,
-        message_id: messageId,
-        text,
-        ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-        ...(parseMode ? { parse_mode: parseMode } : {}),
-      }),
-    });
+    const res = await fetchWithTimeout(
+      this.url("editMessageText"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          chat_id: chatId,
+          message_id: messageId,
+          text,
+          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+          ...(parseMode ? { parse_mode: parseMode } : {}),
+        }),
+      },
+      DEFAULT_TIMEOUT_MS,
+    );
     await parseTelegramResponse(res, "editMessageText");
   }
 
   async deleteMessage(chatId: string | number, messageId: number): Promise<void> {
-    const res = await fetch(this.url("deleteMessage"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
-    });
+    const res = await fetchWithTimeout(
+      this.url("deleteMessage"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+      },
+      DEFAULT_TIMEOUT_MS,
+    );
     await parseTelegramResponse(res, "deleteMessage");
   }
 
@@ -287,7 +348,7 @@ export class TelegramClient implements UpdatesSource {
     form.append("chat_id", String(chatId));
     if (messageThreadId !== undefined) form.append("message_thread_id", String(messageThreadId));
     form.append("document", new Blob([content], { type: "text/plain" }), filename);
-    const res = await fetch(this.url("sendDocument"), { method: "POST", body: form });
+    const res = await fetchWithTimeout(this.url("sendDocument"), { method: "POST", body: form }, FILE_TIMEOUT_MS);
     return parseTelegramResponse(res, "sendDocument");
   }
 
@@ -305,7 +366,7 @@ export class TelegramClient implements UpdatesSource {
     if (messageThreadId !== undefined) form.append("message_thread_id", String(messageThreadId));
     if (caption) form.append("caption", caption);
     form.append("photo", new Blob([bytes]), filename);
-    const res = await fetch(this.url("sendPhoto"), { method: "POST", body: form });
+    const res = await fetchWithTimeout(this.url("sendPhoto"), { method: "POST", body: form }, FILE_TIMEOUT_MS);
     return parseTelegramResponse(res, "sendPhoto");
   }
 
@@ -323,17 +384,21 @@ export class TelegramClient implements UpdatesSource {
     if (messageThreadId !== undefined) form.append("message_thread_id", String(messageThreadId));
     if (caption) form.append("caption", caption);
     form.append("document", new Blob([bytes]), filename);
-    const res = await fetch(this.url("sendDocument"), { method: "POST", body: form });
+    const res = await fetchWithTimeout(this.url("sendDocument"), { method: "POST", body: form }, FILE_TIMEOUT_MS);
     return parseTelegramResponse(res, "sendDocument");
   }
 
   /** Resolves a `file_id` (e.g. a voice note's) to a `file_path` for use with `downloadFile`. */
   async getFile(fileId: string): Promise<{ file_path: string }> {
-    const res = await fetch(this.url("getFile"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ file_id: fileId }),
-    });
+    const res = await fetchWithTimeout(
+      this.url("getFile"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ file_id: fileId }),
+      },
+      DEFAULT_TIMEOUT_MS,
+    );
     return parseTelegramResponse(res, "getFile");
   }
 
@@ -341,7 +406,7 @@ export class TelegramClient implements UpdatesSource {
    * not one of the `/bot<token>/<method>` JSON RPC calls, so it does not go through
    * `parseTelegramResponse`. */
   async downloadFile(filePath: string): Promise<Uint8Array> {
-    const res = await fetch(`${this.baseUrl}/file/bot${this.token}/${filePath}`);
+    const res = await fetchWithTimeout(`${this.baseUrl}/file/bot${this.token}/${filePath}`, {}, FILE_TIMEOUT_MS);
     if (!res.ok) {
       throw new Error(`Telegram file download failed: ${res.status} ${res.statusText}`);
     }
@@ -349,47 +414,67 @@ export class TelegramClient implements UpdatesSource {
   }
 
   async setMyCommands(chatId: string | number, commands: readonly BotCommand[]): Promise<void> {
-    const res = await fetch(this.url("setMyCommands"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ commands, scope: { type: "chat", chat_id: chatId } }),
-    });
+    const res = await fetchWithTimeout(
+      this.url("setMyCommands"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ commands, scope: { type: "chat", chat_id: chatId } }),
+      },
+      DEFAULT_TIMEOUT_MS,
+    );
     await parseTelegramResponse(res, "setMyCommands");
   }
 
   async createForumTopic(chatId: string | number, name: string): Promise<{ message_thread_id: number }> {
-    const res = await fetch(this.url("createForumTopic"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, name }),
-    });
+    const res = await fetchWithTimeout(
+      this.url("createForumTopic"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, name }),
+      },
+      DEFAULT_TIMEOUT_MS,
+    );
     return parseTelegramResponse(res, "createForumTopic");
   }
 
   async editForumTopic(chatId: string | number, messageThreadId: number, name: string): Promise<void> {
-    const res = await fetch(this.url("editForumTopic"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId, name }),
-    });
+    const res = await fetchWithTimeout(
+      this.url("editForumTopic"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId, name }),
+      },
+      DEFAULT_TIMEOUT_MS,
+    );
     await parseTelegramResponse(res, "editForumTopic");
   }
 
   async closeForumTopic(chatId: string | number, messageThreadId: number): Promise<void> {
-    const res = await fetch(this.url("closeForumTopic"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId }),
-    });
+    const res = await fetchWithTimeout(
+      this.url("closeForumTopic"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId }),
+      },
+      DEFAULT_TIMEOUT_MS,
+    );
     await parseTelegramResponse(res, "closeForumTopic");
   }
 
   async deleteForumTopic(chatId: string | number, messageThreadId: number): Promise<void> {
-    const res = await fetch(this.url("deleteForumTopic"), {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId }),
-    });
+    const res = await fetchWithTimeout(
+      this.url("deleteForumTopic"),
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId }),
+      },
+      DEFAULT_TIMEOUT_MS,
+    );
     await parseTelegramResponse(res, "deleteForumTopic");
   }
 }
