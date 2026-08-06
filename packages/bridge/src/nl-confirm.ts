@@ -1,5 +1,6 @@
 import type { FleetCommand } from "./fleet-commands.ts";
 import { monotonicNowMs } from "./monotonic-clock.ts";
+import type { RouterAction } from "./nl-router.ts";
 import type { SessionCommand } from "./session-commands.ts";
 import type { InlineKeyboardButton } from "./telegram.ts";
 
@@ -13,7 +14,7 @@ import type { InlineKeyboardButton } from "./telegram.ts";
  */
 export interface PendingNlConfirm {
   id: string;
-  command: FleetCommand | SessionCommand;
+  command: FleetCommand | SessionCommand | RouterAction;
   /** `undefined` means the control topic, same convention as every other pending-confirm shape in
    * this codebase. */
   threadId: number | undefined;

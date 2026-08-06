@@ -181,6 +181,18 @@ describe("TelegramClient", () => {
     }
   });
 
+  test("deleteMessage forwards the message_id to Telegram", async () => {
+    const stub = new StubTelegramServer();
+    const { baseUrl } = stub.start(0);
+    try {
+      const client = new TelegramClient("control-token", baseUrl);
+      await client.deleteMessage(-1, 42);
+      expect(stub.getDeletedMessageIds("control-token")).toEqual([42]);
+    } finally {
+      stub.stop();
+    }
+  });
+
   test("§5.4: a real 429 becomes a RateLimitedError carrying the response's own retry_after", async () => {
     const stub = new StubTelegramServer();
     const { baseUrl } = stub.start(0);

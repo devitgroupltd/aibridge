@@ -85,6 +85,11 @@ export interface SendMessageSource {
     replyMarkup?: InlineKeyboardMarkup,
     parseMode?: "HTML",
   ): Promise<void>;
+  /** Optional, same reason `editMessageText` is - nl-router.ts's "🤔 Thinking..." placeholder for
+   * the router's own latency gap is removed outright rather than edited into a final state, since
+   * there's no single "final text" that fits every outcome (a command's own reply, a confirm card,
+   * or a forwarded turn's own fresh placeholder all follow as separate messages). */
+  deleteMessage?(chatId: string | number, messageId: number): Promise<void>;
   /** §5.8: renders inline in the topic, unlike `sendDocumentFile` below. Optional for the same
    * reason `editMessageText` is - existing stub/test doubles that never exercise `send_file` stay
    * unaffected. */
@@ -245,6 +250,15 @@ export class TelegramClient implements UpdatesSource {
       }),
     });
     await parseTelegramResponse(res, "editMessageText");
+  }
+
+  async deleteMessage(chatId: string | number, messageId: number): Promise<void> {
+    const res = await fetch(this.url("deleteMessage"), {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
+    });
+    await parseTelegramResponse(res, "deleteMessage");
   }
 
   /** §5.5: a `details` payload over Telegram's 4096-character message limit goes as a document

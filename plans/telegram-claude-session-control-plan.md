@@ -1,7 +1,7 @@
 ---
-version: 0.60.0
+version: 0.61.0
 status: solid
-last_modified_utc: 2026-08-06T15:00:00Z
+last_modified_utc: 2026-08-06T15:45:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,26 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.61.0 (2026-08-06): Fixed a real gap in 0.60.0's NL router, found live by the operator within
+    minutes of shipping: a Russian 'show me the commands I can use' phrase fell through to
+    'Unrecognised control-topic command' instead of the equivalent of /help, because the router only
+    ever knew about the 16 fleet + 3 session commands - /help, /about, /commands, /skills, /assist,
+    /router, and the built-in /compact/`/clear` passthrough were never taught to it at all. Fixed by
+    adding five new RouterAction kinds (help/about/commands/skills/builtin) plus the two newest fleet
+    commands (assist/router, added in 0.60.0 itself and already missed once) to ROUTER_KINDS, and -
+    per the operator's explicit ask to make this 'easy to support all future commands' rather than
+    fix the symptom once more - added a completeness test (nl-router.test.ts) that fails immediately
+    if a future new FleetCommand kind isn't added to ROUTER_KINDS, the same class of gap this entry
+    describes. Also added, per a second live observation (the router's CLI-backend latency is a
+    silent 3.5-5s wait with no feedback): a 'processing' indicator around the router call itself,
+    reusing the two indicators §5 already built for a Claude turn's own latency (`typing-indicator.ts`'s
+    chat action, always; `thinking-placeholder.ts`'s '🤔 Thinking...' message, only for the
+    control-topic/no-session branch, to avoid orphaning a placeholder the forward-to-session branch's
+    own `sendChannelText` would otherwise leak) - the placeholder is deleted outright once the router
+    resolves (new `deleteMessage` on `TelegramClient`/`StubTelegramServer`, `telegram.ts`), not edited
+    into a final state, since no single text fits every outcome. 660 tests pass (up from 616). Live-
+    verified against the real Telegram group post-restart: the original failing Russian phrase and a
+    second one ('что я могу сделать') both now correctly produce the /help card."
   - "0.60.0 (2026-08-06): New §3.5, natural-language command routing (text and voice) - free text or a
     voice transcript that isn't already an exact `/command` gets one forced-structured-output
     classification call before falling through to \"unrecognised\"/forwarded-to-Claude, covering the 16
@@ -2126,15 +2146,23 @@ handle instead of spawning a nonexistent process and retry-looping every 3s fore
 setup step is what actually turns transcription on in practice, not a separate `.env` edit -
 `VOICE_ENABLED=false` exists only for an operator who wants to suppress the warning entirely.
 
-### 3.5 Natural-language command routing (added 0.60.0)
+### 3.5 Natural-language command routing (added 0.60.0, extended 0.61.0)
 
 Free text (typed, or a voice transcript re-entering `dispatchInboundMessage` via §3.4's own Send
 button) that isn't already an exact `/command` gets one forced-structured-output classification call
 before falling through to today's "unrecognised control-topic command" / forward-to-Claude behaviour.
-Covers the 16 fleet commands plus `/model`/`/mode`/`/effort` - **not** repo-specific
-`.claude/commands`/`.claude/skills` (up to 40+ per project), since offering all of those as router
-tools on every single message would balloon per-message token cost for a set that already has its own
-discovery path (`/commands`, `/skills`, or typing the exact `/name`).
+Covers the 18 fleet commands, `/model`/`/mode`/`/effort`, and (0.61.0) `/help`/`/about`/`/commands`/
+`/skills`/`/compact`/`/clear` - **not** a repo's own individually-named `.claude/commands`/
+`.claude/skills` items (up to 40+ per project), since offering all of those as router tools on every
+single message would balloon per-message token cost for a set that already has its own discovery path
+(`/commands`, `/skills`, or typing the exact `/name`). `/help`/`/about`/`/commands`/`/skills`/
+`/compact`/`/clear` were a live-found gap in 0.60.0's initial ship - a Russian "show me the commands"
+phrase fell through to "Unrecognised" - fixed alongside a completeness test
+(`nl-router.test.ts`, checked against a literal copy of `FleetCommand`'s kind union) that fails
+immediately if a future new fleet command is added without a matching router kind, so this doesn't
+recur silently a third time. A "🤔 Thinking..." placeholder (reusing §5's existing indicator
+infrastructure) now covers the router call's own latency gap too, deleted once it resolves rather than
+left to sit.
 
 **Two backends, live-measured 2026-08-06, selectable per operator instance (§4.1.1) via `/router
 api|cli` - neither is a universal default:**

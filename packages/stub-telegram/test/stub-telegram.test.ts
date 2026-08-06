@@ -109,6 +109,16 @@ describe("StubTelegramServer", () => {
     expect(sent[0]).toMatchObject({ method: "sendMessage", chat_id: -1004470540564, message_thread_id: 3, text: "hello" });
   });
 
+  test("deleteMessage is recorded per token and retrievable via getDeletedMessageIds", async () => {
+    const { server, baseUrl } = start();
+    await fetch(`${baseUrl}/bottok/deleteMessage`, {
+      method: "POST",
+      body: JSON.stringify({ chat_id: -1004470540564, message_id: 42 }),
+    });
+
+    expect(server.getDeletedMessageIds("tok")).toEqual([42]);
+  });
+
   test("different tokens have independent update queues and sent logs", async () => {
     const { server, baseUrl } = start();
     server.pushUpdate("control-token", { chatId: -1, text: "for control" });

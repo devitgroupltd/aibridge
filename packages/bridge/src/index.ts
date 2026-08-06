@@ -56,6 +56,7 @@ import { startWhisperServer, transcribeVoiceNote } from "./voice-transcribe.ts";
 import { buildNlConfirmKeyboard, NlConfirmRegistry, resolveNlConfirmCallback } from "./nl-confirm.ts";
 import type { PendingNlConfirm } from "./nl-confirm.ts";
 import { routeText } from "./nl-router.ts";
+import type { RouterAction } from "./nl-router.ts";
 import { SettingsStore } from "./settings-store.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import {
@@ -1781,10 +1782,45 @@ async function main(): Promise<void> {
     );
   }
 
+  /** `/about`'s exact-syntax and NL-matched (`kind: "about"`, nl-router.ts) paths both call this -
+   * extracted so there's one place to keep in sync. */
+  function sendAboutCard(threadId: number | undefined): void {
+    controlBot
+      .sendMessage(config.supergroupChatId, threadId, renderAbout(), { inline_keyboard: buildAboutKeyboard() })
+      .catch((err) => log("WARN", `sendMessage (/about) failed: ${(err as Error).message}`));
+  }
+
+  /** `/help`'s exact-syntax and NL-matched (`kind: "help"`, nl-router.ts) paths both call this. */
+  function sendHelpCard(threadId: number | undefined, route: ReturnType<typeof routing.getByTopicId>): void {
+    const repoCommands = route ? listRepoCommands(route.worktreePath) : [];
+    const repoSkills = route ? listRepoSkills(route.worktreePath) : [];
+    controlBot
+      .sendMessage(config.supergroupChatId, threadId, renderHelp(), { inline_keyboard: buildCommandKeyboard(repoCommands, repoSkills) })
+      .catch((err) => log("WARN", `sendMessage (command list) failed: ${(err as Error).message}`));
+  }
+
+  /** `/commands [<term>]`'s exact-syntax and NL-matched (`kind: "commands"`, nl-router.ts) paths
+   * both call this - session-scoped only (no worktree to read commands from without a `route`). */
+  function sendCommandsListCard(threadId: number | undefined, route: ReturnType<typeof routing.getByTopicId>, term: string): void {
+    const text = route
+      ? renderCommandsListText(listRepoCommands(route.worktreePath), term)
+      : "Repo commands are session-scoped - send /commands inside a session's own topic.";
+    controlBot.sendMessage(config.supergroupChatId, threadId, text).catch((err) => log("WARN", `sendMessage (/commands) failed: ${(err as Error).message}`));
+  }
+
+  /** `/skills [<term>]`'s exact-syntax and NL-matched (`kind: "skills"`, nl-router.ts) paths both
+   * call this - same session-scoping as `sendCommandsListCard`. */
+  function sendSkillsListCard(threadId: number | undefined, route: ReturnType<typeof routing.getByTopicId>, term: string): void {
+    const text = route
+      ? renderSkillsListText(listRepoSkills(route.worktreePath), term)
+      : "Repo skills are session-scoped - send /skills inside a session's own topic.";
+    controlBot.sendMessage(config.supergroupChatId, threadId, text).catch((err) => log("WARN", `sendMessage (/skills) failed: ${(err as Error).message}`));
+  }
+
   /** Short human-readable label for an NL-matched command's confirm card and its finalize message
    * - not exhaustive-per-field (e.g. `/new`'s prompt text isn't echoed back), just enough for the
    * operator to recognise what they're about to approve. */
-  function describeNlCommand(command: FleetCommand | SessionCommand): string {
+  function describeNlCommand(command: FleetCommand | SessionCommand | RouterAction): string {
     switch (command.kind) {
       case "kill":
         return command.all ? "/kill --all" : `/kill${command.slug ? ` ${command.slug}` : ""}`;
@@ -1810,7 +1846,32 @@ async function main(): Promise<void> {
    * a separate copy. `nl-router.ts`'s `mapRouterOutput` already guarantees a `session_*` kind never
    * arrives without `currentSlug`/`threadId` set (`allowedKinds`'s `hasSession` gate), so the guard
    * here is defense in depth, not load-bearing. */
-  function executeMatchedCommand(command: FleetCommand | SessionCommand, threadId: number | undefined, isControl: boolean, currentSlug: string | undefined): void {
+  function executeMatchedCommand(
+    command: FleetCommand | SessionCommand | RouterAction,
+    threadId: number | undefined,
+    isControl: boolean,
+    currentSlug: string | undefined,
+  ): void {
+    if (command.kind === "help") {
+      sendHelpCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined);
+      return;
+    }
+    if (command.kind === "about") {
+      sendAboutCard(threadId);
+      return;
+    }
+    if (command.kind === "commands") {
+      sendCommandsListCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.term);
+      return;
+    }
+    if (command.kind === "skills") {
+      sendSkillsListCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.term);
+      return;
+    }
+    if (command.kind === "builtin") {
+      if (currentSlug) sendRaw(currentSlug, `/${command.name}`);
+      return;
+    }
     if (command.kind === "model" || command.kind === "mode" || command.kind === "effort") {
       if (!currentSlug || threadId === undefined) return;
       if (command.kind === "model") applyModelSwitch(currentSlug, threadId, command.model);
@@ -1823,7 +1884,7 @@ async function main(): Promise<void> {
 
   /** Posts the run/don't-ask-again/cancel card for an NL-matched *destructive* command
    * (nl-confirm.ts) and registers it - mirrors `postFleetConfirm`'s shape exactly. */
-  async function postNlConfirm(command: FleetCommand | SessionCommand, threadId: number | undefined, currentSlug: string | undefined): Promise<void> {
+  async function postNlConfirm(command: FleetCommand | SessionCommand | RouterAction, threadId: number | undefined, currentSlug: string | undefined): Promise<void> {
     const id = randomUUID().slice(0, 8);
     try {
       const sent = await controlBot.sendMessage(config.supergroupChatId, threadId, `🤖 I read that as ${describeNlCommand(command)} - run it?`, {
@@ -1863,7 +1924,33 @@ async function main(): Promise<void> {
       onNoMatch();
       return;
     }
+    const topicIdStr = threadId !== undefined ? String(threadId) : undefined;
+    // The router call itself is the latency gap with no existing "something is happening" signal
+    // (unlike a forwarded turn, which sendChannelText already covers) - live-observed as a silent
+    // multi-second wait on the CLI backend. Reuses §5's two existing indicators rather than
+    // inventing a third: `typingIndicator` (cheap, self-expiring, safe to start/stop repeatedly)
+    // always; the message-based `thinkingPlaceholder` only for `!ctx.hasSession, where nothing
+    // else will start one a moment later - starting it unconditionally would leak an orphaned
+    // placeholder in the `hasSession` branch, since `sendChannelText`'s own `start()` a few lines
+    // below `onNoMatch()` overwrites the pending entry without consuming this one first
+    // (`thinking-placeholder.ts` has no built-in dedup the way `typing-indicator.ts` does).
+    const usePlaceholder = !ctx.hasSession && topicIdStr !== undefined;
+    if (topicIdStr) typingIndicator.start(topicIdStr);
+    if (usePlaceholder) thinkingPlaceholder.start(topicIdStr!);
+
     const result = await routeText(text, ctx, { ...config.nlRouter, backend: nlRouterBackend }, log);
+
+    if (topicIdStr) typingIndicator.stop(topicIdStr);
+    if (usePlaceholder) {
+      const placeholderMsgId = await thinkingPlaceholder.consume(topicIdStr!);
+      // Removed outright, not edited into a final state - no single text fits every outcome below
+      // (a command's own reply, a confirm card, or "Unrecognised control-topic command" are all
+      // separate messages that follow immediately).
+      if (placeholderMsgId !== undefined && controlBot.deleteMessage) {
+        await controlBot.deleteMessage(config.supergroupChatId, placeholderMsgId).catch((err) => log("WARN", `failed to delete NL-router placeholder: ${(err as Error).message}`));
+      }
+    }
+
     if (!result.matched) {
       onNoMatch();
       return;
@@ -2002,11 +2089,7 @@ async function main(): Promise<void> {
     // the on-ramp `/help` deliberately isn't; works from either the control topic or a session's
     // own topic, same as /help.
     if (isAboutCommand(text)) {
-      controlBot
-        .sendMessage(config.supergroupChatId, threadId, renderAbout(), {
-          inline_keyboard: buildAboutKeyboard(),
-        })
-        .catch((err) => log("WARN", `sendMessage (/about) failed: ${(err as Error).message}`));
+      sendAboutCard(threadId);
       return;
     }
 
@@ -2014,13 +2097,7 @@ async function main(): Promise<void> {
     // session topic it's plausible real content meant for Claude (e.g. "?" as a shorthand
     // question), so only the unambiguous slash forms are recognised there.
     if (isHelpCommand(text, isControl)) {
-      const repoCommands = route ? listRepoCommands(route.worktreePath) : [];
-      const repoSkills = route ? listRepoSkills(route.worktreePath) : [];
-      controlBot
-        .sendMessage(config.supergroupChatId, threadId, renderHelp(), {
-          inline_keyboard: buildCommandKeyboard(repoCommands, repoSkills),
-        })
-        .catch((err) => log("WARN", `sendMessage (command list) failed: ${(err as Error).message}`));
+      sendHelpCard(threadId, route);
       return;
     }
 
@@ -2031,18 +2108,12 @@ async function main(): Promise<void> {
     // has no worktree to read commands/skills from.
     const commandsQuery = parseCommandsQuery(text);
     if (commandsQuery) {
-      const text_ = route
-        ? renderCommandsListText(listRepoCommands(route.worktreePath), commandsQuery.term)
-        : "Repo commands are session-scoped - send /commands inside a session's own topic.";
-      controlBot.sendMessage(config.supergroupChatId, threadId, text_).catch((err) => log("WARN", `sendMessage (/commands) failed: ${(err as Error).message}`));
+      sendCommandsListCard(threadId, route, commandsQuery.term);
       return;
     }
     const skillsQuery = parseSkillsQuery(text);
     if (skillsQuery) {
-      const text_ = route
-        ? renderSkillsListText(listRepoSkills(route.worktreePath), skillsQuery.term)
-        : "Repo skills are session-scoped - send /skills inside a session's own topic.";
-      controlBot.sendMessage(config.supergroupChatId, threadId, text_).catch((err) => log("WARN", `sendMessage (/skills) failed: ${(err as Error).message}`));
+      sendSkillsListCard(threadId, route, skillsQuery.term);
       return;
     }
 

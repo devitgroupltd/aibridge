@@ -29,19 +29,52 @@ export type RouterContext = {
   hasSession: boolean;
 };
 
-export type RouterResult = { matched: false } | { matched: true; command: FleetCommand | SessionCommand; destructive: boolean };
+/** Not real `FleetCommand`/`SessionCommand` kinds - each is handled by its own dedicated function
+ * in index.ts rather than `dispatchFleetCommand`, but all five are real, always-available commands
+ * a natural-language message can legitimately mean, so the router needs to recognise them as their
+ * own outcome rather than only ever mapping to the fleet/session command unions. `help`/`about`
+ * were a live-observed gap (a Russian "show me the commands" phrase fell through to "Unrecognised"
+ * without them, 2026-08-06); `commands`/`skills`/`builtin` were added in the same pass for the same
+ * reason - completeness, not because any one of them was separately reported broken. None are ever
+ * destructive. */
+export type RouterAction =
+  | { kind: "help" }
+  | { kind: "about" }
+  | { kind: "commands"; term: string }
+  | { kind: "skills"; term: string }
+  | { kind: "builtin"; name: "compact" | "clear" };
+
+export type RouterResult = { matched: false } | { matched: true; command: FleetCommand | SessionCommand | RouterAction; destructive: boolean };
 
 /** Single-slug/bulk `/kill`/`/rm`, `/restart`, `/deploy`, `/repos rm` - broader than the CLI's own
  * confirm-gated set (only `kill --all`/`rm --all`, `fleet-confirm.ts`) because an NL match is
- * inherently less certain than an operator typing the exact command. */
-function isDestructive(command: FleetCommand | SessionCommand): boolean {
-  if (command.kind === "kill" || command.kind === "rm") return true;
+ * inherently less certain than an operator typing the exact command. `kill --all`/`rm --all`
+ * themselves are the deliberate exception - they already funnel into that existing fleet-confirm
+ * flow unchanged the moment they execute (`index.ts`'s `handleKillCommand`/`handleRmCommand`), so
+ * marking them destructive *here too* would stack a second, redundant confirm card in front of the
+ * first. */
+function isDestructive(command: FleetCommand | SessionCommand | RouterAction): boolean {
+  if (command.kind === "kill") return !command.all;
+  if (command.kind === "rm") return command.bulk?.mode !== "all";
   if (command.kind === "restart" || command.kind === "deploy") return true;
   if (command.kind === "repos" && command.action === "rm") return true;
   return false;
 }
 
-const ROUTER_KINDS = [
+/**
+ * Every `FleetCommand["kind"]` value (`fleet-commands.ts`) has a matching entry here, one-to-one
+ * by name - `nl-router.test.ts`'s "ROUTER_KINDS completeness" test asserts this against a literal
+ * copy of that union so a future new fleet command that forgets to update this list fails a test
+ * immediately, the same
+ * class of gap that let `/help`/`/about`/`/commands`/`/skills`/`/compact`/`/clear` go unrouted
+ * until 2026-08-06. `session_model`/`session_mode`/`session_effort` are `SessionCommand`'s
+ * `model`/`mode`/`effort` under a router-only prefix (avoids a naming collision with `new`'s own
+ * `model` field in the flat schema below); `help`/`about`/`commands`/`skills`/`builtin` are
+ * `RouterAction`'s kinds, covering the fixed always-available commands that live outside both
+ * unions (`isHelpCommand`/`isAboutCommand`/`parseCommandsQuery`/`parseSkillsQuery`/
+ * `isBuiltinPassthroughCommand` in index.ts/fleet-commands.ts/commands.ts).
+ */
+export const ROUTER_KINDS = [
   "new",
   "ls",
   "kill",
@@ -58,9 +91,16 @@ const ROUTER_KINDS = [
   "autostart",
   "repos",
   "voice",
+  "assist",
+  "router",
   "session_model",
   "session_mode",
   "session_effort",
+  "help",
+  "about",
+  "commands",
+  "skills",
+  "builtin",
   "forward",
 ] as const;
 type RouterKind = (typeof ROUTER_KINDS)[number];
@@ -69,11 +109,18 @@ type RouterKind = (typeof ROUTER_KINDS)[number];
  * accept in this context - mirrors that function's own inline `isControl`/`currentSlug` checks
  * rather than inventing separate rules. `/new` and `/budget` are the only fleet commands rejected
  * outright outside the control topic; the rest (kill/rm/attach/etc.) accept an optional slug from
- * either place, so they stay offered everywhere. */
+ * either place, so they stay offered everywhere, as do `/help`/`/about`/`/assist`/`/router`.
+ * `/commands`/`/skills`/`/compact`/`/clear` are all session-scoped in practice (no worktree/PTY to
+ * act on without one - `dispatchInboundMessage`'s own `route`/`currentSlug` checks agree), so they
+ * follow the same `hasSession` gate as the three session commands. */
 function allowedKinds(ctx: RouterContext): RouterKind[] {
   return ROUTER_KINDS.filter((kind) => {
     if ((kind === "new" || kind === "budget") && !ctx.isControl) return false;
-    if ((kind === "session_model" || kind === "session_mode" || kind === "session_effort") && !ctx.hasSession) return false;
+    if (
+      (kind === "session_model" || kind === "session_mode" || kind === "session_effort" || kind === "commands" || kind === "skills" || kind === "builtin") &&
+      !ctx.hasSession
+    )
+      return false;
     return true;
   });
 }
@@ -103,6 +150,10 @@ function buildSchema(ctx: RouterContext): Record<string, unknown> {
       voiceModel: { type: "string", description: "For 'voice', optional model name to switch to." },
       mode: { type: "string", enum: [...MODES], description: "For 'session_mode'." },
       effort: { type: "string", enum: [...EFFORTS], description: "For 'session_effort'." },
+      assistAction: { type: "string", enum: ["status", "on", "off"], description: "For 'assist': confirm-before-destructive-NL-command toggle." },
+      routerAction: { type: "string", enum: ["status", "api", "cli"], description: "For 'router': NL-routing backend toggle." },
+      term: { type: "string", description: "For 'commands'/'skills': an optional search term to filter the list." },
+      builtinName: { type: "string", enum: ["compact", "clear"], description: "For 'builtin': which built-in Claude Code command to run." },
     },
     required: ["kind"],
     additionalProperties: false,
@@ -112,6 +163,11 @@ function buildSchema(ctx: RouterContext): Record<string, unknown> {
 const SYSTEM_INSTRUCTIONS =
   "You classify one Telegram message sent to a fleet-control bot for developer Claude Code sessions. " +
   "If the message clearly requests one of the listed commands, respond with that kind and its fields. " +
+  "A request to see what commands exist, what the bot can do, or how to use it (in any language) is " +
+  "kind='help' (a plain command list) or kind='about' (a friendlier overview with examples) - prefer " +
+  "'help' unless the message specifically sounds like someone new asking what this bot even is. " +
+  "A request to list this project's own custom commands or skills is kind='commands'/'skills'. " +
+  "A request to compact or clear the current conversation is kind='builtin'. " +
   "If it's ambiguous, conversational, or addressed to a coding assistant rather than the fleet itself, " +
   "respond with kind='forward' - never guess a destructive command (kill/rm/restart/deploy/repos-rm) " +
   "from a vague or joking message.";
@@ -137,6 +193,10 @@ interface RawRouterOutput {
   voiceModel?: string;
   mode?: string;
   effort?: string;
+  assistAction?: string;
+  routerAction?: string;
+  term?: string;
+  builtinName?: string;
 }
 
 function isModel(v: unknown): v is Model {
@@ -159,8 +219,12 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
   const kind = raw.kind;
   if (!kind || !allowedKinds(ctx).includes(kind as RouterKind)) return { matched: false };
 
-  const command = ((): FleetCommand | SessionCommand | null => {
+  const command = ((): FleetCommand | SessionCommand | RouterAction | null => {
     switch (kind as RouterKind) {
+      case "help":
+        return { kind: "help" };
+      case "about":
+        return { kind: "about" };
       case "new":
         return raw.repo && raw.prompt ? { kind: "new", repo: raw.repo, prompt: raw.prompt, model: isModel(raw.model) ? raw.model : undefined } : null;
       case "ls":
@@ -207,6 +271,16 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
         return null;
       case "voice":
         return { kind: "voice", model: raw.voiceModel };
+      case "assist":
+        return raw.assistAction === "status" || raw.assistAction === "on" || raw.assistAction === "off" ? { kind: "assist", action: raw.assistAction } : null;
+      case "router":
+        return raw.routerAction === "status" || raw.routerAction === "api" || raw.routerAction === "cli" ? { kind: "router", action: raw.routerAction } : null;
+      case "commands":
+        return { kind: "commands", term: raw.term ?? "" };
+      case "skills":
+        return { kind: "skills", term: raw.term ?? "" };
+      case "builtin":
+        return raw.builtinName === "compact" || raw.builtinName === "clear" ? { kind: "builtin", name: raw.builtinName } : null;
       case "session_model":
         return isModel(raw.model) ? { kind: "model", model: raw.model } : null;
       case "session_mode":

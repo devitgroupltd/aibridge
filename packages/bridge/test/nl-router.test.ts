@@ -1,8 +1,51 @@
 import { describe, expect, test } from "bun:test";
-import { mapRouterOutput } from "../src/nl-router.ts";
+import { mapRouterOutput, ROUTER_KINDS } from "../src/nl-router.ts";
 
 const CONTROL: { isControl: true; hasSession: false } = { isControl: true, hasSession: false };
 const SESSION: { isControl: false; hasSession: true } = { isControl: false, hasSession: true };
+
+/**
+ * A literal copy of `fleet-commands.ts`'s `FleetCommand["kind"]` union, kept here on purpose - not
+ * imported, so this test can't pass by accident just because `nl-router.ts` and `fleet-commands.ts`
+ * happen to agree. If someone adds an 19th fleet command and forgets `ROUTER_KINDS`, this list
+ * silently drifts out of sync with the real union too - but TypeScript's own exhaustiveness check
+ * on `fleet-commands.ts`'s `parseFleetCommand` switch already catches *that* half; this test's job
+ * is only the half TypeScript can't check by itself, namely "does `nl-router.ts` know about it."
+ */
+const ALL_FLEET_COMMAND_KINDS = [
+  "new",
+  "ls",
+  "kill",
+  "rm",
+  "attach",
+  "pause",
+  "usage",
+  "budget",
+  "restart",
+  "deploy",
+  "detail",
+  "verbose",
+  "settings",
+  "autostart",
+  "repos",
+  "voice",
+  "assist",
+  "router",
+] as const;
+
+describe("ROUTER_KINDS completeness", () => {
+  test("every FleetCommand kind has a matching router kind - catches the class of gap that let /help/etc. go unrouted", () => {
+    const missing = ALL_FLEET_COMMAND_KINDS.filter((kind) => !(ROUTER_KINDS as readonly string[]).includes(kind));
+    expect(missing).toEqual([]);
+  });
+
+  test("the fixed always-available commands outside both unions are also covered", () => {
+    const kinds: readonly string[] = ROUTER_KINDS;
+    for (const kind of ["help", "about", "commands", "skills", "builtin"]) {
+      expect(kinds.includes(kind)).toBe(true);
+    }
+  });
+});
 
 describe("mapRouterOutput - one case per kind", () => {
   test("new: requires both repo and prompt", () => {
@@ -30,6 +73,14 @@ describe("mapRouterOutput - one case per kind", () => {
     });
   });
 
+  test("kill --all is NOT destructive here - it already gets its own confirm card the moment it executes (fleet-confirm.ts)", () => {
+    expect(mapRouterOutput({ kind: "kill", all: true }, CONTROL)).toEqual({
+      matched: true,
+      command: { kind: "kill", slug: undefined, all: true },
+      destructive: false,
+    });
+  });
+
   test("kill: bare (no slug) inside a session topic - relies on dispatch's own currentSlug fallback", () => {
     expect(mapRouterOutput({ kind: "kill" }, SESSION)).toEqual({
       matched: true,
@@ -38,11 +89,11 @@ describe("mapRouterOutput - one case per kind", () => {
     });
   });
 
-  test("rm: --all bulk", () => {
+  test("rm: --all bulk is NOT destructive here either - same fleet-confirm.ts double-confirm reasoning as kill --all", () => {
     expect(mapRouterOutput({ kind: "rm", all: true }, CONTROL)).toEqual({
       matched: true,
       command: { kind: "rm", slug: undefined, bulk: { mode: "all" } },
-      destructive: true,
+      destructive: false,
     });
   });
 
@@ -160,6 +211,34 @@ describe("mapRouterOutput - one case per kind", () => {
       command: { kind: "effort", effort: "high" },
       destructive: false,
     });
+  });
+
+  test("help and about: no fields needed, never destructive, offered from anywhere - live gap fixed 2026-08-06 (a Russian 'show me the commands' phrase fell through to 'Unrecognised' before this)", () => {
+    expect(mapRouterOutput({ kind: "help" }, CONTROL)).toEqual({ matched: true, command: { kind: "help" }, destructive: false });
+    expect(mapRouterOutput({ kind: "help" }, SESSION)).toEqual({ matched: true, command: { kind: "help" }, destructive: false });
+    expect(mapRouterOutput({ kind: "about" }, CONTROL)).toEqual({ matched: true, command: { kind: "about" }, destructive: false });
+  });
+
+  test("assist and router: their own status/on/off and status/api/cli enums", () => {
+    expect(mapRouterOutput({ kind: "assist", assistAction: "off" }, CONTROL)).toEqual({ matched: true, command: { kind: "assist", action: "off" }, destructive: false });
+    expect(mapRouterOutput({ kind: "assist", assistAction: "bogus" }, CONTROL)).toEqual({ matched: false });
+    expect(mapRouterOutput({ kind: "router", routerAction: "api" }, CONTROL)).toEqual({ matched: true, command: { kind: "router", action: "api" }, destructive: false });
+    expect(mapRouterOutput({ kind: "router", routerAction: "bogus" }, CONTROL)).toEqual({ matched: false });
+  });
+
+  test("commands and skills: session-scoped, optional term, never destructive", () => {
+    expect(mapRouterOutput({ kind: "commands" }, SESSION)).toEqual({ matched: true, command: { kind: "commands", term: "" }, destructive: false });
+    expect(mapRouterOutput({ kind: "commands", term: "deploy" }, SESSION)).toEqual({ matched: true, command: { kind: "commands", term: "deploy" }, destructive: false });
+    expect(mapRouterOutput({ kind: "commands" }, CONTROL)).toEqual({ matched: false });
+    expect(mapRouterOutput({ kind: "skills" }, SESSION)).toEqual({ matched: true, command: { kind: "skills", term: "" }, destructive: false });
+    expect(mapRouterOutput({ kind: "skills" }, CONTROL)).toEqual({ matched: false });
+  });
+
+  test("builtin: compact/clear, session-scoped, requires a valid name", () => {
+    expect(mapRouterOutput({ kind: "builtin", builtinName: "compact" }, SESSION)).toEqual({ matched: true, command: { kind: "builtin", name: "compact" }, destructive: false });
+    expect(mapRouterOutput({ kind: "builtin", builtinName: "clear" }, SESSION)).toEqual({ matched: true, command: { kind: "builtin", name: "clear" }, destructive: false });
+    expect(mapRouterOutput({ kind: "builtin", builtinName: "bogus" }, SESSION)).toEqual({ matched: false });
+    expect(mapRouterOutput({ kind: "builtin", builtinName: "compact" }, CONTROL)).toEqual({ matched: false });
   });
 
   test("forward: always a no-match, by design - it means 'not a command'", () => {

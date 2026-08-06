@@ -91,6 +91,7 @@ interface TokenState {
   nextTopicId: number;
   nextCallbackQueryId: number;
   sent: SentMessage[];
+  deletedMessageIds: number[];
   answeredCallbackQueries: string[];
   waiters: Array<() => void>;
   topics: Map<number, StubTopic>;
@@ -121,6 +122,7 @@ export class StubTelegramServer {
         nextTopicId: 2,
         nextCallbackQueryId: 1,
         sent: [],
+        deletedMessageIds: [],
         answeredCallbackQueries: [],
         waiters: [],
         topics: new Map(),
@@ -191,6 +193,11 @@ export class StubTelegramServer {
     return [...this.stateFor(token).answeredCallbackQueries];
   }
 
+  /** `message_id`s deleted so far for `token`'s bot, in call order. */
+  getDeletedMessageIds(token: string): number[] {
+    return [...this.stateFor(token).deletedMessageIds];
+  }
+
   /** Current state of a forum topic (name, closed, deleted) for `token`'s bot - undefined if
    * `createForumTopic` was never called for that id. */
   getTopic(token: string, messageThreadId: number): StubTopic | undefined {
@@ -257,6 +264,16 @@ export class StubTelegramServer {
       reply_markup: body.reply_markup,
     });
     return jsonResponse({ ok: true, result: { message_id: messageId, chat: { id: Number(body.chat_id) }, text: body.text } });
+  }
+
+  /** nl-router.ts's "🤔 Thinking..." placeholder removal - tracked separately from `sent` (a
+   * deleted message was never itself a send/edit), so `getDeletedMessageIds` can assert exactly
+   * which ids were removed without a test having to filter `getSent`'s own list for a method that
+   * was never pushed there. */
+  private handleDeleteMessage(state: TokenState, body: Record<string, unknown>): Response {
+    const messageId = Number(body.message_id ?? 0);
+    state.deletedMessageIds.push(messageId);
+    return jsonResponse({ ok: true, result: true });
   }
 
   /** §5.5: `sendDocument` is multipart, not JSON, so it's parsed via `req.formData()` in
@@ -395,6 +412,8 @@ export class StubTelegramServer {
         return this.handleSendMessage(state, body);
       case "editMessageText":
         return this.handleEditMessageText(state, body);
+      case "deleteMessage":
+        return this.handleDeleteMessage(state, body);
       case "createForumTopic":
         return this.handleCreateForumTopic(state, body);
       case "editForumTopic":
