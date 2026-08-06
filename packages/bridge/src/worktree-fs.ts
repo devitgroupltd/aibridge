@@ -329,27 +329,65 @@ export function prepareFileForSend(worktreeRoot: string, relPath: string): SendP
 }
 
 /**
+ * Parses `origin`'s configured URL for a `github.com` owner/repo pair. `null` on any failure (no
+ * `origin`, not a `github.com` remote, not a git repo at all) - shared by `resolveGithubLink` below
+ * and `diff-review.ts`'s compare-link builder, so the regex lives in exactly one place. Reads via
+ * `git config --get remote.origin.url` rather than `git remote get-url origin` deliberately - the
+ * latter applies any local `url.<x>.insteadOf` rewrite before returning, which would silently report
+ * a different host than what's actually configured (harmless in practice today, but this function's
+ * whole job is "what host is this," so it should read the literal configured value).
+ */
+export function parseGithubOwnerRepo(worktreeRoot: string): { owner: string; repo: string } | null {
+  const root = path.resolve(worktreeRoot);
+  try {
+    const remote = execFileSync("git", ["config", "--get", "remote.origin.url"], { cwd: root, encoding: "utf8" }).trim();
+    const m = remote.match(/github\.com[:/]([^/]+)\/(.+?)(?:\.git)?$/);
+    if (!m) return null;
+    const [, owner, repo] = m as [string, string, string];
+    return { owner, repo };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * `git branch -r --contains <sha>` - is this commit already reachable from some pushed remote branch?
+ * Returns the first matching branch's short name (the `origin/` remote prefix stripped) or `null` if
+ * none contain it (expected early in a session per the plan's §2.3 session model - a session's own
+ * branch is only pushed after an explicit, ask-gated `git push`, not a bug to work around). Shared by
+ * `resolveGithubLink` below and `diff-review.ts`'s compare-link builder (which uses a positive result
+ * as its base ref, avoiding an unnecessary throwaway branch). Never throws - `null` on any git failure.
+ */
+export function findRemoteBranchContaining(worktreeRoot: string, sha: string): string | null {
+  const root = path.resolve(worktreeRoot);
+  try {
+    const containing = execFileSync("git", ["branch", "-r", "--contains", sha], { cwd: root, encoding: "utf8" }).trim();
+    if (containing.length === 0) return null;
+    const first = containing.split("\n")[0]?.trim().replace(/^\*\s*/, "") ?? "";
+    const slash = first.indexOf("/");
+    return slash === -1 ? first : first.slice(slash + 1);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Best-effort GitHub blob link - `null` (button omitted) on any failure rather than a link that might
  * show stale content: no `github.com` remote, uncommitted local changes to this file, or the current
- * commit not yet pushed anywhere (expected early in a session per the plan's §2.3 session model - a
- * session's own branch is only pushed after an explicit, ask-gated `git push`, not a bug to work
- * around). Never throws.
+ * commit not yet pushed anywhere. Never throws.
  */
 export function resolveGithubLink(worktreeRoot: string, relPath: string): string | null {
   const resolved = resolveWorktreeRelPath(worktreeRoot, relPath);
   if (!resolved) return null;
   const root = path.resolve(worktreeRoot);
   try {
-    const remote = execFileSync("git", ["remote", "get-url", "origin"], { cwd: root, encoding: "utf8" }).trim();
-    const m = remote.match(/github\.com[:/]([^/]+)\/(.+?)(?:\.git)?$/);
-    if (!m) return null;
-    const [, owner, repo] = m as [string, string, string];
+    const owned = parseGithubOwnerRepo(root);
+    if (!owned) return null;
     const status = execFileSync("git", ["status", "--porcelain", "--", resolved.rel], { cwd: root, encoding: "utf8" }).trim();
     if (status.length > 0) return null;
     const head = execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim();
-    const containing = execFileSync("git", ["branch", "-r", "--contains", head], { cwd: root, encoding: "utf8" }).trim();
-    if (containing.length === 0) return null;
-    return `https://github.com/${owner}/${repo}/blob/${head}/${resolved.rel}`;
+    if (!findRemoteBranchContaining(root, head)) return null;
+    return `https://github.com/${owned.owner}/${owned.repo}/blob/${head}/${resolved.rel}`;
   } catch {
     return null;
   }

@@ -584,6 +584,8 @@ export function renderHelp(): string {
     "  /skills [<term>] - list this project's .claude/skills",
     "  /browse [<path>] - browse this session's worktree, tap folders/files to navigate",
     "  /find <query> - search filenames + file content in this session's worktree",
+    "  /diff - review pending (uncommitted) changes via a GitHub compare link, or a .diff file",
+    "    if there's no GitHub remote",
     "",
     "Built-in passthrough is below - tap a button, or type /compact or /clear directly:",
   ].join("\n");
@@ -626,6 +628,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "skills", description: "List this project's .claude/skills: /skills [<term>]" },
     { command: "browse", description: "Browse this session's worktree: /browse [<path>]" },
     { command: "find", description: "Search filenames + content in this session's worktree: /find <query>" },
+    { command: "diff", description: "Review pending changes via a GitHub compare link (or a .diff file if there's no GitHub remote)" },
     { command: "compact", description: "Compact the session's conversation" },
     { command: "clear", description: "Clear the session's conversation" },
   ];

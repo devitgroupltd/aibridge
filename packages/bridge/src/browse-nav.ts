@@ -96,6 +96,14 @@ export function parseFindCommand(text: string): { query: string } | null {
   return { query: (match[1] ?? "").trim() };
 }
 
+/** `/diff` - no arguments in v1 (always the whole working tree). Boolean rather than a parsed struct
+ * since there's nothing to extract - kept alongside `/browse`/`/find` as the third session-worktree-
+ * native command, not because it shares their rendering (it doesn't page/browse anything) but because
+ * it's the third command gated the same way: only reachable once a session's worktree exists. */
+export function parseDiffCommand(text: string): boolean {
+  return /^\/diff\s*$/.test(text.trim());
+}
+
 function paginationRow(prefix: string, id: string, page: number, totalPages: number): InlineKeyboardButton[] {
   const row: InlineKeyboardButton[] = [];
   if (page > 0) row.push({ text: "◀ Prev", callback_data: `${prefix}:${id}:${page - 1}` });

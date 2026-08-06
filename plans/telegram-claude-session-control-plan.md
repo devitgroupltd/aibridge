@@ -1,7 +1,7 @@
 ---
-version: 0.72.0
+version: 0.73.0
 status: solid
-last_modified_utc: 2026-08-07T02:00:00Z
+last_modified_utc: 2026-08-07T04:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,29 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.73.0 (2026-08-07): new §3.7, '/diff' - a mobile-friendly way to review a session's pending
+    (uncommitted) changes from Telegram, researched and requested by the operator (secret Gists
+    turned out to be link-only, not access-controlled; a self-hosted diff2html/difit viewer would have
+    reopened the tunnel decision §3.6 already deferred; Google Drive added a render-then-upload step
+    for no gain). Landed as: push the pending diff (`git stash create`, zero local-repo mutation) to a
+    throwaway GitHub branch and reply with a native `/compare/base...head` link - access-controlled
+    like any other private-repo page, no PR object needed, one link gives both a per-file 'Files
+    changed' list and the full scrollable diff. Two corrections found mid-design, both documented in
+    §3.7 since they'd otherwise get relitigated: GitHub's compare page 404s on two bare commit SHAs
+    unless they're reachable via a real `refs/heads/*` ref (a custom ref namespace looked cleaner but
+    silently 404s); and a throwaway base branch is usually unnecessary once `findRemoteBranchContaining`
+    (extracted out of §3.6's `resolveGithubLink`, now shared) confirms `HEAD` is already reachable from
+    a pushed remote branch. Falls back to a `secret-scrub.ts`-scrubbed `.diff` document (§5.5's
+    existing precedent) when there's no `github.com` remote or the push itself fails. New
+    `diff-review.ts` + `diff-review.test.ts` (12 new tests, including a `url.*.insteadOf`-based local
+    fixture that exercises the real push+link path without any live GitHub access); `/diff` wired into
+    `browse-nav.ts`/`index.ts`/`nl-router.ts` the same way `/browse`/`/find` were in 0.65.0/0.66.0.
+    Also fixed in passing: `parseGithubOwnerRepo` (extracted from `resolveGithubLink`) now reads
+    `git config --get remote.origin.url` instead of `git remote get-url origin` - the latter silently
+    applies any local `url.*.insteadOf` rewrite before returning, which is exactly wrong for a function
+    whose whole job is reporting the configured host. 732 bridge-package tests pass, tsc --noEmit clean
+    apart from the 2 pre-existing unrelated errors (720 tests total across the bridge package, 58
+    files)."
   - "0.72.0 (2026-08-07): fixed a real §6.2 allowlist regression from the 0.55.0 plugin cutover
     (§10.1.2), found live while testing the 0.71.0 terminal-race fix but not fixed there. Generated
     per-session settings.json still pre-allowed the bot's reply/send_file tools under their old bare
@@ -2479,6 +2502,62 @@ it's allow-listed for *Claude's own* bash tool in `settings.ts`, no guarantee th
 has it on `PATH`), this degrades to filename-only results and says so (`contentSearchSkipped: true`)
 rather than throwing - the same "fail open" posture as `nl-router.ts`/`secret-scrub.ts`. Capped (20
 hits) with an explicit `truncated` flag shown to the operator, never a silent drop.
+
+---
+
+### 3.7 Diff review via GitHub compare link (added 0.73.0)
+
+`/diff` - a mobile-friendly way to review a session's pending (uncommitted) changes without asking
+Claude to paste `git diff` output back as a chat bubble (§5.5: diffs always go as documents, unreadable
+as a chat bubble on a phone). Session-scoped only, Bridge-native (`diff-review.ts`), same "own scoping,
+never through Claude's permission engine" posture as §3.6's browse/find.
+
+**Approach chosen, and what was rejected.** Push the pending diff to a throwaway GitHub branch and hand
+back a native `/compare/base...head` link - a repo page, not a PR object, so private-repo permissions
+apply to it like any other page and no PR needs to exist. One link gives both a per-file "Files changed"
+list and one continuous scrollable diff. Rejected alternatives, researched and discarded before this
+landed: a **secret Gist** (link-only, *not* access-controlled - anyone with the URL can view it
+regardless of the source repo's own privacy, a real downgrade from a private GitHub repo); a
+**self-hosted HTML viewer behind a tunnel** (`diff2html`, or the actively-maintained
+[`difit`](https://github.com/yoshiko-pg/difit) CLI, behind Tailscale Funnel/ngrok - reopens the exact
+tunnel decision §3.6/§11 already deferred once, for no gain over what the GitHub link already gives for
+free); and a **Google Drive upload** (works, but adds a render-then-upload round trip for no benefit
+over a link GitHub already serves and access-controls itself).
+
+**Two corrections a first draft of this got wrong, both load-bearing enough to note here so they don't
+get relitigated:**
+1. GitHub's compare page 404s on two arbitrary commit SHAs unless they're reachable via a real
+   `refs/heads/*`/`refs/tags/*` ref - a custom ref namespace looks cleaner (no branch-list clutter) but
+   silently produces a broken link. Branches pushed by this feature are real `refs/heads/*` branches,
+   namespaced under an `aibridge-review/` prefix, not a custom namespace.
+2. A throwaway base branch is usually unnecessary - `findRemoteBranchContaining` (shared with §3.6's
+   `resolveGithubLink`) already answers "is `HEAD` reachable from some already-pushed remote branch,"
+   typically true once a session's own `claude/<slug>-1` has had at least one push. That becomes the
+   base ref directly; a throwaway `-base` branch is only pushed in the early-session case where nothing
+   has been pushed yet at all.
+
+**Zero local-repo mutation, by construction.** `git stash create` produces a commit object representing
+the working tree's tracked (staged + unstaged) changes without ever touching the index or working tree -
+unlike `git commit` + `git reset --soft` (which would flip previously-unstaged files to staged) or
+`git add -N` (leaves intent-to-add markers behind on failure). Untracked (never `git add`-ed) files are
+therefore *not* included in the diff itself - the reply surfaces `untrackedFiles` by name (with a
+pointer to `/browse` to view them) rather than risk a mutating workaround to include them.
+
+**Fallback (no `github.com` remote, or the push itself fails - offline, no push access).** The unified
+diff text, scrubbed through `secret-scrub.ts` (same defense-in-depth §3.6's `readForPreview` already
+applies) and sent as a `.diff` document per §5.5's existing precedent. Never throws either way - a push
+failure is a degrade, not an error surfaced to the operator as a failure.
+
+**Cleanup.** The throwaway branch(es) are force-pushed/overwritten on every `/diff` call rather than
+accumulating (confirmed ephemeral is fine), and best-effort deleted from `removeSessionRow`'s existing
+`/kill`/`/rm` teardown, right alongside `removeWorktree` - deleting the throwaway `-base` name is always
+safe even when a real remote branch was reused as base instead, since nothing was ever pushed under that
+literal name in that case.
+
+**One accepted, documented risk, not engineered around**: if the operator's own repo already happens to
+have a real branch literally named `aibridge-review/<slug>-head` or `-base`, this force-overwrites it.
+The prefix is namespaced enough that this is treated the same way other `settings.ts`-adjacent gaps in
+this plan are - called out, not defended against.
 
 ---
 

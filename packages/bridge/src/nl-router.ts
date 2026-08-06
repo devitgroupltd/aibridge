@@ -47,7 +47,8 @@ export type RouterAction =
   | { kind: "skills"; term: string }
   | { kind: "builtin"; name: "compact" | "clear" }
   | { kind: "browse"; path: string }
-  | { kind: "find"; query: string };
+  | { kind: "find"; query: string }
+  | { kind: "diff" };
 
 export type RouterResult = { matched: false } | { matched: true; command: FleetCommand | SessionCommand | RouterAction; destructive: boolean };
 
@@ -111,6 +112,7 @@ export const ROUTER_KINDS = [
   "builtin",
   "browse",
   "find",
+  "diff",
   "forward",
 ] as const;
 type RouterKind = (typeof ROUTER_KINDS)[number];
@@ -134,7 +136,8 @@ function allowedKinds(ctx: RouterContext): RouterKind[] {
         kind === "skills" ||
         kind === "builtin" ||
         kind === "browse" ||
-        kind === "find") &&
+        kind === "find" ||
+        kind === "diff") &&
       !ctx.hasSession
     )
       return false;
@@ -316,6 +319,8 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
         return { kind: "browse", path: raw.path ?? "" };
       case "find":
         return raw.query ? { kind: "find", query: raw.query } : null;
+      case "diff":
+        return { kind: "diff" };
       case "session_model":
         return isModel(raw.model) ? { kind: "model", model: raw.model } : null;
       case "session_mode":

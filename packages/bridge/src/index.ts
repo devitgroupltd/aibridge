@@ -50,12 +50,14 @@ import {
   buildFileActionKeyboard,
   buildHitsKeyboard,
   parseBrowseCommand,
+  parseDiffCommand,
   parseFindCommand,
   renderDirText,
   renderHitsText,
   resolveBrowseCallback,
 } from "./browse-nav.ts";
 import { listDirectory, MAX_SEND_BYTES, prepareFileForSend, readForPreview, resolveGithubLink, searchWorktree } from "./worktree-fs.ts";
+import { buildDiffReview, cleanupDiffRefs } from "./diff-review.ts";
 import { FeedCoalescer } from "./feed-coalescer.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
@@ -1445,6 +1447,10 @@ async function main(): Promise<void> {
     routing.clearPtyWrite(slug);
     stopIndicatorsForTopic(row.topicId);
 
+    // Best-effort - must run before removeWorktree deletes the checkout `cleanupDiffRefs` needs as
+    // its `cwd` to reach `origin` at all.
+    cleanupDiffRefs(row.worktreePath, slug);
+
     try {
       await removeWorktree(row.repoPath, row.worktreePath);
     } catch (err) {
@@ -2005,6 +2011,36 @@ async function main(): Promise<void> {
       .catch((err) => log("WARN", `sendMessage (/find) failed: ${(err as Error).message}`));
   }
 
+  /** `/diff` - session-scoped only. Pushes the session's pending (uncommitted) changes to a
+   * throwaway GitHub branch and replies with a compare-view link (diff-review.ts), or a scrubbed
+   * `.diff` document when there's no GitHub remote or the push itself fails - see that module's own
+   * doc comment for the full design. */
+  function sendDiffCard(threadId: number | undefined, route: ReturnType<typeof routing.getByTopicId>): void {
+    if (!route) {
+      confirmSessionCommand(threadId, "Diff review is session-scoped - send /diff inside a session's own topic.");
+      return;
+    }
+    const review = buildDiffReview(route.worktreePath, route.slug);
+    const untrackedNote = review.untrackedFiles.length > 0 ? ` ${review.untrackedFiles.length} new file(s) not shown - /browse to view: ${review.untrackedFiles.join(", ")}` : "";
+    if (review.kind === "empty") {
+      confirmSessionCommand(threadId, review.untrackedFiles.length > 0 ? `No tracked changes.${untrackedNote}` : "No pending changes.");
+      return;
+    }
+    if (review.kind === "link" && review.url) {
+      controlBot
+        .sendMessage(config.supergroupChatId, threadId, `${review.filesChanged} file(s) changed.${untrackedNote}`, {
+          inline_keyboard: [[{ text: "Open diff on GitHub", url: review.url }]],
+        })
+        .catch((err) => log("WARN", `sendMessage (/diff) failed: ${(err as Error).message}`));
+      return;
+    }
+    if (review.kind === "document" && review.diffText !== undefined && controlBot.sendDocumentFile) {
+      controlBot
+        .sendDocumentFile(config.supergroupChatId, threadId, `${route.slug}.diff`, new TextEncoder().encode(review.diffText), `${review.filesChanged} file(s) changed.${untrackedNote}`)
+        .catch((err) => log("WARN", `sendDocumentFile (/diff) failed: ${(err as Error).message}`));
+    }
+  }
+
   /** Short human-readable label for an NL-matched command's confirm card and its finalize message
    * - not exhaustive-per-field (e.g. `/new`'s prompt text isn't echoed back), just enough for the
    * operator to recognise what they're about to approve. */
@@ -2066,6 +2102,10 @@ async function main(): Promise<void> {
     }
     if (command.kind === "find") {
       sendFindCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.query);
+      return;
+    }
+    if (command.kind === "diff") {
+      sendDiffCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined);
       return;
     }
     if (command.kind === "model" || command.kind === "mode" || command.kind === "effort") {
@@ -2329,6 +2369,10 @@ async function main(): Promise<void> {
     const findCmd = parseFindCommand(text);
     if (findCmd) {
       sendFindCard(threadId, route, findCmd.query);
+      return;
+    }
+    if (parseDiffCommand(text)) {
+      sendDiffCard(threadId, route);
       return;
     }
 
