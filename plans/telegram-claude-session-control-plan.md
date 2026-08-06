@@ -1,7 +1,7 @@
 ---
-version: 0.77.0
+version: 0.78.0
 status: solid
-last_modified_utc: 2026-08-06T19:40:00Z
+last_modified_utc: 2026-08-06T19:50:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,15 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.78.0 (2026-08-06): `tsc --noEmit` was silently broken - `pipe-server.ts`'s `net.Server`/
+    `voice-transcribe.ts`'s `ChildProcess` both reported 'Property on does not exist', because the
+    workspace root only ever declared `@types/bun` as a devDependency and never `@types/node`.
+    `bun test` never caught this (Bun's own runtime doesn't need the ambient types tsc resolves
+    against), so the gap wasn't visible until `tsc --noEmit` was actually run per package - §9 lists
+    it as a required CI gate alongside `bun test`, and it had been silently failing. Added
+    `@types/node` as a root devDependency; `skipLibCheck: true` (already set in tsconfig.base.json)
+    keeps it from fighting `@types/bun`'s own declarations. All five packages now pass
+    `tsc --noEmit` clean; `bun test` unaffected (883 pass)."
   - "0.77.0 (2026-08-06): two feed-visibility gaps raised directly by the operator watching a real
     session's Telegram topic while it worked:
     (1) **TodoWrite rendered as nothing but its own name.** hook-events.ts's per-tool summarizer only
