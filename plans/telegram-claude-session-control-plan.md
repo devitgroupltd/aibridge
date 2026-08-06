@@ -1,7 +1,7 @@
 ---
-version: 0.61.0
+version: 0.62.0
 status: solid
-last_modified_utc: 2026-08-06T15:45:00Z
+last_modified_utc: 2026-08-06T16:30:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,22 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.62.0 (2026-08-06): Voice-note confirm card (voice-confirm.ts) can now be skipped entirely, per
+    operator request after two live observations. First: no equivalent of /assist's 'don't ask again'
+    existed for the voice Send/Re-record/Type-instead card itself, so a new `voice_confirm_enabled`
+    setting (settings-store.ts, default on) plus a `/voiceconfirm [on|off]` fleet command and a new
+    '🔇 Send, don't ask again' row on the card (voice-confirm.ts's keyboard, its own `vc:<id>:a` code)
+    were added, mirroring /assist's own on/off/status shape exactly. When confirmation is off, a
+    transcribed voice note is now dispatched immediately (auto-sent) but the transcript is still shown
+    on the finalized message, not discarded - the operator can read what was actually sent and flip
+    /voiceconfirm back on without needing the card. An empty/unrecognised transcript still always shows
+    the card regardless of the setting, since there's nothing useful to auto-send. Second: the finalized
+    card after any tap (Send, Re-record, Type-instead, Cancel) used to replace the transcript text
+    outright with a bare status line ('✅ Sent.') - once the buttons were gone, that was the only record
+    of what had actually been sent/discarded. `finalizeVoiceConfirmMessage` now keeps the transcript
+    visible under the status line for every action, not just the new auto-send path. Extended
+    ROUTER_KINDS/nl-router.ts so 'turn voice confirmation on/off' is itself NL-routable, same
+    completeness discipline 0.61.0 introduced. 665 tests pass (up from 660)."
   - "0.61.0 (2026-08-06): Fixed a real gap in 0.60.0's NL router, found live by the operator within
     minutes of shipping: a Russian 'show me the commands I can use' phrase fell through to
     'Unrecognised control-topic command' instead of the equivalent of /help, because the router only
@@ -2146,7 +2162,7 @@ handle instead of spawning a nonexistent process and retry-looping every 3s fore
 setup step is what actually turns transcription on in practice, not a separate `.env` edit -
 `VOICE_ENABLED=false` exists only for an operator who wants to suppress the warning entirely.
 
-### 3.5 Natural-language command routing (added 0.60.0, extended 0.61.0)
+### 3.5 Natural-language command routing (added 0.60.0, extended 0.61.0, 0.62.0)
 
 Free text (typed, or a voice transcript re-entering `dispatchInboundMessage` via §3.4's own Send
 button) that isn't already an exact `/command` gets one forced-structured-output classification call
@@ -2204,6 +2220,17 @@ store.ts`) - one file, not a second database.
 **Naming.** Landed as `/assist` (confirm toggle) and `/router` (backend switch), not the originally
 drafted `/nlconfirm`/backend-folded-into-`/assist` - both renamed after a short naming pass with the
 operator toward names that read naturally in a sentence ("/assist off", "/router api").
+
+**Voice-note confirmation is independently skippable (0.62.0).** §3.4's own Send/Re-record/Type-instead
+card (`voice-confirm.ts`) can be turned off the same way: `/voiceconfirm [on|off]` (default on,
+`voice_confirm_enabled` in `settings-store.ts`) plus a "🔇 Send, don't ask again" row right on the card
+itself, mirroring `/assist`'s shape exactly. With it off, a transcribed voice note is dispatched
+immediately - but the transcript still lands on the finalized message rather than a bare "✅ Sent.", so
+there's always something to read before deciding whether to flip `/voiceconfirm on` again. An
+empty/unrecognised transcript always shows the card regardless of the setting, since there's nothing
+useful to auto-send. This is a separate toggle from `/assist`/`nl_confirm_enabled` - one gates whether
+a *destructive fleet command matched from NL text* asks first, the other gates whether a *transcribed
+voice note* is sent at all - deliberately not folded together despite the similar shape.
 
 ---
 

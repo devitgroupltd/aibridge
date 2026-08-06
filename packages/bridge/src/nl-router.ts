@@ -91,6 +91,7 @@ export const ROUTER_KINDS = [
   "autostart",
   "repos",
   "voice",
+  "voiceconfirm",
   "assist",
   "router",
   "session_model",
@@ -151,6 +152,7 @@ function buildSchema(ctx: RouterContext): Record<string, unknown> {
       mode: { type: "string", enum: [...MODES], description: "For 'session_mode'." },
       effort: { type: "string", enum: [...EFFORTS], description: "For 'session_effort'." },
       assistAction: { type: "string", enum: ["status", "on", "off"], description: "For 'assist': confirm-before-destructive-NL-command toggle." },
+      voiceConfirmAction: { type: "string", enum: ["status", "on", "off"], description: "For 'voiceconfirm': confirm-before-sending-a-transcribed-voice-note toggle." },
       routerAction: { type: "string", enum: ["status", "api", "cli"], description: "For 'router': NL-routing backend toggle." },
       term: { type: "string", description: "For 'commands'/'skills': an optional search term to filter the list." },
       builtinName: { type: "string", enum: ["compact", "clear"], description: "For 'builtin': which built-in Claude Code command to run." },
@@ -194,6 +196,7 @@ interface RawRouterOutput {
   mode?: string;
   effort?: string;
   assistAction?: string;
+  voiceConfirmAction?: string;
   routerAction?: string;
   term?: string;
   builtinName?: string;
@@ -273,6 +276,10 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
         return { kind: "voice", model: raw.voiceModel };
       case "assist":
         return raw.assistAction === "status" || raw.assistAction === "on" || raw.assistAction === "off" ? { kind: "assist", action: raw.assistAction } : null;
+      case "voiceconfirm":
+        return raw.voiceConfirmAction === "status" || raw.voiceConfirmAction === "on" || raw.voiceConfirmAction === "off"
+          ? { kind: "voiceconfirm", action: raw.voiceConfirmAction }
+          : null;
       case "router":
         return raw.routerAction === "status" || raw.routerAction === "api" || raw.routerAction === "cli" ? { kind: "router", action: raw.routerAction } : null;
       case "commands":

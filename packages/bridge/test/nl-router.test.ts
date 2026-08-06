@@ -29,6 +29,7 @@ const ALL_FLEET_COMMAND_KINDS = [
   "autostart",
   "repos",
   "voice",
+  "voiceconfirm",
   "assist",
   "router",
 ] as const;
@@ -224,6 +225,15 @@ describe("mapRouterOutput - one case per kind", () => {
     expect(mapRouterOutput({ kind: "assist", assistAction: "bogus" }, CONTROL)).toEqual({ matched: false });
     expect(mapRouterOutput({ kind: "router", routerAction: "api" }, CONTROL)).toEqual({ matched: true, command: { kind: "router", action: "api" }, destructive: false });
     expect(mapRouterOutput({ kind: "router", routerAction: "bogus" }, CONTROL)).toEqual({ matched: false });
+  });
+
+  test("voiceconfirm: its own status/on/off enum, never destructive", () => {
+    expect(mapRouterOutput({ kind: "voiceconfirm", voiceConfirmAction: "off" }, CONTROL)).toEqual({
+      matched: true,
+      command: { kind: "voiceconfirm", action: "off" },
+      destructive: false,
+    });
+    expect(mapRouterOutput({ kind: "voiceconfirm", voiceConfirmAction: "bogus" }, CONTROL)).toEqual({ matched: false });
   });
 
   test("commands and skills: session-scoped, optional term, never destructive", () => {

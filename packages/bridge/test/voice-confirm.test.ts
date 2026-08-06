@@ -55,8 +55,9 @@ describe("VoiceConfirmRegistry", () => {
 });
 
 describe("resolveVoiceConfirmCallback", () => {
-  test("resolves send/rerecord/type taps", () => {
+  test("resolves send/send_and_stop_asking/rerecord/type taps", () => {
     expect(resolveVoiceConfirmCallback("vc:abcde123:s")).toEqual({ id: "abcde123", action: "send" });
+    expect(resolveVoiceConfirmCallback("vc:abcde123:a")).toEqual({ id: "abcde123", action: "send_and_stop_asking" });
     expect(resolveVoiceConfirmCallback("vc:abcde123:r")).toEqual({ id: "abcde123", action: "rerecord" });
     expect(resolveVoiceConfirmCallback("vc:abcde123:t")).toEqual({ id: "abcde123", action: "type" });
     expect(resolveVoiceConfirmCallback("vc:abcde123:c")).toEqual({ id: "abcde123", action: "cancel" });
@@ -75,20 +76,22 @@ describe("resolveVoiceConfirmCallback", () => {
 });
 
 describe("buildVoiceConfirmKeyboard", () => {
-  test("builds send/re-record/type/cancel buttons matching resolveVoiceConfirmCallback's own encoding", () => {
+  test("builds send/send-and-stop-asking/re-record/type/cancel buttons matching resolveVoiceConfirmCallback's own encoding", () => {
     const keyboard = buildVoiceConfirmKeyboard("abcde123");
     const flat = keyboard.flat().map((btn) => btn.callback_data);
     for (const data of flat) {
       expect(resolveVoiceConfirmCallback(data)).not.toBeNull();
     }
-    expect(flat).toHaveLength(4);
+    expect(flat).toHaveLength(5);
   });
 
-  test("Send gets its own row, separate from the three discard actions", () => {
+  test("Send and Send-don't-ask-again each get their own row, separate from the three discard actions", () => {
     const keyboard = buildVoiceConfirmKeyboard("abcde123");
-    expect(keyboard).toHaveLength(2);
+    expect(keyboard).toHaveLength(3);
     expect(keyboard[0]).toHaveLength(1);
     expect(resolveVoiceConfirmCallback(keyboard[0]?.[0]?.callback_data ?? "")?.action).toBe("send");
-    expect(keyboard[1]).toHaveLength(3);
+    expect(keyboard[1]).toHaveLength(1);
+    expect(resolveVoiceConfirmCallback(keyboard[1]?.[0]?.callback_data ?? "")?.action).toBe("send_and_stop_asking");
+    expect(keyboard[2]).toHaveLength(3);
   });
 });

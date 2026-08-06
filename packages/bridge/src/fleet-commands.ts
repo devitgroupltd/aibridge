@@ -41,7 +41,8 @@ export type FleetCommand =
   | { kind: "repos"; action: "rm"; name: string }
   | { kind: "voice"; model?: string }
   | { kind: "assist"; action: "status" | "on" | "off" }
-  | { kind: "router"; action: "status" | "api" | "cli" };
+  | { kind: "router"; action: "status" | "api" | "cli" }
+  | { kind: "voiceconfirm"; action: "status" | "on" | "off" };
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
 
@@ -167,6 +168,19 @@ function parseRouterBackend(rest: string): FleetCommand | null {
   return { kind: "router", action };
 }
 
+/** `/voiceconfirm [on|off]` - whether a transcribed voice note shows a Send/Re-record/Type-instead
+ * card first (voice-confirm.ts) before it's dispatched, or the typeable equivalent of that card's
+ * own "Send, don't ask again" button. Bare `/voiceconfirm` reports the current setting, same
+ * "no argument defaults to status" shape as `/assist`/`/autostart`. Kept as its own command rather
+ * than folded into `/voice` (which already takes an optional `<model>` token as its rest-of-line
+ * argument, so `/voice off` would be ambiguous with a (nonexistent) model literally named "off"). */
+function parseVoiceConfirm(rest: string): FleetCommand | null {
+  const trimmed = rest.trim();
+  const action = trimmed.length === 0 ? "status" : trimmed;
+  if (action !== "status" && action !== "on" && action !== "off") return null;
+  return { kind: "voiceconfirm", action };
+}
+
 /**
  * `/repos [list]` / `/repos add <name> [<path>|<git-url>] [--base <branch>] [--model <model>]` /
  * `/repos rm|remove <name>` - §7.5's registry, made mutable from Telegram (`repos-registry.ts`'s
@@ -265,7 +279,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
  * "for us, but invalid" split as `session-commands.ts`'s parser. */
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice|assist|router)\b(.*)$/s);
+  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router)\b(.*)$/s);
   if (!match) return null;
   const [, cmd, rest] = match as [string, string, string];
   switch (cmd) {
@@ -293,6 +307,8 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return parseAssist(rest);
     case "router":
       return parseRouterBackend(rest);
+    case "voiceconfirm":
+      return parseVoiceConfirm(rest);
     case "repos":
       return parseRepos(rest);
     case "voice": {
@@ -532,6 +548,8 @@ export function renderHelp(): string {
     "  /repos [list|add <name> [path|git-url] [--base <b>] [--model <m>]|rm <name>] - manage repos.toml",
     "  /autostart [status|install|uninstall] - manage the logon Task Scheduler entry",
     "  /voice [<model>] - show/switch the Whisper model used for voice-note transcription",
+    "  /voiceconfirm [on|off] - whether a transcribed voice note shows a Send/Re-record/Type-instead",
+    "    card first before it's dispatched (default on)",
     "  /assist [on|off] - whether a natural-language-matched destructive command (kill/rm/",
     "    restart/deploy/repos rm) shows a confirm card first (default on)",
     "  /router [api|cli] - natural-language routing backend: 'cli' uses your Claude Code",
@@ -579,6 +597,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "repos", description: "Manage repos.toml: list|add <name> [path|git-url]|rm <name>" },
     { command: "autostart", description: "Manage the logon Task Scheduler entry: status|install|uninstall" },
     { command: "voice", description: "Show/switch the Whisper model used for voice-note transcription" },
+    { command: "voiceconfirm", description: "Confirm before sending a transcribed voice note: /voiceconfirm [on|off]" },
     { command: "assist", description: "Confirm before running a natural-language-matched destructive command: /assist [on|off]" },
     { command: "router", description: "NL-routing backend: /router [api|cli] - subscription (cli, default) or a funded API key (api)" },
     { command: "help", description: "Show the full command list" },

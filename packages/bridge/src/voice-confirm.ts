@@ -59,34 +59,39 @@ export class VoiceConfirmRegistry {
   }
 }
 
-export type VoiceConfirmAction = "send" | "rerecord" | "type" | "cancel";
+export type VoiceConfirmAction = "send" | "send_and_stop_asking" | "rerecord" | "type" | "cancel";
 
 export interface VoiceConfirmCallback {
   id: string;
   action: VoiceConfirmAction;
 }
 
-const CODE_ACTION: Record<string, VoiceConfirmAction> = { s: "send", r: "rerecord", t: "type", c: "cancel" };
+const CODE_ACTION: Record<string, VoiceConfirmAction> = { s: "send", a: "send_and_stop_asking", r: "rerecord", t: "type", c: "cancel" };
 
-/** `vc:<id>:<s|r|t|c>` - a fresh namespace alongside `perm:`/`ask:`/`sc:`/`fc:`/`d:`. Re-validates
+/** `vc:<id>:<s|a|r|t|c>` - a fresh namespace alongside `perm:`/`ask:`/`sc:`/`fc:`/`d:`. Re-validates
  * the format rather than trusting the tap, same defensive pattern as every other
  * `resolve*Callback` here: any client that can see the message can send arbitrary `callback_data`. */
 export function resolveVoiceConfirmCallback(data: string): VoiceConfirmCallback | null {
-  const match = data.match(/^vc:([A-Za-z0-9]{1,20}):(s|r|t|c)$/);
+  const match = data.match(/^vc:([A-Za-z0-9]{1,20}):(s|a|r|t|c)$/);
   if (!match) return null;
   const action = CODE_ACTION[match[2] ?? ""];
   if (!action) return null;
   return { id: match[1] ?? "", action };
 }
 
-/** Send gets its own row - the primary action, not one of four equally-weighted buttons. The other
- * three all just discard the transcript (§ index.ts's shared "not sending" finalize text) - kept
- * as three distinct buttons rather than collapsed into one because they carry different implied
- * next steps for the operator (re-record vs type vs "never mind, drop it"), even though the
- * registry/callback code treats them identically past the send/no-send branch. */
+/** Send gets its own row - the primary action, not one of five equally-weighted buttons. "Send,
+ * don't ask again" sits right below it, same "adjacent to but visually distinct from the button it
+ * modifies" placement as `nl-confirm.ts`'s own "don't ask again" row - it both sends *this*
+ * transcript and flips `voice_confirm_enabled` off, a bigger decision than a single tap should be
+ * conflated with plain "Send". The remaining three all just discard the transcript (§ index.ts's
+ * shared "not sending" finalize text) - kept as three distinct buttons rather than collapsed into
+ * one because they carry different implied next steps for the operator (re-record vs type vs
+ * "never mind, drop it"), even though the registry/callback code treats them identically past the
+ * send/no-send branch. */
 export function buildVoiceConfirmKeyboard(id: string): InlineKeyboardButton[][] {
   return [
     [{ text: "✅ Send", callback_data: `vc:${id}:s` }],
+    [{ text: "🔇 Send, don't ask again", callback_data: `vc:${id}:a` }],
     [
       { text: "🔁 Re-record", callback_data: `vc:${id}:r` },
       { text: "✏️ I'll type instead", callback_data: `vc:${id}:t` },

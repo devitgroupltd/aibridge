@@ -240,6 +240,24 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/router bogus")).toBeNull();
   });
 
+  test("/voiceconfirm with no argument defaults to status", () => {
+    expect(parseFleetCommand("/voiceconfirm")).toEqual({ kind: "voiceconfirm", action: "status" });
+  });
+
+  test("/voiceconfirm on and /voiceconfirm off", () => {
+    expect(parseFleetCommand("/voiceconfirm on")).toEqual({ kind: "voiceconfirm", action: "on" });
+    expect(parseFleetCommand("/voiceconfirm off")).toEqual({ kind: "voiceconfirm", action: "off" });
+  });
+
+  test("/voiceconfirm with an unrecognised argument is invalid, not a different command", () => {
+    expect(parseFleetCommand("/voiceconfirm bogus")).toBeNull();
+  });
+
+  test("/voiceconfirm is a distinct command from /voice, not a model name collision", () => {
+    expect(parseFleetCommand("/voice off")).toEqual({ kind: "voice", model: "off" });
+    expect(parseFleetCommand("/voiceconfirm off")).toEqual({ kind: "voiceconfirm", action: "off" });
+  });
+
   test("/repos with no argument, or 'list', means list", () => {
     expect(parseFleetCommand("/repos")).toEqual({ kind: "repos", action: "list" });
     expect(parseFleetCommand("/repos list")).toEqual({ kind: "repos", action: "list" });

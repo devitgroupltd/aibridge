@@ -216,6 +216,10 @@ async function main(): Promise<void> {
   // the config default (always "cli" unless NL_ROUTER_BACKEND=api) when nothing's been switched
   // live yet.
   let nlRouterBackend: "api" | "cli" = settingsStore.get("nl_router_backend", config.nlRouter.backend) === "api" ? "api" : "cli";
+  // voice-confirm.ts's own confirm-before-send gate - same "fleet-wide, persisted, in-memory for
+  // reads" shape as assistEnabled above. Default on: Whisper's accuracy varies enough by language
+  // that skipping the review step should be an explicit opt-in, not the out-of-the-box behavior.
+  let voiceConfirmEnabled = settingsStore.get("voice_confirm_enabled", "true") !== "false";
   if (!sessionStore.get(config.phase1.slug)) {
     sessionStore.insert({
       slug: config.phase1.slug,
@@ -1242,14 +1246,35 @@ async function main(): Promise<void> {
         { ffmpegPath: config.voice.ffmpegPath, serverUrl: `http://127.0.0.1:${config.voice.port}` },
         oggBytes,
       );
-      const id = randomUUID().slice(0, 8);
       const preview = text.length > 0 ? text : "(nothing recognised - try again?)";
+      // An empty transcript always still shows the card, even with confirmation off - there's
+      // nothing useful to auto-send, and re-record/type-instead are the only sensible next steps.
+      if (voiceConfirmEnabled || text.length === 0) {
+        const id = randomUUID().slice(0, 8);
+        if (controlBot.editMessageText) {
+          await feedGovernor.scheduleAsync("P1", () =>
+            controlBot.editMessageText!(config.supergroupChatId, placeholderId!, `🎤 ${preview}`, { inline_keyboard: buildVoiceConfirmKeyboard(id) }),
+          );
+        }
+        voiceConfirmRegistry.add({ id, threadId, messageId, transcript: text, from, confirmCardMessageId: placeholderId });
+        return;
+      }
+      // Confirmation is off - send straight through, but the transcript stays visible on the
+      // finalized message (not just a bare "Sent") so there's still something to read before
+      // deciding to flip /voiceconfirm back on.
       if (controlBot.editMessageText) {
         await feedGovernor.scheduleAsync("P1", () =>
-          controlBot.editMessageText!(config.supergroupChatId, placeholderId!, `🎤 ${preview}`, { inline_keyboard: buildVoiceConfirmKeyboard(id) }),
+          controlBot.editMessageText!(
+            config.supergroupChatId,
+            placeholderId!,
+            `🎤 ${preview}\n\n✅ Auto-sent (confirmation off - /voiceconfirm on to review before sending).`,
+            { inline_keyboard: [] },
+          ),
         );
       }
-      voiceConfirmRegistry.add({ id, threadId, messageId, transcript: text, from, confirmCardMessageId: placeholderId });
+      const autoIsControl = isControlTopic(threadId);
+      const autoRoute = threadId !== undefined ? routing.getByTopicId(threadId) : undefined;
+      void dispatchInboundMessage(messageId, text, threadId, autoIsControl, autoRoute, autoRoute?.slug, from);
     } catch (err) {
       log("WARN", `voice transcription failed: ${(err as Error).message}`);
       const failText = "Couldn't transcribe that voice note - try again, or just type it.";
@@ -1302,10 +1327,14 @@ async function main(): Promise<void> {
     }
   }
 
-  async function finalizeVoiceConfirmMessage(pending: PendingVoiceConfirm, text: string): Promise<void> {
+  /** Keeps the transcript visible under the final status line rather than replacing it outright -
+   * once the card's buttons are gone, the transcript text was the only record of what a "Sent"/
+   * "Discarded" tap actually applied to; losing it made the finalized message unreadable on its
+   * own (live-reported: a "✅ Sent." card with no way to see what was sent). */
+  async function finalizeVoiceConfirmMessage(pending: PendingVoiceConfirm, statusLine: string): Promise<void> {
     if (!controlBot.editMessageText) return;
     try {
-      await controlBot.editMessageText(config.supergroupChatId, pending.confirmCardMessageId, text, { inline_keyboard: [] });
+      await controlBot.editMessageText(config.supergroupChatId, pending.confirmCardMessageId, `🎤 ${pending.transcript}\n\n${statusLine}`, { inline_keyboard: [] });
     } catch (err) {
       log("WARN", `failed to finalize voice-confirm message: ${(err as Error).message}`);
     }
@@ -1756,6 +1785,24 @@ async function main(): Promise<void> {
     );
   }
 
+  /** `/voiceconfirm [on|off]` - whether a transcribed voice note shows a Send/Re-record/Type-
+   * instead card first (voice-confirm.ts) or is auto-sent straight through. Same in-memory-for-
+   * reads, persisted-on-write shape as `handleAssistCommand`. */
+  function handleVoiceConfirmCommand(cmd: Extract<FleetCommand, { kind: "voiceconfirm" }>, topicId: number | undefined): void {
+    if (cmd.action === "status") {
+      confirmSessionCommand(topicId, `Voice-note send confirmation is ${voiceConfirmEnabled ? "on" : "off"}.`);
+      return;
+    }
+    voiceConfirmEnabled = cmd.action === "on";
+    settingsStore.set("voice_confirm_enabled", voiceConfirmEnabled ? "true" : "false");
+    confirmSessionCommand(
+      topicId,
+      voiceConfirmEnabled
+        ? "Voice-note send confirmation is now on - a transcribed voice note shows a Send/Re-record/Type-instead card before it's dispatched."
+        : "Voice-note send confirmation is now off - a transcribed voice note is sent straight through, with the transcript still shown so you can see what was sent - /voiceconfirm on to review before sending again.",
+    );
+  }
+
   /** `/router [api|cli]` - live switch for the NL-router backend, no restart needed either
    * direction. Switching to "api" is refused (not silently downgraded to "cli") when no key is
    * configured - the operator asked for the fast/paid path specifically, so a silent no-op would
@@ -2045,6 +2092,10 @@ async function main(): Promise<void> {
     }
     if (fleetCmd.kind === "router") {
       handleRouterBackendCommand(fleetCmd, threadId);
+      return;
+    }
+    if (fleetCmd.kind === "voiceconfirm") {
+      handleVoiceConfirmCommand(fleetCmd, threadId);
       return;
     }
     handlePauseCommand(fleetCmd, threadId, currentSlug);
@@ -2385,12 +2436,18 @@ async function main(): Promise<void> {
         // alongside "sc:"/"fc:"/"d:". "Re-record"/"Type instead"/"Cancel" all discard the
         // transcript; they differ only in which follow-up text is shown, so all three fall into
         // the same finalize call below rather than needing separate registry/dispatch handling.
+        // "Send, don't ask again" additionally flips `voiceConfirmEnabled` off (and persists it)
+        // before sending, the typeable equivalent being `/voiceconfirm off`.
         const voiceConfirmAction = callbackQuery.data ? resolveVoiceConfirmCallback(callbackQuery.data) : null;
         if (voiceConfirmAction) {
           const pending = voiceConfirmRegistry.resolve(voiceConfirmAction.id);
           if (!pending) return;
-          if (voiceConfirmAction.action === "send") {
-            void finalizeVoiceConfirmMessage(pending, "✅ Sent.");
+          if (voiceConfirmAction.action === "send" || voiceConfirmAction.action === "send_and_stop_asking") {
+            if (voiceConfirmAction.action === "send_and_stop_asking") {
+              voiceConfirmEnabled = false;
+              settingsStore.set("voice_confirm_enabled", "false");
+            }
+            void finalizeVoiceConfirmMessage(pending, voiceConfirmAction.action === "send_and_stop_asking" ? "✅ Sent (confirmation now off - /voiceconfirm on to re-enable)." : "✅ Sent.");
             const pendingIsControl = isControlTopic(pending.threadId);
             const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
             void dispatchInboundMessage(pending.messageId, pending.transcript, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from);
