@@ -21,6 +21,7 @@ import { isImagePath, resolveOutboxPath } from "./outbox.ts";
 import { buildPermissionKeyboard, renderPermissionCard } from "./permission-callback.ts";
 import { PermissionRegistry, type PendingPermissionRequest } from "./permission-registry.ts";
 import type { RateGovernor } from "./rate-governor.ts";
+import { scrubSecrets } from "./secret-scrub.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import type { Routing } from "./routing.ts";
 import type { SendMessageSource } from "./telegram.ts";
@@ -124,13 +125,21 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
 
   async function handleReply(msg: ReplyMessage): Promise<void> {
     try {
+      // Last-line-of-defence, not a substitute for §6.2's Read/Edit deny rules: those stop Claude's
+      // own tools from opening a secret file, but a subprocess the session wrote can still read one
+      // and quote it back here. Every reply passes through this chokepoint regardless of how its
+      // text was produced, so it's the one place that actually catches that gap (secret-scrub.ts).
+      const { text, triggered } = scrubSecrets(msg.text);
+      if (triggered.length > 0) {
+        log("WARN", `redacted ${triggered.join(", ")} from a reply for slug "${msg.slug}" before sending to Telegram`);
+      }
       const placeholderId = await opts.thinkingPlaceholder?.consume(msg.topic_id);
       if (placeholderId !== undefined && opts.controlBot.editMessageText) {
-        await p1(() => opts.controlBot.editMessageText!(opts.chatId, placeholderId, msg.text));
+        await p1(() => opts.controlBot.editMessageText!(opts.chatId, placeholderId, text));
       } else {
-        await p1(() => opts.controlBot.sendMessage(opts.chatId, Number(msg.topic_id), msg.text));
+        await p1(() => opts.controlBot.sendMessage(opts.chatId, Number(msg.topic_id), text));
       }
-      opts.onReplySent?.(msg.topic_id, msg.text);
+      opts.onReplySent?.(msg.topic_id, text);
     } catch (err) {
       log("ERROR", `failed to deliver reply for slug "${msg.slug}": ${(err as Error).message}`);
     }
@@ -162,11 +171,22 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       const bytes = readFileSync(resolved);
       const filename = path.basename(resolved);
       const asPhoto = isImagePath(filename);
+      // The caption is free text Claude supplies, same as a reply - scrub it the same way (the
+      // file's own bytes are unaffected; this repo has no equivalent scanner for file contents,
+      // which is exactly the kind of gap §8.3 already tracks rather than something new).
+      let caption = msg.caption;
+      if (caption !== undefined) {
+        const { text, triggered } = scrubSecrets(caption);
+        caption = text;
+        if (triggered.length > 0) {
+          log("WARN", `redacted ${triggered.join(", ")} from a send_file caption for slug "${msg.slug}" before sending to Telegram`);
+        }
+      }
       if (asPhoto && opts.controlBot.sendPhotoFile) {
-        await p1(() => opts.controlBot.sendPhotoFile!(opts.chatId, Number(msg.topic_id), filename, bytes, msg.caption));
+        await p1(() => opts.controlBot.sendPhotoFile!(opts.chatId, Number(msg.topic_id), filename, bytes, caption));
         log("INFO", `sent "${filename}" (${bytes.length} bytes) as a photo for slug "${msg.slug}"`);
       } else if (opts.controlBot.sendDocumentFile) {
-        await p1(() => opts.controlBot.sendDocumentFile!(opts.chatId, Number(msg.topic_id), filename, bytes, msg.caption));
+        await p1(() => opts.controlBot.sendDocumentFile!(opts.chatId, Number(msg.topic_id), filename, bytes, caption));
         log("INFO", `sent "${filename}" (${bytes.length} bytes) as a document for slug "${msg.slug}"`);
       } else {
         log("WARN", `send_file for slug "${msg.slug}" dropped - control bot has no file-sending method`);

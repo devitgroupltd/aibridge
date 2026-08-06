@@ -1,7 +1,7 @@
 ---
-version: 0.63.0
+version: 0.64.0
 status: solid
-last_modified_utc: 2026-08-06T17:00:00Z
+last_modified_utc: 2026-08-06T18:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,20 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.64.0 (2026-08-06): Two cheap mitigations for §8.3's 'no OS-enforced containment before
+    Phase 6b' gap, shipped instead of the heavier Windows-native restricted-token sandbox that idea
+    was weighed against (parked in §11 with the trigger for building it later). First,
+    `settings.ts`'s generated `deny` list broadened from just `Read(~/.ssh/**)`/`Read(~/.aws/**)` to
+    `Read(~/**)`/`Edit(~/**)` - the worktree lives entirely outside the home directory, so this costs
+    a session nothing it needs while closing every other secret-shaped file under
+    `%USERPROFILE%` the narrower list missed; still only binds Claude's own tools, the accepted
+    subprocess gap is unchanged. Second, new `secret-scrub.ts`: every `reply` and `send_file` caption
+    now passes through a pattern-based redaction chokepoint (PEM private key blocks, AWS access key
+    ids, GitHub tokens, `.env`-shaped `KEY=`/`SECRET=`/`TOKEN=`/`PASSWORD=` assignments) before
+    `pipe-server.ts` hands the text to Telegram - this is the control that actually holds even when
+    something upstream (e.g. a subprocess reading a file the deny rules can't reach) puts secret
+    material into a reply, since nothing reaches Telegram without passing this one point. 673 tests
+    pass (up from 665)."
   - "0.63.0 (2026-08-06): /restart (§4.5.1) had a confirmation for 'restarting now' but nothing for
     'back up now' - `runStartupReconciliation`'s own messages only post when there's an orphaned
     process or a deleted-topic session to report, so a clean restart posted nothing at all, and the
@@ -3893,8 +3907,9 @@ because that is precisely what the system is for.
 | **Untrusted relay text** | `description` and `input_preview` are attacker-influenced. Clients before v2.1.211 do not sanitize them at all. The Bridge escapes them for HTML parse mode, strips bidi overrides and zero-width characters, folds whitespace, truncates to 500 chars in the prompt, and **always renders them inside `<pre>`**. They never reach a parse mode that could forge a button or a fake "✅ approved by system" line |
 | **Callback authenticity** | Every `callback_query` is re-checked against the sender allowlist. Telegram callbacks carry the tapping user, and in a group that need not be the operator |
 | **Denylist is not overridable** | `permissions.deny` entries cannot be lifted by an `♾️ Always` tap. The button path can only add to `allow`, and `deny` wins in Claude Code's precedence |
-| **Secrets** | Both bot tokens in `~/.config/aibridge/.env`, mode `0600`, never in a worktree, never in any target repo. `Read(.env)` and the ssh/aws paths are denied so a session cannot read credentials and hand them to Claude, which would put them in a transcript |
+| **Secrets** | Both bot tokens in `~/.config/aibridge/.env`, mode `0600`, never in a worktree, never in any target repo. `Read(.env)` and (as of 0.64.0) the whole home directory (`Read(~/**)`/`Edit(~/**)`, `settings.ts`) are denied so a session cannot read credentials and hand them to Claude, which would put them in a transcript |
 | **Secrets, actually enforced** | The row above is necessary and insufficient. Read and Edit deny rules cover Claude's file tools and the Bash file commands Claude Code recognises (`cat`, `head`, `tail`, `sed`); they explicitly do **not** cover an arbitrary subprocess that opens the file itself, so a three-line Python script walks past them. `sandbox.credentials.files` (§6.7) is the kernel-enforced version and is the control that actually holds. `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` strips Anthropic and cloud credentials from every subprocess regardless of sandboxing, and is set for all sessions |
+| **Output-side secret scrubbing** *(0.64.0)* | The row above still can't stop a subprocess-read secret from reaching Telegram once Claude quotes it in a reply - the deny rules bind Claude's tools, not what it says. `secret-scrub.ts` is the chokepoint that holds regardless: every `reply` and `send_file` caption is pattern-matched (PEM key blocks, AWS access key ids, GitHub tokens, `.env`-shaped `KEY=`/`SECRET=`/`TOKEN=`/`PASSWORD=` lines) and redacted before `pipe-server.ts` sends it, no matter how the text was produced upstream |
 | **Telegram account is the perimeter** | 2FA on the Telegram account is mandatory, not advisory. The bot token grants full control of the fleet; treat it as an SSH key |
 
 ### 8.3 Accepted residual risks
@@ -4521,6 +4536,8 @@ fragile coupling this plan avoids elsewhere. Accepted, and revisit if Anthropic 
 | Slash-command passthrough | Channel messages reach Claude's context, not the CLI, so `/foo` is just text | The `/cmd` shim in §4.2 covers most of it |
 | A live TUI mirror per session | `tmux attach` is gone with the host change (§2.3); reproducing a terminal in Telegram is decision 2 all over again | `/attach` posts a PTY tail; `claude --resume` at the desk |
 | The OS sandbox, before Phase 6 | Not a choice: unsupported on native Windows (§6.7) | §7.6 is the migration, written as a checklist |
+| Reconfirming stale replayed messages | Today a Bridge restart replays every Telegram update queued while it was down (offset-persisted, §4.5.1) with no "still relevant?" check - a stale destructive control-topic command could re-fire on boot. Speculative: no incident has actually happened yet, and the real risk is narrow (destructive control-topic commands only; stale session-topic chat replay is harmless) | Compare a replayed update's Telegram `date` to the Bridge's own start time; if it queued while down, route control-topic exact commands through the existing confirm-card infra (`nl-confirm.ts`'s pattern) instead of auto-executing. Leave session-topic free text untouched |
+| A Windows-native OS-enforced sandbox (restricted process token + per-worktree ACLs) | §8.3's "no OS-enforced containment before Phase 6b" gap (a subprocess Claude writes reads any file the operator can, `deny` rules bind only Claude's own tools) already has a planned fix - the §7.6 WSL2 migration's kernel sandbox. Building a parallel Windows-native mechanism now (spawn each session's PTY under a restricted token via `CreateProcessAsUser`, with NTFS ACLs scoping read/write to that session's own worktree) would duplicate that work and likely get thrown away at the Phase 6 cutover. The two cheap, non-duplicative mitigations - broadened `~/**` deny rules (§6.2) and output-side secret scrubbing on every `reply`/`send_file` (§8.2) - ship instead; see 2026-08-06's changelog entry | Build this only if the Phase 6/WSL2 migration stalls or is rejected outright and OS-enforced containment is still wanted - it is the Windows-native fallback for that gap, not a step on the way to WSL2 |
 
 **The zero-build alternative, stated plainly.** [Remote Control](https://code.claude.com/docs/en/remote-control)
 already delivers most of this today with no code: `claude remote-control --spawn worktree --capacity 32`

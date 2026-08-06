@@ -99,8 +99,17 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         "Bash(curl * | sh)",
         "Bash(curl * | bash)",
         "Read(.env)",
-        "Read(~/.ssh/**)",
-        "Read(~/.aws/**)",
+        // Broadened from just ~/.ssh and ~/.aws to the whole home directory: the operator's
+        // worktree lives under c:\data\worktrees\<slug>, entirely outside ~, so denying all of ~
+        // costs a session nothing it needs and closes every other secret-shaped file under
+        // %USERPROFILE% (browser profiles, other tools' tokens, %APPDATA%\aibridge itself) that a
+        // narrower ~/.ssh/~/.aws-only list would have missed. Still only binds Claude's own
+        // Read/Edit tools and the Bash file commands Claude Code recognises (cat, sed, ...) - a
+        // script the session writes and runs itself still walks straight past this (§8.3's
+        // accepted "no OS-enforced containment before Phase 6b" gap; see also the plan's §11 note
+        // on a Windows-native restricted-token fallback).
+        "Read(~/**)",
+        "Edit(~/**)",
       ],
       ask: ["Bash(git commit *)", "Bash(git push *)", "Bash(gh pr *)", "Bash(npm publish *)", "Bash(dotnet nuget push *)"],
       allow: [
