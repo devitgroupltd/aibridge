@@ -48,6 +48,8 @@ export const ABOUT_TOPICS: Record<string, { label: string; blurb: string; detail
       "/rm --all removes every session regardless of state (including live ones) - this is destructive, so it asks for a Yes/No confirm tap before doing anything, unlike the other two.",
       "",
       "/kill --all is the same idea for stopping (not removing) everything live - also confirm-gated.",
+      "",
+      "A bare /rm sent inside a topic the Bridge has no session row for (e.g. a Telegram topic left behind after an earlier removal) offers to delete that topic itself instead - also confirm-gated.",
     ].join("\n"),
   },
   tuning: {

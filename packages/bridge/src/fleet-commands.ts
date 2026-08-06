@@ -548,6 +548,7 @@ export function renderHelp(): string {
     "  /ls - list sessions, with what's running/waiting on each",
     "  /kill [<slug>|--all] - stop a session (or all, confirm-gated)",
     "  /rm [<slug>|--dead|--prefix <text>|--all] - remove a dead session row",
+    "  /rm (bare, inside a topic with no tracked session) - offers to delete that orphaned Telegram topic itself, confirm-gated",
     "  /attach [<slug>] - show a session's PTY tail",
     "  /pause [<slug>] - pause a session",
     "  /usage [<slug>] - token/cost usage",

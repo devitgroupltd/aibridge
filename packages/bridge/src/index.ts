@@ -1366,12 +1366,35 @@ async function main(): Promise<void> {
    * trusting a snapshot from when the confirm card was posted, since a session can die or get
    * removed independently in the minutes between posting and the tap. */
   async function executeFleetConfirm(pending: PendingFleetConfirm): Promise<void> {
+    // §4.5.2's `rm-topic` variant has no session row at all - it acts on `pending.topicId`
+    // directly, which is the only reason it was postable in the first place (no DB lookup).
+    if (pending.kind === "rm-topic") {
+      if (pending.topicId === undefined) {
+        await finalizeFleetConfirmMessage(pending, "Nothing left to act on.");
+        return;
+      }
+      try {
+        await controlBot.deleteForumTopic(config.supergroupChatId, pending.topicId);
+        await finalizeFleetConfirmMessage(pending, "Topic deleted.");
+      } catch (err) {
+        log("WARN", `deleteForumTopic failed for orphan topic ${pending.topicId}: ${(err as Error).message}`);
+        await finalizeFleetConfirmMessage(pending, "Telegram would not delete this topic - it may need to be removed by hand (topic menu -> Delete Topic).");
+      }
+      return;
+    }
+
     const rows = pending.slugs.map((s) => sessionStore.get(s)).filter((r): r is SessionRow => r !== undefined);
+    let allTopicsDeleted = true;
     for (const row of rows) {
-      await (pending.kind === "kill" ? killSessionRow(row) : removeSessionRow(row));
+      if (pending.kind === "kill") {
+        await killSessionRow(row);
+      } else if (!(await removeSessionRow(row))) {
+        allTopicsDeleted = false;
+      }
     }
     const verb = pending.kind === "kill" ? "Killed" : "Removed";
-    await finalizeFleetConfirmMessage(pending, rows.length === 0 ? "Nothing left to act on." : `${verb} ${rows.length} session${rows.length === 1 ? "" : "s"}: ${rows.map((r) => r.slug).join(", ")}`);
+    const note = pending.kind === "rm" && !allTopicsDeleted ? ORPHAN_TOPIC_NOTE : "";
+    await finalizeFleetConfirmMessage(pending, rows.length === 0 ? "Nothing left to act on." : `${verb} ${rows.length} session${rows.length === 1 ? "" : "s"}: ${rows.map((r) => r.slug).join(", ")}${note}`);
   }
 
   async function handleKillCommand(cmd: Extract<FleetCommand, { kind: "kill" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
@@ -1393,8 +1416,11 @@ async function main(): Promise<void> {
   }
 
   /** The actual teardown `/rm` does for one row - shared by the single-slug form and the bulk
-   * `--dead`/`--prefix` forms below, so the two can't drift. */
-  async function removeSessionRow(row: SessionRow): Promise<void> {
+   * `--dead`/`--prefix` forms below, so the two can't drift. Returns whether the Telegram topic
+   * itself was actually deleted - the DB row is removed either way (§4.5.2: a Telegram-side
+   * failure here, e.g. `TOPIC_ID_INVALID`, shouldn't leave a zombie row behind), but callers use
+   * this to tell the operator when a topic was left orphaned rather than silently succeeding. */
+  async function removeSessionRow(row: SessionRow): Promise<boolean> {
     const { slug } = row;
     if (row.state !== "dead") {
       ptyProcessBySlug.get(slug)?.kill();
@@ -1408,9 +1434,11 @@ async function main(): Promise<void> {
     } catch (err) {
       log("WARN", `removeWorktree failed for "${slug}": ${(err as Error).message}`);
     }
+    let topicDeleted = true;
     try {
       await controlBot.deleteForumTopic(config.supergroupChatId, row.topicId);
     } catch (err) {
+      topicDeleted = false;
       log("WARN", `deleteForumTopic failed for "${slug}": ${(err as Error).message}`);
     }
 
@@ -1418,7 +1446,15 @@ async function main(): Promise<void> {
     routing.remove(slug);
     feedStates.delete(slug);
     feedMessageIds.delete(slug);
+    return topicDeleted;
   }
+
+  /** §4.5.2's note appended to an `/rm` confirmation whenever `deleteForumTopic` failed above -
+   * without this the operator only finds out days later, by eye, that a topic was left behind
+   * (as happened live: two such orphans had accumulated with nothing pointing at them). Naming
+   * `/rm` explicitly rather than just describing the fix, since that's the exact recovery step
+   * (§4.5.2's `rm-topic` confirm below, keyed off the orphaned topic's own thread id). */
+  const ORPHAN_TOPIC_NOTE = " (Telegram topic itself could not be deleted - send /rm inside it directly to clean it up)";
 
   async function handleRmCommand(cmd: Extract<FleetCommand, { kind: "rm" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
     // `--all` (added 2026-08-04) is the deliberate exception to the dead-only rule below - it can
@@ -1442,22 +1478,54 @@ async function main(): Promise<void> {
         confirmSessionCommand(topicId, "No dead sessions matched - nothing removed.");
         return;
       }
+      let allTopicsDeleted = true;
       for (const row of targets) {
-        await removeSessionRow(row);
+        if (!(await removeSessionRow(row))) allTopicsDeleted = false;
       }
-      confirmSessionCommand(topicId, `Removed ${targets.length} dead session${targets.length === 1 ? "" : "s"}: ${targets.map((r) => r.slug).join(", ")}`);
+      confirmSessionCommand(
+        topicId,
+        `Removed ${targets.length} dead session${targets.length === 1 ? "" : "s"}: ${targets.map((r) => r.slug).join(", ")}${allTopicsDeleted ? "" : ORPHAN_TOPIC_NOTE}`,
+      );
       return;
     }
 
     const resolved = resolveTargetSlug(cmd.slug, currentSlug);
     if ("error" in resolved) {
+      // §4.5.2: a bare `/rm` with nothing to resolve to - if this is a real Telegram topic (not
+      // the control topic itself) that just has no session row, it's very likely one of these
+      // orphans (an earlier `deleteForumTopic` failure left the topic behind after its row was
+      // already removed) rather than a plain usage mistake. Offer to delete the topic directly,
+      // keyed off `topicId` alone, since there is nothing in the DB to look up for it.
+      if (topicId !== undefined && !isControlTopic(topicId) && cmd.slug === undefined) {
+        await postOrphanTopicRmConfirm(topicId);
+        return;
+      }
       confirmSessionCommand(topicId, resolved.error);
       return;
     }
     const { slug } = resolved;
     const row = sessionStore.get(slug) as NonNullable<ReturnType<typeof sessionStore.get>>;
-    await removeSessionRow(row);
-    confirmSessionCommand(topicId, `Removed "${slug}" - worktree and topic deleted.`);
+    const topicDeleted = await removeSessionRow(row);
+    confirmSessionCommand(topicId, `Removed "${slug}" - worktree and topic deleted.${topicDeleted ? "" : ORPHAN_TOPIC_NOTE}`);
+  }
+
+  /** §4.5.2: posts the confirm card for deleting a Telegram topic that has no matching session
+   * row at all - the `rm-topic` fleet-confirm variant. Unlike `postFleetConfirm`, there are no
+   * `slugs` to show (there is nothing tracked for this topic), so the prompt just names the topic
+   * by id. */
+  async function postOrphanTopicRmConfirm(topicId: number): Promise<void> {
+    const id = randomUUID().slice(0, 8);
+    try {
+      const sent = await controlBot.sendMessage(
+        config.supergroupChatId,
+        topicId,
+        "This topic has no session tracked in the Bridge - delete this Telegram topic itself?",
+        { inline_keyboard: buildFleetConfirmKeyboard("rm-topic", id) },
+      );
+      fleetConfirmRegistry.add({ id, kind: "rm-topic", slugs: [], topicId, messageId: sent.message_id });
+    } catch (err) {
+      log("WARN", `failed to post orphan-topic /rm confirmation: ${(err as Error).message}`);
+    }
   }
 
   function handleAttachCommand(cmd: Extract<FleetCommand, { kind: "attach" }>, topicId: number | undefined, currentSlug: string | undefined): void {

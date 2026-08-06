@@ -51,13 +51,26 @@ describe("FleetConfirmRegistry", () => {
     now = 999;
     expect(registry.resolve("aaaaaaaa")?.slugs).toEqual(["a", "b", "c"]);
   });
+
+  test("an rm-topic entry carries no slugs but keeps its topicId (§4.5.2 - acts on the topic directly)", () => {
+    const registry = new FleetConfirmRegistry();
+    registry.add(entry({ id: "aaaaaaaa", kind: "rm-topic", slugs: [], topicId: 42 }));
+
+    const resolved = registry.resolve("aaaaaaaa");
+    expect(resolved?.kind).toBe("rm-topic");
+    expect(resolved?.slugs).toEqual([]);
+    expect(resolved?.topicId).toBe(42);
+  });
 });
 
 describe("resolveFleetConfirmCallback", () => {
-  test("resolves a yes and a no tap for both kill and rm", () => {
+  test("resolves a yes and a no tap for kill, rm, and rm-topic", () => {
     expect(resolveFleetConfirmCallback("fc:kill:abcde123:y")).toEqual({ id: "abcde123", kind: "kill", confirmed: true });
     expect(resolveFleetConfirmCallback("fc:kill:abcde123:n")).toEqual({ id: "abcde123", kind: "kill", confirmed: false });
     expect(resolveFleetConfirmCallback("fc:rm:abcde123:y")).toEqual({ id: "abcde123", kind: "rm", confirmed: true });
+    // §4.5.2: orphaned-Telegram-topic delete, keyed off topicId alone, no session row involved.
+    expect(resolveFleetConfirmCallback("fc:rm-topic:abcde123:y")).toEqual({ id: "abcde123", kind: "rm-topic", confirmed: true });
+    expect(resolveFleetConfirmCallback("fc:rm-topic:abcde123:n")).toEqual({ id: "abcde123", kind: "rm-topic", confirmed: false });
   });
 
   test("rejects an unknown kind or malformed confirmation code (tampered callback_data)", () => {
@@ -80,5 +93,11 @@ describe("buildFleetConfirmKeyboard", () => {
       expect(resolveFleetConfirmCallback(data)).not.toBeNull();
     }
     expect(flat).toEqual(["fc:rm:abcde123:y", "fc:rm:abcde123:n"]);
+  });
+
+  test("also builds a valid rm-topic row (§4.5.2)", () => {
+    const keyboard = buildFleetConfirmKeyboard("rm-topic", "abcde123");
+    const flat = keyboard.flat().map((btn) => btn.callback_data!);
+    expect(flat).toEqual(["fc:rm-topic:abcde123:y", "fc:rm-topic:abcde123:n"]);
   });
 });

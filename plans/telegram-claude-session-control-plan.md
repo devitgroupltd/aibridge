@@ -1,7 +1,7 @@
 ---
-version: 0.67.0
+version: 0.68.0
 status: solid
-last_modified_utc: 2026-08-06T21:00:00Z
+last_modified_utc: 2026-08-06T23:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,25 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.68.0 (2026-08-06): Closed §4.5.2's orphaned-topic gap, found the same day: `/rm --all` correctly
+    removed the one session still in the `sessions` table (querying `aibridge.db` via `bun:sqlite` in
+    readonly mode confirmed 0 rows left afterward), but two other Telegram topics stayed visible with
+    nothing tracking them - `deleteForumTopic` had already failed for them in an earlier run
+    (`Bad Request: TOPIC_ID_INVALID`), and `removeSessionRow` deletes the DB row regardless of whether
+    that call succeeds, by design. Fixed: a bare `/rm` sent inside a topic with no matching row (and
+    that isn't the control topic) now offers a confirm-gated direct `deleteForumTopic`, via a new
+    `rm-topic` `FleetConfirmKind` (fleet-confirm.ts) - keyed off the topic's own `message_thread_id`,
+    no DB lookup involved. `removeSessionRow` now also reports whether the Telegram-side delete actually
+    succeeded, so every `/rm` path can tell the operator when a fresh orphan was just created instead of
+    only logging it. 2 new fleet-confirm tests. 693 bridge-package tests pass (up from 691). **Live
+    verification against the actual two orphans from this incident found a sharper edge**: restarting
+    the real Bridge and driving `/rm` into both via `scripts/telegram-automation/` got total silence from
+    both - not even a bare `/help` got a reply, confirmed past a hard page reload (ruling out stale
+    client caching). That matches the original `TOPIC_ID_INVALID`: these two specific threads are dead at
+    the Bot API level, not just absent from the DB, so nothing bot-driven - this fix included - can ever
+    reach them again in either direction. §4.5.2 now documents two distinct orphan shapes and that this
+    fix only covers the reachable one; the unreachable shape needs manual deletion via the operator's own
+    Telegram client."
   - "0.67.0 (2026-08-06): Two more fixes from the same live session. (1) `nl-router.test.ts`'s two
     ROUTER_KINDS-completeness checks were both hand-copied literal lists - neither would have failed
     the day `/browse`/`/find` shipped without a router entry, since a hand-copied list drifts in
@@ -2761,6 +2780,74 @@ supervisor's own automatic restarts; `/restart` just makes the operator able to 
 deliberately, on their own schedule, instead of only when something crashes. It becomes non-destructive
 once Phase 5's session-id persistence lands, and not before - **`/restart` is therefore Phase 5 scope**,
 not a Phase 1 retrofit, same as the supervisor duty it's a manual trigger for.
+
+### 4.5.2 Orphaned-topic reconciliation (implemented 0.68.0; live verification found a sharper edge)
+
+**Gap noticed live (2026-08-06).** `/rm --all`, run against a fleet whose `sessions` table had exactly
+one row, correctly removed that row (verified after the fact by querying `aibridge.db` directly in
+readonly mode: 0 rows left) - but three Telegram topics were still visible afterward, including two that
+had nothing to do with the row just removed. Root cause: `removeSessionRow` (§4, `index.ts`) calls
+`deleteForumTopic` but only `WARN`-logs on failure and deletes the DB row regardless - reproduced live in
+this exact incident (`Bad Request: TOPIC_ID_INVALID` for the row that *was* just removed). Once that
+happens, the topic can still be visible in Telegram with nothing in aibridge tracking it - `/rm`, `/kill`,
+and the restart-time scan in §4.5's table above all key off `sessionStore.all()` or a live process list,
+never the Telegram topic list itself, so a topic that outlives its row is invisible to every one of them
+until someone notices it by eye.
+
+**Why the obvious fix (enumerate Telegram's topics, diff against the DB) doesn't work.** The Bot API has
+no `getForumTopics`-style listing call - a bot only ever learns a `message_thread_id` from a message it
+already received in that thread. There is no way for the Bridge to ask Telegram "what topics exist in
+this supergroup" and get a real answer; `scripts/telegram-automation/list-topics.js` can do it, but only
+because it drives the operator's own logged-in Telegram Web K client (MTProto via a real user session),
+which the Bridge - holding only bot tokens - cannot do at runtime.
+
+**Shipped design.** Reconciliation is triggered *from inside* the orphaned topic itself, where Telegram
+hands the Bridge the one thing it's otherwise missing - that topic's own `message_thread_id`, for free, on
+every incoming message:
+
+- A bare `/rm` (no slug, no `--dead`/`--prefix`/`--all`) sent in a topic that does **not** resolve to any
+  row via `routing.getByTopicId`, and that isn't the control topic itself, now falls back to an
+  orphan-topic delete instead of the old plain "usage: ..." error (`handleRmCommand`, `index.ts`) -
+  confirm-gated through a new `rm-topic` `FleetConfirmKind` (`fleet-confirm.ts`), same Yes/Cancel button
+  pattern as `/kill --all`/`/rm --all`, since deleting a topic is exactly as irreversible as removing a
+  session. Confirmed, it calls `deleteForumTopic(chatId, topicId)` directly - no DB lookup at all, since
+  there is nothing in the DB to look up.
+- Deliberately scoped to "the topic the operator is standing in right now," not a bulk sweep - there is
+  still no way to discover *other* orphans without visiting each one, an accepted limitation rather than a
+  gap to solve later.
+- `removeSessionRow` now returns whether `deleteForumTopic` actually succeeded, and every caller
+  (single-slug `/rm`, bulk `--dead`/`--prefix`, and the `--all` fleet-confirm path) appends a note to its
+  confirmation message when it didn't - "(Telegram topic itself could not be deleted - send /rm inside it
+  directly to clean it up)" - so the operator learns about a fresh orphan the moment it's created instead
+  of discovering it by eye later, as happened here.
+- Tests: `fleet-confirm.test.ts` covers the new `rm-topic` callback encoding, keyboard, and registry
+  entry (no `slugs`, `topicId`-keyed). `bun test`: 693 pass (up from 691).
+
+**Live verification surfaced a real limit this design can't clear.** Restarted the actual running Bridge
+and drove `/rm` into both leftover orphan topics from the original incident via
+`scripts/telegram-automation/` (new one-off scripts: `verify-orphan-rm.js`, `send-by-index.js`,
+`check-topic-index.js`, `reload-and-list.js` - needed once two topics shared an identical last-message
+preview and plain substring matching could no longer tell them apart). Neither topic ever produced a
+reply - not the new orphan-confirm card, not even a bare `/help`'s response, confirmed after a hard page
+reload ruled out stale client-side caching. That total silence, symmetric with the `TOPIC_ID_INVALID`
+`deleteForumTopic` failure that created these two orphans in the first place, means the Bot API considers
+the thread itself invalid, not just absent from aibridge's DB - and an invalid thread can't be posted
+*into* any more than it can be deleted, so the Bridge can never see a message sent there, and this fix's
+`/rm`-inside-the-topic trigger can never fire for it. There are therefore two distinct orphan shapes, not
+one:
+
+| Shape | Bot API can still reach the topic | This fix helps |
+|---|---|---|
+| Row removed, `deleteForumTopic` failed for a transient reason (rate limit, a momentary permissions blip) but the thread itself is still alive | Yes | Yes - `/rm` inside it now deletes it |
+| Row removed, and the underlying thread is *itself* already `TOPIC_ID_INVALID` (this incident's actual two survivors) | No - confirmed live, not even `/help` gets a reply | No - nothing bot-driven can reach it |
+
+For the second shape, the only remaining path is deleting the topic by hand from the Telegram client
+itself (topic menu -> Delete Topic) - that goes through the operator's own MTProto session, not the bot,
+so it isn't subject to whatever made the thread `TOPIC_ID_INVALID` for the Bot API. Not chased further:
+building bot-side detection for "is this specific topic Bot-API-dead" would need the same missing
+`getForumTopics`-equivalent call already ruled out above, or a probe-and-guess heuristic no more reliable
+than `topic-probe.ts`'s existing `isTopicDeleted` (§4.5) - which already exists for the *row-side* half of
+this same problem and could be reused here if this turns out to matter often enough to justify it.
 
 ---
 
