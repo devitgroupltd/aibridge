@@ -112,6 +112,7 @@ import {
   isGitUrl,
   loadReposRegistry,
   removeRepoEntry,
+  resolveRepoNameFuzzy,
   type ReposRegistry,
 } from "./repos-registry.ts";
 import { launchSession, resolveBunExecutable, stripAnsi } from "./session-launcher.ts";
@@ -1136,10 +1137,19 @@ async function main(): Promise<void> {
       confirmSessionCommand(controlTopicId, "No repos.toml registered yet - see §7.5.");
       return;
     }
-    const repo = reposRegistry.get(cmd.repo);
+    let repo = reposRegistry.get(cmd.repo);
     if (!repo) {
-      confirmSessionCommand(controlTopicId, `Unknown repo "${cmd.repo}". Registered: ${reposRegistry.names().join(", ") || "(none)"}`);
-      return;
+      // Voice-transcribed /new commands routinely mangle the repo name ("aibridge" heard back as
+      // "eI-Bridge") before it ever reaches this codebase - fall back to the single unambiguous
+      // fuzzy match (see resolveRepoNameFuzzy's own doc comment) rather than failing outright.
+      const fuzzy = resolveRepoNameFuzzy(reposRegistry.all(), cmd.repo);
+      if (fuzzy) {
+        repo = fuzzy;
+        confirmSessionCommand(controlTopicId, `Unknown repo "${cmd.repo}" - using closest match "${fuzzy.name}".`);
+      } else {
+        confirmSessionCommand(controlTopicId, `Unknown repo "${cmd.repo}". Registered: ${reposRegistry.names().join(", ") || "(none)"}`);
+        return;
+      }
     }
     const model = cmd.model ?? repo.model ?? "sonnet";
 

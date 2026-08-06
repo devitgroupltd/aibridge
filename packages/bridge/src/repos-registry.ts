@@ -226,6 +226,63 @@ export function removeRepoEntry(reposTomlPath: string, name: string): void {
   writeFileSync(reposTomlPath, serializeReposToml(existing.filter((e) => e.name !== name)), "utf8");
 }
 
+function normalizeRepoName(name: string): string {
+  return name.toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+/** Classic edit-distance, used only by `resolveRepoNameFuzzy` below - repo names are short (single
+ * words), so the O(n*m) table is never worth optimizing away. */
+function levenshtein(a: string, b: string): number {
+  const rows = a.length + 1;
+  const cols = b.length + 1;
+  const d: number[][] = Array.from({ length: rows }, () => new Array<number>(cols).fill(0));
+  for (let i = 0; i < rows; i++) d[i]![0] = i;
+  for (let j = 0; j < cols; j++) d[0]![j] = j;
+  for (let i = 1; i < rows; i++) {
+    for (let j = 1; j < cols; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      d[i]![j] = Math.min(d[i - 1]![j]! + 1, d[i]![j - 1]! + 1, d[i - 1]![j - 1]! + cost);
+    }
+  }
+  return d[rows - 1]![cols - 1]!;
+}
+
+/**
+ * §7.5 voice-transcription fallback: `/new` spoken aloud gets transcribed before it ever reaches
+ * this codebase (the operator's own report - "aibridge" heard back as "eI-Bridge"), so an exact-name
+ * miss on `ReposRegistry.get` isn't necessarily a real "no such repo" - it's often the *right* repo
+ * with a mangled name. Two cases this resolves without asking again:
+ *   - Exactly one repo registered at all: no other repo could possibly have been meant, regardless
+ *     of how mangled the transcription is. Always resolves to it.
+ *   - Several repos registered: resolves only to an unambiguous single closest match by Levenshtein
+ *     distance (over a normalized, alphanumeric-only form of both strings, so "eI-Bridge" and
+ *     "aibridge" compare as "eibridge"/"aibridge"). A guess that's actually ambiguous - a tie for
+ *     closest, or nothing close enough - returns `undefined` just like a real miss; picking the
+ *     *wrong* repo to run a session against is worse than asking the operator to retype it, so this
+ *     never guesses past real uncertainty.
+ */
+export function resolveRepoNameFuzzy(all: readonly RepoEntry[], requested: string): RepoEntry | undefined {
+  if (all.length === 0) return undefined;
+  if (all.length === 1) return all[0];
+
+  const target = normalizeRepoName(requested);
+  if (target.length === 0) return undefined;
+
+  const scored = all
+    .map((entry) => ({ entry, dist: levenshtein(target, normalizeRepoName(entry.name)) }))
+    .sort((a, b) => a.dist - b.dist);
+  const best = scored[0]!;
+  const runnerUp = scored[1];
+
+  // Allow roughly two garbled characters per five, floor of 2 - loose enough to survive a
+  // transcription slip ("eibridge" vs "aibridge", distance 1) without matching names that just
+  // happen to share a few letters.
+  const threshold = Math.max(2, Math.ceil(target.length * 0.4));
+  if (best.dist > threshold) return undefined;
+  if (runnerUp && runnerUp.dist === best.dist) return undefined;
+  return best.entry;
+}
+
 /** Throws naming the file, not a generic ENOENT, since a missing registry means every `/new` fails
  * with no obvious cause otherwise. */
 export function loadReposRegistry(reposTomlPath: string): ReposRegistry {

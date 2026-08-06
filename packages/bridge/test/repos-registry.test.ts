@@ -11,6 +11,7 @@ import {
   parseReposToml,
   removeRepoEntry,
   ReposRegistry,
+  resolveRepoNameFuzzy,
   serializeReposToml,
 } from "../src/repos-registry.ts";
 
@@ -165,6 +166,51 @@ describe("inferDefaultRepoPath", () => {
       { name: "b", path: "d:\\elsewhere\\b" },
     ];
     expect(inferDefaultRepoPath(existing, "new")).toBeNull();
+  });
+});
+
+describe("resolveRepoNameFuzzy", () => {
+  test("returns undefined with no repos registered at all", () => {
+    expect(resolveRepoNameFuzzy([], "anything")).toBeUndefined();
+  });
+
+  test("with exactly one repo registered, always resolves to it regardless of mismatch", () => {
+    const only = [{ name: "aibridge", path: "/repos/aibridge" }];
+    expect(resolveRepoNameFuzzy(only, "eI-Bridge")).toEqual(only[0]);
+    expect(resolveRepoNameFuzzy(only, "completely-unrelated-name")).toEqual(only[0]);
+  });
+
+  test("with several repos, resolves the unambiguous closest voice-transcription-style match", () => {
+    const repos = [
+      { name: "aibridge", path: "/repos/aibridge" },
+      { name: "seowrite", path: "/repos/seowrite" },
+    ];
+    expect(resolveRepoNameFuzzy(repos, "eI-Bridge")).toEqual(repos[0]);
+  });
+
+  test("refuses to guess when two repos are equidistant - ambiguous, not a match", () => {
+    const repos = [
+      { name: "abcd", path: "/repos/abcd" },
+      { name: "abce", path: "/repos/abce" },
+    ];
+    // "abcx" is distance 1 from both - a genuine tie.
+    expect(resolveRepoNameFuzzy(repos, "abcx")).toBeUndefined();
+  });
+
+  test("refuses to guess when nothing is close enough", () => {
+    const repos = [
+      { name: "aibridge", path: "/repos/aibridge" },
+      { name: "seowrite", path: "/repos/seowrite" },
+    ];
+    expect(resolveRepoNameFuzzy(repos, "totally-different")).toBeUndefined();
+  });
+
+  test("an exact name match among several still resolves (distance 0)", () => {
+    const repos = [
+      { name: "aibridge", path: "/repos/aibridge" },
+      { name: "seowrite", path: "/repos/seowrite" },
+    ];
+    expect(resolveRepoNameFuzzy(repos, "seowrite")).toEqual(repos[1]);
   });
 });
 

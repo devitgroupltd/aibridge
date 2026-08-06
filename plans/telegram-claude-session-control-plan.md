@@ -1,7 +1,7 @@
 ---
-version: 0.78.0
+version: 0.79.0
 status: solid
-last_modified_utc: 2026-08-06T19:50:00Z
+last_modified_utc: 2026-08-06T20:15:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,18 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.79.0 (2026-08-06): §7.5's `/new <repo>` failed outright on a voice-transcribed repo name that
+    didn't match any `repos.toml` entry verbatim (e.g. \"aibridge\" heard back as \"eI-Bridge\") -
+    raised directly by the operator hitting exactly that case live. Added
+    `resolveRepoNameFuzzy` (`repos-registry.ts`) as a fallback when the exact lookup misses: with
+    only one repo registered, no other repo could possibly have been meant, so it always resolves to
+    that one; with several registered, it resolves only an unambiguous single closest match by
+    Levenshtein distance over a normalized (alphanumeric-only) form of both strings, refusing to
+    guess on a tie or on nothing close enough - picking the wrong repo is worse than asking again.
+    `handleNewCommand` (`index.ts`) tries this before giving up, and tells the operator which repo it
+    picked so a wrong guess is visible immediately. `repos-registry.test.ts` covers the single-repo
+    case, the unambiguous-match case, the tie case, the nothing-close-enough case, and the
+    already-exact-match case; 848 pass, `tsc --noEmit` clean."
   - "0.78.0 (2026-08-06): `tsc --noEmit` was silently broken - `pipe-server.ts`'s `net.Server`/
     `voice-transcribe.ts`'s `ChildProcess` both reported 'Property on does not exist', because the
     workspace root only ever declared `@types/bun` as a devDependency and never `@types/node`.
