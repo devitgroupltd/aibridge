@@ -42,7 +42,7 @@ describe("ROUTER_KINDS completeness", () => {
 
   test("the fixed always-available commands outside both unions are also covered", () => {
     const kinds: readonly string[] = ROUTER_KINDS;
-    for (const kind of ["help", "about", "commands", "skills", "builtin"]) {
+    for (const kind of ["help", "about", "commands", "skills", "builtin", "browse", "find"]) {
       expect(kinds.includes(kind)).toBe(true);
     }
   });
@@ -249,6 +249,22 @@ describe("mapRouterOutput - one case per kind", () => {
     expect(mapRouterOutput({ kind: "builtin", builtinName: "clear" }, SESSION)).toEqual({ matched: true, command: { kind: "builtin", name: "clear" }, destructive: false });
     expect(mapRouterOutput({ kind: "builtin", builtinName: "bogus" }, SESSION)).toEqual({ matched: false });
     expect(mapRouterOutput({ kind: "builtin", builtinName: "compact" }, CONTROL)).toEqual({ matched: false });
+  });
+
+  test("browse: session-scoped, optional path, never destructive", () => {
+    expect(mapRouterOutput({ kind: "browse" }, SESSION)).toEqual({ matched: true, command: { kind: "browse", path: "" }, destructive: false });
+    expect(mapRouterOutput({ kind: "browse", path: "src" }, SESSION)).toEqual({ matched: true, command: { kind: "browse", path: "src" }, destructive: false });
+    expect(mapRouterOutput({ kind: "browse" }, CONTROL)).toEqual({ matched: false });
+  });
+
+  test("find: session-scoped, requires a query, never destructive", () => {
+    expect(mapRouterOutput({ kind: "find", query: "package.json" }, SESSION)).toEqual({
+      matched: true,
+      command: { kind: "find", query: "package.json" },
+      destructive: false,
+    });
+    expect(mapRouterOutput({ kind: "find" }, SESSION)).toEqual({ matched: false });
+    expect(mapRouterOutput({ kind: "find", query: "package.json" }, CONTROL)).toEqual({ matched: false });
   });
 
   test("forward: always a no-match, by design - it means 'not a command'", () => {

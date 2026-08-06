@@ -1976,6 +1976,14 @@ async function main(): Promise<void> {
       if (currentSlug) sendRaw(currentSlug, `/${command.name}`);
       return;
     }
+    if (command.kind === "browse") {
+      sendBrowseCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.path);
+      return;
+    }
+    if (command.kind === "find") {
+      sendFindCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.query);
+      return;
+    }
     if (command.kind === "model" || command.kind === "mode" || command.kind === "effort") {
       if (!currentSlug || threadId === undefined) return;
       if (command.kind === "model") applyModelSwitch(currentSlug, threadId, command.model);

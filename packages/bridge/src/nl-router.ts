@@ -30,19 +30,24 @@ export type RouterContext = {
 };
 
 /** Not real `FleetCommand`/`SessionCommand` kinds - each is handled by its own dedicated function
- * in index.ts rather than `dispatchFleetCommand`, but all five are real, always-available commands
+ * in index.ts rather than `dispatchFleetCommand`, but all seven are real, always-available commands
  * a natural-language message can legitimately mean, so the router needs to recognise them as their
  * own outcome rather than only ever mapping to the fleet/session command unions. `help`/`about`
  * were a live-observed gap (a Russian "show me the commands" phrase fell through to "Unrecognised"
  * without them, 2026-08-06); `commands`/`skills`/`builtin` were added in the same pass for the same
- * reason - completeness, not because any one of them was separately reported broken. None are ever
- * destructive. */
+ * reason - completeness, not because any one of them was separately reported broken. `browse`/`find`
+ * were added 2026-08-06 for the same reason again (a voice note - "give me a file package.json" -
+ * fell through to "Unrecognised control-topic command" with no `/browse`/`/find` intent to catch it,
+ * since browse-nav.ts's own parsers only ever recognised literal `/browse`/`/find` syntax). None are
+ * ever destructive. */
 export type RouterAction =
   | { kind: "help" }
   | { kind: "about" }
   | { kind: "commands"; term: string }
   | { kind: "skills"; term: string }
-  | { kind: "builtin"; name: "compact" | "clear" };
+  | { kind: "builtin"; name: "compact" | "clear" }
+  | { kind: "browse"; path: string }
+  | { kind: "find"; query: string };
 
 export type RouterResult = { matched: false } | { matched: true; command: FleetCommand | SessionCommand | RouterAction; destructive: boolean };
 
@@ -67,12 +72,14 @@ function isDestructive(command: FleetCommand | SessionCommand | RouterAction): b
  * copy of that union so a future new fleet command that forgets to update this list fails a test
  * immediately, the same
  * class of gap that let `/help`/`/about`/`/commands`/`/skills`/`/compact`/`/clear` go unrouted
- * until 2026-08-06. `session_model`/`session_mode`/`session_effort` are `SessionCommand`'s
- * `model`/`mode`/`effort` under a router-only prefix (avoids a naming collision with `new`'s own
- * `model` field in the flat schema below); `help`/`about`/`commands`/`skills`/`builtin` are
- * `RouterAction`'s kinds, covering the fixed always-available commands that live outside both
- * unions (`isHelpCommand`/`isAboutCommand`/`parseCommandsQuery`/`parseSkillsQuery`/
- * `isBuiltinPassthroughCommand` in index.ts/fleet-commands.ts/commands.ts).
+ * until 2026-08-06 (and `/browse`/`/find` go unrouted a second time, same day). `session_model`/
+ * `session_mode`/`session_effort` are `SessionCommand`'s `model`/`mode`/`effort` under a
+ * router-only prefix (avoids a naming collision with `new`'s own `model` field in the flat schema
+ * below); `help`/`about`/`commands`/`skills`/`builtin`/`browse`/`find` are `RouterAction`'s kinds,
+ * covering the fixed always-available commands that live outside both unions
+ * (`isHelpCommand`/`isAboutCommand`/`parseCommandsQuery`/`parseSkillsQuery`/
+ * `isBuiltinPassthroughCommand`/`parseBrowseCommand`/`parseFindCommand` in
+ * index.ts/fleet-commands.ts/commands.ts/browse-nav.ts).
  */
 export const ROUTER_KINDS = [
   "new",
@@ -102,6 +109,8 @@ export const ROUTER_KINDS = [
   "commands",
   "skills",
   "builtin",
+  "browse",
+  "find",
   "forward",
 ] as const;
 type RouterKind = (typeof ROUTER_KINDS)[number];
@@ -111,14 +120,21 @@ type RouterKind = (typeof ROUTER_KINDS)[number];
  * rather than inventing separate rules. `/new` and `/budget` are the only fleet commands rejected
  * outright outside the control topic; the rest (kill/rm/attach/etc.) accept an optional slug from
  * either place, so they stay offered everywhere, as do `/help`/`/about`/`/assist`/`/router`.
- * `/commands`/`/skills`/`/compact`/`/clear` are all session-scoped in practice (no worktree/PTY to
- * act on without one - `dispatchInboundMessage`'s own `route`/`currentSlug` checks agree), so they
- * follow the same `hasSession` gate as the three session commands. */
+ * `/commands`/`/skills`/`/compact`/`/clear`/`/browse`/`/find` are all session-scoped in practice (no
+ * worktree/PTY to act on without one - `dispatchInboundMessage`'s own `route`/`currentSlug` checks
+ * agree), so they follow the same `hasSession` gate as the three session commands. */
 function allowedKinds(ctx: RouterContext): RouterKind[] {
   return ROUTER_KINDS.filter((kind) => {
     if ((kind === "new" || kind === "budget") && !ctx.isControl) return false;
     if (
-      (kind === "session_model" || kind === "session_mode" || kind === "session_effort" || kind === "commands" || kind === "skills" || kind === "builtin") &&
+      (kind === "session_model" ||
+        kind === "session_mode" ||
+        kind === "session_effort" ||
+        kind === "commands" ||
+        kind === "skills" ||
+        kind === "builtin" ||
+        kind === "browse" ||
+        kind === "find") &&
       !ctx.hasSession
     )
       return false;
@@ -156,6 +172,8 @@ function buildSchema(ctx: RouterContext): Record<string, unknown> {
       routerAction: { type: "string", enum: ["status", "api", "cli"], description: "For 'router': NL-routing backend toggle." },
       term: { type: "string", description: "For 'commands'/'skills': an optional search term to filter the list." },
       builtinName: { type: "string", enum: ["compact", "clear"], description: "For 'builtin': which built-in Claude Code command to run." },
+      path: { type: "string", description: "For 'browse': an optional folder path (relative to the session's worktree root) to list." },
+      query: { type: "string", description: "For 'find': the filename/content search text." },
     },
     required: ["kind"],
     additionalProperties: false,
@@ -170,6 +188,10 @@ const SYSTEM_INSTRUCTIONS =
   "'help' unless the message specifically sounds like someone new asking what this bot even is. " +
   "A request to list this project's own custom commands or skills is kind='commands'/'skills'. " +
   "A request to compact or clear the current conversation is kind='builtin'. " +
+  "A request to see the folder structure, list files in a directory, or look inside a specific " +
+  "folder is kind='browse' (optionally with 'path'). A request to find, search for, or get/show a " +
+  "file by name or by content (e.g. 'give me package.json', 'find the file with the API key') is " +
+  "kind='find' with the search text as 'query'. " +
   "If it's ambiguous, conversational, or addressed to a coding assistant rather than the fleet itself, " +
   "respond with kind='forward' - never guess a destructive command (kill/rm/restart/deploy/repos-rm) " +
   "from a vague or joking message.";
@@ -200,6 +222,8 @@ interface RawRouterOutput {
   routerAction?: string;
   term?: string;
   builtinName?: string;
+  path?: string;
+  query?: string;
 }
 
 function isModel(v: unknown): v is Model {
@@ -288,6 +312,10 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
         return { kind: "skills", term: raw.term ?? "" };
       case "builtin":
         return raw.builtinName === "compact" || raw.builtinName === "clear" ? { kind: "builtin", name: raw.builtinName } : null;
+      case "browse":
+        return { kind: "browse", path: raw.path ?? "" };
+      case "find":
+        return raw.query ? { kind: "find", query: raw.query } : null;
       case "session_model":
         return isModel(raw.model) ? { kind: "model", model: raw.model } : null;
       case "session_mode":

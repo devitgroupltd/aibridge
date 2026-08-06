@@ -1,7 +1,7 @@
 ---
-version: 0.65.0
+version: 0.66.0
 status: solid
-last_modified_utc: 2026-08-06T19:00:00Z
+last_modified_utc: 2026-08-06T20:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,22 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.66.0 (2026-08-06): Closed a gap in 0.65.0's own delivery, caught live: a voice note (\"give me a
+    file package.json\"), sent in the control topic, fell through to fleet-commands' generic
+    'Unrecognised control-topic command' fallback instead of either running `/find` or reporting
+    `/browse`/`/find` as session-scoped. Root cause was `nl-router.ts` - `/browse`/`/find` only ever
+    existed as literal-syntax parsers (`browse-nav.ts`'s `parseBrowseCommand`/`parseFindCommand`), never
+    added to `ROUTER_KINDS`/`RouterAction`, so natural-language phrasing for either had no intent to
+    match - the same class of gap 0.63.0 already named and fixed once for `/help`/`/about`/`/commands`/
+    `/skills`/`/compact`/`/clear`, recurring because a *new* command still has to be added to the
+    router by hand; there is no mechanism yet that forces it. Fixed by adding `browse`/`find` to
+    `ROUTER_KINDS`/`RouterAction` (`path`/`query` fields on the shared schema), gating both behind the
+    same `hasSession` check as `/commands`/`/skills`, and wiring the matched action to the existing
+    `sendBrowseCard`/`sendFindCard` in `index.ts`'s `executeMatchedCommand` - no new UI, this only
+    lets natural language reach the handlers `/browse`/`/find` already had. 6 new nl-router tests
+    (completeness list + one mapRouterOutput case per kind). Audited the rest of the command surface
+    (`fleet-commands.ts`'s full `FleetCommand` union, `session-commands.ts`) for the same gap while at
+    it - found no other command missing from the router."
   - "0.65.0 (2026-08-06): New §3.6, `/browse [<path>]`/`/find <query>` - a Total-Commander-style file
     browser/search over a session's own worktree from Telegram (`worktree-fs.ts`, `browse-nav.ts`).
     Session-scoped only, Bridge-native (not a Claude tool call), with its own independent path-
@@ -2273,7 +2289,7 @@ useful to auto-send. This is a separate toggle from `/assist`/`nl_confirm_enable
 a *destructive fleet command matched from NL text* asks first, the other gates whether a *transcribed
 voice note* is sent at all - deliberately not folded together despite the similar shape.
 
-### 3.6 File browser + search (added 0.65.0)
+### 3.6 File browser + search (added 0.65.0; NL routing added 0.66.0)
 
 `/browse [<path>]` and `/find <query>` - a Total-Commander-style way to look inside a session's own
 worktree from Telegram without spending a Claude turn on pure navigation. Session-scoped only, hard-
@@ -2325,6 +2341,16 @@ message. Four callback namespaces, one id minted per row: `br:<id>:<page>` (fold
 Prev/Next), `bf:<id>` (a file row's action menu), `bv:<id>:<view|send>` (the action itself), `bs:<id>:
 <page>` (paging a `/find` result set - a snapshot taken at search time, not re-run per page, so a
 result list can't shift under the operator mid-browse).
+
+**Natural-language routing (added 0.66.0, §3.5).** Shipped in 0.65.0 with literal-syntax parsing only
+(`parseBrowseCommand`/`parseFindCommand`) - a voice note or typed sentence ("give me the file
+package.json") had no `/browse`/`/find` intent to match and fell through to fleet-commands' generic
+"unrecognised command" fallback, live-caught the same day. `browse`/`find` are now `RouterAction` kinds
+in `nl-router.ts` (§3.5), gated behind the same `hasSession` check as `commands`/`skills` - a match from
+the control topic still can't act on a worktree that doesn't exist there, but now reports that plainly
+("File search is session-scoped - send /find inside a session's own topic.") via the exact same
+`sendBrowseCard`/`sendFindCard` the literal-syntax path already used, rather than a generic fallback with
+no relation to what was actually meant.
 
 **Search (`searchWorktree`).** Filename substring match (a plain recursive walk) plus content match via
 a spawned `rg`, both filtered by the same exclusion rule as listing. If `rg` isn't spawnable (`ENOENT` -
