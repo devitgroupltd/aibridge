@@ -1,7 +1,7 @@
 ---
-version: 0.71.0
+version: 0.72.0
 status: solid
-last_modified_utc: 2026-08-07T01:15:00Z
+last_modified_utc: 2026-08-07T02:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,18 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.72.0 (2026-08-07): fixed a real §6.2 allowlist regression from the 0.55.0 plugin cutover
+    (§10.1.2), found live while testing the 0.71.0 terminal-race fix but not fixed there. Generated
+    per-session settings.json still pre-allowed the bot's reply/send_file tools under their old bare
+    names (mcp__aibridge__reply, mcp__aibridge__send_file); since the plugin cutover, Claude Code
+    presents these as the plugin-scoped mcp__plugin_aibridge-telegram_aibridge__reply /
+    ...__send_file - confirmed live via a real terminal permission dialog reading
+    'plugin:aibridge-telegram:aibridge - reply(...)'. The old names matched nothing, so every
+    session's first reply/send_file call was silently un-pre-approved and could raise an unplanned
+    permission prompt. Fix: settings.ts now allows both the plugin-scoped names (the ones that
+    actually match today) and the old bare names (harmless if unmatched, and covers any future
+    non-plugin registration path). New settings.test.ts case added; 708 bridge-package tests pass,
+    tsc --noEmit clean apart from the 2 pre-existing unrelated errors."
   - "0.71.0 (2026-08-07): §13 check 4 ('terminal race') automated, which surfaced that §6.5's own
     'answered at the terminal' resolution heuristic had never actually been implemented - only the
     30-minute TTL-expiry sweep existed (`permission-registry.ts`); a `hook-events.ts` comment claimed

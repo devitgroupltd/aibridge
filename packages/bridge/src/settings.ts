@@ -82,8 +82,14 @@ function buildTelemetryEnv(otlpPort: number): Record<string, string> {
  * §6.2's per-session settings baseline, verbatim. Content-scoped from the start (§6.1.1: a bare
  * `Bash` ask rule is skipped for sandboxed commands, so writing it broad now avoids a rewrite at
  * the §7.6 sandbox migration), `~/`-anchored paths only (a single leading slash anchors at the
- * settings source, not the filesystem root), and `mcp__aibridge__reply` pre-allowed since the
- * channel server's own reply tool otherwise raises its own permission prompt on first use (§3.3).
+ * settings source, not the filesystem root), and the channel server's `reply`/`send_file` tools
+ * pre-allowed since they otherwise raise their own permission prompt on first use (§3.3). Found live
+ * 2026-08-07: the 0.55.0 plugin-cutover migration (§10.1.2) changed the actual MCP tool name Claude
+ * Code presents from `mcp__aibridge__*` to the plugin-scoped `mcp__plugin_<plugin>_<server>__*`
+ * form - confirmed via a real terminal dialog reading "plugin:aibridge-telegram:aibridge - reply(...)".
+ * The old bare name was left in this allowlist by that migration and never actually matched anything,
+ * silently un-pre-approving every session's first `reply`/`send_file` call. Both forms are listed
+ * below so a future non-plugin registration path (or a stale already-launched session) still matches.
  * `hookClientPath` is optional so every existing caller/test that only cares about the permission
  * baseline is unaffected - `session-launcher.ts` is the one real caller that passes it. `otlpPort`
  * defaults to §5.7's `4318` - overridable for tests that run their own throwaway listener.
@@ -119,6 +125,8 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         "NotebookRead",
         "mcp__aibridge__reply",
         "mcp__aibridge__send_file",
+        "mcp__plugin_aibridge-telegram_aibridge__reply",
+        "mcp__plugin_aibridge-telegram_aibridge__send_file",
         "Bash(git status *)",
         "Bash(git diff *)",
         "Bash(git log *)",

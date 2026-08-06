@@ -76,6 +76,15 @@ describe("generateSettings", () => {
     expect(settings.permissions.allow).toContain("mcp__aibridge__reply");
   });
 
+  // Found live 2026-08-07: the 0.55.0 plugin cutover changed the real MCP tool name Claude Code
+  // presents to `mcp__plugin_<plugin>_<server>__*`, but the allowlist still only listed the old bare
+  // `mcp__aibridge__*` form, which no longer matched anything - every session's first reply/send_file
+  // call silently stopped being pre-approved.
+  test("pre-allows the plugin-scoped reply/send_file tool names actually presented post-0.55.0", () => {
+    expect(settings.permissions.allow).toContain("mcp__plugin_aibridge-telegram_aibridge__reply");
+    expect(settings.permissions.allow).toContain("mcp__plugin_aibridge-telegram_aibridge__send_file");
+  });
+
   test("omits the hooks block entirely when no hook client path is given", () => {
     expect(settings.hooks).toBeUndefined();
   });
