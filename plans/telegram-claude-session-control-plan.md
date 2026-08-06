@@ -1,7 +1,7 @@
 ---
-version: 0.73.0
+version: 0.74.0
 status: solid
-last_modified_utc: 2026-08-07T04:00:00Z
+last_modified_utc: 2026-08-07T05:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,26 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.74.0 (2026-08-07): closed the two real gaps left after a 'what's left to implement/fix' pass
+    (excluding §13's manual-check-only items). (1) §7.2's autostart logging gap, found live while
+    writing the README in 0.34.0 and left unfixed since - a Task Scheduler launch captured no
+    stdout/stderr at all, because the dev log file was only ever an artifact of
+    scripts/dev-bridge.sh's own shell redirect, not something the Bridge process did itself. New
+    logger.ts: the Bridge now owns a real file sink (%LOCALAPPDATA%\\aibridge\\bridge.log, 10MB cap,
+    one rotated .1 backup) independent of launch method, plus uncaughtException/unhandledRejection
+    handlers that log before exiting - live-verified by restarting the dev Bridge and confirming
+    bridge.log is written by the Bridge itself, not the dev launcher's redirect. README's autostart
+    section updated to describe the fix instead of the gap. (2) §4.4's second rename-once trigger
+    ('when a SessionStart hook reports a sessionTitle') was retired, not implemented - checked
+    directly against Claude Code's own hooks reference (code.claude.com/docs/en/hooks):
+    `sessionTitle` is real, but it's a field a SessionStart hook's own JSON *output* may set, never a
+    field present in a SessionStart hook's *input* payload - there was nothing for the Bridge to read
+    on this path, ever. §4.4 rewritten to describe only the one path that was ever buildable (the
+    existing reply-triggered rename-once); the two changelog entries that had left this open-ended
+    ('never independently confirmed to exist') updated to record the actual finding. No new code for
+    (2) - the honest fix was correcting the design doc's premise, not writing dead code against a
+    field that doesn't exist. New logger.test.ts (5 tests); 725 bridge-package tests pass total, tsc
+    --noEmit clean apart from the 2 pre-existing unrelated errors."
   - "0.73.0 (2026-08-07): new §3.7, '/diff' - a mobile-friendly way to review a session's pending
     (uncommitted) changes from Telegram, researched and requested by the operator (secret Gists
     turned out to be link-only, not access-controlled; a self-hosted diff2html/difit viewer would have
@@ -2832,9 +2852,19 @@ queued or silently dropped, which is the one case the table above does not cover
 ### 4.4 Naming
 
 Topics are created immediately at `/new` with a provisional title derived from the prompt (first 5
-words, truncated to Telegram's 128-char topic-name cap). When the session first calls `reply`, or when
-a `SessionStart` hook reports a `sessionTitle`, the Bridge issues `editForumTopic` once to upgrade the
-name. Renaming is capped at one per session to avoid burning rate-limit budget on cosmetics.
+words, truncated to Telegram's 128-char topic-name cap). When the session first calls `reply`, the
+Bridge issues `editForumTopic` once to upgrade the name. Renaming is capped at one per session to avoid
+burning rate-limit budget on cosmetics.
+
+**Retired (0.74.0): the second trigger this section originally also named** - "or when a `SessionStart`
+hook reports a `sessionTitle`" - rested on a premise checked directly against Claude Code's own hooks
+reference and found false. `sessionTitle` is real, but it is a field a `SessionStart` hook's own JSON
+*output* may set (to tell Claude Code what to display as the session's title in its own UI) - it is not
+a field present anywhere in a `SessionStart` hook's *input* payload for the Bridge to read. There is
+nothing to trigger a rename off here: the documented `SessionStart` input fields are `session_id`,
+`prompt_id`, `transcript_path`, `cwd`, `permission_mode`, `effort`, `hook_event_name`, and (not
+guaranteed) `model` - no title-shaped field among them. The reply-triggered path above is the entire
+implementation of this section; no second path is missing, and none should be built.
 
 ### 4.5 Restart recovery and orphan reconciliation
 
@@ -5112,9 +5142,11 @@ item 3 is moot until §7.6.
   `claude --resume` hint) but not yet exercised live against a real multi-line PTY tail.
 - ~~Topic lifecycle including create, rename-once and delete.~~ **Create, delete and rename-once all
   done** (2026-08-04). Rename-once fires off a session's first real `reply` (a new `renamed` column,
-  capped at one edit per session); the `SessionStart`-reported-title path §4.4 also names is **not
-  implemented** - that hook payload field was never independently confirmed to exist, and the
-  reply-triggered path alone was enough to close the gap live testing actually hit.
+  capped at one edit per session); the `SessionStart`-reported-title path §4.4 also named was retired in
+  0.74.0, not implemented - checked directly against Claude Code's hooks reference, `sessionTitle` turned
+  out to be a `SessionStart` hook *output* field (what a hook can tell Claude Code to display), never an
+  *input* field the Bridge could read. Nothing was missing; §4.4 now only describes the one path that
+  was ever buildable.
 - ~~Worktree provisioning per session; the SQLite routing table.~~ **Done**, including
   reconciliation now - `session-store.ts` persists §4.3's schema at `$STATE/aibridge.db`, with §4.3's
   state-transition table enforced (`isValidTransition`); the hook-driven half of the table

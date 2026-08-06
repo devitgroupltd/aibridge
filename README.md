@@ -76,14 +76,17 @@ Claude Code credential store are not things this project is willing to assume. T
 gap in practice: reboot deliberately and log in right after, or enable Windows autologon with the
 workstation immediately locked afterward.
 
-**A second, currently-undocumented-elsewhere gap worth knowing before you rely on this:** a Task
-Scheduler launch captures no stdout/stderr today - there is no production log file equivalent to
-`bridge:logs`' dev one. If the Bridge is silently not answering after a reboot, `/autostart status`'s
+**Fixed in 0.74.0: the Bridge now owns its own log file regardless of launch method.** A Task Scheduler
+launch used to capture no stdout/stderr at all - `bridge:logs`' dev log file was only ever an artifact
+of `scripts/dev-bridge.sh`'s own shell redirect, not something the Bridge process did itself, so
+autostart launches had nothing. `logger.ts` now writes every `log()` line to
+`%LOCALAPPDATA%\aibridge\bridge.log` directly (10MB cap, one rotated `.1` backup) no matter how the
+process was started, and uncaught exceptions/unhandled rejections are logged there before the process
+exits - so a silent post-reboot failure now has a real log file to read, on top of `/autostart status`'s
 `Last result` field (a Win32 exit code - `0` means the process exited cleanly, which for a daemon that's
 supposed to keep running is itself a bad sign) and Windows' own Event Viewer (Task Scheduler's
-operational log, under *Task Scheduler Library*) are the only diagnostics until this gets a real log
-file. Confirm the Bridge is actually up via `/ls` or `/settings` from Telegram, not just a "registered"
-status.
+operational log, under *Task Scheduler Library*). Confirm the Bridge is actually up via `/ls` or
+`/settings` from Telegram either way, not just a "registered" status.
 
 ### The VPS escape hatch
 

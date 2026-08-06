@@ -22,6 +22,7 @@ import {
   resolveCommandAction,
 } from "./commands.ts";
 import { loadConfig, STATE_DIR } from "./config.ts";
+import { initFileLogging, log } from "./logger.ts";
 import {
   clearDeployMarker,
   deployBranch,
@@ -141,12 +142,19 @@ import { createThinkingPlaceholder } from "./thinking-placeholder.ts";
 import { createTypingIndicator } from "./typing-indicator.ts";
 import { removeWorktree } from "./worktree.ts";
 
-type LogLevel = "INFO" | "WARN" | "ERROR";
-
-function log(level: LogLevel, message: string): void {
-  // §9's convention: ERROR/WARN/INFO, never a token or full tool input in the line.
-  console.log(`[${new Date().toISOString()}] ${level} ${message}`);
-}
+// §7.2's Task Scheduler stdout/stderr gap (logger.ts's own doc comment has the full story): a
+// launch that predates `main()` itself getting to run - a bad env file, a throw during module
+// load - still deserves a line in the real log file, so the sink is initialized and the crash
+// handlers are installed at module scope, not inside `main()`.
+initFileLogging(STATE_DIR);
+process.on("uncaughtException", (err) => {
+  log("ERROR", `uncaught exception: ${err.stack ?? err.message}`);
+  process.exit(1);
+});
+process.on("unhandledRejection", (reason) => {
+  log("ERROR", `unhandled rejection: ${reason instanceof Error ? reason.stack ?? reason.message : String(reason)}`);
+  process.exit(1);
+});
 
 /** §4.1: topic 1 (the implicit "General" topic) is the control topic - real Telegram omits
  * `message_thread_id` entirely for a General-topic message, so both `undefined` and the literal
