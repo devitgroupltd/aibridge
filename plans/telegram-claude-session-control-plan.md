@@ -1,7 +1,7 @@
 ---
-version: 0.76.0
+version: 0.77.0
 status: solid
-last_modified_utc: 2026-08-06T18:55:00Z
+last_modified_utc: 2026-08-06T19:40:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,38 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.77.0 (2026-08-06): two feed-visibility gaps raised directly by the operator watching a real
+    session's Telegram topic while it worked:
+    (1) **TodoWrite rendered as nothing but its own name.** hook-events.ts's per-tool summarizer only
+    ever looked at file_path/command/pattern; TodoWrite's actual payload (`{ todos: [...] }`) is an
+    array, matching none of them, so both the compact card line and /detail full's blockquote showed
+    a bare 'TodoWrite' the entire time a session worked through a checklist - exactly the 'what is
+    Claude doing' signal the feed exists for, silently missing for this one very common tool. Fixed
+    with a dedicated TodoWrite branch: the compact line now shows a progress count plus whichever
+    item is in_progress ('TodoWrite  1/3 done · now: Fixing bug B'), and /detail full shows the
+    whole checklist with ✓/▶/· markers, the same vocabulary the IDE's own todo view uses. While
+    auditing every other tool for the same array/object-field gap: Task/WebFetch/WebSearch/
+    NotebookEdit/Skill/ExitPlanMode all fell back to their bare tool name on the *compact* line too
+    (their target already showed fine in /detail full's generic string-field dump) - broadened the
+    compact summarizer's named-field list (description/url/query/skill/plan/notebook_path) plus a
+    generic 'first string field' last resort, so an unrecognised future tool degrades to something
+    better than its bare name instead of nothing.
+    (2) **The /detail 'full' button. Tapping it always sent a brand-new message, leaving the small
+    '📋 Details' anchor sitting there unchanged and still tappable forever** - a session an
+    operator taps repeatedly piles up a duplicate message per tap. Reworked to edit the anchor
+    message itself in place (full log as the new text, keyboard removed) instead of posting
+    alongside it; the oversized (>4096 char) case still has to send the .txt document as its own
+    message (Telegram can't inline a file into an edited text message) but now also edits the anchor
+    down to a short 'sent as a file below' note first. Needs the anchor's own message_id remembered
+    between the post and the tap - the operator's own call was to persist this (new
+    details-anchor-store.ts, same aibridge.db file as session-store.ts/settings-store.ts/
+    cost-store.ts) rather than keep it in memory only, so a tap still works in place across a
+    /restart, not just within one process lifetime. A tap with no anchor on record (predates this
+    feature, or its row aged out past the 30-day retention window) falls back to today's
+    send-a-new-message behaviour rather than a dead button. Live-verified against a real session
+    topic: tapped Details, confirmed the anchor's own text changed and its button disappeared with
+    no new message appended, while two other untapped anchors from earlier turns in the same topic
+    kept their buttons untouched."
   - "0.76.0 (2026-08-06): the two MAJOR findings the 0.75.0 sweep flagged but deliberately didn't
     auto-apply (each was a feature, not a patch, so it waited for an explicit go-ahead):
     (1) **`/budget`'s rolling 5h spend and the burn-rate alarm reset to $0 on every `/restart`/`/deploy`.**

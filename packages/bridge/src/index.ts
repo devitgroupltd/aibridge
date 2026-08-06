@@ -36,6 +36,7 @@ import {
   writeDeployMarker,
 } from "./deploy.ts";
 import { buildDetailsKeyboard, parseDetailsCallback } from "./details-button.ts";
+import { DetailsAnchorStore, DETAILS_ANCHOR_RETENTION_MS } from "./details-anchor-store.ts";
 import {
   attachmentKindLabel,
   buildAttachmentAnnouncement,
@@ -243,6 +244,9 @@ async function main(): Promise<void> {
   // reasoning `/budget`/`/settings` staying control-topic-only already established. Lives in the
   // same aibridge.db file, not a second database (settings-store.ts).
   const settingsStore = new SettingsStore(dbPath);
+  // §5.5's details-button edit-in-place (details-anchor-store.ts) - same aibridge.db file, same
+  // reasoning as settingsStore above.
+  const detailsAnchorStore = new DetailsAnchorStore(dbPath);
   let assistEnabled = settingsStore.get("assist_enabled", "true") !== "false";
   // Live override for config.ts's nlRouter.backend startup default - see that field's own doc
   // comment for why an API key's mere presence must never switch this on its own. Falls back to
@@ -481,11 +485,15 @@ async function main(): Promise<void> {
   // storm notifies again rather than staying silent forever after the first one.
   let quietModeNotified = false;
 
-  /** §5.5: one small, un-edited anchor message per turn carrying the `details` button - see
+  /** §5.5: one small anchor message per turn carrying the `details` button - see
    * `details-button.ts` for why this can't just live on the turn card itself. P1 lane (a
    * lifecycle notice, not a permission/question card), and skipped for a `/pause`d session for
    * the same reason `feedCoalescer`'s own flush is (§4.2: "replies and prompts still flow, only
-   * the feed card stops updating" - this is feed-adjacent, not a reply or a prompt). */
+   * the feed card stops updating" - this is feed-adjacent, not a reply or a prompt).
+   *
+   * The anchor is edited in place (not left un-edited) once its button is actually tapped - see
+   * the "d:" callback branch below - so its own message_id is persisted here (`detailsAnchorStore`,
+   * survives a restart on the operator's own request) the moment it's known. */
   function postDetailsButton(slug: string, turnSeq: number): void {
     if (sessionStore.get(slug)?.paused) return;
     const route = routing.get(slug);
@@ -494,6 +502,7 @@ async function main(): Promise<void> {
       .scheduleAsync("P1", () =>
         controlBot.sendMessage(config.supergroupChatId, route.topicId, "📋", { inline_keyboard: buildDetailsKeyboard(slug, turnSeq) }),
       )
+      .then((sent) => detailsAnchorStore.set(slug, turnSeq, sent.message_id, Date.now()))
       .catch((err) => log("WARN", `failed to post details button for "${slug}": ${(err as Error).message}`));
   }
 
@@ -694,6 +703,11 @@ async function main(): Promise<void> {
       (err) => log("WARN", `failed to mark permission request as expired: ${err.message}`),
     );
     browseRegistry.sweep();
+
+    // §5.5's edit-in-place anchor: rows for a button that's never tapped at all (the common case)
+    // would otherwise grow the table by one per turn, forever - see details-anchor-store.ts's own
+    // comment on why this window is much longer than cost-store.ts's.
+    detailsAnchorStore.deleteOlderThan(Date.now() - DETAILS_ANCHOR_RETENTION_MS);
 
     // §6.5's "a stale button must not look tappable and silently do nothing", applied to the four
     // operator-confirm cards too: past their TTL, strip the keyboard and say so. Doubles as the
@@ -2715,11 +2729,38 @@ async function main(): Promise<void> {
           const stillCurrent = state && state.turnSeq === detailsAction.turnSeq;
           const verboseDetails = sessionStore.get(detailsAction.slug)?.feedVerbose ?? false;
           const text = stillCurrent ? renderDetails(state, verboseDetails) : "That turn has ended - its log is no longer available.";
-          if (text.length <= 4096) {
-            // renderDetails renders the same `<code>`/escaped-entity markup the turn card itself
-            // uses (feed-renderer.ts) - needs "HTML" here or Telegram shows the literal tags.
+          // renderDetails renders the same `<code>`/escaped-entity markup the turn card itself
+          // uses (feed-renderer.ts) - needs "HTML" here or Telegram shows the literal tags.
+          const fitsInOneMessage = text.length <= 4096;
+          const anchorMsgId = detailsAnchorStore.get(detailsAction.slug, detailsAction.turnSeq);
+
+          if (anchorMsgId !== undefined) {
+            // Edit the button's own anchor message in place (full log + button removed) instead
+            // of posting a separate message - the operator's own request, so a repeated /detail
+            // tap doesn't keep piling up new messages next to the one that already has the answer.
+            // The oversized case still edits the anchor too, just to a short note - the .txt
+            // document itself still has to be its own message (Telegram can't inline a file into
+            // an edited text message).
+            const anchorText = fitsInOneMessage ? text : "📄 Details sent as a file below.";
+            feedGovernor
+              .scheduleAsync("P1", () => controlBot.editMessageText!(config.supergroupChatId, anchorMsgId, anchorText, { inline_keyboard: [] }, "HTML"))
+              .then(() => detailsAnchorStore.delete(detailsAction.slug, detailsAction.turnSeq))
+              .catch((err) => {
+                // A stale/already-deleted anchor (or any other edit failure) degrades to the
+                // pre-edit-in-place behaviour - the operator still gets the details, just as a new
+                // message instead of an edit. Drop the now-unreliable mapping either way so a
+                // future tap doesn't keep retrying the same broken edit.
+                detailsAnchorStore.delete(detailsAction.slug, detailsAction.turnSeq);
+                log("WARN", `details-anchor edit failed for "${detailsAction.slug}" turn ${detailsAction.turnSeq}, falling back to a new message: ${(err as Error).message}`);
+                if (fitsInOneMessage) confirmSessionCommand(threadId, text, "HTML");
+              });
+          } else if (fitsInOneMessage) {
+            // No anchor on record (posted before this feature shipped, or the Bridge restarted
+            // between posting it and this tap) - today's exact fallback behaviour.
             confirmSessionCommand(threadId, text, "HTML");
-          } else {
+          }
+
+          if (!fitsInOneMessage) {
             // §5.5: "Diffs always go as documents" - the same reasoning applies to a details log
             // too long to fit in one message. Plain text, not renderDetails's HTML markup - a
             // document viewer has no HTML renderer to make that markup invisible.

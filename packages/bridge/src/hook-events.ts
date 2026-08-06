@@ -51,17 +51,84 @@ function truncate(text: string): string {
   return truncateTo(text, MAX_SUMMARY_LEN);
 }
 
-/** §5.3's per-tool one-liner. Best-effort: an unrecognised tool falls back to its name alone
- * rather than guessing at an input shape that hasn't been seen. */
+interface TodoItem {
+  content?: string;
+  status?: string;
+  activeForm?: string;
+}
+
+/** `TodoWrite`'s payload is `{ todos: [{content, status, activeForm}, ...] }` (confirmed live -
+ * every `TodoWrite` call this project's own sessions make sends exactly this shape) - an array, not
+ * a string field, so it matches none of `summarizeToolInput`/`fullToolInput`'s named-field checks
+ * and silently fell back to the bare tool name in both the compact card line and the `/detail full`
+ * blockquote (found during the `/deep-check` follow-up: an operator watching a session work through
+ * a todo list saw nothing but "TodoWrite" the whole time). */
+function asTodoItems(toolInput: Record<string, unknown>): TodoItem[] | undefined {
+  const todos = toolInput.todos;
+  if (!Array.isArray(todos)) return undefined;
+  const items = todos.filter((t): t is TodoItem => typeof t === "object" && t !== null);
+  return items.length > 0 ? items : undefined;
+}
+
+/** §5.3's compact one-liner for `TodoWrite`: progress count plus whichever item is actually in
+ * flight - the one thing worth knowing at a glance while the rest of the checklist sits still. */
+function summarizeTodos(toolInput: Record<string, unknown>): string | undefined {
+  const todos = asTodoItems(toolInput);
+  if (!todos) return undefined;
+  const done = todos.filter((t) => t.status === "completed").length;
+  const current = todos.find((t) => t.status === "in_progress");
+  const activeForm = current?.activeForm ?? current?.content;
+  return truncate(`TodoWrite  ${done}/${todos.length} done${activeForm ? ` · now: ${activeForm}` : ""}`);
+}
+
+/** `/detail full`'s sibling of `summarizeTodos` - the whole checklist, one line per item, same
+ * ✓/▶/· convention the IDE's own todo view uses so an operator who's used Claude Code before
+ * doesn't have to learn a new vocabulary just because they're reading it in Telegram. */
+function fullTodos(toolInput: Record<string, unknown>): string | undefined {
+  const todos = asTodoItems(toolInput);
+  if (!todos) return undefined;
+  const lines = todos.map((t) => {
+    const mark = t.status === "completed" ? "✓" : t.status === "in_progress" ? "▶" : "·";
+    const text = (t.status === "in_progress" ? t.activeForm : undefined) ?? t.content ?? "(untitled)";
+    return `${mark} ${text}`;
+  });
+  return truncateTo(lines.join("\n"), MAX_FULL_LEN);
+}
+
+/** §5.3's per-tool one-liner. Named-field priority mirrors `fullToolInput` below (see that
+ * function's own comment for the full-detail side of this): a growing set of well-known fields
+ * that carry a tool call's actual target, checked in specificity order, before falling back to
+ * whatever string field happens to come first, and only then to the bare tool name. Found during
+ * the `/deep-check` follow-up: `Task`/`WebFetch`/`WebSearch`/`NotebookEdit`/`Skill`/`ExitPlanMode`
+ * all fell back to their bare name here even though their actual target (a subagent's task,
+ * a URL, a search query, a notebook path, a skill name, a plan) was sitting right there and
+ * already rendered fine in `/detail full` - the always-visible card line was the one place it was
+ * missing. */
 function summarizeToolInput(toolName: string, toolInput: Record<string, unknown> | undefined): string {
   if (!toolInput) return toolName;
-  const filePath = str(toolInput, "file_path");
+  if (toolName === "TodoWrite") return summarizeTodos(toolInput) ?? toolName;
   const command = str(toolInput, "command");
-  const pattern = str(toolInput, "pattern");
   if (toolName === "Bash" && command) return truncate(`${toolName}  ${command}`);
+  const filePath = str(toolInput, "file_path") ?? str(toolInput, "notebook_path");
   if (filePath) return truncate(`${toolName}  ${filePath}`);
+  const pattern = str(toolInput, "pattern");
   if (pattern) return truncate(`${toolName}  "${pattern}"`);
-  return toolName;
+  const known = str(toolInput, "url") ?? str(toolInput, "query") ?? str(toolInput, "skill") ?? str(toolInput, "description") ?? str(toolInput, "plan");
+  if (known) return truncate(`${toolName}  ${known}`);
+  const anyString = firstStringField(toolInput);
+  return anyString ? truncate(`${toolName}  ${anyString}`) : toolName;
+}
+
+/** Last-resort fallback shared by both summarizers - object key order from a parsed tool call
+ * mirrors the order the tool's own schema declares its fields in, so "the first string field" is
+ * usually the primary one (`skill` before `args`, `query` before secondary options, ...) even for
+ * a tool this file has no specific name for yet. Better than the bare tool name; not a substitute
+ * for a real named-field match above when one exists. */
+function firstStringField(toolInput: Record<string, unknown>): string | undefined {
+  for (const value of Object.values(toolInput)) {
+    if (typeof value === "string" && value.trim().length > 0) return value;
+  }
+  return undefined;
 }
 
 /** `/detail full`'s untruncated (well, `MAX_FULL_LEN`-truncated) sibling of `summarizeToolInput` -
@@ -71,7 +138,8 @@ function summarizeToolInput(toolName: string, toolInput: Record<string, unknown>
  * silently having less than the compact line already gave. */
 function fullToolInput(toolName: string, toolInput: Record<string, unknown> | undefined): string {
   if (!toolInput) return toolName;
-  const filePath = str(toolInput, "file_path");
+  if (toolName === "TodoWrite") return fullTodos(toolInput) ?? toolName;
+  const filePath = str(toolInput, "file_path") ?? str(toolInput, "notebook_path");
   const command = str(toolInput, "command");
   const pattern = str(toolInput, "pattern");
   const description = str(toolInput, "description");

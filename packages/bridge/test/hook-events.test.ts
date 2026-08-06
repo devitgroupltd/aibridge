@@ -183,4 +183,129 @@ describe("normalizeHookEvent", () => {
       expect((event as { fullInput: string }).fullInput.length).toBeLessThan(1600);
     });
   });
+
+  // Found during a /deep-check follow-up (2026-08-06): TodoWrite's payload is `{ todos: [...] }` -
+  // an array, not a string field - so it matched none of the named-field checks and silently fell
+  // back to the bare tool name in both the compact card line and /detail full's blockquote. The
+  // payload shape below is verbatim from this project's own live TodoWrite calls, same convention
+  // as the Stage-0 fixtures above.
+  describe("TodoWrite renders the actual checklist, not just its own name", () => {
+    const PRE_TOOL_USE_TODO_WRITE = {
+      session_id: "c43382b2",
+      hook_event_name: "PreToolUse",
+      tool_name: "TodoWrite",
+      tool_input: {
+        todos: [
+          { content: "Fix bug A", status: "completed", activeForm: "Fixing bug A" },
+          { content: "Fix bug B", status: "in_progress", activeForm: "Fixing bug B" },
+          { content: "Fix bug C", status: "pending", activeForm: "Fixing bug C" },
+        ],
+      },
+      tool_use_id: "toolu_todo1",
+    };
+
+    test("compact summary shows progress count and the in-progress item's activeForm", () => {
+      const event = normalizeHookEvent("PreToolUse", PRE_TOOL_USE_TODO_WRITE);
+      expect(event).toMatchObject({ summary: "TodoWrite  1/3 done · now: Fixing bug B" });
+    });
+
+    test("full detail lists every item with a status marker, most-informative text first", () => {
+      const event = normalizeHookEvent("PreToolUse", PRE_TOOL_USE_TODO_WRITE);
+      expect(event).toMatchObject({
+        fullInput: "✓ Fix bug A\n▶ Fixing bug B\n· Fix bug C",
+      });
+    });
+
+    test("no in-progress item: compact summary still shows the progress count, no dangling '· now:'", () => {
+      const allPending = {
+        ...PRE_TOOL_USE_TODO_WRITE,
+        tool_input: { todos: [{ content: "Fix bug A", status: "pending" }] },
+      };
+      const event = normalizeHookEvent("PreToolUse", allPending);
+      expect(event).toMatchObject({ summary: "TodoWrite  0/1 done" });
+    });
+
+    test("an empty or malformed todos array degrades to the bare tool name, not a crash", () => {
+      expect(normalizeHookEvent("PreToolUse", { ...PRE_TOOL_USE_TODO_WRITE, tool_input: { todos: [] } })).toMatchObject({
+        summary: "TodoWrite",
+        fullInput: "TodoWrite",
+      });
+      expect(normalizeHookEvent("PreToolUse", { ...PRE_TOOL_USE_TODO_WRITE, tool_input: { todos: "not an array" } })).toMatchObject({
+        summary: "TodoWrite",
+        fullInput: "TodoWrite",
+      });
+    });
+  });
+
+  // Found the same follow-up: several real tools (Task, WebFetch, WebSearch, NotebookEdit, Skill)
+  // carry their actual target in a field this file previously never looked at, so the always-visible
+  // compact line fell back to the bare tool name even though /detail full already showed it fine
+  // (via fullToolInput's generic string-field dump). This closes the gap on the compact side too.
+  describe("compact summary covers tools beyond file_path/command/pattern", () => {
+    test("Task/Agent's subagent description becomes the compact summary", () => {
+      const event = normalizeHookEvent("PreToolUse", {
+        session_id: "x",
+        hook_event_name: "PreToolUse",
+        tool_name: "Task",
+        tool_input: { description: "Review the auth module", prompt: "Full prompt text here" },
+        tool_use_id: "t1",
+      });
+      expect(event).toMatchObject({ summary: "Task  Review the auth module" });
+    });
+
+    test("WebFetch's url becomes the compact summary", () => {
+      const event = normalizeHookEvent("PreToolUse", {
+        session_id: "x",
+        hook_event_name: "PreToolUse",
+        tool_name: "WebFetch",
+        tool_input: { url: "https://example.com/docs", prompt: "summarize" },
+        tool_use_id: "t1",
+      });
+      expect(event).toMatchObject({ summary: "WebFetch  https://example.com/docs" });
+    });
+
+    test("WebSearch's query becomes the compact summary", () => {
+      const event = normalizeHookEvent("PreToolUse", {
+        session_id: "x",
+        hook_event_name: "PreToolUse",
+        tool_name: "WebSearch",
+        tool_input: { query: "claude code todowrite schema" },
+        tool_use_id: "t1",
+      });
+      expect(event).toMatchObject({ summary: "WebSearch  claude code todowrite schema" });
+    });
+
+    test("NotebookEdit's notebook_path is treated the same as file_path", () => {
+      const event = normalizeHookEvent("PreToolUse", {
+        session_id: "x",
+        hook_event_name: "PreToolUse",
+        tool_name: "NotebookEdit",
+        tool_input: { notebook_path: "C:\\data\\analysis.ipynb", new_source: "print(1)" },
+        tool_use_id: "t1",
+      });
+      expect(event).toMatchObject({ summary: "NotebookEdit  C:\\data\\analysis.ipynb" });
+    });
+
+    test("a tool with none of the known fields falls back to its first string field, not its bare name", () => {
+      const event = normalizeHookEvent("PreToolUse", {
+        session_id: "x",
+        hook_event_name: "PreToolUse",
+        tool_name: "Skill",
+        tool_input: { skill: "deep-check", args: "--report-only" },
+        tool_use_id: "t1",
+      });
+      expect(event).toMatchObject({ summary: "Skill  deep-check" });
+    });
+
+    test("a tool with no string fields at all still degrades to its bare name, not a crash", () => {
+      const event = normalizeHookEvent("PreToolUse", {
+        session_id: "x",
+        hook_event_name: "PreToolUse",
+        tool_name: "SomeFutureTool",
+        tool_input: { count: 3, nested: { a: 1 } },
+        tool_use_id: "t1",
+      });
+      expect(event).toMatchObject({ summary: "SomeFutureTool" });
+    });
+  });
 });
