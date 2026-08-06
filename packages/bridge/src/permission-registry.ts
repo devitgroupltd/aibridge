@@ -61,6 +61,28 @@ export class PermissionRegistry {
     return this.pending.get(requestId);
   }
 
+  /**
+   * §6.5's "answered at the terminal" resolution heuristic. There is no protocol event for "a
+   * pending prompt was resolved elsewhere" - a `PostToolUse`/`PostToolUseFailure`/`PermissionDenied`
+   * hook whose `tool_name` matches a pending entry for the same session means the operator's own
+   * terminal answered it. The plan's own worked example pairs on `(session_id, tool_name,
+   * deep-equal tool_input)`, but `PermissionRequest` carries neither `session_id` nor structured
+   * `tool_input` (only a text `input_preview`, §6.5's own measured-payload finding) - `slug` already
+   * identifies the one session a request came from just as uniquely here (one `claude` process per
+   * slug), so this pairs on `(slug, toolName)` instead. Ties resolve oldest-first, matching the
+   * plan's own note that two byte-identical concurrent calls are indistinguishable to the operator
+   * too, so arrival order is correct rather than a compromise.
+   */
+  resolveByToolMatch(slug: string, toolName: string): PendingPermissionRequest | undefined {
+    let oldest: PendingPermissionRequest | undefined;
+    for (const entry of this.pending.values()) {
+      if (entry.slug !== slug || entry.toolName !== toolName) continue;
+      if (!oldest || entry.createdAt < oldest.createdAt) oldest = entry;
+    }
+    if (oldest) this.pending.delete(oldest.requestId);
+    return oldest;
+  }
+
   /** Non-consuming snapshot of every pending entry - `/ls`'s detail column (fleet-commands.ts's
    * `buildLsDetail`) needs to find "the pending permission for slug X", not resolve one. */
   all(): PendingPermissionRequest[] {

@@ -425,6 +425,56 @@ describe("startPipeServer", () => {
     });
   });
 
+  // §13 check 4, found live 2026-08-06: the §6.5 terminal-answer heuristic can call
+  // finalizePermissionMessage under a second after the card's own sendMessage, and the real
+  // Telegram Bot API intermittently 400s that fast an edit with "message to edit not found"
+  // (reproduced 2/2 live runs) - the same class of fresh-object flakiness §4.5.2/0.69.0 already
+  // document for topics. finalizePermissionMessage retries on that specific error rather than
+  // giving up on the first loss.
+  describe("finalizePermissionMessage retry (§13 check 4)", () => {
+    test("retries past a transient 'message to edit not found' and succeeds", async () => {
+      const path = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      let attempts = 0;
+      const controlBot: SendMessageSource = {
+        sendMessage: async () => ({ message_id: 9 }),
+        editMessageText: async () => {
+          attempts++;
+          if (attempts < 3) throw new Error("Telegram editMessageText failed: Bad Request: message to edit not found");
+        },
+      };
+
+      const handle = startPipeServer({ pipePath: path, routing, controlBot, chatId: "-1" });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      await handle.finalizePermissionMessage(9, "✅ Allowed: Write (answered at terminal)");
+      expect(attempts).toBe(3);
+    });
+
+    test("gives up and rethrows a non-transient editMessageText error immediately", async () => {
+      const path = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      let attempts = 0;
+      const controlBot: SendMessageSource = {
+        sendMessage: async () => ({ message_id: 9 }),
+        editMessageText: async () => {
+          attempts++;
+          throw new Error("Telegram editMessageText failed: Bad Request: chat not found");
+        },
+      };
+
+      const handle = startPipeServer({ pipePath: path, routing, controlBot, chatId: "-1" });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      await expect(handle.finalizePermissionMessage(9, "text")).rejects.toThrow(/chat not found/);
+      expect(attempts).toBe(1);
+    });
+  });
+
   describe("sendInbound", () => {
     test("delivers to the connected channel server for that slug", async () => {
       const path = pipePath();

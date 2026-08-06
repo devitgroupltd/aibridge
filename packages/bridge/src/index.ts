@@ -456,6 +456,22 @@ async function main(): Promise<void> {
       sessionStore.setSessionId(msg.slug, msg.session_id);
     }
 
+    // §6.5's terminal-race fix (§13 check 4): if the operator answers Claude Code's own terminal
+    // prompt instead of tapping the Telegram card, there is no protocol event saying so - the
+    // first sign is one of these three hooks landing for the same tool the pending card is for.
+    // `PermissionDenied` on its own is ambiguous (fired by the sandbox's own deny rules too, with
+    // nothing pending to match), so it's folded into the same lookup rather than special-cased.
+    if (msg.hook_event_name === "PostToolUse" || msg.hook_event_name === "PostToolUseFailure" || msg.hook_event_name === "PermissionDenied") {
+      const toolName = typeof msg.payload.tool_name === "string" ? msg.payload.tool_name : undefined;
+      const resolved = toolName ? pipeHandle.permissionRegistry.resolveByToolMatch(msg.slug, toolName) : undefined;
+      if (resolved) {
+        const behaviorLabel = msg.hook_event_name === "PermissionDenied" ? "⛔ Denied" : "✅ Allowed";
+        pipeHandle
+          .finalizePermissionMessage(resolved.messageId, `${behaviorLabel}: ${resolved.toolName} (answered at terminal)`)
+          .catch((err) => log("WARN", `failed to finalize permission message resolved at the terminal for "${msg.slug}": ${(err as Error).message}`));
+      }
+    }
+
     // §4.3's state table, the hook-driven half (the permission/ask half is wired via
     // onAwaitingInput/maybeSetState below) - a stale/duplicate event is a silent no-op, not an error.
     const targetState = stateForHookEvent(msg.hook_event_name);
@@ -1430,7 +1446,7 @@ async function main(): Promise<void> {
     stopIndicatorsForTopic(row.topicId);
 
     try {
-      removeWorktree(row.repoPath, row.worktreePath);
+      await removeWorktree(row.repoPath, row.worktreePath);
     } catch (err) {
       log("WARN", `removeWorktree failed for "${slug}": ${(err as Error).message}`);
     }

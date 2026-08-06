@@ -131,4 +131,52 @@ describe("PermissionRegistry", () => {
     expect(verdictSent).toBe(false);
     expect(registry.get("aaaaa")).toBeDefined();
   });
+
+  // §13 check 4 / §6.5's "answered at the terminal" heuristic: no protocol event says a pending
+  // prompt was resolved elsewhere, so a matching PostToolUse/PermissionDenied is the only signal.
+  describe("resolveByToolMatch", () => {
+    test("matches by (slug, toolName) and removes the entry", () => {
+      const registry = new PermissionRegistry();
+      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Write" }));
+
+      const resolved = registry.resolveByToolMatch("session-a", "Write");
+      expect(resolved?.requestId).toBe("aaaaa");
+      expect(registry.get("aaaaa")).toBeUndefined();
+    });
+
+    test("does not match a different session with the same tool", () => {
+      const registry = new PermissionRegistry();
+      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Write" }));
+
+      expect(registry.resolveByToolMatch("session-b", "Write")).toBeUndefined();
+      expect(registry.get("aaaaa")).toBeDefined();
+    });
+
+    test("does not match the same session with a different tool", () => {
+      const registry = new PermissionRegistry();
+      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Write" }));
+
+      expect(registry.resolveByToolMatch("session-a", "Bash")).toBeUndefined();
+      expect(registry.get("aaaaa")).toBeDefined();
+    });
+
+    test("two concurrent matches for the same (slug, toolName) resolve oldest first", () => {
+      let now = 0;
+      const registry = new PermissionRegistry({ now: () => now });
+      registry.add(entry({ requestId: "aaaaa", slug: "session-a", toolName: "Write" }));
+      now = 100;
+      registry.add(entry({ requestId: "bbbbb", slug: "session-a", toolName: "Write" }));
+
+      const first = registry.resolveByToolMatch("session-a", "Write");
+      expect(first?.requestId).toBe("aaaaa");
+      const second = registry.resolveByToolMatch("session-a", "Write");
+      expect(second?.requestId).toBe("bbbbb");
+    });
+
+    test("an unknown (slug, toolName) pair returns undefined without throwing", () => {
+      const registry = new PermissionRegistry();
+      expect(() => registry.resolveByToolMatch("no-such-session", "Bash")).not.toThrow();
+      expect(registry.resolveByToolMatch("no-such-session", "Bash")).toBeUndefined();
+    });
+  });
 });

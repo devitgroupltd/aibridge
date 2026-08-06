@@ -390,9 +390,28 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     return permissionRegistry.resolve(requestId);
   }
 
+  /**
+   * §13 check 4, found live 2026-08-06: the §6.5 terminal-answer heuristic (`resolveByToolMatch`
+   * in index.ts) can fire and call this within under a second of the card's own `sendMessage` -
+   * far faster than a human or even a scripted button tap ever resolves one - and the real
+   * Telegram Bot API intermittently 400s an edit that fast with `Bad Request: message to edit not
+   * found`, reproduced on 2 of 2 live runs. Same class of fresh-object eventual-consistency
+   * flakiness §4.5.2/0.69.0 already document for topics, now observed for messages too. A short
+   * retry absorbs it; the button-tap path above never needs it in practice (real taps are already
+   * seconds behind the send) but gets the same safety net for free.
+   */
   async function finalizePermissionMessage(messageId: number, text: string): Promise<void> {
     if (!opts.controlBot.editMessageText) return;
-    await p0(() => opts.controlBot.editMessageText!(opts.chatId, messageId, text, { inline_keyboard: [] }));
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await p0(() => opts.controlBot.editMessageText!(opts.chatId, messageId, text, { inline_keyboard: [] }));
+        return;
+      } catch (err) {
+        const isFreshMessageRace = /message to edit not found/i.test((err as Error).message);
+        if (!isFreshMessageRace || attempt >= 2) throw err;
+        await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+      }
+    }
   }
 
   function answerAsk(id: string, questionIndex: number, optionIndex: number): { entry: PendingAsk; label: string; allAnswered: boolean } | null {

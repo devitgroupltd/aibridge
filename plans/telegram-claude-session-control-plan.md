@@ -1,7 +1,7 @@
 ---
-version: 0.69.0
+version: 0.71.0
 status: solid
-last_modified_utc: 2026-08-06T23:45:00Z
+last_modified_utc: 2026-08-07T01:15:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,51 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.71.0 (2026-08-07): §13 check 4 ('terminal race') automated, which surfaced that §6.5's own
+    'answered at the terminal' resolution heuristic had never actually been implemented - only the
+    30-minute TTL-expiry sweep existed (`permission-registry.ts`); a `hook-events.ts` comment claimed
+    'the two Permission* events feed the relay's resolution heuristic in permission-registry.ts
+    instead' but that code was never written. Until now, answering a permission prompt at the real
+    terminal instead of tapping Telegram left the card hanging for the full 30 minutes, then wrongly
+    sent it a `deny` verdict and marked it '⌛ expired' even though the operator had already said yes.
+    Implemented: `PermissionRegistry.resolveByToolMatch(slug, toolName)` pairs a pending card against
+    an incoming `PostToolUse`/`PostToolUseFailure`/`PermissionDenied` hook - the plan's own worked
+    example pairs on `(session_id, tool_name, deep-equal tool_input)`, but `PermissionRequest` carries
+    neither `session_id` nor structured `tool_input` (§6.5's own measured-payload finding), so this
+    pairs on `(slug, toolName)` instead (`slug` already identifies the one session as uniquely here)
+    and resolves oldest-first on a tie. Wired into `index.ts`'s `handleHookEvent`, editing the card to
+    '✅ Allowed: <tool> (answered at terminal)' / '⛔ Denied: <tool> (answered at terminal)' with the
+    keyboard stripped, no verdict sent over the pipe (the terminal answer already settled it on
+    Claude's side). Live automation (`scripts/telegram-automation/terminal-race-check.js`, using the
+    dev-only `AIBRIDGE_DEV_CONTROL_PORT` loopback endpoint to write a raw Enter into the session's own
+    PTY - a real ConPTY-level write, standing in for the operator's own keystroke) found a second real
+    bug on the very first live run: the heuristic could call `finalizePermissionMessage` under a
+    second after the card's own `sendMessage` - far faster than any human or scripted tap - and the
+    real Telegram Bot API intermittently 400s an edit that fast with `Bad Request: message to edit
+    not found` (reproduced 2/2 runs). Same class of fresh-object eventual-consistency flakiness
+    §4.5.2/0.69.0 already document for topics, now observed for messages; fixed with a 3-attempt retry
+    (1s/2s backoff) in `finalizePermissionMessage` scoped to that exact error string. Third live run
+    passed clean: card resolved to '✅ Allowed: Write (answered at terminal)' 2s after the simulated
+    terminal answer, no tap, no hang. 9 new tests (5 on `resolveByToolMatch`, 2 on the retry, 2 live
+    automation runs not counted) - 707 bridge-package tests pass (up from 700). Also fixed in this
+    sitting: `removeWorktree`'s Windows file-lock race from the 0.69.0 rate-storm run (see below)."
+  - "0.70.0 (2026-08-07): Fixed the smaller of the two known-but-unfixed bugs 0.69.0's rate-storm run
+    surfaced: `removeWorktree` (`worktree.ts`, `/rm`'s teardown path) now retries on a Windows
+    file-lock race instead of failing on the first loss. `/rm`/reconciliation kills the session's
+    `claude.exe` immediately before calling this, but Windows releases that process's open handles
+    into the worktree directory asynchronously - a removal attempted in the same tick routinely lost
+    the race with `error: failed to delete '...': Permission denied`, exactly as seen live for all
+    three throwaway rate-storm sessions. Fixed with a fixed backoff (300ms/600ms/1.2s/2.4s, ~4.5s max)
+    that retries only on that specific class of error (`Permission denied`/`EBUSY`/`resource busy or
+    locked`, split into a separately unit-tested `isWorktreeLockRaceError` classifier per §9's
+    silent-wrong bar - misclassifying either direction either retries a permanent git error
+    pointlessly or gives up on the transient race this exists to survive) and rethrows immediately on
+    anything else. The call site in `index.ts`'s `removeSessionRow` now awaits it. 5 new tests
+    (real removal, missing-worktree no-op, plus 3 on the classifier) - 700 bridge-package tests pass
+    (up from 695). Not independently live-re-verified against a fresh reconciliation-respawn race
+    (the original only reproduced under real concurrent load); the fix is a straightforward retry
+    around the exact failure mode logged live, not a new mechanism. The other 0.69.0-surfaced bug
+    (`TOPIC_ID_INVALID` on fresh topics) remains classified as harmless, not a bug to fix."
   - "0.69.0 (2026-08-06): §13 check 6 ('rate storm') automated end to end via a new
     `scripts/telegram-automation/rate-storm-check.js` - three throwaway `/new` sessions plus the
     existing idle `test-session` (four Sonnet units, exactly `WEIGHTED_CAP`), one ending in a real
@@ -5161,8 +5206,11 @@ Manual checks that automated tests cannot cover, run at the end of Phase 6a, and
    shows an accurate state and no phantom pending prompts.
 3. **Stale command.** Send "push it" while the machine is asleep. On resume it is confirmed, not
    executed.
-4. **Terminal race.** Trigger a permission prompt, answer it at the terminal, confirm the Telegram
-   buttons resolve rather than hanging.
+4. ~~**Terminal race.** Trigger a permission prompt, answer it at the terminal, confirm the Telegram
+   buttons resolve rather than hanging.~~ **Done (0.71.0), automated rather than manual** - see that
+   changelog entry. Automating this found the §6.5 resolution heuristic itself had never been built
+   (only the TTL-expiry path existed) and, once built, found a second real bug (a fast-path Telegram
+   edit race) on the very first live run - the check earning its keep twice over in one sitting.
 5. **Guard rails hold, all four paths - run against SeoWrite, the pilot project.** From the phone:
    (a) ask a session on `main` to commit - SeoWrite's PowerShell guard hard-blocks it and the block is
    visible in the topic; (b) ask it to `git commit --no-verify` on a feature branch - blocked; (c) ask

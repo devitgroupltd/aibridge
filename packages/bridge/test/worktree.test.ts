@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { ensureWorktree } from "../src/worktree.ts";
+import { ensureWorktree, isWorktreeLockRaceError, removeWorktree } from "../src/worktree.ts";
 
 let repoDir: string;
 let worktreesDir: string;
@@ -55,5 +55,42 @@ describe("ensureWorktree", () => {
     // leaves behind) - a fresh attempt at the same slug must still succeed.
     expect(() => ensureWorktree(repoDir, worktreePath, "claude/test-session-1")).not.toThrow();
     expect(existsSync(worktreePath)).toBe(true);
+  });
+});
+
+describe("removeWorktree", () => {
+  test("removes a real worktree", async () => {
+    const worktreePath = path.join(worktreesDir, "test-session");
+    ensureWorktree(repoDir, worktreePath, "claude/test-session-1");
+
+    await removeWorktree(repoDir, worktreePath);
+
+    expect(existsSync(worktreePath)).toBe(false);
+  });
+
+  test("a missing worktree is a no-op, not an error", async () => {
+    const worktreePath = path.join(worktreesDir, "never-created");
+    await expect(removeWorktree(repoDir, worktreePath)).resolves.toBeUndefined();
+  });
+});
+
+describe("isWorktreeLockRaceError", () => {
+  // The exact classifier removeWorktree's retry loop branches on (§9's "silent-wrong" bar) -
+  // misclassifying either direction either retries a permanent failure pointlessly or gives up on
+  // the transient race this was added to survive.
+  test("recognizes Windows' 'Permission denied' worktree-removal message", () => {
+    expect(
+      isWorktreeLockRaceError("error: failed to delete 'C:/data/worktrees/x': Permission denied\n"),
+    ).toBe(true);
+  });
+
+  test("recognizes EBUSY and POSIX 'resource busy or locked'", () => {
+    expect(isWorktreeLockRaceError("EBUSY: resource busy or locked, unlink 'x'")).toBe(true);
+    expect(isWorktreeLockRaceError("resource busy or locked")).toBe(true);
+  });
+
+  test("does not misclassify an unrelated git error as the lock race", () => {
+    expect(isWorktreeLockRaceError("fatal: 'x' is not a working tree")).toBe(false);
+    expect(isWorktreeLockRaceError("")).toBe(false);
   });
 });
