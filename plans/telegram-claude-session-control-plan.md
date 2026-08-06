@@ -1,7 +1,7 @@
 ---
-version: 0.55.0
+version: 0.59.0
 status: solid
-last_modified_utc: 2026-08-06T00:30:00Z
+last_modified_utc: 2026-08-06T09:20:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,70 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.59.0 (2026-08-06): Fixed the §7.2 point 2 gap found live in 0.58.0 (3-day execution time limit
+    left on every autostart task), and found + fixed a second, more serious one while live-testing the
+    fix: `/restart` silently failed to survive against a Task-Scheduler-launched Bridge. Root cause was
+    two-fold. (1) Windows runs a scheduled task's process inside a Job Object; `child_process.spawn`'s
+    `detached: true` on Windows only sets `CREATE_NEW_PROCESS_GROUP`, not a job-breakaway flag, so
+    `/restart`'s raw detached successor was killed the instant its Task-Scheduler-tracked parent exited,
+    before it could finish starting - no crash, no error, total silence, and this was the first time
+    `/restart` had ever been exercised against an autostart-launched instance. Fixed by having
+    `/restart` re-trigger the *same registered task* via `schtasks /Run` (`buildRunArgs`, new) instead
+    of a raw spawn, which launches a wholly independent action outside the dying job; falls back to the
+    old direct-spawn behaviour when autostart isn't registered (no job to escape in a manually-started
+    dev Bridge anyway). (2) That fix alone still failed live: `schtasks /Create`'s own default
+    `MultipleInstances` policy is `IgnoreNew`, so the `/Run` re-trigger was silently dropped while the
+    dying old instance was still marked \"Running\", leaving nothing running at all. Fixed by setting
+    it to `Parallel`. Both task-settings fixes (this one and 0.58.0's `ExecutionTimeLimit`) now live in
+    one `buildFixTaskSettingsScript` (renamed from `buildDisableTimeLimitScript`), run automatically by
+    `/autostart install` right after `/Create` - a fresh `/autostart install` on any other machine now
+    gets both fixes with no separate step. All three mechanisms (buildRunArgs, ExecutionTimeLimit,
+    MultipleInstances) live-verified against the real registered task on this host, including a full
+    kill-relaunch-via-schtasks-/Run-then-/restart cycle that previously failed and now survives with the
+    session continuously idle across the restart (not fresh-spawned). Also found and corrected two
+    self-inflicted mistakes made while live-testing this, recorded for the record rather than quietly
+    fixed: an accidentally-created empty `bridge.db` stray file (wrong filename in an ad-hoc query,
+    deleted), and a real `claude.exe` process wrongly killed on the strength of the Bridge's own
+    'orphaned process' warning without independently checking its settings path first - that warning
+    can be a false positive immediately after a restart (`findOrphanProcesses` only excludes pids from
+    non-dead rows, and a freshly-resumed row's pid can lag the scan by a beat), and killing it turned a
+    real, healthy session dead. Not a code bug fixed here - recorded as a live lesson: verify command-
+    line/slug independently before acting on an orphan warning taken right after a restart. `bun test`
+    (575 pass, up from 573) and `tsc --noEmit` clean."
+  - "0.58.0 (2026-08-06): §13 check 1 (cold boot) live-verified for the first time and passed. Real
+    Windows reboot, autologon brought the desktop up, the §7.2 logon-trigger Task Scheduler task fired
+    unattended (no manual start), and the operator's real `/ls` from Telegram got a working reply.
+    Cross-checked at the process level, not just the Telegram transcript: `bun.exe run
+    packages/bridge/src/index.ts` (PID 5756) launched at 8:38:59 AM exactly matching the task's own
+    `Last Run Time`, `/ls` answered by 8:39 AM - under a minute end-to-end, well inside the 2-minute
+    bar. `schtasks /Query` independently confirmed `Status: Running` at the same timestamp. Both
+    previously-running sessions (`test-session`, `give-me-a-unique-one-line`) were resumed automatically
+    via reconciliation, channel-server processes spawned within seconds of the Bridge itself starting.
+    Separately found and left open (not blocking): the registered task's `Stop Task If Runs X Hours and
+    X Mins` is still the schtasks default of 72:00:00 (3 days) - §7.2 point 2 explicitly calls for this
+    to be disabled and `autostart.ts`'s `buildCreateArgs` does not do so; `schtasks` has no plain flag
+    for it, needs `/Change` or an XML-based `/Create`. Also added `setup-windows.ps1`'s missing
+    reminder to run `/autostart install` from Telegram once the Bridge is up - the script itself can't
+    do this (registration needs a running Bridge to receive the command), and nothing in its 'still
+    needs a human' list said so before this pass."
+  - "0.57.0 (2026-08-06): A remote `/reboot` command (OS-level reboot, distinct from `/restart` which
+    only restarts the Bridge process) was proposed and explicitly deferred, same discipline as 0.56.0's
+    Phase 6b deferral - recorded so it isn't silently re-proposed or silently forgotten. Considered
+    design: a read-only autologon precondition check (HKLM Winlogon `AutoAdminLogon`) before allowing
+    it, so a remote reboot can't strand the fleet with no logged-in session to re-trigger the §7.2
+    logon task. Not built because the actual trigger case is narrow (OS degraded but still responsive
+    enough to receive the command - a true hang defeats it the same way it defeats every other Telegram
+    command) and no real incident has needed it yet; `/restart` already covers the far more common
+    Bridge-is-broken case. Revisit if a concrete incident (stuck Windows Update, memory pressure across
+    long-running sessions) actually strands a session while the operator is away from the desk - build
+    the autologon check at that point, not before."
+  - "0.56.0 (2026-08-06): Phase 6b (the WSL2 migration) explicitly deferred to the far future, per
+    operator direction - not skipped, not deprioritized-by-silence. §12's Phase 6b section and §13
+    check 7 already named its real trigger conditions (unattended overnight runs, an uncomfortably
+    broad allowlist, or a second target repo); none has occurred, so there is nothing to schedule
+    yet. Recorded here so a future reader doesn't mistake continued deferral for an oversight. Phase
+    6a's own manual §13 checks (1-6, 8) remain open and are unaffected by this - 6a's exit doesn't
+    depend on 6b."
   - "0.55.0 (2026-08-06): deleted the old --dangerously-load-development-channels/.mcp.json launch
     path from session-launcher.ts, per the operator's explicit request rather than leaving it as
     dead-but-present code now that 0.54.0 proved the plugin form is the real default. Removed:
@@ -3444,6 +3508,13 @@ Two Windows-specific costs to accept:
 4. Session PTYs are children of the Bridge, so there is nothing else to start. A Bridge restart does
    **not** kill running sessions if they are spawned detached, and §2.5's reconnect logic exists
    precisely so they survive it.
+5. **`/restart`'s self-respawn must re-trigger this same task (`schtasks /Run`), not raw-spawn a
+   successor.** A scheduled task's process runs inside a Windows Job Object; a plain detached
+   `child_process.spawn` successor is killed the instant the Task-Scheduler-tracked parent exits,
+   silently, before it finishes starting. This also needs the task's `MultipleInstances` policy set to
+   `Parallel` (schtasks' own default, `IgnoreNew`, drops the re-trigger while the dying old instance is
+   still marked "Running"). Both live-verified 2026-08-06 (0.59.0) - see that changelog entry for the
+   full failure mode. `/autostart install` sets this and point 2's time limit automatically now.
 
 **The one honest gap: this starts at logon, not at boot.** After a reboot the machine must reach a
 logged-in desktop session before the bot answers. The alternatives are worse than the gap: *Run whether
@@ -3451,6 +3522,15 @@ user is logged on or not* puts the task in session 0, where ConPTY behaviour is 
 should assume and where the Claude Code credential store in the user profile may not resolve. Options,
 in order: accept it and reboot deliberately; or enable autologon with the workstation locked
 immediately afterwards. **Verification item, not a design decision** - §13 check 1 measures it.
+
+**A remote `/reboot` command (OS-level, distinct from `/restart`'s Bridge-process-only restart) was
+considered and deliberately deferred (0.57.0) - not built.** It would only help in the narrow band where
+Windows is degraded but still responsive enough to receive the command at all; a genuine hang defeats it
+the same way it defeats every other Telegram command, which is the scenario it would most want to cover.
+If built, it must gate on a read-only autologon precondition check first (`AutoAdminLogon` in
+`HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon`) - autologon is what stands between a
+remote reboot and stranding the whole fleet with nobody logged in to re-trigger this section's logon
+task. Revisit only once a real incident (not a hypothetical) needs it.
 
 ### 7.3 A target repo's own guard hook needs no work from aibridge
 
@@ -4632,7 +4712,13 @@ unattended running defensible, and **should not be skipped just because Phases 1
   silent no-op, not a hang. Phase 6a is now fully closed.
 
 **6b, the migration (§7.6),** triggered by wanting unattended overnight runs, by prompts-per-hour
-showing an uncomfortably broad allowlist, or by adding a repo other than this one:
+showing an uncomfortably broad allowlist, or by adding a repo other than this one.
+
+**Deliberately deferred to the far future (0.56.0) - not skipped, not lost track of.** None of the
+three trigger conditions above has occurred as of this sitting. The operator made this call
+explicitly rather than it falling out by silence; re-read this section when one of the triggers
+actually fires, not on a calendar. Phase 6a's own exit and its §13 manual checks (1-6, 8) do not
+depend on this and remain the nearer-term work.
 
 - WSL2 install and the reboot; sandbox dependencies; the AppArmor profile if the sysctl says so.
 - For SeoWrite specifically: `guard-git-write.sh` at parity, pinned by its own `test_claude_hook_guards`
@@ -4650,9 +4736,12 @@ showing an uncomfortably broad allowlist, or by adding a repo other than this on
 Manual checks that automated tests cannot cover, run at the end of Phase 6a, and check 7 again after
 6b:
 
-1. **Cold boot.** Reboot Windows, log in, touch nothing. Within two minutes the bot answers `/ls`.
+1. ~~**Cold boot.** Reboot Windows, log in, touch nothing. Within two minutes the bot answers `/ls`.
    Note that "log in" is load-bearing on this host and is the §7.2 gap being measured, not an
-   incidental step: record how long after the desktop appears the bot becomes responsive.
+   incidental step: record how long after the desktop appears the bot becomes responsive.~~ **Done**
+   (0.58.0): real reboot, autologon, logon-trigger task fired unattended, `/ls` answered under a
+   minute after desktop login - process-level cross-check confirmed the Bridge PID's start time matched
+   the task's own `Last Run Time`, not a manually-started process.
 2. **Sleep and resume.** Close the lid for 30 minutes with a session mid-turn. On resume, the topic
    shows an accurate state and no phantom pending prompts.
 3. **Stale command.** Send "push it" while the machine is asleep. On resume it is confirmed, not

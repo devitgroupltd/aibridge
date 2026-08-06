@@ -7,7 +7,7 @@ import type { ChannelMetaFields, HookEventMessage } from "@aibridge/protocol";
 import { renderChannelTag } from "@aibridge/protocol";
 import { resolveAskCallback, renderAskAnsweredCard, renderAskCancelledCard } from "./ask-callback.ts";
 import { ABOUT_TOPICS, buildAboutKeyboard, isAboutCommand, renderAbout, resolveAboutCallback } from "./about.ts";
-import { buildCreateArgs, buildDeleteArgs, buildQueryArgs, parseQueryOutput, renderAutostartStatus, TASK_NAME } from "./autostart.ts";
+import { buildCreateArgs, buildDeleteArgs, buildFixTaskSettingsScript, buildQueryArgs, buildRunArgs, parseQueryOutput, renderAutostartStatus, TASK_NAME } from "./autostart.ts";
 import {
   buildCmdShimText,
   buildCommandKeyboard,
@@ -1494,8 +1494,17 @@ async function main(): Promise<void> {
     } catch (err) {
       log("WARN", `failed to send /restart confirmation: ${(err as Error).message}`);
     }
-    log("INFO", "/restart requested - spawning a detached successor and exiting");
-    spawn(process.execPath, process.argv.slice(1), { detached: true, stdio: "ignore" }).unref();
+    log("INFO", "/restart requested - relaunching and exiting");
+    // A raw detached spawn is killed instantly if this process is itself a Task-Scheduler-launched
+    // task (Windows Job Object containment - see buildRunArgs's own note) - re-run the same registered
+    // task instead when it exists, so the successor is a fresh, independent Task Scheduler action
+    // rather than a doomed child of this one. Only reachable when /autostart install has been run;
+    // falls back to the direct spawn otherwise, which is correct for a manually-started dev Bridge
+    // where there is no job to escape in the first place.
+    const ranViaTask = !(await runSchtasks(buildRunArgs())).failed;
+    if (!ranViaTask) {
+      spawn(process.execPath, process.argv.slice(1), { detached: true, stdio: "ignore" }).unref();
+    }
     process.exit(0);
   }
 
@@ -1658,6 +1667,17 @@ async function main(): Promise<void> {
     });
   }
 
+  /** Runs a PowerShell one-liner and reports success/failure the same shape as `runSchtasks` -
+   * `schtasks.exe` alone can't fix the two task-settings defaults `buildFixTaskSettingsScript` targets,
+   * so `/autostart install` needs this second tool as well. */
+  function runPowershell(script: string): Promise<{ stderr: string; failed: boolean }> {
+    return new Promise((resolve) => {
+      execFile("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true }, (err, _stdout, stderr) => {
+        resolve({ stderr: stderr ?? "", failed: err !== null });
+      });
+    });
+  }
+
   /** `/autostart status|install|uninstall`: §7.2's Task Scheduler entry, made reachable from
    * Telegram instead of only from the desk. `install` registers a logon-trigger task under this
    * account's own token (`/RL LIMITED`), which needs no admin rights. */
@@ -1676,9 +1696,17 @@ async function main(): Promise<void> {
         const entryScript = path.join(import.meta.dirname, "index.ts");
         const result = await runSchtasks(buildCreateArgs(resolveBunExecutable(), entryScript));
         if (result.failed) throw new Error(result.stderr.trim() || "schtasks /Create failed");
+        // schtasks /Create leaves two defaults that would bite later (§7.2 point 2's 3-day execution
+        // limit, and a "Multiple Instances" policy that silently breaks /restart's buildRunArgs path -
+        // see buildFixTaskSettingsScript's own doc comment for both). Best-effort: the task is already
+        // registered and usable either way, so a failure here is reported, not thrown, and doesn't
+        // undo the install.
+        const settingsResult = await runPowershell(buildFixTaskSettingsScript(TASK_NAME));
         confirmSessionCommand(
           topicId,
-          `Registered "${TASK_NAME}" as a logon-trigger scheduled task (§7.2) - starts the Bridge at next log-on, current-user scope, no admin rights needed.`,
+          settingsResult.failed
+            ? `Registered "${TASK_NAME}" as a logon-trigger scheduled task (§7.2), but fixing its execution-time-limit/multiple-instances defaults failed: ${settingsResult.stderr.trim() || "unknown error"}. It will still start at logon, but a long-running fleet risks the 3-day kill and /restart may not survive - run /autostart install again once fixed, or fix both manually in Task Scheduler.`
+            : `Registered "${TASK_NAME}" as a logon-trigger scheduled task (§7.2) - starts the Bridge at next log-on, current-user scope, no admin rights needed. Its 3-day execution time limit is disabled and multiple-instances is set to Parallel, so a long-running fleet won't get killed on the fourth day and /restart works reliably.`,
         );
         return;
       }

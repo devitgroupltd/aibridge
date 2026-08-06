@@ -405,6 +405,7 @@ $manual = @(
     "Monthly spend limit (P-5): set under claude.ai Settings -> Usage before any unattended run."
     "Claude Code login: run 'claude' once interactively and complete the browser login, as the account the Bridge will run as."
     "Fleet SSH deploy key: add the .pub (see 'Fleet SSH key' above) as a deploy key on every repo registered in $reposToml."
+    "Autostart (§7.2): nothing above registers the logon Task Scheduler entry - this script can't do it (chicken-and-egg: registration is a Telegram command, so the Bridge has to be running first). Once it's up, send /autostart install from the control topic, then /autostart status to confirm. Skip this and the Bridge will not come back after a reboot."
 )
 if (-not ($envValues['CONTROL_BOT_TOKEN'] -and $envValues['FEED_BOT_TOKEN'] -and $envValues['SUPERGROUP_CHAT_ID'])) {
     $manual += "Telegram secrets: fill in the remaining blank value(s) in $envFile - re-run this script and it will prompt for just those."
