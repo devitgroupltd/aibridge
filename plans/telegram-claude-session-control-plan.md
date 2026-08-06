@@ -1,7 +1,7 @@
 ---
-version: 0.59.0
+version: 0.60.0
 status: solid
-last_modified_utc: 2026-08-06T09:20:00Z
+last_modified_utc: 2026-08-06T15:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,43 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.60.0 (2026-08-06): New §3.5, natural-language command routing (text and voice) - free text or a
+    voice transcript that isn't already an exact `/command` gets one forced-structured-output
+    classification call before falling through to \"unrecognised\"/forwarded-to-Claude, covering the 16
+    fleet commands + `/model`/`/mode`/`/effort` (not yet repo-specific `.claude/commands`/`skills`,
+    scoped out - see §3.5). Two live findings drove the design away from the original single-backend
+    plan: (1) `claude -p` (the CLI, using the existing subscription) measured at 3.5-5.4s per call and
+    ~20-30k tokens of the CLI's own fixed system-prompt/tool-schema overhead even from an empty
+    directory with nothing else to load, vs. ~200-500ms for a direct `@anthropic-ai/sdk` call - so both
+    a `\"cli\"` backend (subscription, no new billing, slower, eats into the fleet's own Claude Code
+    usage budget) and an `\"api\"` backend (`@anthropic-ai/sdk`, a funded ANTHROPIC_API_KEY, faster, a
+    small but real per-message dollar cost) were built, selectable per operator instance (§4.1.1) via
+    `/router api|cli` (settings-store.ts, live, no restart). (2) Per explicit operator direction,
+    `backend` never auto-switches to `\"api\"` just because a key is configured - it always starts as
+    `\"cli\"` unless `NL_ROUTER_BACKEND=api` or a live `/router api`, so provisioning a key never
+    silently starts spending money. A third option (a persistent, periodically-restarted Claude Code
+    session doing the classification instead of a stateless call) was considered and rejected: the
+    measured latency is dominated by the CLI's internal tool-loop turns, not process-spawn time, so a
+    live process wouldn't remove it; Anthropic's server-side prompt caching already reuses the fixed
+    system-prompt/tool-schema overhead across independent stateless calls (confirmed live - a second,
+    unrelated `claude -p` call reused 18,617 cached tokens from a first one moments earlier) without
+    needing a process to keep alive; and a shared live session would serialise concurrent messages from
+    different topics behind one conversation turn, which independent stateless calls don't. Destructive
+    commands (single-slug and every `/rm` form of `kill`/`rm`, `restart`, `deploy`, `repos rm` -
+    deliberately broader than the CLI's own confirm-gated set of just `kill --all`/`rm --all`, since an
+    NL match is inherently less certain than a typed command) show a confirm card first by default
+    (nl-confirm.ts), toggleable via `/assist on|off` or the card's own \"don't ask again\" button
+    (persisted in a new `bridge_settings` key/value table in the same aibridge.db - settings-store.ts).
+    Named `/assist` (not the original `/nlconfirm`) and `/router` (not `/nlrouter`/backend-in-`/assist`)
+    after a naming pass with the operator. New files: nl-router.ts, nl-confirm.ts, settings-store.ts;
+    new fleet commands `/assist`, `/router`; new dependency `@anthropic-ai/sdk`; new optional secrets
+    `ANTHROPIC_API_KEY`/`NL_ROUTER_MODEL`/`NL_ROUTER_BACKEND` (config.ts). 616 tests pass (up from 575).
+    Live-verified against the real Bridge/Telegram group post-restart: `/assist` and `/router` both
+    report status correctly (backend defaulted to `cli` with no key configured, as designed); \"show me
+    the current sessions\" in the control topic correctly executed `/ls` immediately (non-destructive);
+    \"restart\" correctly produced the run/don't-ask-again/cancel confirm card instead of restarting
+    immediately (destructive); tapping Cancel finalised the card (\"Cancelled - nothing was changed\")
+    and left the Bridge running, confirmed by a follow-up `/ls` still answering normally."
   - "0.59.0 (2026-08-06): Fixed the §7.2 point 2 gap found live in 0.58.0 (3-day execution time limit
     left on every autostart task), and found + fixed a second, more serious one while live-testing the
     fix: `/restart` silently failed to survive against a Task-Scheduler-launched Bridge. Root cause was
@@ -2088,6 +2125,57 @@ because `startWhisperServer` checks for the binary and model file first: on a ma
 handle instead of spawning a nonexistent process and retry-looping every 3s forever. Running the
 setup step is what actually turns transcription on in practice, not a separate `.env` edit -
 `VOICE_ENABLED=false` exists only for an operator who wants to suppress the warning entirely.
+
+### 3.5 Natural-language command routing (added 0.60.0)
+
+Free text (typed, or a voice transcript re-entering `dispatchInboundMessage` via §3.4's own Send
+button) that isn't already an exact `/command` gets one forced-structured-output classification call
+before falling through to today's "unrecognised control-topic command" / forward-to-Claude behaviour.
+Covers the 16 fleet commands plus `/model`/`/mode`/`/effort` - **not** repo-specific
+`.claude/commands`/`.claude/skills` (up to 40+ per project), since offering all of those as router
+tools on every single message would balloon per-message token cost for a set that already has its own
+discovery path (`/commands`, `/skills`, or typing the exact `/name`).
+
+**Two backends, live-measured 2026-08-06, selectable per operator instance (§4.1.1) via `/router
+api|cli` - neither is a universal default:**
+
+- **`"cli"`** (the default) - `claude -p --json-schema`, using the operator's existing Claude Code
+  subscription. No new billing. Measured live at 3.5-5.4s per call and ~20-30k tokens of the CLI's own
+  fixed system-prompt/tool-schema overhead *even from an empty directory with nothing else to load* -
+  real, but charged against the subscription's own usage/rate-limit budget (§10.5's `/budget`), not a
+  separate dollar cost.
+- **`"api"`** - a direct `@anthropic-ai/sdk` call (`tool_choice: { type: "tool", name: "route" }`, so
+  the response is always the schema's shape, never free text to parse). ~200-500ms per call, needs a
+  funded Anthropic Console API key (`ANTHROPIC_API_KEY`, `%APPDATA%\aibridge\.env`) - a real but small
+  per-message dollar cost, separate from the Claude Code subscription.
+
+**A configured key never silently switches the backend.** `backend` always starts as `"cli"` at
+startup regardless of whether `ANTHROPIC_API_KEY` is set, unless `NL_ROUTER_BACKEND=api` in `.env` -
+per explicit operator direction, provisioning a key must never be the thing that starts spending real
+money on its own. `/router api` / `/router cli` switch live, no restart, either direction, any time
+(`settings-store.ts`'s `nl_router_backend` key).
+
+**A persistent, periodically-restarted classification session was considered and rejected.** The
+measured latency above is dominated by the CLI's internal tool-loop turns (`num_turns: 2` even for a
+trivial classification), not process-spawn time, so keeping one process alive wouldn't remove it.
+Anthropic's server-side prompt caching already reuses the fixed system-prompt/tool-schema overhead
+across independent stateless calls for free - live-confirmed: a second, unrelated `claude -p` call
+reused 18,617 cached tokens from a first one moments earlier, no shared process involved. And a shared
+live session would serialise concurrent messages from different topics behind one conversation turn,
+which independent per-message calls never do. Stateless-per-call stays the design.
+
+**Destructive commands get a confirm card first, by default.** Broader than the CLI's own confirm-
+gated set (§4.2's `/kill --all`/`/rm --all` only, via `fleet-confirm.ts`) - single-slug and every `/rm`
+form of `kill`/`rm`, `restart`, `deploy`, and `repos rm` all count here, since an NL match is inherently
+less certain than an operator typing the exact command. The card (`nl-confirm.ts`) offers "✅ Yes, run
+it" / "🔇 Yes, don't ask again" / "❌ Cancel" - the middle option both runs the command and flips the
+toggle off. `/assist [on|off]` is the typeable equivalent, and the toggle persists across a Bridge
+restart in a new `bridge_settings` key/value table added to the existing `aibridge.db` (`settings-
+store.ts`) - one file, not a second database.
+
+**Naming.** Landed as `/assist` (confirm toggle) and `/router` (backend switch), not the originally
+drafted `/nlconfirm`/backend-folded-into-`/assist` - both renamed after a short naming pass with the
+operator toward names that read naturally in a sentence ("/assist off", "/router api").
 
 ---
 

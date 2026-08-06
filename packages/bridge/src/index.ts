@@ -53,6 +53,10 @@ import type { PendingStaleConfirm } from "./stale-confirm.ts";
 import { buildVoiceConfirmKeyboard, resolveVoiceConfirmCallback, VoiceConfirmRegistry } from "./voice-confirm.ts";
 import type { PendingVoiceConfirm } from "./voice-confirm.ts";
 import { startWhisperServer, transcribeVoiceNote } from "./voice-transcribe.ts";
+import { buildNlConfirmKeyboard, NlConfirmRegistry, resolveNlConfirmCallback } from "./nl-confirm.ts";
+import type { PendingNlConfirm } from "./nl-confirm.ts";
+import { routeText } from "./nl-router.ts";
+import { SettingsStore } from "./settings-store.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import {
   botCommandList,
@@ -110,7 +114,7 @@ import {
   resolveModeCallback,
   resolveModelCallback,
 } from "./session-commands.ts";
-import type { Mode } from "./session-commands.ts";
+import type { Mode, SessionCommand } from "./session-commands.ts";
 import { stateForHookEvent } from "./session-state-transitions.ts";
 import { formatUsagePanel } from "./usage-panel.ts";
 import { isValidTransition, SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
@@ -199,7 +203,18 @@ async function main(): Promise<void> {
 
   const nowIso = () => new Date().toISOString();
 
-  const sessionStore = new SessionStore(process.env.AIBRIDGE_DB_PATH ?? path.join(STATE_DIR, "aibridge.db"));
+  const dbPath = process.env.AIBRIDGE_DB_PATH ?? path.join(STATE_DIR, "aibridge.db");
+  const sessionStore = new SessionStore(dbPath);
+  // nl-router.ts's confirm gate (nl-confirm.ts) - a fleet-wide preference, not per-session, same
+  // reasoning `/budget`/`/settings` staying control-topic-only already established. Lives in the
+  // same aibridge.db file, not a second database (settings-store.ts).
+  const settingsStore = new SettingsStore(dbPath);
+  let assistEnabled = settingsStore.get("assist_enabled", "true") !== "false";
+  // Live override for config.ts's nlRouter.backend startup default - see that field's own doc
+  // comment for why an API key's mere presence must never switch this on its own. Falls back to
+  // the config default (always "cli" unless NL_ROUTER_BACKEND=api) when nothing's been switched
+  // live yet.
+  let nlRouterBackend: "api" | "cli" = settingsStore.get("nl_router_backend", config.nlRouter.backend) === "api" ? "api" : "cli";
   if (!sessionStore.get(config.phase1.slug)) {
     sessionStore.insert({
       slug: config.phase1.slug,
@@ -326,6 +341,9 @@ async function main(): Promise<void> {
   // dispatched directly, only replayed from a tap on its own Send/Re-record/Type-instead card
   // (voice-confirm.ts), same shape as the stale-inbound confirm above.
   const voiceConfirmRegistry = new VoiceConfirmRegistry();
+  // nl-router.ts's destructive-command confirm gate (nl-confirm.ts) - own registry, same
+  // add/resolve-pops-and-checks-TTL shape as fleetConfirmRegistry/voiceConfirmRegistry above.
+  const nlConfirmRegistry = new NlConfirmRegistry();
   const voiceServer = config.voice.enabled ? startWhisperServer(config.voice, log) : null;
 
   function maybeSetState(slug: string, target: SessionState): void {
@@ -1276,7 +1294,7 @@ async function main(): Promise<void> {
       const suggestedName = guessAttachmentFilename(kind, fileName, mimeType);
       const absPath = writeAttachmentToInbox(STATE_DIR, route.slug, suggestedName, bytes);
       const announcement = buildAttachmentAnnouncement(kind, absPath, caption);
-      dispatchInboundMessage(messageId, announcement, threadId, isControl, route, route.slug, from);
+      void dispatchInboundMessage(messageId, announcement, threadId, isControl, route, route.slug, from);
     } catch (err) {
       log("WARN", `attachment download failed: ${(err as Error).message}`);
       confirmSessionCommand(threadId, `Couldn't download that ${kind} - try sending it again.`);
@@ -1718,6 +1736,233 @@ async function main(): Promise<void> {
     }
   }
 
+  /** `/assist [on|off]` - whether an NL-matched destructive command shows a confirm card first
+   * (nl-confirm.ts). `assistEnabled` is the in-memory copy every confirm-gate check reads;
+   * `settingsStore` is only touched on an actual change, matching `feed_detail`/`feed_verbose`'s
+   * own "in-memory for reads, persisted on write" shape (session-store.ts). */
+  function handleAssistCommand(cmd: Extract<FleetCommand, { kind: "assist" }>, topicId: number | undefined): void {
+    if (cmd.action === "status") {
+      confirmSessionCommand(topicId, `Natural-language destructive-command confirmation is ${assistEnabled ? "on" : "off"}.`);
+      return;
+    }
+    assistEnabled = cmd.action === "on";
+    settingsStore.set("assist_enabled", assistEnabled ? "true" : "false");
+    confirmSessionCommand(
+      topicId,
+      assistEnabled
+        ? "Natural-language destructive-command confirmation is now on - kill/rm/restart/deploy/repos-rm matched from plain text or voice will ask first."
+        : "Natural-language destructive-command confirmation is now off - kill/rm/restart/deploy/repos-rm matched from plain text or voice will run immediately.",
+    );
+  }
+
+  /** `/router [api|cli]` - live switch for the NL-router backend, no restart needed either
+   * direction. Switching to "api" is refused (not silently downgraded to "cli") when no key is
+   * configured - the operator asked for the fast/paid path specifically, so a silent no-op would
+   * be more confusing than telling them what's missing. */
+  function handleRouterBackendCommand(cmd: Extract<FleetCommand, { kind: "router" }>, topicId: number | undefined): void {
+    if (cmd.action === "status") {
+      confirmSessionCommand(
+        topicId,
+        `Natural-language routing backend: ${nlRouterBackend}${nlRouterBackend === "cli" ? " (your Claude Code subscription)" : " (funded ANTHROPIC_API_KEY)"}.`,
+      );
+      return;
+    }
+    if (cmd.action === "api" && !config.nlRouter.apiKey) {
+      confirmSessionCommand(topicId, "No ANTHROPIC_API_KEY configured in .env - add one first, then /router api.");
+      return;
+    }
+    nlRouterBackend = cmd.action;
+    settingsStore.set("nl_router_backend", nlRouterBackend);
+    confirmSessionCommand(
+      topicId,
+      nlRouterBackend === "api"
+        ? "Natural-language routing now uses the API backend - faster, but each unmatched message has a small real cost."
+        : "Natural-language routing now uses your Claude Code subscription (cli backend) - no extra cost, but slower per message.",
+    );
+  }
+
+  /** Short human-readable label for an NL-matched command's confirm card and its finalize message
+   * - not exhaustive-per-field (e.g. `/new`'s prompt text isn't echoed back), just enough for the
+   * operator to recognise what they're about to approve. */
+  function describeNlCommand(command: FleetCommand | SessionCommand): string {
+    switch (command.kind) {
+      case "kill":
+        return command.all ? "/kill --all" : `/kill${command.slug ? ` ${command.slug}` : ""}`;
+      case "rm":
+        if (command.bulk?.mode === "all") return "/rm --all";
+        if (command.bulk?.mode === "dead") return "/rm --dead";
+        if (command.bulk?.mode === "prefix") return `/rm --prefix ${command.bulk.prefix}`;
+        return `/rm${command.slug ? ` ${command.slug}` : ""}`;
+      case "restart":
+        return "/restart";
+      case "deploy":
+        return `/deploy ${command.slug}`;
+      case "repos":
+        return command.action === "rm" ? `/repos rm ${command.name}` : "/repos";
+      default:
+        return `/${command.kind}`;
+    }
+  }
+
+  /** Executes an NL-matched command that either wasn't destructive, or was and got confirmed -
+   * routes to the exact same handlers a typed `/command` or `/model`/`/mode`/`/effort` would use
+   * (`dispatchFleetCommand` above, `applyModelSwitch`/`applyModeSwitch`/`applyEffortSwitch`), never
+   * a separate copy. `nl-router.ts`'s `mapRouterOutput` already guarantees a `session_*` kind never
+   * arrives without `currentSlug`/`threadId` set (`allowedKinds`'s `hasSession` gate), so the guard
+   * here is defense in depth, not load-bearing. */
+  function executeMatchedCommand(command: FleetCommand | SessionCommand, threadId: number | undefined, isControl: boolean, currentSlug: string | undefined): void {
+    if (command.kind === "model" || command.kind === "mode" || command.kind === "effort") {
+      if (!currentSlug || threadId === undefined) return;
+      if (command.kind === "model") applyModelSwitch(currentSlug, threadId, command.model);
+      else if (command.kind === "effort") applyEffortSwitch(currentSlug, threadId, command.effort);
+      else applyModeSwitch(currentSlug, threadId, command.mode);
+      return;
+    }
+    dispatchFleetCommand(command, threadId, isControl, currentSlug);
+  }
+
+  /** Posts the run/don't-ask-again/cancel card for an NL-matched *destructive* command
+   * (nl-confirm.ts) and registers it - mirrors `postFleetConfirm`'s shape exactly. */
+  async function postNlConfirm(command: FleetCommand | SessionCommand, threadId: number | undefined, currentSlug: string | undefined): Promise<void> {
+    const id = randomUUID().slice(0, 8);
+    try {
+      const sent = await controlBot.sendMessage(config.supergroupChatId, threadId, `🤖 I read that as ${describeNlCommand(command)} - run it?`, {
+        inline_keyboard: buildNlConfirmKeyboard(id),
+      });
+      nlConfirmRegistry.add({ id, command, threadId, currentSlug, messageId: sent.message_id });
+    } catch (err) {
+      log("WARN", `failed to post NL-confirm card: ${(err as Error).message}`);
+    }
+  }
+
+  async function finalizeNlConfirmMessage(pending: PendingNlConfirm, text: string): Promise<void> {
+    if (!controlBot.editMessageText) return;
+    try {
+      await controlBot.editMessageText(config.supergroupChatId, pending.messageId, text, { inline_keyboard: [] });
+    } catch (err) {
+      log("WARN", `failed to finalize NL-confirm message: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * The one entry point for both of `dispatchInboundMessage`'s fallthrough branches (no session /
+   * forward-to-session) - tries the NL router, and only calls `onNoMatch` (today's existing
+   * behaviour for that branch) when it genuinely didn't match anything. Never throws and never
+   * takes longer than the router itself does to fail - `routeText` (nl-router.ts) already catches
+   * every backend error internally and resolves `{ matched: false }`.
+   */
+  async function routeOrFallback(
+    text: string,
+    ctx: { isControl: boolean; hasSession: boolean },
+    threadId: number | undefined,
+    isControl: boolean,
+    currentSlug: string | undefined,
+    onNoMatch: () => void,
+  ): Promise<void> {
+    if (!config.nlRouter.enabled) {
+      onNoMatch();
+      return;
+    }
+    const result = await routeText(text, ctx, { ...config.nlRouter, backend: nlRouterBackend }, log);
+    if (!result.matched) {
+      onNoMatch();
+      return;
+    }
+    if (result.destructive && assistEnabled) {
+      void postNlConfirm(result.command, threadId, currentSlug);
+      return;
+    }
+    executeMatchedCommand(result.command, threadId, isControl, currentSlug);
+  }
+
+  /**
+   * The exact-syntax `/command` switch, extracted so both a typed `/command` (`parseFleetCommand`,
+   * below) and an NL-matched command (nl-router.ts, wired further down) execute through the exact
+   * same code path - no separate copy to keep in sync. `isControl` mirrors the same two inline
+   * checks (`/new`, `/budget`) `dispatchInboundMessage` always ran; an NL match can never produce
+   * either kind outside the control topic anyway (`nl-router.ts`'s `allowedKinds`), but the check
+   * stays here too as defense in depth rather than trusting that filtering happened upstream.
+   */
+  function dispatchFleetCommand(fleetCmd: FleetCommand, threadId: number | undefined, isControl: boolean, currentSlug: string | undefined): void {
+    if (fleetCmd.kind === "new") {
+      if (!isControl) {
+        confirmSessionCommand(threadId, "/new only works from the control topic.");
+        return;
+      }
+      void handleNewCommand(fleetCmd, threadId);
+      return;
+    }
+    if (fleetCmd.kind === "ls") {
+      handleLsCommand(threadId);
+      return;
+    }
+    if (fleetCmd.kind === "budget") {
+      if (!isControl) {
+        confirmSessionCommand(threadId, "/budget only works from the control topic.");
+        return;
+      }
+      handleBudgetCommand(threadId);
+      return;
+    }
+    if (fleetCmd.kind === "kill") {
+      void handleKillCommand(fleetCmd, threadId, currentSlug);
+      return;
+    }
+    if (fleetCmd.kind === "rm") {
+      void handleRmCommand(fleetCmd, threadId, currentSlug);
+      return;
+    }
+    if (fleetCmd.kind === "attach") {
+      handleAttachCommand(fleetCmd, threadId, currentSlug);
+      return;
+    }
+    if (fleetCmd.kind === "usage") {
+      void handleUsageCommand(fleetCmd, threadId, currentSlug);
+      return;
+    }
+    if (fleetCmd.kind === "restart") {
+      void handleRestartCommand(threadId);
+      return;
+    }
+    if (fleetCmd.kind === "deploy") {
+      void handleDeployCommand(threadId, fleetCmd.slug);
+      return;
+    }
+    if (fleetCmd.kind === "detail") {
+      handleDetailCommand(fleetCmd, threadId, currentSlug);
+      return;
+    }
+    if (fleetCmd.kind === "verbose") {
+      handleVerboseCommand(fleetCmd, threadId, currentSlug);
+      return;
+    }
+    if (fleetCmd.kind === "settings") {
+      handleSettingsCommand(threadId);
+      return;
+    }
+    if (fleetCmd.kind === "autostart") {
+      void handleAutostartCommand(fleetCmd, threadId);
+      return;
+    }
+    if (fleetCmd.kind === "repos") {
+      handleReposCommand(fleetCmd, threadId);
+      return;
+    }
+    if (fleetCmd.kind === "voice") {
+      handleVoiceModelCommand(fleetCmd, threadId);
+      return;
+    }
+    if (fleetCmd.kind === "assist") {
+      handleAssistCommand(fleetCmd, threadId);
+      return;
+    }
+    if (fleetCmd.kind === "router") {
+      handleRouterBackendCommand(fleetCmd, threadId);
+      return;
+    }
+    handlePauseCommand(fleetCmd, threadId, currentSlug);
+  }
+
   /**
    * The full plain-text/command dispatch that used to sit inline inside `onUpdate` - extracted
    * (§7.4) so a stale backlog message can be replayed from `staleConfirmRegistry`'s "yes" tap
@@ -1727,8 +1972,14 @@ async function main(): Promise<void> {
    * (`isControl`/`route`/`currentSlug`/`from`) arrive - as parameters instead of closed-over
    * `const`s - plus `text` now derives from `rawText` internally instead of being handed in
    * pre-stripped, so a replay strips a `@botusername` mention the same way a live message would.
+   *
+   * Async since 2026-08-06 (nl-router.ts): the final two fallthrough branches (no session /
+   * forward-to-session) now try the NL router first - a real network/process call - before
+   * falling back to today's immediate behaviour. Every existing caller already calls this
+   * fire-and-forget (`void dispatchInboundMessage(...)` or a bare call inside a non-awaited
+   * context), so returning a `Promise<void>` instead of `void` changes nothing at any call site.
    */
-  function dispatchInboundMessage(
+  async function dispatchInboundMessage(
     messageId: number,
     rawText: string,
     threadId: number | undefined,
@@ -1736,82 +1987,14 @@ async function main(): Promise<void> {
     route: ReturnType<typeof routing.getByTopicId>,
     currentSlug: string | undefined,
     from: string,
-  ): void {
+  ): Promise<void> {
     // Strip a Telegram-inserted "@botusername" before any command parsing below - see
     // stripBotMention's doc comment for why this has to happen exactly once, here.
     const text = stripBotMention(rawText.trim());
 
     const fleetCmd = parseFleetCommand(text);
     if (fleetCmd) {
-      if (fleetCmd.kind === "new") {
-        if (!isControl) {
-          confirmSessionCommand(threadId, "/new only works from the control topic.");
-          return;
-        }
-        void handleNewCommand(fleetCmd, threadId);
-        return;
-      }
-      if (fleetCmd.kind === "ls") {
-        handleLsCommand(threadId);
-        return;
-      }
-      if (fleetCmd.kind === "budget") {
-        if (!isControl) {
-          confirmSessionCommand(threadId, "/budget only works from the control topic.");
-          return;
-        }
-        handleBudgetCommand(threadId);
-        return;
-      }
-      if (fleetCmd.kind === "kill") {
-        void handleKillCommand(fleetCmd, threadId, currentSlug);
-        return;
-      }
-      if (fleetCmd.kind === "rm") {
-        void handleRmCommand(fleetCmd, threadId, currentSlug);
-        return;
-      }
-      if (fleetCmd.kind === "attach") {
-        handleAttachCommand(fleetCmd, threadId, currentSlug);
-        return;
-      }
-      if (fleetCmd.kind === "usage") {
-        void handleUsageCommand(fleetCmd, threadId, currentSlug);
-        return;
-      }
-      if (fleetCmd.kind === "restart") {
-        void handleRestartCommand(threadId);
-        return;
-      }
-      if (fleetCmd.kind === "deploy") {
-        void handleDeployCommand(threadId, fleetCmd.slug);
-        return;
-      }
-      if (fleetCmd.kind === "detail") {
-        handleDetailCommand(fleetCmd, threadId, currentSlug);
-        return;
-      }
-      if (fleetCmd.kind === "verbose") {
-        handleVerboseCommand(fleetCmd, threadId, currentSlug);
-        return;
-      }
-      if (fleetCmd.kind === "settings") {
-        handleSettingsCommand(threadId);
-        return;
-      }
-      if (fleetCmd.kind === "autostart") {
-        void handleAutostartCommand(fleetCmd, threadId);
-        return;
-      }
-      if (fleetCmd.kind === "repos") {
-        handleReposCommand(fleetCmd, threadId);
-        return;
-      }
-      if (fleetCmd.kind === "voice") {
-        handleVoiceModelCommand(fleetCmd, threadId);
-        return;
-      }
-      handlePauseCommand(fleetCmd, threadId, currentSlug);
+      dispatchFleetCommand(fleetCmd, threadId, isControl, currentSlug);
       return;
     }
 
@@ -1915,7 +2098,12 @@ async function main(): Promise<void> {
     }
 
     if (!currentSlug || threadId === undefined) {
-      if (isControl) confirmSessionCommand(threadId, "Unrecognised control-topic command. Try /new, /ls or /help.");
+      // Natural-language routing (nl-router.ts) - only reached once every exact-syntax check
+      // above has already rejected this text. `hasSession: false` narrows the offered commands to
+      // the control-topic-only subset (`/new`/`/budget`); on no match, today's exact behaviour.
+      await routeOrFallback(text, { isControl, hasSession: false }, threadId, isControl, undefined, () => {
+        if (isControl) confirmSessionCommand(threadId, "Unrecognised control-topic command. Try /new, /ls or /help.");
+      });
       return;
     }
 
@@ -1958,11 +2146,16 @@ async function main(): Promise<void> {
       }
     }
 
-    // §10.1.2: notifications/claude/channel is confirmed broken upstream (getClientCapabilities()
-    // never negotiates the capability), so inbound delivery writes the same <channel> tag
-    // Claude Code would have rendered itself directly to the session's PTY, exactly as an
-    // operator typing it and pressing Enter would.
-    sendChannelText(currentSlug, threadId, rawText, String(messageId), from);
+    // Natural-language routing again - this time with a real session to either act on
+    // (`hasSession: true`, so `/model`/`/mode`/`/effort` are also offered) or forward to on no
+    // match, exactly as §10.1.2's note below always did.
+    await routeOrFallback(text, { isControl, hasSession: true }, threadId, isControl, currentSlug, () => {
+      // §10.1.2: notifications/claude/channel is confirmed broken upstream (getClientCapabilities()
+      // never negotiates the capability), so inbound delivery writes the same <channel> tag
+      // Claude Code would have rendered itself directly to the session's PTY, exactly as an
+      // operator typing it and pressing Enter would.
+      sendChannelText(currentSlug, threadId, rawText, String(messageId), from);
+    });
   }
 
   const offsetPath = path.join(STATE_DIR, "telegram-offset.json");
@@ -2072,6 +2265,30 @@ async function main(): Promise<void> {
           return;
         }
 
+        // nl-router.ts's destructive-command confirm keyboard (nl-confirm.ts) - "nc:", a fresh
+        // namespace alongside "fc:"/"vc:"/"sc:"/"d:". "Run" and "run, don't ask again" both
+        // execute the pending command through the same `executeMatchedCommand` a non-destructive
+        // NL match already uses; "don't ask again" additionally flips `assistEnabled` off first
+        // (and persists it) so every subsequent NL-matched destructive command skips this card
+        // until `/assist on` turns it back on.
+        const nlConfirmAction = callbackQuery.data ? resolveNlConfirmCallback(callbackQuery.data) : null;
+        if (nlConfirmAction) {
+          const pending = nlConfirmRegistry.resolve(nlConfirmAction.id);
+          if (!pending) return;
+          if (nlConfirmAction.action === "cancel") {
+            void finalizeNlConfirmMessage(pending, "❌ Cancelled - nothing was changed.");
+            return;
+          }
+          if (nlConfirmAction.action === "run_and_stop_asking") {
+            assistEnabled = false;
+            settingsStore.set("assist_enabled", "false");
+          }
+          void finalizeNlConfirmMessage(pending, `✅ Running ${describeNlCommand(pending.command)}${nlConfirmAction.action === "run_and_stop_asking" ? " (confirmation now off - /assist on to re-enable)" : ""}.`);
+          const pendingIsControl = isControlTopic(pending.threadId);
+          executeMatchedCommand(pending.command, pending.threadId, pendingIsControl, pending.currentSlug);
+          return;
+        }
+
         // §7.4's stale-inbound confirm keyboard (stale-confirm.ts) - "sc:", a fresh namespace
         // alongside "fc:". Recomputes isControl/route/currentSlug fresh from the pending card's
         // own threadId rather than trusting anything cached from when the card was first posted -
@@ -2089,7 +2306,7 @@ async function main(): Promise<void> {
           void finalizeStaleConfirmMessage(pending, "✅ Confirmed - processing now.");
           const pendingIsControl = isControlTopic(pending.threadId);
           const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
-          dispatchInboundMessage(pending.messageId, pending.rawText, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from);
+          void dispatchInboundMessage(pending.messageId, pending.rawText, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from);
           return;
         }
 
@@ -2105,7 +2322,7 @@ async function main(): Promise<void> {
             void finalizeVoiceConfirmMessage(pending, "✅ Sent.");
             const pendingIsControl = isControlTopic(pending.threadId);
             const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
-            dispatchInboundMessage(pending.messageId, pending.transcript, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from);
+            void dispatchInboundMessage(pending.messageId, pending.transcript, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from);
             return;
           }
           const doneText =
@@ -2249,7 +2466,7 @@ async function main(): Promise<void> {
         return;
       }
 
-      dispatchInboundMessage(message.message_id, message.text, threadId, isControl, route, currentSlug, from);
+      void dispatchInboundMessage(message.message_id, message.text, threadId, isControl, route, currentSlug, from);
     },
     onError: (err) => {
       log("WARN", `getUpdates failed, retrying: ${(err as Error).message}`);

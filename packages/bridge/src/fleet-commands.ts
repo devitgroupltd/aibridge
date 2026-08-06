@@ -39,7 +39,9 @@ export type FleetCommand =
   | { kind: "repos"; action: "list" }
   | { kind: "repos"; action: "add"; name: string; path?: string; base?: string; model?: string }
   | { kind: "repos"; action: "rm"; name: string }
-  | { kind: "voice"; model?: string };
+  | { kind: "voice"; model?: string }
+  | { kind: "assist"; action: "status" | "on" | "off" }
+  | { kind: "router"; action: "status" | "api" | "cli" };
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
 
@@ -140,6 +142,31 @@ function parseAutostart(rest: string): FleetCommand | null {
   return { kind: "autostart", action };
 }
 
+/** `/assist [on|off]` - whether a natural-language-matched *destructive* command shows a confirm
+ * card first (nl-confirm.ts), or the typeable equivalent of that card's own "don't ask again"
+ * button. Bare `/assist` reports the current setting, same "no argument defaults to status" shape
+ * as `/autostart`. Named for what it reads as in a sentence ("/assist off") rather than spelling
+ * out "nl"/"confirm" literally - see the plan's changelog for the naming discussion. */
+function parseAssist(rest: string): FleetCommand | null {
+  const trimmed = rest.trim();
+  const action = trimmed.length === 0 ? "status" : trimmed;
+  if (action !== "status" && action !== "on" && action !== "off") return null;
+  return { kind: "assist", action };
+}
+
+/** `/router [api|cli]` - live switch for the NL-router backend (`config.ts`'s `nlRouter.backend`
+ * one-time startup default, overridden here without a restart - see `settings-store.ts`'s
+ * `nl_router_backend` key). Per explicit operator direction: configuring an API key must never be
+ * the thing that switches this on its own - this command (or its own confirm-free execution in
+ * index.ts) is the only way to actually opt in to spending real money, and switching back to
+ * `"cli"` is exactly as supported as switching to `"api"` in the first place. */
+function parseRouterBackend(rest: string): FleetCommand | null {
+  const trimmed = rest.trim();
+  const action = trimmed.length === 0 ? "status" : trimmed;
+  if (action !== "status" && action !== "api" && action !== "cli") return null;
+  return { kind: "router", action };
+}
+
 /**
  * `/repos [list]` / `/repos add <name> [<path>|<git-url>] [--base <branch>] [--model <model>]` /
  * `/repos rm|remove <name>` - §7.5's registry, made mutable from Telegram (`repos-registry.ts`'s
@@ -238,7 +265,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
  * "for us, but invalid" split as `session-commands.ts`'s parser. */
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice)\b(.*)$/s);
+  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice|assist|router)\b(.*)$/s);
   if (!match) return null;
   const [, cmd, rest] = match as [string, string, string];
   switch (cmd) {
@@ -262,6 +289,10 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return { kind: "settings" };
     case "autostart":
       return parseAutostart(rest);
+    case "assist":
+      return parseAssist(rest);
+    case "router":
+      return parseRouterBackend(rest);
     case "repos":
       return parseRepos(rest);
     case "voice": {
@@ -501,6 +532,15 @@ export function renderHelp(): string {
     "  /repos [list|add <name> [path|git-url] [--base <b>] [--model <m>]|rm <name>] - manage repos.toml",
     "  /autostart [status|install|uninstall] - manage the logon Task Scheduler entry",
     "  /voice [<model>] - show/switch the Whisper model used for voice-note transcription",
+    "  /assist [on|off] - whether a natural-language-matched destructive command (kill/rm/",
+    "    restart/deploy/repos rm) shows a confirm card first (default on)",
+    "  /router [api|cli] - natural-language routing backend: 'cli' uses your Claude Code",
+    "    subscription (slower, no extra cost), 'api' uses a funded ANTHROPIC_API_KEY (faster, real",
+    "    but small per-message cost). Defaults to 'cli' even if a key is configured - switch on",
+    "    purpose, either direction, any time",
+    "",
+    "You can also just say what you want in plain English (typed or a voice note) instead of the",
+    "exact command above - e.g. \"show me the sessions\" or \"restart this session\".",
     "",
     "Session commands (inside a session's own topic):",
     `  /model <${MODELS.join("|")}>`,
@@ -539,6 +579,8 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "repos", description: "Manage repos.toml: list|add <name> [path|git-url]|rm <name>" },
     { command: "autostart", description: "Manage the logon Task Scheduler entry: status|install|uninstall" },
     { command: "voice", description: "Show/switch the Whisper model used for voice-note transcription" },
+    { command: "assist", description: "Confirm before running a natural-language-matched destructive command: /assist [on|off]" },
+    { command: "router", description: "NL-routing backend: /router [api|cli] - subscription (cli, default) or a funded API key (api)" },
     { command: "help", description: "Show the full command list" },
     { command: "model", description: `Set model: /model <${MODELS.join("|")}>` },
     { command: "mode", description: `Set mode: /mode <${MODES.join("|")}>` },

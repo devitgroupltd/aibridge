@@ -214,6 +214,32 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/autostart bogus")).toBeNull();
   });
 
+  test("/assist with no argument defaults to status", () => {
+    expect(parseFleetCommand("/assist")).toEqual({ kind: "assist", action: "status" });
+  });
+
+  test("/assist on and /assist off", () => {
+    expect(parseFleetCommand("/assist on")).toEqual({ kind: "assist", action: "on" });
+    expect(parseFleetCommand("/assist off")).toEqual({ kind: "assist", action: "off" });
+  });
+
+  test("/assist with an unrecognised argument is invalid, not a different command", () => {
+    expect(parseFleetCommand("/assist bogus")).toBeNull();
+  });
+
+  test("/router with no argument defaults to status", () => {
+    expect(parseFleetCommand("/router")).toEqual({ kind: "router", action: "status" });
+  });
+
+  test("/router api and /router cli", () => {
+    expect(parseFleetCommand("/router api")).toEqual({ kind: "router", action: "api" });
+    expect(parseFleetCommand("/router cli")).toEqual({ kind: "router", action: "cli" });
+  });
+
+  test("/router with an unrecognised argument is invalid, not a different command", () => {
+    expect(parseFleetCommand("/router bogus")).toBeNull();
+  });
+
   test("/repos with no argument, or 'list', means list", () => {
     expect(parseFleetCommand("/repos")).toEqual({ kind: "repos", action: "list" });
     expect(parseFleetCommand("/repos list")).toEqual({ kind: "repos", action: "list" });
@@ -326,6 +352,8 @@ describe("renderHelp", () => {
       "/settings",
       "/repos",
       "/autostart",
+      "/assist",
+      "/router",
     ]) {
       expect(text).toContain(cmd);
     }

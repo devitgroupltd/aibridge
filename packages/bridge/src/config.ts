@@ -49,6 +49,33 @@ export interface BridgeConfig {
     port: number;
     threads: number;
   };
+  /**
+   * Natural-language command routing (nl-router.ts). `enabled` defaults on, same convention as
+   * `voice.enabled`. Two backends, live-measured 2026-08-06 (see the plan's changelog for the
+   * numbers) - neither is a clear default for every operator (§4.1.1: each operator runs their own
+   * independent instance with their own budget), so this is explicitly per-instance config, not a
+   * fixed choice:
+   *
+   * - `"api"` - a direct `@anthropic-ai/sdk` call. ~200-500ms, real but small pay-per-token cost
+   *   (a funded Anthropic Console API key, separate from the Claude Code subscription).
+   * - `"cli"` - `claude -p --json-schema` using the operator's existing Claude Code subscription.
+   *   No new billing, but measured live at 3.5-5.4s per call and ~20-30k tokens of the CLI's own
+   *   fixed system-prompt/tool-schema overhead *even from an empty directory with nothing else to
+   *   load* - that overhead is charged against the subscription's own usage/rate-limit budget
+   *   (§10.5's `/budget`), not a separate dollar cost, but a real one nonetheless.
+   *
+   * `backend` **always defaults to `"cli"`**, even when `apiKey` is set - per explicit operator
+   * direction (2026-08-06): configuring a key must never silently start spending real money: the
+   * operator opts in to `"api"` deliberately, either via `NL_ROUTER_BACKEND=api` here or live via
+   * `/router api` (index.ts, backed by `settings-store.ts` - no restart needed either direction,
+   * and switching back to `/router cli` at any time is exactly as supported as switching to it).
+   */
+  nlRouter: {
+    enabled: boolean;
+    apiKey: string | undefined;
+    model: string;
+    backend: "api" | "cli";
+  };
 }
 
 const SECRETS_DIR = path.join(process.env.APPDATA ?? "", "aibridge");
@@ -93,6 +120,19 @@ export function loadConfig(envPath = path.join(SECRETS_DIR, ".env")): BridgeConf
       // that saturating the CPU briefly beats a slow transcription. Override via WHISPER_THREADS
       // if this ever needs to leave headroom for other work happening at the same time.
       threads: Number(parsed.WHISPER_THREADS || String(os.cpus().length || 4)),
+    },
+    nlRouter: {
+      enabled: parsed.NL_ROUTER_ENABLED !== "false",
+      apiKey: parsed.ANTHROPIC_API_KEY || undefined,
+      // Haiku tier: the router makes one forced-structured-output request per unmatched
+      // message, so cost and latency both scale with fleet-wide message volume - see
+      // nl-router.ts's own note.
+      model: parsed.NL_ROUTER_MODEL || "claude-haiku-4-5-20251001",
+      // Always "cli" unless explicitly forced - see this block's own doc comment for why an
+      // API key's mere presence must never silently switch this. index.ts's `/router` command
+      // is the live, restart-free way to actually switch, backed by settings-store.ts; this is
+      // only the one-time startup default before any live override has been set.
+      backend: parsed.NL_ROUTER_BACKEND === "api" ? "api" : "cli",
     },
   };
 }

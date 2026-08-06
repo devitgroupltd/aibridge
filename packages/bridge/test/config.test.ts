@@ -93,3 +93,47 @@ describe("loadConfig - voice.modelPath / threads", () => {
     });
   });
 });
+
+describe("loadConfig - nlRouter", () => {
+  test("defaults to enabled with no API key, a Haiku-tier model, and the cli backend", async () => {
+    await withEnvFile(REQUIRED, (envPath) => {
+      const { nlRouter } = loadConfig(envPath);
+      expect(nlRouter.enabled).toBe(true);
+      expect(nlRouter.apiKey).toBeUndefined();
+      expect(nlRouter.model).toBe("claude-haiku-4-5-20251001");
+      expect(nlRouter.backend).toBe("cli");
+    });
+  });
+
+  test("NL_ROUTER_ENABLED=false opts out explicitly", async () => {
+    await withEnvFile(`${REQUIRED}NL_ROUTER_ENABLED=false\n`, (envPath) => {
+      expect(loadConfig(envPath).nlRouter.enabled).toBe(false);
+    });
+  });
+
+  test("ANTHROPIC_API_KEY and NL_ROUTER_MODEL both override their defaults", async () => {
+    await withEnvFile(`${REQUIRED}ANTHROPIC_API_KEY=sk-ant-test\nNL_ROUTER_MODEL=claude-sonnet-5\n`, (envPath) => {
+      const { nlRouter } = loadConfig(envPath);
+      expect(nlRouter.apiKey).toBe("sk-ant-test");
+      expect(nlRouter.model).toBe("claude-sonnet-5");
+    });
+  });
+
+  test("backend defaults to cli even once an API key is configured - a key's presence must never silently switch it", async () => {
+    await withEnvFile(`${REQUIRED}ANTHROPIC_API_KEY=sk-ant-test\n`, (envPath) => {
+      expect(loadConfig(envPath).nlRouter.backend).toBe("cli");
+    });
+  });
+
+  test("NL_ROUTER_BACKEND=api opts in explicitly (the one-time startup default; /router switches live)", async () => {
+    await withEnvFile(`${REQUIRED}ANTHROPIC_API_KEY=sk-ant-test\nNL_ROUTER_BACKEND=api\n`, (envPath) => {
+      expect(loadConfig(envPath).nlRouter.backend).toBe("api");
+    });
+  });
+
+  test("an unrecognised NL_ROUTER_BACKEND value falls back to cli rather than erroring", async () => {
+    await withEnvFile(`${REQUIRED}NL_ROUTER_BACKEND=bogus\n`, (envPath) => {
+      expect(loadConfig(envPath).nlRouter.backend).toBe("cli");
+    });
+  });
+});
