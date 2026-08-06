@@ -166,20 +166,55 @@ const FILE_TIMEOUT_MS = 60_000;
  * network I/O, not compute) - confirmed live: the control bot and feed bot both went completely
  * silent at once, with no crash and no log line, and only cleared once the process was killed.
  * `AbortController` here turns that into a loud, bounded, retriable failure instead.
+ *
+ * Found again during the `/deep-check` sweep: the first version cleared the timer as soon as
+ * `fetch()` resolved - i.e. once *headers* arrive - not once the body has actually been read. Every
+ * caller here goes on to await `res.json()`/`.text()`/`.arrayBuffer()` (`parseTelegramResponse`,
+ * `downloadFile`) *after* this function returns, so a connection that stalls mid-body (headers land,
+ * then nothing) reproduced the exact unbounded hang this function exists to prevent - the timeout
+ * would already be disarmed by the time the stall happened. Fixed by leaving the timer armed and
+ * instead wrapping the response's own body-reading methods so the same bound covers both phases,
+ * clearing the timer only once the body genuinely settles (success or failure) either way.
  */
 export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number): Promise<Response> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // Some callers (downloadFile's `!res.ok` branch) legitimately never read the body at all, so the
+  // timer can outlive the request it was guarding by design - `unref` (Node/Bun; absent under other
+  // runtimes, hence the guard) just keeps that from holding the process/test runner open, since a
+  // late no-op abort() against an already-finished request is harmless either way.
+  (timer as unknown as { unref?: () => void }).unref?.();
+  let res: Response;
   try {
-    return await fetch(url, { ...init, signal: controller.signal });
+    res = await fetch(url, { ...init, signal: controller.signal });
   } catch (err) {
+    clearTimeout(timer);
     if (controller.signal.aborted) {
       throw new Error(`Telegram request timed out after ${timeoutMs}ms: ${url}`);
     }
     throw err;
-  } finally {
-    clearTimeout(timer);
   }
+  // Deliberately NOT cleared here - see the comment above. `guard` re-arms the same bound around
+  // whichever body-reading method the caller actually uses, and is the only place the timer gets
+  // cleared, on every path (success or failure).
+  const guard = <A extends unknown[], R>(fn: (...args: A) => Promise<R>) =>
+    async (...args: A): Promise<R> => {
+      try {
+        return await fn(...args);
+      } catch (err) {
+        if (controller.signal.aborted) {
+          throw new Error(`Telegram request timed out after ${timeoutMs}ms while reading the response body: ${url}`);
+        }
+        throw err;
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+  return Object.assign(res, {
+    json: guard(res.json.bind(res)),
+    text: guard(res.text.bind(res)),
+    arrayBuffer: guard(res.arrayBuffer.bind(res)),
+  });
 }
 
 async function parseTelegramResponse<T>(res: Response, method: string): Promise<T> {

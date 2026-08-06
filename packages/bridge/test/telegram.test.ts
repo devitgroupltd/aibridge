@@ -39,6 +39,27 @@ describe("fetchWithTimeout", () => {
     }
   });
 
+  // Found during the /deep-check sweep: the first fix cleared the timer as soon as fetch()
+  // resolved - i.e. as soon as headers arrived - not once the body was actually read. A connection
+  // that sends headers and then stalls mid-body reproduced the exact unbounded hang this function
+  // exists to prevent, just one phase later. This server writes real HTTP headers (with a
+  // Content-Length promising a body) and then never writes that body.
+  test("rejects with a named timeout when headers arrive but the body then stalls", async () => {
+    const server = createServer((socket) => {
+      socket.write("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 100\r\n\r\n");
+      socket.on("error", () => {});
+    });
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const port = (server.address() as { port: number }).port;
+
+    try {
+      const res = await fetchWithTimeout(`http://127.0.0.1:${port}/`, {}, 200);
+      await expect(res.json()).rejects.toThrow(/timed out after 200ms while reading the response body/);
+    } finally {
+      server.close();
+    }
+  });
+
   test("a fast server resolves normally, unaffected by the timeout budget", async () => {
     const stub = new StubTelegramServer();
     const { baseUrl } = stub.start(0);

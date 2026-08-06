@@ -1,7 +1,7 @@
 ---
-version: 0.75.0
+version: 0.76.0
 status: solid
-last_modified_utc: 2026-08-07T07:30:00Z
+last_modified_utc: 2026-08-06T18:55:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,27 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.76.0 (2026-08-06): the two MAJOR findings the 0.75.0 sweep flagged but deliberately didn't
+    auto-apply (each was a feature, not a patch, so it waited for an explicit go-ahead):
+    (1) **`/budget`'s rolling 5h spend and the burn-rate alarm reset to $0 on every `/restart`/`/deploy`.**
+    `CostTracker` was in-memory only. New `cost-store.ts` (same `aibridge.db` file, same runtime
+    SQLite binding as `session-store.ts`/`settings-store.ts`) persists every recorded spend event;
+    `CostTracker` takes it as an optional injected `CostStorePort` (kept optional/dependency-free so
+    it's still unit-testable with no SQLite at all) and reseeds its in-memory maps from it at
+    construction, so the very first `/budget`/`/ls` after a restart already reflects pre-restart
+    spend. `index.ts` wires the real store in; every existing caller/test that omits it keeps
+    today's in-memory-only behaviour unchanged.
+    (2) **`fetchWithTimeout`'s `AbortController` guarded the wrong half of the request.** The
+    2026-08-06 fix (0.75.0 changelog) cleared the timer as soon as `fetch()` resolved - i.e. once
+    *headers* arrived - not once the body was actually read, and every caller here awaits
+    `.json()`/`.text()`/`.arrayBuffer()` *after* this function returns. A connection that sends
+    headers and then stalls mid-body reproduced the exact unbounded per-origin-pool wedge this
+    function was written to prevent, one phase later. Fixed by leaving the timer armed and wrapping
+    the response's own body-reading methods so the same bound covers both phases; the timer is
+    `unref()`'d so a caller that legitimately never reads the body (`downloadFile`'s `!res.ok`
+    branch) doesn't hold the process open waiting for it to fire. Live-verified with a raw TCP
+    server that writes real HTTP headers (`Content-Length: 100`) and then never writes the body -
+    this reproduced the hang before the fix and times out cleanly after."
   - "0.75.0 (2026-08-07): a full critique-and-fix sweep of packages/bridge/src (~11k lines, 59 files),
     run as three review rounds - the first over the whole package, the second and third adversarially
     over the fixes themselves, which is where a third of the real findings came from. ~30 defects fixed;

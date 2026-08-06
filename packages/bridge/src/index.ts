@@ -95,6 +95,7 @@ import { applyEvent, createFeedState, promptsInLastHour } from "./feed-state.ts"
 import { monotonicNowMs } from "./monotonic-clock.ts";
 import { normalizeHookEvent } from "./hook-events.ts";
 import { CostTracker, FIVE_HOURS_MS, ONE_WEEK_MS } from "./cost-tracker.ts";
+import { CostStore } from "./cost-store.ts";
 import { checkConcurrencyCap, currentUnits, WEIGHTED_CAP } from "./concurrency-cap.ts";
 import { findOrphanProcesses } from "./orphan-scan.ts";
 import { startOtlpListener } from "./otlp-listener.ts";
@@ -278,7 +279,10 @@ async function main(): Promise<void> {
   // overridable for symmetry with the other AIBRIDGE_* dev overrides, though nothing in the test
   // suite currently spawns a full Bridge process that would need it.
   const otlpPort = Number(process.env.AIBRIDGE_OTLP_PORT ?? 4318);
-  const costTracker = new CostTracker();
+  // Same aibridge.db file as sessionStore/settingsStore (dbPath above) - see cost-store.ts's own
+  // doc comment for why this is injected rather than imported directly into cost-tracker.ts.
+  const costStore = new CostStore(dbPath);
+  const costTracker = new CostTracker(costStore);
 
   function slugForSessionId(sessionId: string): string | undefined {
     return sessionStore.getBySessionId(sessionId)?.slug;
