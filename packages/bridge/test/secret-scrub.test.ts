@@ -89,8 +89,15 @@ describe("scrubSecrets - shapes added after review", () => {
   // session in the fleet. The Bridge's own .env is the file most likely to be read back "to check
   // the config".
   test("redacts a Telegram bot token", () => {
-    const result = scrubSecrets("CONTROL_BOT_TOKEN=8123456789:AAFmMlq3xR7pQz9WvT2kLbN4hJ6yD8sGvXc");
-    expect(result.text).not.toContain("AAFmMlq3xR7pQz9WvT2kLbN4hJ6yD8sGvXc");
+    // Built by concatenation, not as one literal: a fixture shaped exactly like a real token
+    // (digits ":" "AA" + 30+ chars) is indistinguishable from a live secret to a scanner that
+    // only matches source text, and this repo has already eaten one false-positive GitHub
+    // secret-scanning alert over the literal form. Runtime concatenation still exercises the
+    // real regex in secret-scrub.ts - `scrubSecrets` only ever sees the joined string - it just
+    // means no contiguous token-shaped string sits in the source itself.
+    const fakeToken = ["8123456789", ":", "AA", "FmMlq3xR7pQz9WvT2kLbN4hJ6yD8sGvXc"].join("");
+    const result = scrubSecrets(`CONTROL_BOT_TOKEN=${fakeToken}`);
+    expect(result.text).not.toContain(fakeToken);
     expect(result.triggered.length).toBeGreaterThan(0);
   });
 
