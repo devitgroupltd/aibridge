@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { botCommandList } from "../src/fleet-commands.ts";
-import { buildSystemInstructions, mapRouterOutput, ROUTER_KINDS } from "../src/nl-router.ts";
+import { buildRouteViaCliArgs, buildSystemInstructions, mapRouterOutput, ROUTER_KINDS } from "../src/nl-router.ts";
 
 const CONTROL: { isControl: true; hasSession: false } = { isControl: true, hasSession: false };
 const SESSION: { isControl: false; hasSession: true } = { isControl: false, hasSession: true };
@@ -378,5 +378,24 @@ describe("buildSystemInstructions", () => {
     const withRepos = buildSystemInstructions({ ...SESSION, repoNames: ["aibridge"] });
     expect(withRepos).toContain("kill yourself");
     expect(withRepos).toContain("aibridge");
+  });
+});
+
+describe("buildRouteViaCliArgs", () => {
+  // 2026-08-07: without --strict-mcp-config, every claude -p call (including this classifier)
+  // auto-connects to the Bridge's own named pipe as a stray channel (the aibridge-telegram MCP
+  // server is registered user-level in ~/.claude.json) - live-root-caused to a garbled voice
+  // transcript timing out and falling through to "Unrecognised control-topic command". This test
+  // exists so a future "simplification" that drops the flag fails here instead of only live.
+  test("always includes --strict-mcp-config", () => {
+    expect(buildRouteViaCliArgs("hello", CONTROL, "claude-haiku-4-5-20251001")).toContain("--strict-mcp-config");
+  });
+
+  test("carries the model, the JSON schema, and the message text", () => {
+    const args = buildRouteViaCliArgs("delete this session", SESSION, "claude-haiku-4-5-20251001");
+    expect(args).toContain("claude-haiku-4-5-20251001");
+    expect(args).toContain("json");
+    expect(args.some((a) => a.includes("delete this session"))).toBe(true);
+    expect(args.some((a) => a.includes('"kind"'))).toBe(true);
   });
 });

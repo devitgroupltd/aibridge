@@ -1,7 +1,7 @@
 ---
-version: 0.94.0
+version: 0.94.1
 status: solid
-last_modified_utc: 2026-08-07T16:00:00Z
+last_modified_utc: 2026-08-07T16:15:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,15 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.94.1 (2026-08-07): follow-up to 0.94.0 below, prompted by the operator asking whether the fix
+    had tests - it didn't, and 'not independently unit-testable' was the wrong call: this codebase's
+    own established pattern (`session-launcher.ts`'s `buildClaudeSpawnArgs`) is to pull the exec
+    call's *argument-building* out as a pure, exported, testable function, leaving only the impure
+    `execFile`/`spawn` call itself untested - `routeViaCli` should have gotten the same treatment the
+    first time. Extracted `buildRouteViaCliArgs` (nl-router.ts) out of `routeViaCli`; 2 new tests in
+    `nl-router.test.ts` assert `--strict-mcp-config` is always present (so a future 'simplification'
+    that drops it fails a test instead of only ever showing up live again) and that the model/schema/
+    message text are all carried through. 916 total passing (up from 914), `tsc --noEmit` clean."
   - "0.94.0 (2026-08-07): a garbled voice transcript ('IEI-Бридж' for 'AI-Bridge', a whisper-server
     mishearing) answered 'Unrecognised control-topic command' instead of matching kind='new' the way
     the 0.92.0/repo-name-hint logic should have. `bridge-dev.log` showed the real cause: a

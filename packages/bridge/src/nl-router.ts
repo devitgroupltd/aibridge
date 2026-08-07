@@ -474,12 +474,21 @@ async function routeViaApi(text: string, ctx: RouterContext, apiKey: string, mod
  * once its own MCP config is empty. */
 const EXEC_TIMEOUT_MS = 45_000;
 
+/** Pure argument-building pulled out of `routeViaCli`, same pattern as `session-launcher.ts`'s
+ * `buildClaudeSpawnArgs` - the impure `execFile` call itself still isn't unit-testable, but there's
+ * no reason the array it's handed shouldn't be. Exported so a regression here (e.g. someone removing
+ * `--strict-mcp-config` while "simplifying" this later) fails a test instead of only ever showing up
+ * live, the same way `--strict-mcp-config`'s own absence did. */
+export function buildRouteViaCliArgs(text: string, ctx: RouterContext, model: string): string[] {
+  const schema = JSON.stringify(buildSchema(ctx));
+  return ["-p", `${buildSystemInstructions(ctx)}\n\nMessage: ${text}`, "--output-format", "json", "--json-schema", schema, "--model", model, "--strict-mcp-config"];
+}
+
 function routeViaCli(text: string, ctx: RouterContext, model: string, log: RouterLog): Promise<RawRouterOutput | null> {
   return new Promise((resolve) => {
-    const schema = JSON.stringify(buildSchema(ctx));
     execFile(
       "claude",
-      ["-p", `${buildSystemInstructions(ctx)}\n\nMessage: ${text}`, "--output-format", "json", "--json-schema", schema, "--model", model, "--strict-mcp-config"],
+      buildRouteViaCliArgs(text, ctx, model),
       { cwd: os.tmpdir(), timeout: EXEC_TIMEOUT_MS },
       (err, stdout) => {
         if (err) {
