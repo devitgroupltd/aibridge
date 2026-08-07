@@ -1,7 +1,7 @@
 ---
-version: 0.95.0
+version: 0.95.1
 status: solid
-last_modified_utc: 2026-08-07T16:45:00Z
+last_modified_utc: 2026-08-07T17:15:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,28 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.95.1 (2026-08-07): follow-up to 0.95.0 below, prompted by being asked directly whether it was
+    fully tested - it wasn't. Added the pure-logic edge cases the first pass missed in
+    `message-context.test.ts`: the exact 200-char preview boundary (not just 'over it'), an
+    empty-string `text`/`caption` (falsy but not `undefined` - confirmed it's treated as absent, same
+    as truly missing), `text` preferred over `caption` when a message somehow carries both, and an
+    unrecognised future `forward_origin.type` degrading to `''` rather than throwing. Also
+    live-verified the actual `index.ts` wiring itself (unit tests structurally can't reach it) against
+    the real running Bridge via `scripts/telegram-automation/`: a genuine Telegram
+    `reply_to_message` on a live message correctly produced
+    '[Replying to an earlier message with no text/caption]' inside the `<channel>` tag the session's
+    PTY actually received (confirmed in `bridge-dev.log`). New `reply-context-test.js` one-off,
+    kept for reuse - its own trial-and-error surfaced two real Telegram-Web-K/Playwright gotchas now
+    documented inline: a topic's sidebar row must be selected via `.last()`, not `.first()` (a hidden
+    'all chats' duplicate of the same row sits earlier in the DOM with a null bounding box), and the
+    right-click context menu's 'Reply' item needs polling for a real bounding box rather than one
+    `locator().click()` attempt. A full forward-message live trial was attempted but not completed -
+    a live chat's own real-time re-sorting (every stray test message that lands in the wrong topic
+    triggers an immediate reply there, which reorders the sidebar) raced with the test script's own
+    element lookups, compounding with each retry; given the reply case's mechanism is already
+    confirmed live and forward/reply share the exact same `buildContextPrefix`/`dispatchInboundMessage`
+    code path, this was judged not worth further tooling time. 5 new tests (932 total, up from 927),
+    `tsc --noEmit` clean."
   - "0.95.0 (2026-08-07): operator asked whether forwarded messages and Telegram's own swipe-to-reply
     were handled - content-wise (text/voice/photo/document/video/audio) they always were, since every
     handler only ever branched on the content fields, never on `forward_origin`/`reply_to_message`
