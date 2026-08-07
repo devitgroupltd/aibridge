@@ -22,6 +22,11 @@ export const DEFAULT_MODE: Mode = "manual";
 export const EFFORTS = ["low", "medium", "high", "xhigh", "max"] as const;
 export type Effort = (typeof EFFORTS)[number];
 
+// Live-observed default (§4.2.1's PTY status line reads "◐ medium" on a freshly spawned session
+// with no /effort ever sent) - same "tracked starting value until the first switch" convention as
+// DEFAULT_MODE below, not a verified API-level default.
+export const DEFAULT_EFFORT: Effort = "medium";
+
 /** Standard xterm Shift+Tab (back-tab). One press advances the picker by exactly one entry. */
 export const SHIFT_TAB = "\x1b[Z";
 
@@ -92,15 +97,22 @@ export interface InlineKeyboardButton {
 /** A bare `/model`, `/mode` or `/effort` with no argument (no valid target to act on) surfaces a
  * button per option, same UX as the `/help` command list, instead of falling through as ordinary
  * chat text - confirmed live that a bare `/effort` otherwise lands as a plain message Claude
- * answers conversationally rather than a command the CLI intercepts. */
-function buildLevelKeyboard<T extends string>(namespace: string, levels: readonly T[]): InlineKeyboardButton[][] {
-  return levels.map((level) => [{ text: level, callback_data: `${namespace}:${level}` }]);
+ * answers conversationally rather than a command the CLI intercepts. `current`, when known, gets a
+ * "✓ " prefix on its own button so the operator can see where they already are without having to
+ * remember or go check - and a trailing "✖️ Cancel" row lets them back out without picking anything,
+ * rather than the only escape being to type over the card with an unrelated message. */
+function buildLevelKeyboard<T extends string>(namespace: string, levels: readonly T[], current?: T): InlineKeyboardButton[][] {
+  const rows = levels.map((level) => [{ text: level === current ? `✓ ${level}` : level, callback_data: `${namespace}:${level}` }]);
+  rows.push([{ text: "✖️ Cancel", callback_data: `${namespace}:cancel` }]);
+  return rows;
 }
 
 /**
  * Parses a `<namespace>:<value>` callback_data string, re-validating against `isValid` rather
  * than trusting the tap - same defensive pattern as resolveCommandAction/resolvePermCallback,
- * since callback_data is attacker-shaped input in principle.
+ * since callback_data is attacker-shaped input in principle. "cancel" is reserved (never a valid
+ * `T`) so it always falls through here as a non-match - callers check `isLevelCancelCallback`
+ * first to tell "cancelled" apart from "unrecognised".
  */
 function resolveLevelCallback<T extends string>(namespace: string, data: string, isValid: (value: string) => value is T): T | null {
   const match = data.match(new RegExp(`^${namespace}:(.+)$`));
@@ -109,10 +121,20 @@ function resolveLevelCallback<T extends string>(namespace: string, data: string,
   return isValid(value) ? value : null;
 }
 
-export const buildModelKeyboard = (): InlineKeyboardButton[][] => buildLevelKeyboard("model", MODELS);
-export const buildModeKeyboard = (): InlineKeyboardButton[][] => buildLevelKeyboard("mode", MODES);
-export const buildEffortKeyboard = (): InlineKeyboardButton[][] => buildLevelKeyboard("effort", EFFORTS);
+/** True for `<namespace>:cancel` - checked ahead of `resolveLevelCallback` since "cancel" is never
+ * a valid level and would otherwise just look like an unrecognised tap. */
+function isLevelCancelCallback(namespace: string, data: string): boolean {
+  return data === `${namespace}:cancel`;
+}
+
+export const buildModelKeyboard = (current?: Model): InlineKeyboardButton[][] => buildLevelKeyboard("model", MODELS, current);
+export const buildModeKeyboard = (current?: Mode): InlineKeyboardButton[][] => buildLevelKeyboard("mode", MODES, current);
+export const buildEffortKeyboard = (current?: Effort): InlineKeyboardButton[][] => buildLevelKeyboard("effort", EFFORTS, current);
 
 export const resolveModelCallback = (data: string): Model | null => resolveLevelCallback("model", data, isModel);
 export const resolveModeCallback = (data: string): Mode | null => resolveLevelCallback("mode", data, isMode);
 export const resolveEffortCallback = (data: string): Effort | null => resolveLevelCallback("effort", data, isEffort);
+
+export const isModelCancelCallback = (data: string): boolean => isLevelCancelCallback("model", data);
+export const isModeCancelCallback = (data: string): boolean => isLevelCancelCallback("mode", data);
+export const isEffortCancelCallback = (data: string): boolean => isLevelCancelCallback("effort", data);

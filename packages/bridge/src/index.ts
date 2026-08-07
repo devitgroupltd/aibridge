@@ -126,6 +126,9 @@ import {
   buildModeKeystrokes,
   buildModelKeyboard,
   EFFORTS,
+  isEffortCancelCallback,
+  isModeCancelCallback,
+  isModelCancelCallback,
   isSessionCommandAttempt,
   MODELS,
   MODES,
@@ -134,7 +137,7 @@ import {
   resolveModeCallback,
   resolveModelCallback,
 } from "./session-commands.ts";
-import type { Mode, SessionCommand } from "./session-commands.ts";
+import type { Effort, Mode, Model, SessionCommand } from "./session-commands.ts";
 import { stateForHookEvent } from "./session-state-transitions.ts";
 import { formatUsagePanel } from "./usage-panel.ts";
 import { isValidTransition, SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
@@ -1127,8 +1130,9 @@ async function main(): Promise<void> {
     confirmSessionCommand(topicId, `Switched ${slug} to ${mode} mode`);
   }
 
-  function applyEffortSwitch(slug: string, topicId: number, effort: string): void {
+  function applyEffortSwitch(slug: string, topicId: number, effort: Effort): void {
     sendEffortCommand(slug, effort);
+    routing.setEffort(slug, effort);
     confirmSessionCommand(topicId, `Switched ${slug} to ${effort} effort`);
   }
 
@@ -2599,11 +2603,24 @@ async function main(): Promise<void> {
     // A bare /model, /mode or /effort (no argument to act on) surfaces a button per option
     // instead of falling through to the ordinary inbound-message path, where it would just
     // arrive as plain chat text and get answered conversationally rather than switching
-    // anything (confirmed live for /effort).
+    // anything (confirmed live for /effort). Each shows the session's current value (✓-marked
+    // button, named in the prompt text) when one is known, and a trailing Cancel button - without
+    // that, the only way to back out was to ignore the card and hope, or send an unrelated message
+    // that just sits below it.
+    const currentModel = currentSlug ? sessionStore.get(currentSlug)?.model : undefined;
     const bareCommandKeyboards: Record<string, { prompt: string; keyboard: () => ReturnType<typeof buildEffortKeyboard> }> = {
-      "/model": { prompt: "Choose a model:", keyboard: buildModelKeyboard },
-      "/mode": { prompt: "Choose a permission mode:", keyboard: buildModeKeyboard },
-      "/effort": { prompt: "Choose an effort level:", keyboard: buildEffortKeyboard },
+      "/model": {
+        prompt: currentModel ? `Choose a model (current: ${currentModel}):` : "Choose a model:",
+        keyboard: () => buildModelKeyboard((MODELS as readonly string[]).includes(currentModel ?? "") ? (currentModel as Model) : undefined),
+      },
+      "/mode": {
+        prompt: currentSlug ? `Choose a permission mode (current: ${routing.getMode(currentSlug)}):` : "Choose a permission mode:",
+        keyboard: () => buildModeKeyboard(currentSlug ? routing.getMode(currentSlug) : undefined),
+      },
+      "/effort": {
+        prompt: currentSlug ? `Choose an effort level (current: ${routing.getEffort(currentSlug)}):` : "Choose an effort level:",
+        keyboard: () => buildEffortKeyboard(currentSlug ? routing.getEffort(currentSlug) : undefined),
+      },
     };
     const bareCommand = bareCommandKeyboards[text];
     if (bareCommand) {
@@ -3045,6 +3062,21 @@ async function main(): Promise<void> {
           const models = listAvailableVoiceModels(voiceDir);
           const currentName = path.basename(voiceServer.currentModelPath()).replace(/^ggml-/, "").replace(/\.bin$/, "");
           void applyVoiceModelSwitch(threadId, voiceModelName, voiceDir, models, currentName);
+          return;
+        }
+
+        // The trailing "✖️ Cancel" row on the /model, /mode and /effort pickers (session-commands.ts's
+        // buildLevelKeyboard) - checked ahead of the three resolve* calls below since "cancel" is
+        // deliberately never a valid level for any of them and would otherwise just look like an
+        // unrecognised tap. Edits the card to a plain "Cancelled." with the keyboard stripped,
+        // rather than leaving a stale keyboard sitting there or a whole new message.
+        if (callbackQuery.data && (isModelCancelCallback(callbackQuery.data) || isModeCancelCallback(callbackQuery.data) || isEffortCancelCallback(callbackQuery.data))) {
+          const cancelMsgId = callbackQuery.message?.message_id;
+          if (cancelMsgId !== undefined && controlBot.editMessageText) {
+            controlBot
+              .editMessageText(config.supergroupChatId, cancelMsgId, "Cancelled.", { inline_keyboard: [] })
+              .catch((err) => log("WARN", `editMessageText (cancel) failed: ${(err as Error).message}`));
+          }
           return;
         }
 

@@ -5,6 +5,9 @@ import {
   buildModeKeystrokes,
   buildModelKeyboard,
   EFFORTS,
+  isEffortCancelCallback,
+  isModeCancelCallback,
+  isModelCancelCallback,
   isSessionCommandAttempt,
   MODELS,
   MODES,
@@ -90,54 +93,71 @@ describe("buildModeKeystrokes", () => {
 });
 
 describe("buildEffortKeyboard / resolveEffortCallback", () => {
-  test("builds one button per effort level, matching resolveEffortCallback's own encoding", () => {
+  test("builds one button per effort level plus a trailing cancel row, matching resolveEffortCallback's own encoding", () => {
     const keyboard = buildEffortKeyboard();
     const flat = keyboard.flat().map((btn) => btn.callback_data);
-    expect(flat).toEqual(EFFORTS.map((effort) => `effort:${effort}`));
-    for (const data of flat) {
+    expect(flat).toEqual([...EFFORTS.map((effort) => `effort:${effort}`), "effort:cancel"]);
+    for (const data of flat.slice(0, -1)) {
       expect(resolveEffortCallback(data)).not.toBeNull();
     }
+    expect(resolveEffortCallback("effort:cancel")).toBeNull();
+    expect(isEffortCancelCallback("effort:cancel")).toBe(true);
   });
 
   test("resolves a valid effort callback", () => {
     expect(resolveEffortCallback("effort:high")).toBe("high");
   });
 
+  test("marks the current level's button and leaves the rest plain", () => {
+    const keyboard = buildEffortKeyboard("high");
+    const flat = keyboard.flat().map((btn) => btn.text);
+    expect(flat).toContain("✓ high");
+    expect(flat).not.toContain("high");
+  });
+
   test("rejects an unknown level or a tampered/unrelated callback_data", () => {
     expect(resolveEffortCallback("effort:extreme")).toBeNull();
     expect(resolveEffortCallback("run:builtin:compact")).toBeNull();
     expect(resolveEffortCallback("effort:")).toBeNull();
+    expect(isEffortCancelCallback("effort:high")).toBe(false);
+    expect(isEffortCancelCallback("mode:cancel")).toBe(false);
   });
 });
 
 describe("buildModelKeyboard / resolveModelCallback", () => {
-  test("builds one button per model, matching resolveModelCallback's own encoding", () => {
+  test("builds one button per model plus a trailing cancel row, matching resolveModelCallback's own encoding", () => {
     const keyboard = buildModelKeyboard();
     const flat = keyboard.flat().map((btn) => btn.callback_data);
-    expect(flat).toEqual(MODELS.map((model) => `model:${model}`));
-    for (const data of flat) {
+    expect(flat).toEqual([...MODELS.map((model) => `model:${model}`), "model:cancel"]);
+    for (const data of flat.slice(0, -1)) {
       expect(resolveModelCallback(data)).not.toBeNull();
     }
+    expect(resolveModelCallback("model:cancel")).toBeNull();
+    expect(isModelCancelCallback("model:cancel")).toBe(true);
   });
 
   test("rejects an unknown model or a tampered/unrelated callback_data", () => {
     expect(resolveModelCallback("model:gpt5")).toBeNull();
     expect(resolveModelCallback("effort:high")).toBeNull();
+    expect(isModelCancelCallback("model:sonnet")).toBe(false);
   });
 });
 
 describe("buildModeKeyboard / resolveModeCallback", () => {
-  test("builds one button per mode, matching resolveModeCallback's own encoding", () => {
+  test("builds one button per mode plus a trailing cancel row, matching resolveModeCallback's own encoding", () => {
     const keyboard = buildModeKeyboard();
     const flat = keyboard.flat().map((btn) => btn.callback_data);
-    expect(flat).toEqual(MODES.map((mode) => `mode:${mode}`));
-    for (const data of flat) {
+    expect(flat).toEqual([...MODES.map((mode) => `mode:${mode}`), "mode:cancel"]);
+    for (const data of flat.slice(0, -1)) {
       expect(resolveModeCallback(data)).not.toBeNull();
     }
+    expect(resolveModeCallback("mode:cancel")).toBeNull();
+    expect(isModeCancelCallback("mode:cancel")).toBe(true);
   });
 
   test("rejects an unknown mode or a tampered/unrelated callback_data", () => {
     expect(resolveModeCallback("mode:yolo")).toBeNull();
     expect(resolveModeCallback("model:sonnet")).toBeNull();
+    expect(isModeCancelCallback("mode:manual")).toBe(false);
   });
 });

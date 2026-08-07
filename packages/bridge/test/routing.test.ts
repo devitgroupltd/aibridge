@@ -21,6 +21,26 @@ describe("Routing mode tracking (§4.2.2)", () => {
   });
 });
 
+describe("Routing effort tracking (§4.2.1's /effort keyboard current-value display)", () => {
+  test("defaults to medium before any /effort write - matches the live-observed CLI default", () => {
+    const routing = new Routing();
+    expect(routing.getEffort("test-session")).toBe("medium");
+  });
+
+  test("setEffort is remembered for subsequent getEffort calls", () => {
+    const routing = new Routing();
+    routing.setEffort("test-session", "xhigh");
+    expect(routing.getEffort("test-session")).toBe("xhigh");
+  });
+
+  test("tracks each slug independently", () => {
+    const routing = new Routing();
+    routing.setEffort("a", "low");
+    expect(routing.getEffort("a")).toBe("low");
+    expect(routing.getEffort("b")).toBe("medium");
+  });
+});
+
 describe("Routing multi-session lookups (Phase 5)", () => {
   test("getByTopicId resolves the same route add() registered", () => {
     const routing = new Routing();
@@ -36,14 +56,18 @@ describe("Routing multi-session lookups (Phase 5)", () => {
     expect(routing.all().map((r) => r.slug).sort()).toEqual(["a", "b"]);
   });
 
-  test("remove forgets the slug, its topic mapping and its pty write function", () => {
+  test("remove forgets the slug, its topic mapping, pty write function, mode and effort", () => {
     const routing = new Routing();
     routing.add({ slug: "a", topicId: 2, worktreePath: "c:\\wt\\a" });
     routing.setPtyWrite("a", () => {});
+    routing.setMode("a", "auto");
+    routing.setEffort("a", "high");
     routing.remove("a");
     expect(routing.get("a")).toBeUndefined();
     expect(routing.getByTopicId(2)).toBeUndefined();
     expect(routing.getPtyWrite("a")).toBeUndefined();
+    expect(routing.getMode("a")).toBe("manual");
+    expect(routing.getEffort("a")).toBe("medium");
   });
 
   test("clearPtyWrite drops the write function but keeps the route (§4.2's /kill: worktree/topic mapping survive)", () => {

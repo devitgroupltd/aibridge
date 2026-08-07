@@ -1,4 +1,4 @@
-import { DEFAULT_MODE, type Mode } from "./session-commands.ts";
+import { DEFAULT_EFFORT, DEFAULT_MODE, type Effort, type Mode } from "./session-commands.ts";
 
 /**
  * In-memory routing table (§4.3). Phase 1 keeps this in memory only, seeded once at startup with
@@ -25,6 +25,10 @@ export class Routing {
   // belief about where the picker sits - not a verified read of the session's real state. Drifts if
   // the operator cycles modes by hand at the desk; see the plan's honest caveat.
   private readonly modeBySlug = new Map<string, Mode>();
+  // Same "Bridge's own optimistic belief, no ack exists" caveat as modeBySlug above - the
+  // keyboard-current-value display (session-commands.ts's buildEffortKeyboard) is the only
+  // consumer, so drift here is cosmetic, not something any command's actual effect relies on.
+  private readonly effortBySlug = new Map<string, Effort>();
   private readonly ringBufferBySlug = new Map<string, string>();
 
   add(route: SessionRoute): void {
@@ -53,6 +57,7 @@ export class Routing {
     this.bySlug.delete(slug);
     this.ptyWriteBySlug.delete(slug);
     this.modeBySlug.delete(slug);
+    this.effortBySlug.delete(slug);
     this.ringBufferBySlug.delete(slug);
   }
 
@@ -79,6 +84,14 @@ export class Routing {
 
   setMode(slug: string, mode: Mode): void {
     this.modeBySlug.set(slug, mode);
+  }
+
+  getEffort(slug: string): Effort {
+    return this.effortBySlug.get(slug) ?? DEFAULT_EFFORT;
+  }
+
+  setEffort(slug: string, effort: Effort): void {
+    this.effortBySlug.set(slug, effort);
   }
 
   /** Appends raw PTY output to `/attach`'s ring buffer, trimmed to the last
