@@ -1,7 +1,7 @@
 ---
-version: 0.84.0
+version: 0.85.0
 status: solid
-last_modified_utc: 2026-08-07T10:55:00Z
+last_modified_utc: 2026-08-07T11:10:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,18 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.85.0 (2026-08-07): fixed another live-observed nl-router gap, same class as 0.82's `kind='new'`
+    fix - a bare one-word voice transcript ('Restart.') fell through to 'Unrecognised control-topic
+    command' because `restart`/`deploy`/`kill`/`rm` (all destructive) had no positive trigger
+    sentence in `SYSTEM_INSTRUCTIONS_BASE`, only the closing 'never guess a destructive command ...
+    from a vague or joking message' caution - with nothing to weigh against it, a short unadorned
+    command read as exactly the terse, low-context message that caution exists to suppress. Added
+    the missing positive sentence for all four and reworded the caution so 'short' can no longer be
+    conflated with 'vague'. Checked the other twenty-odd router kinds for the same shape while at it
+    (per operator instruction to look for similar unhandled cases alongside every fix, not just the
+    one reported): none of the others carry that specific suppressive caution, since it only applies
+    to the destructive subset - non-destructive kinds classify off their schema field descriptions
+    without a competing 'don't guess' clause pulling the other way."
   - "0.84.0 (2026-08-07): fixed a real operator-hit bug - tapping a fleet-confirm 'Yes, proceed'
     button (§4.2's `/rm --all`, also `/kill --all` and `rm-topic`) after a Bridge restart wiped the
     pending confirm did nothing at all, no message, spinner already cleared. `ConfirmRegistry.take`

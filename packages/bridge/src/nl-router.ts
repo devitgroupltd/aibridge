@@ -211,7 +211,16 @@ function buildSchema(ctx: RouterContext): Record<string, unknown> {
  * "Unrecognised control-topic command" because `new` was covered only implicitly via the schema's
  * per-field descriptions, and the catch-all "addressed to a coding assistant → forward" clause won
  * out over it since most of the message's words were really the *task*, not the request to create
- * a session. Same class of gap as the `help`/`browse`/`find` fixes noted on `RouterAction` above. */
+ * a session. Same class of gap as the `help`/`browse`/`find` fixes noted on `RouterAction` above.
+ *
+ * `restart`/`deploy`/`kill`/`rm` got the same treatment the same day, for the same class of gap
+ * caught by re-checking every other command for it after the `new` fix: a bare one-word voice
+ * transcript ("Restart.") also fell through to "Unrecognised", this time because the *only* mention
+ * these four destructive kinds got was the closing "never guess a destructive command ... from a
+ * vague or joking message" caution - with no positive trigger sentence to weigh against it, a short,
+ * unadorned command reads as exactly the kind of terse, low-context message that caution was written
+ * to suppress. The fix adds the missing positive sentence and narrows the caution's own wording so
+ * "short" stops being conflated with "vague". */
 const SYSTEM_INSTRUCTIONS_BASE =
   "You classify one Telegram message sent to a fleet-control bot for developer Claude Code sessions. " +
   "If the message clearly requests one of the listed commands, respond with that kind and its fields. " +
@@ -235,9 +244,15 @@ const SYSTEM_INSTRUCTIONS_BASE =
   "like 'default', 'new sessions', 'from now on', or 'every session'. A request to change the " +
   "mode/effort for *this* session (no such wording) is kind='session_mode'/'session_effort' instead " +
   "- do not confuse the two. " +
+  "A clear, direct instruction to restart the Bridge itself (even just the single word 'restart') is " +
+  "kind='restart' - a short command is not the same thing as a vague one, so don't withhold it just " +
+  "for being brief. The same goes for a clear instruction to redeploy (kind='deploy', with 'slug' if a " +
+  "session was named), or to kill/remove a specific named session or explicitly 'all' sessions " +
+  "(kind='kill'/'rm', with 'slug' or 'all' set accordingly). " +
   "If it's ambiguous, conversational, or addressed to a coding assistant rather than the fleet itself, " +
-  "respond with kind='forward' - never guess a destructive command (kill/rm/restart/deploy/repos-rm) " +
-  "from a vague or joking message.";
+  "respond with kind='forward' - the caution against guessing a destructive command (kill/rm/restart/" +
+  "deploy/repos-rm) means don't infer one from a joke or unrelated chatter, not that an unambiguous " +
+  "short command naming the action should be refused.";
 
 /** Appends the operator's actual `repos.toml` short names, when known, as a closing hint - added
  * 2026-08-07 alongside the `kind='new'` trigger sentence above, for the same live-observed gap.
