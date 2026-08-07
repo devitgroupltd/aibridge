@@ -1,7 +1,7 @@
 ---
-version: 0.86.0
+version: 0.87.0
 status: solid
-last_modified_utc: 2026-08-07T11:56:00Z
+last_modified_utc: 2026-08-07T12:09:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,17 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.87.0 (2026-08-07): operator request - a single dash before a recognised flag word
+    (`/rm -all`, `/kill -all`, `/rm -dead`, `/rm -prefix <text>`, `/new -opus`, `/repos add
+    ... -base|-model`) now parses the same as the double-dash form, everywhere one of these flags is
+    accepted, not just `/rm`. `normalizeDashFlags` (already responsible for the 2026-08-06 en/em-dash
+    autocorrect fix) gained a second regex pass keyed off one shared `KNOWN_FLAG_WORDS` list so every
+    command that takes a `--flag` benefits at once rather than fixing them one report at a time; a
+    negative lookbehind skips an already-double-dashed flag (no `---all`) and a negative lookahead
+    stops a longer word that merely starts with a flag's letters (`-allocate`, `--prefix -deadline-
+    fix`) from being misread. New tests: 4 for `normalizeDashFlags` (single-dash rewrite, the two
+    false-positive guards, idempotence on an already-double-dashed flag), 3 for `parseFleetCommand`
+    (`/rm -all`/`-dead`/`-prefix`, `/kill -all`)."
   - "0.86.0 (2026-08-07): a newly-`/new`'d session ('check-what-still-needs-to') sat 'Thinking...'
     forever with no reply - root-caused to a second live daemon-killing crash, same class as
     0.83's-era pty-write-guard.ts fix but a different gap in it: `writeModeKeystrokes` writes through

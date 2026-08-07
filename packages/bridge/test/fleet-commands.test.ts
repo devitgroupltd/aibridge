@@ -27,6 +27,45 @@ describe("normalizeDashFlags", () => {
     expect(normalizeDashFlags("--all")).toBe("--all");
     expect(normalizeDashFlags("--prefix say-hello")).toBe("--prefix say-hello");
   });
+
+  // Operator-reported 2026-08-07: typing `--` reliably on a phone keyboard is its own small tax -
+  // a single dash before a recognised flag word should mean the same thing as the double-dash form,
+  // for every fleet command that has one, not just whichever got the bug report.
+  test("rewrites a single dash before a known flag word to --, for every command that has one", () => {
+    expect(normalizeDashFlags("-all")).toBe("--all");
+    expect(normalizeDashFlags("-dead")).toBe("--dead");
+    expect(normalizeDashFlags("-prefix foo")).toBe("--prefix foo");
+    expect(normalizeDashFlags("-opus some repo prompt")).toBe("--opus some repo prompt");
+    expect(normalizeDashFlags("name -base main -model sonnet")).toBe("name --base main --model sonnet");
+  });
+
+  test("leaves an ordinary word that merely starts with a flag word's letters alone", () => {
+    // "-allocate" must not become "--allocate" of a flag that doesn't exist, and a real slug/prefix
+    // argument that happens to start with one of these words (e.g. "-deadline") must survive too.
+    expect(normalizeDashFlags("-allocate")).toBe("-allocate");
+    expect(normalizeDashFlags("--prefix -deadline-fix")).toBe("--prefix -deadline-fix");
+  });
+
+  test("--all already double-dashed is left alone, not doubled again", () => {
+    expect(normalizeDashFlags("--all")).toBe("--all");
+    expect(normalizeDashFlags("--dead")).toBe("--dead");
+  });
+});
+
+describe("parseFleetCommand with a single-dash flag", () => {
+  test("/rm -all parses the same as /rm --all", () => {
+    expect(parseFleetCommand("/rm -all")).toEqual(parseFleetCommand("/rm --all"));
+    expect(parseFleetCommand("/rm -all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
+  });
+
+  test("/kill -all parses the same as /kill --all", () => {
+    expect(parseFleetCommand("/kill -all")).toEqual({ kind: "kill", all: true });
+  });
+
+  test("/rm -dead and /rm -prefix <text> also work single-dash", () => {
+    expect(parseFleetCommand("/rm -dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
+    expect(parseFleetCommand("/rm -prefix foo")).toEqual({ kind: "rm", bulk: { mode: "prefix", prefix: "foo" } });
+  });
 });
 
 describe("isHelpCommand", () => {

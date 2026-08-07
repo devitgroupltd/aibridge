@@ -50,17 +50,36 @@ export type FleetCommand =
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
 
 /**
+ * Every recognised flag word across every fleet command that takes one (`/kill --all`,
+ * `/rm --all|--dead|--prefix`, `/repos add ... --base|--model`, `/new --opus|...`) - kept as one
+ * list so a single-dash typo (`/rm -all`, operator-reported 2026-08-07: typing `--` reliably on a
+ * phone keyboard is its own small tax) is recognised the same way everywhere, rather than only for
+ * whichever command happened to get a bug report first.
+ */
+const KNOWN_FLAG_WORDS = ["all", "dead", "prefix", "base", "model", ...MODELS] as const;
+
+/** Matches a *single* leading hyphen immediately before one of `KNOWN_FLAG_WORDS`, but not a second
+ * hyphen of an already-double-dash flag (the `(?<!-)` lookbehind) and not a longer word that merely
+ * starts with one of these (the `(?![a-zA-Z])` lookahead - `-allocate` must not become `--allocate`
+ * of a flag that doesn't exist). */
+const SINGLE_DASH_FLAG_RE = new RegExp(`(?<!-)-(${KNOWN_FLAG_WORDS.join("|")})(?![a-zA-Z])`, "g");
+
+/**
  * Mobile keyboards' "smart punctuation"/autocorrect commonly rewrites a typed `--` into a single
  * en dash (–, U+2013), em dash (—, U+2014), or figure dash (‒, U+2012) mid-message - live-observed
  * 2026-08-06 (a phone keyboard did this, not Telegram's own client, which passes typed text through
- * unchanged). Every `--flag` this codebase parses (`/kill --all`, `/rm --all|--dead|--prefix`,
- * `/repos add ... --base|--model`, `/new --opus|...`) only ever means the ASCII double-hyphen, so
+ * unchanged). Every `--flag` this codebase parses only ever means the ASCII double-hyphen, so
  * normalising back before parsing is always safe *here* - unlike a general chat message forwarded
  * to a session, which never runs through this function at all and could legitimately contain a real
  * em dash in prose.
+ *
+ * Also normalises a plain single dash before a recognised flag word (`/rm -all` -> `/rm --all`),
+ * same idea as the dash-character fix above - a keyboard that dropped one hyphen shouldn't produce
+ * a different, unhelpful error (or worse, get parsed as a slug named "-all") instead of the command
+ * that was obviously meant.
  */
 export function normalizeDashFlags(text: string): string {
-  return text.replace(/[‒–—]/g, "--");
+  return text.replace(/[‒–—]/g, "--").replace(SINGLE_DASH_FLAG_RE, "--$1");
 }
 
 /** `/new [--opus|--haiku|--fable|--sonnet] <repo> <prompt...>` - the flag, if present, must come
