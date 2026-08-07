@@ -1,7 +1,7 @@
 ---
-version: 0.81.0
+version: 0.82.0
 status: solid
-last_modified_utc: 2026-08-07T10:06:00Z
+last_modified_utc: 2026-08-07T10:18:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,24 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.82.0 (2026-08-07): consolidated 0.81.0's two separately-named commands into one -
+    `/default [mode|effort] [<value>]` - per direct operator feedback right after that version
+    shipped (\"I just want one /default I can remember, that shows me what I can set\"). Bare
+    `/default` (or `/default status`) posts both current values plus a tappable Mode/Effort keyboard
+    (`session-commands.ts`'s `buildDefaultCategoryKeyboard`); tapping a category edits the same
+    message into that category's own value picker (`buildDefaultModeKeyboard`/
+    `buildDefaultEffortKeyboard`, current value marked); tapping a value edits it again into a plain
+    confirmation - one evolving message for the whole drill-down, not a new one per step. Typed
+    shortcuts still work at any depth (`/default mode`, `/default mode auto`).
+    The value pickers use a `defmode:`/`defeffort:` callback namespace, deliberately distinct from
+    the session-scoped `/mode`/`/effort` pickers' `mode:`/`effort:` - those resolve against
+    `currentSlug`, which doesn't exist in `/default`'s control-topic-only context, so a tap
+    misrouted onto the wrong namespace would have silently no-op'd instead of doing anything visibly
+    wrong. `FleetCommand`'s `defaultmode`/`defaulteffort` kinds collapsed into one `default` kind
+    with a `category`/`value` shape; `nl-router.ts`'s `ROUTER_KINDS`/`allowedKinds`/
+    `mapRouterOutput`/`SYSTEM_INSTRUCTIONS` updated to match (new `defaultCategory` schema field,
+    reusing the existing `mode`/`effort` fields for the value).
+    877 pass, `tsc --noEmit` clean."
   - "0.81.0 (2026-08-07): new fleet commands `/defaultmode [manual|acceptEdits|plan|auto]` and
     `/defaulteffort [low|medium|high|xhigh|max]` - the permission mode/reasoning effort every *new*
     session launches into, before its own first turn, requested directly by the operator after

@@ -203,29 +203,34 @@ describe("mapRouterOutput - one case per kind", () => {
     });
   });
 
-  test("defaultmode/defaulteffort: control-topic only, status when no value given, never destructive (a deliberate typed command, not a fuzzy NL guess)", () => {
-    expect(mapRouterOutput({ kind: "defaultmode" }, CONTROL)).toEqual({
+  test("default: control-topic only, status when no category given, category with no value shows a picker, never destructive (a deliberate typed/tapped command, not a fuzzy NL guess)", () => {
+    expect(mapRouterOutput({ kind: "default" }, CONTROL)).toEqual({
       matched: true,
-      command: { kind: "defaultmode", action: "status" },
+      command: { kind: "default", category: "status" },
       destructive: false,
     });
-    expect(mapRouterOutput({ kind: "defaultmode", mode: "auto" }, CONTROL)).toEqual({
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "mode" }, CONTROL)).toEqual({
       matched: true,
-      command: { kind: "defaultmode", action: "auto" },
+      command: { kind: "default", category: "mode", value: undefined },
       destructive: false,
     });
-    expect(mapRouterOutput({ kind: "defaultmode", mode: "auto" }, SESSION)).toEqual({ matched: false });
-    expect(mapRouterOutput({ kind: "defaulteffort" }, CONTROL)).toEqual({
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "mode", mode: "auto" }, CONTROL)).toEqual({
       matched: true,
-      command: { kind: "defaulteffort", action: "status" },
+      command: { kind: "default", category: "mode", value: "auto" },
       destructive: false,
     });
-    expect(mapRouterOutput({ kind: "defaulteffort", effort: "xhigh" }, CONTROL)).toEqual({
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "mode", mode: "auto" }, SESSION)).toEqual({ matched: false });
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "effort" }, CONTROL)).toEqual({
       matched: true,
-      command: { kind: "defaulteffort", action: "xhigh" },
+      command: { kind: "default", category: "effort", value: undefined },
       destructive: false,
     });
-    expect(mapRouterOutput({ kind: "defaulteffort", effort: "xhigh" }, SESSION)).toEqual({ matched: false });
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "effort", effort: "xhigh" }, CONTROL)).toEqual({
+      matched: true,
+      command: { kind: "default", category: "effort", value: "xhigh" },
+      destructive: false,
+    });
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "effort", effort: "xhigh" }, SESSION)).toEqual({ matched: false });
   });
 
   test("repos: list/add/rm, only rm is destructive", () => {

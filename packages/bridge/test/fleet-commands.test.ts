@@ -287,35 +287,35 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/voiceconfirm off")).toEqual({ kind: "voiceconfirm", action: "off" });
   });
 
-  test("/defaultmode with no argument defaults to status", () => {
-    expect(parseFleetCommand("/defaultmode")).toEqual({ kind: "defaultmode", action: "status" });
+  test("/default with no argument (or 'status') reports the status category", () => {
+    expect(parseFleetCommand("/default")).toEqual({ kind: "default", category: "status" });
+    expect(parseFleetCommand("/default status")).toEqual({ kind: "default", category: "status" });
   });
 
-  test("/defaultmode accepts every real mode", () => {
-    expect(parseFleetCommand("/defaultmode manual")).toEqual({ kind: "defaultmode", action: "manual" });
-    expect(parseFleetCommand("/defaultmode acceptEdits")).toEqual({ kind: "defaultmode", action: "acceptEdits" });
-    expect(parseFleetCommand("/defaultmode plan")).toEqual({ kind: "defaultmode", action: "plan" });
-    expect(parseFleetCommand("/defaultmode auto")).toEqual({ kind: "defaultmode", action: "auto" });
+  test("/default mode / /default effort with no value shows that category's picker (value undefined)", () => {
+    expect(parseFleetCommand("/default mode")).toEqual({ kind: "default", category: "mode" });
+    expect(parseFleetCommand("/default effort")).toEqual({ kind: "default", category: "effort" });
   });
 
-  test("/defaultmode with an unrecognised argument is invalid, not a different command", () => {
-    expect(parseFleetCommand("/defaultmode bogus")).toBeNull();
+  test("/default mode <value> accepts every real mode", () => {
+    expect(parseFleetCommand("/default mode manual")).toEqual({ kind: "default", category: "mode", value: "manual" });
+    expect(parseFleetCommand("/default mode acceptEdits")).toEqual({ kind: "default", category: "mode", value: "acceptEdits" });
+    expect(parseFleetCommand("/default mode plan")).toEqual({ kind: "default", category: "mode", value: "plan" });
+    expect(parseFleetCommand("/default mode auto")).toEqual({ kind: "default", category: "mode", value: "auto" });
   });
 
-  test("/defaulteffort with no argument defaults to status", () => {
-    expect(parseFleetCommand("/defaulteffort")).toEqual({ kind: "defaulteffort", action: "status" });
+  test("/default effort <value> accepts every real effort level", () => {
+    expect(parseFleetCommand("/default effort low")).toEqual({ kind: "default", category: "effort", value: "low" });
+    expect(parseFleetCommand("/default effort medium")).toEqual({ kind: "default", category: "effort", value: "medium" });
+    expect(parseFleetCommand("/default effort high")).toEqual({ kind: "default", category: "effort", value: "high" });
+    expect(parseFleetCommand("/default effort xhigh")).toEqual({ kind: "default", category: "effort", value: "xhigh" });
+    expect(parseFleetCommand("/default effort max")).toEqual({ kind: "default", category: "effort", value: "max" });
   });
 
-  test("/defaulteffort accepts every real effort level", () => {
-    expect(parseFleetCommand("/defaulteffort low")).toEqual({ kind: "defaulteffort", action: "low" });
-    expect(parseFleetCommand("/defaulteffort medium")).toEqual({ kind: "defaulteffort", action: "medium" });
-    expect(parseFleetCommand("/defaulteffort high")).toEqual({ kind: "defaulteffort", action: "high" });
-    expect(parseFleetCommand("/defaulteffort xhigh")).toEqual({ kind: "defaulteffort", action: "xhigh" });
-    expect(parseFleetCommand("/defaulteffort max")).toEqual({ kind: "defaulteffort", action: "max" });
-  });
-
-  test("/defaulteffort with an unrecognised argument is invalid, not a different command", () => {
-    expect(parseFleetCommand("/defaulteffort bogus")).toBeNull();
+  test("/default with an unrecognised category or value is invalid, not a different command", () => {
+    expect(parseFleetCommand("/default bogus")).toBeNull();
+    expect(parseFleetCommand("/default mode bogus")).toBeNull();
+    expect(parseFleetCommand("/default effort bogus")).toBeNull();
   });
 
   test("/repos with no argument, or 'list', means list", () => {
@@ -432,8 +432,7 @@ describe("renderHelp", () => {
       "/autostart",
       "/assist",
       "/router",
-      "/defaultmode",
-      "/defaulteffort",
+      "/default",
     ]) {
       expect(text).toContain(cmd);
     }

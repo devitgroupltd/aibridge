@@ -121,6 +121,9 @@ import { RateGovernor } from "./rate-governor.ts";
 import { deriveAlwaysRule, ruleAlreadyCovered } from "./rule-derivation.ts";
 import { Routing } from "./routing.ts";
 import {
+  buildDefaultCategoryKeyboard,
+  buildDefaultEffortKeyboard,
+  buildDefaultModeKeyboard,
   buildEffortKeyboard,
   buildModeKeyboard,
   buildModeKeystrokes,
@@ -128,6 +131,9 @@ import {
   DEFAULT_EFFORT,
   DEFAULT_MODE,
   EFFORTS,
+  isDefaultCategoryCancelCallback,
+  isDefaultEffortCancelCallback,
+  isDefaultModeCancelCallback,
   isEffortCancelCallback,
   isModeCancelCallback,
   isModelCancelCallback,
@@ -135,11 +141,14 @@ import {
   MODELS,
   MODES,
   parseSessionCommand,
+  resolveDefaultCategoryCallback,
+  resolveDefaultEffortCallback,
+  resolveDefaultModeCallback,
   resolveEffortCallback,
   resolveModeCallback,
   resolveModelCallback,
 } from "./session-commands.ts";
-import type { Effort, Mode, Model, SessionCommand } from "./session-commands.ts";
+import type { DefaultCategory, Effort, Mode, Model, SessionCommand } from "./session-commands.ts";
 import { stateForHookEvent } from "./session-state-transitions.ts";
 import { formatUsagePanel } from "./usage-panel.ts";
 import { isValidTransition, SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
@@ -2187,41 +2196,85 @@ async function main(): Promise<void> {
     );
   }
 
-  /** `/defaultmode [manual|acceptEdits|plan|auto]` - the permission mode `handleNewCommand` puts
-   * every *new* session into, before its own first turn. Same in-memory-for-reads,
-   * persisted-on-write shape as `handleAssistCommand`/`handleVoiceConfirmCommand`.
-   *
-   * `auto` gets its own explicit warning in the confirmation text (unlike the other three modes) -
-   * it's the one `nl-router.ts`'s `isDestructive` already treats as security-sensitive when reached
-   * via natural language, and setting it here has a wider blast radius than that single-session
-   * case: every session launched from this point on starts with no permission prompts at all, not
-   * just the one the operator is looking at right now, until this is explicitly changed back. */
-  function handleDefaultModeCommand(cmd: Extract<FleetCommand, { kind: "defaultmode" }>, topicId: number | undefined): void {
-    if (cmd.action === "status") {
-      confirmSessionCommand(topicId, `New sessions currently start in ${defaultSessionMode} mode.`);
-      return;
-    }
-    defaultSessionMode = cmd.action;
-    settingsStore.set("default_session_mode", defaultSessionMode);
-    confirmSessionCommand(
-      topicId,
-      defaultSessionMode === "auto"
-        ? `New sessions will now start in auto mode - no permission prompts at all for any tool call, including git commit/push, until this is changed back. /defaultmode manual to revert.`
-        : `New sessions will now start in ${defaultSessionMode} mode.`,
-    );
+  /** Text shown by both bare `/default` and the "Cancel"-free result of applying a mode change -
+   * kept as one function so the two spots that need "what are the defaults right now" (the status
+   * card and the mode-change confirmation) can't drift apart. */
+  function renderDefaultModeConfirmation(mode: Mode): string {
+    return mode === "auto"
+      ? "New sessions will now start in auto mode - no permission prompts at all for any tool call, including git commit/push, until this is changed back. /default mode manual to revert."
+      : `New sessions will now start in ${mode} mode.`;
   }
 
-  /** `/defaulteffort [low|medium|high|xhigh|max]` - the reasoning effort `handleNewCommand` puts
-   * every *new* session into. Same shape as `handleDefaultModeCommand`, minus that one's `auto`
-   * warning - an effort level has no safety implication, only a cost/latency one. */
-  function handleDefaultEffortCommand(cmd: Extract<FleetCommand, { kind: "defaulteffort" }>, topicId: number | undefined): void {
-    if (cmd.action === "status") {
-      confirmSessionCommand(topicId, `New sessions currently start at ${defaultSessionEffort} effort.`);
+  /** `/default` (bare or `status`): both current values, plus a tappable Mode/Effort keyboard to
+   * drill into either one (`session-commands.ts`'s `buildDefaultCategoryKeyboard`) - one command to
+   * remember instead of two separately-named ones (operator feedback, 2026-08-07). Sent directly via
+   * `controlBot`, not `confirmSessionCommand`, so the keyboard actually attaches - same reasoning as
+   * the bare `/model`/`/mode`/`/effort` keyboards further down. */
+  function sendDefaultStatusCard(topicId: number | undefined): void {
+    controlBot
+      .sendMessage(
+        config.supergroupChatId,
+        topicId,
+        `New sessions currently start in ${defaultSessionMode} mode at ${defaultSessionEffort} effort. Tap one to change it:`,
+        { inline_keyboard: buildDefaultCategoryKeyboard(defaultSessionMode, defaultSessionEffort) },
+      )
+      .catch((err) => log("WARN", `sendMessage (/default status) failed: ${(err as Error).message}`));
+  }
+
+  /** `/default mode` / `/default effort` with no value (typed, or reached by tapping a category
+   * button from `sendDefaultStatusCard`'s keyboard): shows that category's own value picker, current
+   * value marked, under the `defmode:`/`defeffort:` namespace (`session-commands.ts` - deliberately
+   * not `mode:`/`effort:`, which resolve against `currentSlug` and would silently no-op here). */
+  function sendDefaultCategoryPicker(topicId: number | undefined, category: DefaultCategory): void {
+    const [prompt, keyboard] =
+      category === "mode"
+        ? [`Choose the default permission mode for new sessions (current: ${defaultSessionMode}):`, buildDefaultModeKeyboard(defaultSessionMode)]
+        : [`Choose the default effort level for new sessions (current: ${defaultSessionEffort}):`, buildDefaultEffortKeyboard(defaultSessionEffort)];
+    controlBot
+      .sendMessage(config.supergroupChatId, topicId, prompt, { inline_keyboard: keyboard })
+      .catch((err) => log("WARN", `sendMessage (/default ${category}) failed: ${(err as Error).message}`));
+  }
+
+  /** `/default mode <value>` / `/default effort <value>` (typed, or via the value pickers' own
+   * callback taps in the `onUpdate` handler below) - the actual set-and-persist, shared by both
+   * entry points so a typed command and a tapped button can't drift into different behavior.
+   *
+   * `mode`'s `auto` gets its own explicit warning in the confirmation text - it's the one
+   * `nl-router.ts`'s `isDestructive` already treats as security-sensitive when reached via natural
+   * language inside a live session, and setting it here has a wider blast radius than that
+   * single-session case: every session launched from this point on starts with no permission
+   * prompts at all, not just the one the operator is looking at right now, until this is explicitly
+   * changed back. `effort` has no such warning - it's a cost/latency choice, not a safety one. */
+  function applyDefaultMode(mode: Mode): string {
+    defaultSessionMode = mode;
+    settingsStore.set("default_session_mode", mode);
+    return renderDefaultModeConfirmation(mode);
+  }
+
+  function applyDefaultEffort(effort: Effort): string {
+    defaultSessionEffort = effort;
+    settingsStore.set("default_session_effort", effort);
+    return `New sessions will now start at ${effort} effort.`;
+  }
+
+  function handleDefaultCommand(cmd: Extract<FleetCommand, { kind: "default" }>, topicId: number | undefined): void {
+    if (cmd.category === "status") {
+      sendDefaultStatusCard(topicId);
       return;
     }
-    defaultSessionEffort = cmd.action;
-    settingsStore.set("default_session_effort", defaultSessionEffort);
-    confirmSessionCommand(topicId, `New sessions will now start at ${defaultSessionEffort} effort.`);
+    if (cmd.category === "mode") {
+      if (cmd.value === undefined) {
+        sendDefaultCategoryPicker(topicId, "mode");
+        return;
+      }
+      confirmSessionCommand(topicId, applyDefaultMode(cmd.value));
+      return;
+    }
+    if (cmd.value === undefined) {
+      sendDefaultCategoryPicker(topicId, "effort");
+      return;
+    }
+    confirmSessionCommand(topicId, applyDefaultEffort(cmd.value));
   }
 
   /** `/router [api|cli]` - live switch for the NL-router backend, no restart needed either
@@ -2591,20 +2644,12 @@ async function main(): Promise<void> {
       handleVoiceConfirmCommand(fleetCmd, threadId);
       return;
     }
-    if (fleetCmd.kind === "defaultmode") {
+    if (fleetCmd.kind === "default") {
       if (!isControl) {
-        confirmSessionCommand(threadId, "/defaultmode only works from the control topic.");
+        confirmSessionCommand(threadId, "/default only works from the control topic.");
         return;
       }
-      handleDefaultModeCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "defaulteffort") {
-      if (!isControl) {
-        confirmSessionCommand(threadId, "/defaulteffort only works from the control topic.");
-        return;
-      }
-      handleDefaultEffortCommand(fleetCmd, threadId);
+      handleDefaultCommand(fleetCmd, threadId);
       return;
     }
     handlePauseCommand(fleetCmd, threadId, currentSlug);
@@ -3210,6 +3255,53 @@ async function main(): Promise<void> {
         if (effort) {
           if (currentSlug && threadId !== undefined) applyEffortSwitch(currentSlug, threadId, effort);
           return;
+        }
+
+        // `/default`'s three-namespace picker flow: "default:mode"/"default:effort" (the top-level
+        // category keyboard) edits the same message into that category's own value picker;
+        // "defmode:<value>"/"defeffort:<value>" (that picker's own buttons) applies the change and
+        // edits the message into a plain confirmation; either picker's own Cancel row edits to
+        // "Cancelled.". All three edit in place - unlike the session-scoped /model|/mode|/effort
+        // pickers above, which only ever confirm via a *new* message (`applyModelSwitch` etc.),
+        // `/default` has no `currentSlug` to hand off to and the picker itself is the whole UI, so
+        // editing it through each step reads as one drill-down instead of a new message per tap.
+        const defaultMsgId = callbackQuery.message?.message_id;
+        if (callbackQuery.data && defaultMsgId !== undefined && controlBot.editMessageText) {
+          const category = resolveDefaultCategoryCallback(callbackQuery.data);
+          if (category) {
+            const [prompt, keyboard] =
+              category === "mode"
+                ? [`Choose the default permission mode for new sessions (current: ${defaultSessionMode}):`, buildDefaultModeKeyboard(defaultSessionMode)]
+                : [`Choose the default effort level for new sessions (current: ${defaultSessionEffort}):`, buildDefaultEffortKeyboard(defaultSessionEffort)];
+            controlBot
+              .editMessageText(config.supergroupChatId, defaultMsgId, prompt, { inline_keyboard: keyboard })
+              .catch((err) => log("WARN", `editMessageText (/default category) failed: ${(err as Error).message}`));
+            return;
+          }
+          if (
+            isDefaultCategoryCancelCallback(callbackQuery.data) ||
+            isDefaultModeCancelCallback(callbackQuery.data) ||
+            isDefaultEffortCancelCallback(callbackQuery.data)
+          ) {
+            controlBot
+              .editMessageText(config.supergroupChatId, defaultMsgId, "Cancelled.", { inline_keyboard: [] })
+              .catch((err) => log("WARN", `editMessageText (/default cancel) failed: ${(err as Error).message}`));
+            return;
+          }
+          const defaultMode = resolveDefaultModeCallback(callbackQuery.data);
+          if (defaultMode) {
+            controlBot
+              .editMessageText(config.supergroupChatId, defaultMsgId, applyDefaultMode(defaultMode), { inline_keyboard: [] })
+              .catch((err) => log("WARN", `editMessageText (/default mode) failed: ${(err as Error).message}`));
+            return;
+          }
+          const defaultEffort = resolveDefaultEffortCallback(callbackQuery.data);
+          if (defaultEffort) {
+            controlBot
+              .editMessageText(config.supergroupChatId, defaultMsgId, applyDefaultEffort(defaultEffort), { inline_keyboard: [] })
+              .catch((err) => log("WARN", `editMessageText (/default effort) failed: ${(err as Error).message}`));
+            return;
+          }
         }
 
         // `/about`'s "more info" buttons ("about:") - a fresh namespace alongside "run:"/"perm:"/

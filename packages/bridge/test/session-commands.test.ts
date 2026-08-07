@@ -1,10 +1,16 @@
 import { describe, expect, test } from "bun:test";
 import {
+  buildDefaultCategoryKeyboard,
+  buildDefaultEffortKeyboard,
+  buildDefaultModeKeyboard,
   buildEffortKeyboard,
   buildModeKeyboard,
   buildModeKeystrokes,
   buildModelKeyboard,
   EFFORTS,
+  isDefaultCategoryCancelCallback,
+  isDefaultEffortCancelCallback,
+  isDefaultModeCancelCallback,
   isEffortCancelCallback,
   isModeCancelCallback,
   isModelCancelCallback,
@@ -12,6 +18,9 @@ import {
   MODELS,
   MODES,
   parseSessionCommand,
+  resolveDefaultCategoryCallback,
+  resolveDefaultEffortCallback,
+  resolveDefaultModeCallback,
   resolveEffortCallback,
   resolveModeCallback,
   resolveModelCallback,
@@ -159,5 +168,53 @@ describe("buildModeKeyboard / resolveModeCallback", () => {
     expect(resolveModeCallback("mode:yolo")).toBeNull();
     expect(resolveModeCallback("model:sonnet")).toBeNull();
     expect(isModeCancelCallback("mode:manual")).toBe(false);
+  });
+});
+
+describe("buildDefaultModeKeyboard / buildDefaultEffortKeyboard - distinct namespace from the session-scoped pickers", () => {
+  test("defmode:/defeffort: callback_data, not mode:/effort: - a session-scoped resolver must never match these", () => {
+    const modeFlat = buildDefaultModeKeyboard().flat().map((btn) => btn.callback_data);
+    expect(modeFlat).toEqual([...MODES.map((mode) => `defmode:${mode}`), "defmode:cancel"]);
+    expect(resolveModeCallback("defmode:manual")).toBeNull();
+    expect(resolveDefaultModeCallback("mode:manual")).toBeNull();
+
+    const effortFlat = buildDefaultEffortKeyboard().flat().map((btn) => btn.callback_data);
+    expect(effortFlat).toEqual([...EFFORTS.map((effort) => `defeffort:${effort}`), "defeffort:cancel"]);
+    expect(resolveEffortCallback("defeffort:high")).toBeNull();
+    expect(resolveDefaultEffortCallback("effort:high")).toBeNull();
+  });
+
+  test("marks the current value and resolves cancel separately from a real value", () => {
+    expect(buildDefaultModeKeyboard("auto").flat().map((btn) => btn.text)).toContain("✓ auto");
+    expect(resolveDefaultModeCallback("defmode:auto")).toBe("auto");
+    expect(resolveDefaultModeCallback("defmode:cancel")).toBeNull();
+    expect(isDefaultModeCancelCallback("defmode:cancel")).toBe(true);
+    expect(isDefaultModeCancelCallback("defmode:auto")).toBe(false);
+
+    expect(buildDefaultEffortKeyboard("xhigh").flat().map((btn) => btn.text)).toContain("✓ xhigh");
+    expect(resolveDefaultEffortCallback("defeffort:xhigh")).toBe("xhigh");
+    expect(resolveDefaultEffortCallback("defeffort:cancel")).toBeNull();
+    expect(isDefaultEffortCancelCallback("defeffort:cancel")).toBe(true);
+    expect(isDefaultEffortCancelCallback("defeffort:xhigh")).toBe(false);
+  });
+});
+
+describe("buildDefaultCategoryKeyboard / resolveDefaultCategoryCallback", () => {
+  test("one row per category, each labelled with its current value, plus a cancel row", () => {
+    const keyboard = buildDefaultCategoryKeyboard("manual", "medium");
+    expect(keyboard).toEqual([
+      [{ text: "Mode (manual)", callback_data: "default:mode" }],
+      [{ text: "Effort (medium)", callback_data: "default:effort" }],
+      [{ text: "✖️ Cancel", callback_data: "default:cancel" }],
+    ]);
+  });
+
+  test("resolves mode/effort taps, rejects cancel and unrelated callback_data", () => {
+    expect(resolveDefaultCategoryCallback("default:mode")).toBe("mode");
+    expect(resolveDefaultCategoryCallback("default:effort")).toBe("effort");
+    expect(resolveDefaultCategoryCallback("default:cancel")).toBeNull();
+    expect(resolveDefaultCategoryCallback("defmode:manual")).toBeNull();
+    expect(isDefaultCategoryCancelCallback("default:cancel")).toBe(true);
+    expect(isDefaultCategoryCancelCallback("default:mode")).toBe(false);
   });
 });

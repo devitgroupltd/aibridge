@@ -138,3 +138,43 @@ export const resolveEffortCallback = (data: string): Effort | null => resolveLev
 export const isModelCancelCallback = (data: string): boolean => isLevelCancelCallback("model", data);
 export const isModeCancelCallback = (data: string): boolean => isLevelCancelCallback("mode", data);
 export const isEffortCancelCallback = (data: string): boolean => isLevelCancelCallback("effort", data);
+
+/** `/default`'s own value pickers - same `buildLevelKeyboard` shape as the session-scoped
+ * `/mode`/`/effort` pickers above, but under a distinct `defmode:`/`defeffort:` callback namespace.
+ * Deliberately not `mode:`/`effort:` - those are resolved (index.ts) against `currentSlug`, which
+ * is nonsense in the control-topic-only context `/default` lives in (no session to apply to); a tap
+ * misrouted onto the wrong namespace would silently no-op rather than doing anything visibly wrong,
+ * which is worse than a clean "unrecognised", hence the separate namespace rather than reusing one. */
+export const buildDefaultModeKeyboard = (current?: Mode): InlineKeyboardButton[][] => buildLevelKeyboard("defmode", MODES, current);
+export const buildDefaultEffortKeyboard = (current?: Effort): InlineKeyboardButton[][] => buildLevelKeyboard("defeffort", EFFORTS, current);
+export const resolveDefaultModeCallback = (data: string): Mode | null => resolveLevelCallback("defmode", data, isMode);
+export const resolveDefaultEffortCallback = (data: string): Effort | null => resolveLevelCallback("defeffort", data, isEffort);
+export const isDefaultModeCancelCallback = (data: string): boolean => isLevelCancelCallback("defmode", data);
+export const isDefaultEffortCancelCallback = (data: string): boolean => isLevelCancelCallback("defeffort", data);
+
+export type DefaultCategory = "mode" | "effort";
+
+/** `/default`'s top-level picker (bare `/default`, or a tapped "back" from either value picker in
+ * a future pass) - one row per category, each button's own label carrying that category's current
+ * value so the whole picker doubles as a status readout, plus the same trailing Cancel row every
+ * other picker here has. */
+export function buildDefaultCategoryKeyboard(currentMode: Mode, currentEffort: Effort): InlineKeyboardButton[][] {
+  return [
+    [{ text: `Mode (${currentMode})`, callback_data: "default:mode" }],
+    [{ text: `Effort (${currentEffort})`, callback_data: "default:effort" }],
+    [{ text: "✖️ Cancel", callback_data: "default:cancel" }],
+  ];
+}
+
+/** `default:mode`/`default:effort` - not `resolveLevelCallback`-shaped (there's no enum of valid
+ * category *values* to re-validate against, just two fixed literal strings), so this is its own
+ * small parser rather than a third `buildLevelKeyboard` instantiation. */
+export function resolveDefaultCategoryCallback(data: string): DefaultCategory | null {
+  if (data === "default:mode") return "mode";
+  if (data === "default:effort") return "effort";
+  return null;
+}
+
+export function isDefaultCategoryCancelCallback(data: string): boolean {
+  return data === "default:cancel";
+}
