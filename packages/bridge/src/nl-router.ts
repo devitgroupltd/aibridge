@@ -458,14 +458,29 @@ async function routeViaApi(text: string, ctx: RouterContext, apiKey: string, mod
  * subscription rather than a separate API key. Run from the OS temp dir, not the Bridge's own
  * cwd or any worktree - live-measured 2026-08-06: even an *empty* directory still costs ~20-30k
  * tokens of the CLI's own fixed system-prompt/tool-schema overhead, and running from inside a real
- * project would additionally load its CLAUDE.md on every single call for no benefit here. */
+ * project would additionally load its CLAUDE.md on every single call for no benefit here.
+ *
+ * `--strict-mcp-config` (added 2026-08-07, live-root-caused): without it, *every* `claude -p` call
+ * anywhere on this machine auto-connects to the Bridge's own named pipe as a stray "channel" -
+ * the aibridge-telegram MCP server is registered user-level in `~/.claude.json` (§2.4, precisely so
+ * a real session never gets a "new MCP server" consent dialog), and that registration applies to
+ * any `claude` invocation, not just ones this Bridge itself launched with `--channels`. Confirmed
+ * live: a garbled voice transcript ("IEI-Бридж" for "AI-Bridge") answered "Unrecognised
+ * control-topic command" because this call exceeded its own `EXEC_TIMEOUT_MS` - `bridge-dev.log`
+ * showed a `channel server for "Temp" connected` line ~26s before the timeout fired, and re-running
+ * the same call by hand confirmed `--strict-mcp-config` (no tool this classifier ever needs anyway -
+ * it only ever produces the `--json-schema`'s structured output) drops cache-creation tokens ~5x and
+ * removes the stray connection outright, since the classifier has nothing registered to connect to
+ * once its own MCP config is empty. */
+const EXEC_TIMEOUT_MS = 45_000;
+
 function routeViaCli(text: string, ctx: RouterContext, model: string, log: RouterLog): Promise<RawRouterOutput | null> {
   return new Promise((resolve) => {
     const schema = JSON.stringify(buildSchema(ctx));
     execFile(
       "claude",
-      ["-p", `${buildSystemInstructions(ctx)}\n\nMessage: ${text}`, "--output-format", "json", "--json-schema", schema, "--model", model],
-      { cwd: os.tmpdir(), timeout: 30_000 },
+      ["-p", `${buildSystemInstructions(ctx)}\n\nMessage: ${text}`, "--output-format", "json", "--json-schema", schema, "--model", model, "--strict-mcp-config"],
+      { cwd: os.tmpdir(), timeout: EXEC_TIMEOUT_MS },
       (err, stdout) => {
         if (err) {
           log("WARN", `nl-router (cli backend) call failed: ${(err as Error).message}`);

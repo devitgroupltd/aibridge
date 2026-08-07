@@ -1,7 +1,7 @@
 ---
-version: 0.93.0
+version: 0.94.0
 status: solid
-last_modified_utc: 2026-08-07T15:30:00Z
+last_modified_utc: 2026-08-07T16:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,26 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.94.0 (2026-08-07): a garbled voice transcript ('IEI-Бридж' for 'AI-Bridge', a whisper-server
+    mishearing) answered 'Unrecognised control-topic command' instead of matching kind='new' the way
+    the 0.92.0/repo-name-hint logic should have. `bridge-dev.log` showed the real cause: a
+    `channel server for \"Temp\" connected` line ~26s before `nl-router (cli backend) call failed`
+    (its execFile timeout). Root cause: the aibridge-telegram MCP server is registered user-level in
+    `~/.claude.json` (§2.4) specifically so a real session never gets a 'new MCP server' consent
+    dialog - but that registration applies to *any* `claude` invocation on this machine, including
+    the NL router's own ad hoc `claude -p` classifier calls (run from the OS temp dir, per
+    2026-08-06's note). Every single classification call was therefore auto-connecting to the
+    Bridge's own named pipe as a stray, pointless channel, adding real token/latency overhead on top
+    of an already-documented ~20-30k-token fixed cost - live-reproduced by hand: re-running the exact
+    failing command with `--strict-mcp-config` dropped cache-creation tokens from ~23.7k to ~4.6k and
+    the stray channel connection vanished outright (the classifier never calls a tool anyway - it
+    only ever produces `--json-schema`'s structured output). Fixed by adding `--strict-mcp-config` to
+    `routeViaCli`'s `claude -p` invocation (nl-router.ts) and, as a safety margin against slower
+    classifications generally, raising its execFile timeout 30s -> 45s (named `EXEC_TIMEOUT_MS`). Not
+    independently unit-testable (same as `session-launcher.ts`'s `pty.spawn` - the impure exec call
+    itself, as opposed to pure argument-building, has no existing extraction pattern here); verified
+    via `tsc --noEmit` + the full suite (914 passing, unchanged) plus the live hand-reproduction above,
+    and will be live-verified again after this restart with the same voice transcript replayed."
   - "0.93.0 (2026-08-07): operator hit a destructive-NL-command confirm card (nl-confirm.ts, e.g. the
     kind='rm' one 0.92.0 just made reachable by voice) expire before they tapped it, and asked whether
     a `/retry` existed to re-arm it instead of retyping/re-recording the exact same request and hoping
