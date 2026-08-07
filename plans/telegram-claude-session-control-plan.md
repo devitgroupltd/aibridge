@@ -1,7 +1,7 @@
 ---
-version: 0.89.0
+version: 0.90.0
 status: solid
-last_modified_utc: 2026-08-07T13:30:00Z
+last_modified_utc: 2026-08-07T13:40:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,17 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.90.0 (2026-08-07): operator feedback on the 0.89.0 entry just below - 'config.phase1.slug' is
+    a strange name. Confirmed the identifier was confined to exactly two files (config.ts, index.ts -
+    every other 'phase1'/'Phase 1' hit elsewhere in the repo was prose about the design stage, not
+    this field) and that no PHASE1_* var was ever actually set in the live `.env`, so this was a pure,
+    migration-free rename: `config.phase1` -> `config.selfCheck`, `PHASE1_SLUG`/`PHASE1_TOPIC_ID`/
+    `PHASE1_REPO_PATH`/`PHASE1_WORKTREES_ROOT` -> `SELF_CHECK_SLUG`/`SELF_CHECK_TOPIC_ID`/
+    `SELF_CHECK_REPO_PATH`/`SELF_CHECK_WORKTREES_ROOT`. `selfCheck` was picked (offered alongside
+    `devSession`/`bootSession`) because it names what the thing actually verifies - a permanent
+    internal smoke-test session the Bridge always relaunches at startup to prove it can spawn a
+    session at all - rather than just when it runs or that it's dev-only. No behaviour change,
+    tsc --noEmit clean, bun test 902/902 passing."
   - "0.89.0 (2026-08-07): operator report - `/rm --all` proposed removing 1 session ('test-session')
     the operator couldn't find anywhere in Telegram. Root cause: `test-session` is `config.phase1.slug`
     - the Bridge's own hardcoded Phase-1 dev/self-check session, bound to a fixed `PHASE1_TOPIC_ID`

@@ -32,8 +32,13 @@ export interface BridgeConfig {
   controlBotToken: string;
   feedBotToken: string;
   supergroupChatId: string;
-  /** Phase-1-only hardcoded test session (§12 Phase 1) - superseded by /new + repos.toml in Phase 5. */
-  phase1: {
+  /** A permanent internal smoke-test session the Bridge always (re)launches at startup, on a fixed
+   * hardcoded topic, to verify it can spawn a session at all - not an operator-created one, and not
+   * discoverable as its own named Telegram topic (renamed 2026-08-07 from `phase1`/`PHASE1_*`, a
+   * name left over from when this was the Phase-1 walking-skeleton's only session; the identifier
+   * was confined to config.ts/index.ts and no PHASE1_* var was ever actually set in a live `.env`,
+   * so the rename needed no migration). */
+  selfCheck: {
     slug: string;
     topicId: number;
     repoPath: string;
@@ -96,10 +101,10 @@ export function loadConfig(envPath = path.join(SECRETS_DIR, ".env")): BridgeConf
     controlBotToken: required("CONTROL_BOT_TOKEN"),
     feedBotToken: required("FEED_BOT_TOKEN"),
     supergroupChatId: required("SUPERGROUP_CHAT_ID"),
-    phase1: {
-      slug: parsed.PHASE1_SLUG || "test-session",
-      topicId: Number(parsed.PHASE1_TOPIC_ID || "3"),
-      repoPath: parsed.PHASE1_REPO_PATH || path.resolve(import.meta.dirname, "../../.."),
+    selfCheck: {
+      slug: parsed.SELF_CHECK_SLUG || "test-session",
+      topicId: Number(parsed.SELF_CHECK_TOPIC_ID || "3"),
+      repoPath: parsed.SELF_CHECK_REPO_PATH || path.resolve(import.meta.dirname, "../../.."),
     },
     voice: {
       // Defaults to enabled (unlike a real risk like the git-push SSH key, this is just a local

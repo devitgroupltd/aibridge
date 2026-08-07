@@ -254,12 +254,12 @@ async function main(): Promise<void> {
   // for free. Fleet sessions created via /new use the plain §7.5 convention instead
   // (`c:\data\worktrees\<slug>`, `launchSession`'s own default) since they aren't all nested under
   // one repo any more.
-  const phase1WorktreesRoot = process.env.PHASE1_WORKTREES_ROOT ?? path.join(config.phase1.repoPath, ".worktrees");
-  const phase1WorktreePath = path.join(phase1WorktreesRoot, config.phase1.slug);
+  const selfCheckWorktreesRoot = process.env.SELF_CHECK_WORKTREES_ROOT ?? path.join(config.selfCheck.repoPath, ".worktrees");
+  const selfCheckWorktreePath = path.join(selfCheckWorktreesRoot, config.selfCheck.slug);
   const fleetWorktreesRoot = process.env.AIBRIDGE_WORKTREES_ROOT;
 
   const routing = new Routing();
-  routing.add({ slug: config.phase1.slug, topicId: config.phase1.topicId, worktreePath: phase1WorktreePath });
+  routing.add({ slug: config.selfCheck.slug, topicId: config.selfCheck.topicId, worktreePath: selfCheckWorktreePath });
 
   const nowIso = () => new Date().toISOString();
 
@@ -297,14 +297,14 @@ async function main(): Promise<void> {
     const stored = settingsStore.get("default_session_effort", DEFAULT_EFFORT);
     return (EFFORTS as readonly string[]).includes(stored) ? (stored as Effort) : DEFAULT_EFFORT;
   })();
-  if (!sessionStore.get(config.phase1.slug)) {
+  if (!sessionStore.get(config.selfCheck.slug)) {
     sessionStore.insert({
-      slug: config.phase1.slug,
-      topicId: config.phase1.topicId,
+      slug: config.selfCheck.slug,
+      topicId: config.selfCheck.topicId,
       sessionId: null,
-      worktreePath: phase1WorktreePath,
-      branch: `claude/${config.phase1.slug}-1`,
-      repoPath: config.phase1.repoPath,
+      worktreePath: selfCheckWorktreePath,
+      branch: `claude/${config.selfCheck.slug}-1`,
+      repoPath: config.selfCheck.repoPath,
       model: "sonnet",
       ptyPid: 0,
       state: "starting",
@@ -815,16 +815,16 @@ async function main(): Promise<void> {
 
   if (process.env.AIBRIDGE_SKIP_LAUNCH !== "1") {
     const session = launchSession({
-      slug: config.phase1.slug,
-      topicId: config.phase1.topicId,
-      repoPath: config.phase1.repoPath,
-      worktreesRoot: phase1WorktreesRoot,
+      slug: config.selfCheck.slug,
+      topicId: config.selfCheck.topicId,
+      repoPath: config.selfCheck.repoPath,
+      worktreesRoot: selfCheckWorktreesRoot,
       mirrorPtyToConsole: process.env.AIBRIDGE_DEV_MIRROR_PTY === "1",
       otlpPort,
       log,
     });
 
-    wireSession(config.phase1.slug, session.ptyProcess, config.phase1.topicId);
+    wireSession(config.selfCheck.slug, session.ptyProcess, config.selfCheck.topicId);
 
     // Stage 7 manual-verification-only affordance: this process's own stdin isn't a real TTY
     // when the Bridge itself is launched non-interactively, so mirrorPtyToConsole's stdin pipe
@@ -931,7 +931,7 @@ async function main(): Promise<void> {
 
   async function runStartupReconciliation(): Promise<void> {
     await reportOrphanProcesses();
-    const rows = sessionStore.all().filter((r) => r.slug !== config.phase1.slug && r.state !== "dead");
+    const rows = sessionStore.all().filter((r) => r.slug !== config.selfCheck.slug && r.state !== "dead");
     if (rows.length === 0) return;
     const live = await reapRowsWithDeletedTopics(rows);
     if (live.length === 0) return;
@@ -1154,7 +1154,7 @@ async function main(): Promise<void> {
       wireSession(slug, session.ptyProcess, topicId);
       sessionStore.setPtyPid(slug, session.ptyProcess.pid ?? 0);
       // Without this, `routing.getByTopicId(topicId)` stays undefined for this session forever
-      // after this restart (only the phase1 slot and freshly-`/new`'d sessions ever call
+      // after this restart (only the self-check slot and freshly-`/new`'d sessions ever call
       // `routing.add` otherwise) - every message in its topic then silently drops at the
       // `!isControl && !route` guard, with no error and no log line. Confirmed live 2026-08-04:
       // a resumed session answered /ls (control topic, doesn't need routing) but never replied to
@@ -1725,12 +1725,12 @@ async function main(): Promise<void> {
 
   async function handleKillCommand(cmd: Extract<FleetCommand, { kind: "kill" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
     if (cmd.all) {
-      // Excludes config.phase1.slug the same way runStartupReconciliation already does (index.ts's
+      // Excludes config.selfCheck.slug the same way runStartupReconciliation already does (index.ts's
       // reconciliation filter) - it's the Bridge's own hardcoded dev/self-check session (a fixed
-      // PHASE1_TOPIC_ID from .env, always relaunched on the next restart regardless), not a real
+      // SELF_CHECK_TOPIC_ID from .env, always relaunched on the next restart regardless), not a real
       // operator-created session with its own discoverable Telegram topic, so a blanket "kill
       // everything" must not sweep it in.
-      const targets = sessionStore.all().filter((r) => r.state !== "dead" && r.slug !== config.phase1.slug);
+      const targets = sessionStore.all().filter((r) => r.state !== "dead" && r.slug !== config.selfCheck.slug);
       await postFleetConfirm("kill", topicId, targets, `Kill ${targets.length} live session${targets.length === 1 ? "" : "s"}?`);
       return;
     }
@@ -1797,11 +1797,11 @@ async function main(): Promise<void> {
     // rather than executing on the same message (fleet-commands.ts's RmBulkFilter note).
     if (cmd.bulk?.mode === "all") {
       // Same exclusion as /kill --all just above (and runStartupReconciliation's own filter) -
-      // config.phase1.slug is the Bridge's own hardcoded dev/self-check session, not a real
+      // config.selfCheck.slug is the Bridge's own hardcoded dev/self-check session, not a real
       // operator-created one, and removeSessionRow would delete its worktree and try to
-      // deleteForumTopic against a hardcoded PHASE1_TOPIC_ID that was never actually created via
+      // deleteForumTopic against a hardcoded SELF_CHECK_TOPIC_ID that was never actually created via
       // createForumTopic in the first place.
-      const targets = sessionStore.all().filter((r) => r.slug !== config.phase1.slug);
+      const targets = sessionStore.all().filter((r) => r.slug !== config.selfCheck.slug);
       await postFleetConfirm("rm", topicId, targets, `Remove ALL ${targets.length} session${targets.length === 1 ? "" : "s"} - worktrees and topics deleted, live ones killed first?`);
       return;
     }
