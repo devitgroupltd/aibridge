@@ -68,10 +68,18 @@ describe("ROUTER_KINDS completeness", () => {
     clear: "builtin",
   };
 
+  /** `/retry` (retry-store.ts) is the one deliberate exception: `isRetryPhrase` intercepts it (and
+   * its "try again"/"do it again" equivalents) in `dispatchInboundMessage` *before* the NL router is
+   * ever consulted, and what it re-arms is per-topic in-memory state (`retryStore`) the router has
+   * no way to produce as structured output anyway - there is no `FleetCommand`/`SessionCommand`
+   * shape for "the thing that just expired here" to map to. */
+  const NEVER_ROUTED = new Set(["retry"]);
+
   test("every command in botCommandList() (Telegram's own autocomplete source) maps to a known router kind", () => {
     const kinds: readonly string[] = ROUTER_KINDS;
     const missing = botCommandList()
       .map((c) => c.command)
+      .filter((command) => !NEVER_ROUTED.has(command))
       .filter((command) => !kinds.includes(COMMAND_TO_ROUTER_KIND[command] ?? command));
     expect(missing).toEqual([]);
   });

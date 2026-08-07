@@ -71,6 +71,7 @@ import type { PendingVoiceConfirm } from "./voice-confirm.ts";
 import { startWhisperServer, transcribeVoiceNote } from "./voice-transcribe.ts";
 import { buildNlConfirmKeyboard, NlConfirmRegistry, resolveNlConfirmCallback } from "./nl-confirm.ts";
 import type { PendingNlConfirm } from "./nl-confirm.ts";
+import { isRetryPhrase, retryTopicKey, RetryStore } from "./retry-store.ts";
 import { routeText } from "./nl-router.ts";
 import type { RouterAction } from "./nl-router.ts";
 import { SettingsStore } from "./settings-store.ts";
@@ -432,6 +433,11 @@ async function main(): Promise<void> {
   // nl-router.ts's destructive-command confirm gate (nl-confirm.ts) - own registry, same
   // add/resolve-pops-and-checks-TTL shape as fleetConfirmRegistry/voiceConfirmRegistry above.
   const nlConfirmRegistry = new NlConfirmRegistry();
+  // §4.2's `/retry` (retry-store.ts): the single most recently *expired* nl-confirm per topic, so
+  // it can be re-armed without retyping/re-saying the original request. Populated only where an
+  // nl-confirm entry actually expires (the sweep below, and the tap-loses-the-race path further
+  // down) - never on a cancel/run, which already has its own explicit outcome.
+  const retryStore = new RetryStore();
   // `/browse`/`/find`'s own id-per-row registry (browse-nav.ts) - unlike the confirm registries
   // above, entries here are non-consuming (a folder's Prev/Next can be tapped repeatedly) and never
   // store a messageId - a tap edits whichever message it came from, read straight off the callback.
@@ -790,7 +796,7 @@ async function main(): Promise<void> {
     // operator-confirm cards too: past their TTL, strip the keyboard and say so. Doubles as the
     // sweep these four never had - entries used to be dropped only by a tap, so an untapped card
     // (and its whole replay payload) leaked for the lifetime of the daemon.
-    for (const entry of nlConfirmRegistry.takeExpired()) void markConfirmCardExpired(entry.messageId);
+    for (const entry of nlConfirmRegistry.takeExpired()) void markNlConfirmCardExpired(entry);
     for (const entry of fleetConfirmRegistry.takeExpired()) void markConfirmCardExpired(entry.messageId);
     for (const entry of staleConfirmRegistry.takeExpired()) void markConfirmCardExpired(entry.confirmCardMessageId);
     for (const entry of voiceConfirmRegistry.takeExpired()) void markConfirmCardExpired(entry.confirmCardMessageId);
@@ -1529,6 +1535,15 @@ async function main(): Promise<void> {
    * expired instead of as a button that does nothing. */
   function markConfirmCardExpired(messageId: number): Promise<void> {
     return finalizeCard(messageId, "⌛ This confirmation expired - send it again if you still want it.");
+  }
+
+  /** Same "past its TTL" outcome as `markConfirmCardExpired`, but for nl-confirm specifically:
+   * stashes the command into `retryStore` first (see that file's doc comment) and says so on the
+   * card, so `/retry` - or a spoken "retry"/"try again" - re-arms it instead of the operator having
+   * to retype/re-say the original request. */
+  function markNlConfirmCardExpired(entry: PendingNlConfirm): Promise<void> {
+    retryStore.add({ id: retryTopicKey(entry.threadId), command: entry.command, threadId: entry.threadId, currentSlug: entry.currentSlug });
+    return finalizeCard(entry.messageId, "⌛ This confirmation expired - /retry to re-arm it, or send it again if you still want it.");
   }
 
   /** What a tap on an id `registry.take()` no longer has leaves behind. Two causes look identical
@@ -2772,6 +2787,20 @@ async function main(): Promise<void> {
       return;
     }
 
+    // `/retry` (retry-store.ts, §4.2, added 2026-08-07): only intercepted when `retryStore` actually
+    // holds something for this topic - so a plain "retry"/"try again" meant for Claude, in a topic
+    // with nothing pending, still falls through to the session untouched instead of being swallowed
+    // on the strength of the phrase alone.
+    if (isRetryPhrase(text)) {
+      const pendingRetry = retryStore.resolve(retryTopicKey(threadId));
+      if (!pendingRetry) {
+        confirmSessionCommand(threadId, "Nothing to retry - no expired confirmation is waiting here.");
+        return;
+      }
+      void postNlConfirm(pendingRetry.command, pendingRetry.threadId, pendingRetry.currentSlug);
+      return;
+    }
+
     // `/about`: the friendly capability overview (about.ts) - checked ahead of /help since it's
     // the on-ramp `/help` deliberately isn't; works from either the control topic or a session's
     // own topic, same as /help.
@@ -3215,7 +3244,7 @@ async function main(): Promise<void> {
             return;
           }
           if (nlTaken.expired) {
-            void markConfirmCardExpired(nlTaken.entry.messageId);
+            void markNlConfirmCardExpired(nlTaken.entry);
             return;
           }
           const pending = nlTaken.entry;

@@ -731,6 +731,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "browse", description: "Browse this session's worktree: /browse [<path>]" },
     { command: "find", description: "Search filenames + content in this session's worktree: /find <query>" },
     { command: "diff", description: "Review pending changes via a GitHub compare link (or a .diff file if there's no GitHub remote)" },
+    { command: "retry", description: "Re-arm the last expired confirmation in this topic (also works as spoken/typed 'retry'/'try again')" },
     { command: "compact", description: "Compact the session's conversation" },
     { command: "clear", description: "Clear the session's conversation" },
   ];

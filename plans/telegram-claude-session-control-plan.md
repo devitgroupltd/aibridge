@@ -1,7 +1,7 @@
 ---
-version: 0.92.0
+version: 0.93.0
 status: solid
-last_modified_utc: 2026-08-07T15:00:00Z
+last_modified_utc: 2026-08-07T15:30:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,29 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.93.0 (2026-08-07): operator hit a destructive-NL-command confirm card (nl-confirm.ts, e.g. the
+    kind='rm' one 0.92.0 just made reachable by voice) expire before they tapped it, and asked whether
+    a `/retry` existed to re-arm it instead of retyping/re-recording the exact same request and hoping
+    the router classified it identically a second time. New `retry-store.ts`: `RetryStore` (a
+    `ConfirmRegistry` keyed by topic, via a new `retryTopicKey`, rather than a random id - `/retry`
+    never names one) remembers the single most recently *expired* nl-confirm per topic; the sweep
+    loop and the tap-loses-the-race-against-the-sweep path (index.ts) both now stash into it via a new
+    `markNlConfirmCardExpired` (the expired card's own text now says '/retry to re-arm it, or send it
+    again'). `isRetryPhrase` recognises `/retry` and its natural-language voice/text equivalents
+    ('retry', 'try again', 'do it/that again', with or without the leading slash/trailing
+    punctuation) - checked in `dispatchInboundMessage` only when `retryStore` actually holds something
+    for that topic, so ordinary chatter that happens to contain 'retry' still falls through to the
+    session untouched. Deliberately scoped to nl-confirm only, not all four confirm-card kinds (fleet
+    `--all`, stale-inbound, voice-transcript review) - `--all`'s target list can go stale within
+    minutes and stale/voice confirms are inherently time-/content-sensitive, so blindly replaying
+    either past its own cautious TTL is a different, riskier call than re-arming one already-
+    classified command; extend the same way later if wanted. Added `retry` to `botCommandList()`
+    (so it's discoverable via `/help` and Telegram's own autocomplete) with a documented exemption in
+    `nl-router.test.ts`'s completeness check, since `/retry` is intercepted before the NL router is
+    ever consulted and re-arms in-memory state the router has no way to produce as structured output.
+    New tests: 9 in `retry-store.test.ts`; `nl-router.test.ts`'s completeness check updated with a
+    documented `NEVER_ROUTED` exemption for `retry`. 914 total passing, 0 failures, `tsc --noEmit`
+    clean."
   - "0.92.0 (2026-08-07): operator asked why they couldn't kill/remove a session from inside its own
     topic - had to go to the control topic and name it by slug instead. Investigation found the
     mechanism already exists: a slug-less `/kill`/`/rm` typed as an exact command already resolves to
