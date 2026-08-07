@@ -1,7 +1,7 @@
 ---
-version: 0.96.0
+version: 0.96.1
 status: solid
-last_modified_utc: 2026-08-07T21:30:00Z
+last_modified_utc: 2026-08-07T21:45:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,20 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.96.1 (2026-08-07): follow-up to 0.96.0 below, prompted by being asked directly whether the
+    resume-in-place rewrite was covered by tests - it wasn't; `autoRecoverWedgedSession` had gone from
+    zero tests to zero tests across that rewrite, covered only by \"restart and confirm clean
+    startup\", which never exercises the wedged path at all. Extracted the one piece of it that's
+    actually decidable - and the one regression that would silently defeat the whole fix - into new
+    `wedged-recovery.ts`'s `recoverWedgedPty(ptyProcessBySlug, slug)`: kills the named entry's PTY
+    without ever deleting it from the map first. That \"don't delete first\" is the entire mechanism
+    that makes this recovery kill indistinguishable from a real crash to `handleUnexpectedExit` - the
+    one contract worth a permanent regression guard, distinct from index.ts's own remaining
+    orchestration (`sessionStore`/`log`/wiring), which stays a closure-inside-main() like the rest of
+    that file's command handlers. 4 new tests in `wedged-recovery.test.ts`: no-op on a missing slug,
+    kills and returns true on a live one, the map entry survives the call (the regression guard),
+    and killing one slug never touches another's entry. 944 total (up from 940), `tsc --noEmit`
+    clean."
   - "0.96.0 (2026-08-07): investigated a live report - session \"check-what-is-left-to\" wedged
     (Telegram: \"isn't responding to its last message ... Try /kill then /new again\"). Root-caused via
     bridge.log (not bridge-dev.log - this instance was started via `bun run`, not the dev script, so

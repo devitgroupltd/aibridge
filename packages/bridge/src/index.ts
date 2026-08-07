@@ -75,6 +75,7 @@ import { isRetryPhrase, retryTopicKey, RetryStore } from "./retry-store.ts";
 import { buildContextPrefix } from "./message-context.ts";
 import type { MessageOrigin } from "./message-context.ts";
 import { ChannelConnectCoordinator } from "./channel-connect-coordinator.ts";
+import { recoverWedgedPty } from "./wedged-recovery.ts";
 import { routeText } from "./nl-router.ts";
 import type { RouterAction } from "./nl-router.ts";
 import { SettingsStore } from "./settings-store.ts";
@@ -1049,23 +1050,22 @@ async function main(): Promise<void> {
    *
    * Deliberately does *not* reuse `/kill`'s `killSessionRow` (that marks the row "dead" and closes
    * the topic - a dead end, not a recovery) or duplicate any resume logic of its own. Instead it
-   * terminates just the wedged PTY *without* first clearing `ptyProcessBySlug` - the one thing
-   * `/kill`/`/rm` deliberately do first (see `handleUnexpectedExit`'s own doc comment) specifically
-   * to mark a kill as "deliberate, don't resume". Leaving the map entry in place makes this
-   * indistinguishable from a real crash to `handleUnexpectedExit`, which already does exactly
-   * "restore/fix and continue" right: same slug, same topic, same worktree, `claude --resume
-   * <session_id>` on a fresh PTY, with its own backoff/give-up safety net
-   * (`MAX_CONSECUTIVE_RESUME_ATTEMPTS`) already in place for the rarer case where the underlying
-   * process is now so broken even a resume immediately re-exits.
+   * terminates just the wedged PTY via `recoverWedgedPty` (wedged-recovery.ts) *without* first
+   * clearing `ptyProcessBySlug` - the one thing `/kill`/`/rm` deliberately do first (see
+   * `handleUnexpectedExit`'s own doc comment) specifically to mark a kill as "deliberate, don't
+   * resume". Leaving the map entry in place makes this indistinguishable from a real crash to
+   * `handleUnexpectedExit`, which already does exactly "restore/fix and continue" right: same
+   * slug, same topic, same worktree, `claude --resume <session_id>` on a fresh PTY, with its own
+   * backoff/give-up safety net (`MAX_CONSECUTIVE_RESUME_ATTEMPTS`) already in place for the rarer
+   * case where the underlying process is now so broken even a resume immediately re-exits.
    */
   function autoRecoverWedgedSession(slug: string): void {
-    const ptyProcess = ptyProcessBySlug.get(slug);
-    if (!ptyProcess) return; // already gone - a manual /kill/rm, or a real crash, raced this same detection
+    const recovered = recoverWedgedPty(ptyProcessBySlug, slug);
+    if (!recovered) return; // already gone - a manual /kill/rm, or a real crash, raced this same detection
     log(
       "WARN",
       `session "${slug}"'s PTY write-socket is dead but its process is still alive - killing it so the existing crash-resume path (§12 Phase 5) can relaunch it via claude --resume instead of leaving a zombie`,
     );
-    ptyProcess.kill();
     // handleUnexpectedExit (wired in wireSession's onExit) takes over from here - it posts its own
     // "attempting to resume" notice, so no separate confirmSessionCommand here would just double up.
   }
