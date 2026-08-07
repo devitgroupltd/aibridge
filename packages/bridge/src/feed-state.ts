@@ -30,10 +30,40 @@ export interface FeedState {
    * tap (from a turn whose log is already gone) apart from a fresh one: a tap only resolves
    * against `lines` if its `turn` still matches the session's current `turnSeq`. */
   turnSeq: number;
+  /** Index into `lines` where the *current* Telegram card's visible window starts - everything
+   * before it belongs to an earlier, now-frozen card from the same turn (index.ts's `splitCard`
+   * below, triggered once a turn's line count crosses `MAX_LINES_PER_CARD`). Reset to 0 by
+   * `turn_start` alongside `lines` itself. `renderDetails`/`renderDetailsPlainText` ignore this -
+   * the `details` button always shows the whole turn regardless of how many cards it spanned. */
+  cardLineOffset: number;
 }
 
 export function createFeedState(slug: string): FeedState {
-  return { slug, turnActive: false, turnStartedAtMs: null, lines: [], promptTimestampsMs: [], turnSeq: 0 };
+  return { slug, turnActive: false, turnStartedAtMs: null, lines: [], promptTimestampsMs: [], turnSeq: 0, cardLineOffset: 0 };
+}
+
+/** A very long turn otherwise edits the same message forever, which loses any sense of *when*
+ * things happened relative to anything else in the topic (live-observed complaint, 2026-08-07).
+ * Splitting into a fresh card every this-many lines gives the operator real timestamped
+ * checkpoints without giving up §5.4's "one card, edited in place" rate-budget win within each
+ * chunk - roughly 2.5x `feed-renderer.ts`'s own 8-line visible cap, so a split card still shows a
+ * handful of full chunks' worth of `details`-button history before the operator taps for more. */
+export const MAX_LINES_PER_CARD = 20;
+
+/** True once the current card's window (`lines` since `cardLineOffset`) has grown past the split
+ * threshold - checked by index.ts after every event, not derived automatically inside `applyEvent`
+ * itself, since deciding *whether* to actually split (vs. just measuring) also has to coordinate
+ * with `feedCoalescer`/`feedMessageIds`, which this module knows nothing about. */
+export function shouldSplitCard(state: FeedState, threshold = MAX_LINES_PER_CARD): boolean {
+  return state.lines.length - state.cardLineOffset >= threshold;
+}
+
+/** Freezes the current card's window by moving `cardLineOffset` up to the turn's line count so
+ * far - the caller (index.ts) is expected to render/flush the pre-split state *first* so the
+ * boundary-crossing line still lands in the card being frozen, then apply this, then render again
+ * so the next flush starts the new card's window at the very next line instead of duplicating it. */
+export function splitCard(state: FeedState): FeedState {
+  return { ...state, cardLineOffset: state.lines.length };
 }
 
 const ONE_HOUR_MS = 60 * 60 * 1000;
@@ -61,6 +91,7 @@ export function applyEvent(state: FeedState, event: FeedEvent, nowMs: number): F
         lines: [],
         promptTimestampsMs: pruneOldPrompts([...state.promptTimestampsMs, nowMs], nowMs),
         turnSeq: state.turnSeq + 1,
+        cardLineOffset: 0,
       };
 
     case "tool_start":

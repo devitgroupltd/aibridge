@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { applyEvent, createFeedState, promptsInLastHour } from "../src/feed-state.ts";
+import { applyEvent, createFeedState, MAX_LINES_PER_CARD, promptsInLastHour, shouldSplitCard, splitCard } from "../src/feed-state.ts";
 
 const T0 = 1_700_000_000_000;
 
@@ -73,6 +73,53 @@ describe("applyEvent", () => {
     state = applyEvent(state, { kind: "subagent_start", agentId: "x" }, T0 + 2);
     expect(state.lines.map((l) => l.summary)).toEqual(["compacting context…", "compacted", "→ subagent started"]);
     expect(state.lines.every((l) => l.toolUseId === null)).toBe(true);
+  });
+
+  test("turn_start resets cardLineOffset alongside lines", () => {
+    let state = createFeedState("slug");
+    state = applyEvent(state, { kind: "turn_start" }, T0);
+    for (let i = 0; i < MAX_LINES_PER_CARD; i++) {
+      state = applyEvent(state, { kind: "tool_start", toolUseId: `t${i}`, toolName: "Read", summary: `Read ${i}`, fullInput: `Read ${i}` }, T0);
+    }
+    state = splitCard(state);
+    expect(state.cardLineOffset).toBeGreaterThan(0);
+    state = applyEvent(state, { kind: "turn_start" }, T0 + 1000);
+    expect(state.cardLineOffset).toBe(0);
+  });
+});
+
+describe("shouldSplitCard / splitCard", () => {
+  function withNLines(n: number) {
+    let state = createFeedState("slug");
+    state = applyEvent(state, { kind: "turn_start" }, T0);
+    for (let i = 0; i < n; i++) {
+      state = applyEvent(state, { kind: "tool_start", toolUseId: `t${i}`, toolName: "Read", summary: `Read ${i}`, fullInput: `Read ${i}` }, T0);
+    }
+    return state;
+  }
+
+  test("false below the threshold, true once the current window reaches it", () => {
+    expect(shouldSplitCard(withNLines(MAX_LINES_PER_CARD - 1))).toBe(false);
+    expect(shouldSplitCard(withNLines(MAX_LINES_PER_CARD))).toBe(true);
+  });
+
+  test("splitCard moves cardLineOffset to the current line count without touching lines", () => {
+    const state = withNLines(MAX_LINES_PER_CARD);
+    const split = splitCard(state);
+    expect(split.cardLineOffset).toBe(MAX_LINES_PER_CARD);
+    expect(split.lines).toBe(state.lines);
+  });
+
+  test("threshold resets relative to the new offset - not split again until another full window", () => {
+    let state = withNLines(MAX_LINES_PER_CARD);
+    state = splitCard(state);
+    expect(shouldSplitCard(state)).toBe(false);
+    for (let i = 0; i < MAX_LINES_PER_CARD - 1; i++) {
+      state = applyEvent(state, { kind: "tool_start", toolUseId: `u${i}`, toolName: "Read", summary: `Read u${i}`, fullInput: `Read u${i}` }, T0);
+    }
+    expect(shouldSplitCard(state)).toBe(false);
+    state = applyEvent(state, { kind: "tool_start", toolUseId: "last", toolName: "Read", summary: "Read last", fullInput: "Read last" }, T0);
+    expect(shouldSplitCard(state)).toBe(true);
   });
 });
 

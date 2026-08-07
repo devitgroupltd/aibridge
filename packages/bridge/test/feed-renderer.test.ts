@@ -54,6 +54,21 @@ describe("renderCard", () => {
     expect(card).not.toContain("file-0.ts");
   });
 
+  test("cardLineOffset windows the rendered lines to the current (split) card only", () => {
+    const state = { ...stateWithLines(10), cardLineOffset: 5 };
+    const card = renderCard(state, T0);
+    expect(card).toContain("file-9.ts");
+    expect(card).not.toContain("file-4.ts");
+    expect(card).not.toContain("earlier steps"); // 5 lines in the window, well under the 8 cap
+  });
+
+  test("a card past the first for its turn is marked (cont'd)", () => {
+    const fresh = renderCard(stateWithLines(3), T0);
+    expect(fresh).not.toContain("cont’d");
+    const split = { ...stateWithLines(3), cardLineOffset: 3 };
+    expect(renderCard(split, T0)).toContain("cont’d");
+  });
+
   test("a failed line's error text is appended", () => {
     let state = createFeedState("s");
     state = applyEvent(state, { kind: "tool_start", toolUseId: "a", toolName: "Bash", summary: "Bash exit 1", fullInput: "$ exit 1" }, T0);

@@ -64,11 +64,16 @@ function renderLineFull(line: ActivityLine, verbose: boolean): string {
 export function renderCard(state: FeedState, nowMs: number, settings: FeedRenderSettings = COMPACT_SETTINGS): string {
   const stateWord = state.turnActive ? "working" : "idle";
   const durationMs = state.turnStartedAtMs !== null ? nowMs - state.turnStartedAtMs : 0;
-  const header = `🔨 <b>${escapeForFeed(state.slug)}</b> · ${stateWord} (${formatDuration(durationMs)})`;
+  // A card past the first for this turn (`cardLineOffset > 0`, index.ts's `splitCard`) is labelled
+  // "(cont'd)" - without it, a fresh card with only a couple of lines and no visible link back to
+  // the turn it belongs to reads as a new, unrelated turn rather than a continuation of a long one.
+  const continued = (state.cardLineOffset ?? 0) > 0 ? " (cont’d)" : "";
+  const header = `🔨 <b>${escapeForFeed(state.slug)}</b> · ${stateWord} (${formatDuration(durationMs)})${continued}`;
+  const currentCardLines = state.lines.slice(state.cardLineOffset ?? 0);
 
   if (settings.detail === "compact") {
-    const total = state.lines.length;
-    const visible = total > MAX_VISIBLE_LINES ? state.lines.slice(total - MAX_VISIBLE_LINES) : state.lines;
+    const total = currentCardLines.length;
+    const visible = total > MAX_VISIBLE_LINES ? currentCardLines.slice(total - MAX_VISIBLE_LINES) : currentCardLines;
     const overflow = total - visible.length;
     const parts = [header, ""];
     if (overflow > 0) parts.push(`  …and ${overflow} earlier steps`);
@@ -83,8 +88,8 @@ export function renderCard(state: FeedState, nowMs: number, settings: FeedRender
   const rendered: string[] = [];
   let used = 0;
   let overflow = 0;
-  for (let i = state.lines.length - 1; i >= 0; i--) {
-    const text = renderLineFull(state.lines[i] as ActivityLine, settings.verbose);
+  for (let i = currentCardLines.length - 1; i >= 0; i--) {
+    const text = renderLineFull(currentCardLines[i] as ActivityLine, settings.verbose);
     if (rendered.length > 0 && used + text.length + 1 > budget) {
       overflow = i + 1;
       break;

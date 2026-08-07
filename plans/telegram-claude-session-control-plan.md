@@ -1,7 +1,7 @@
 ---
-version: 0.79.0
+version: 0.80.0
 status: solid
-last_modified_utc: 2026-08-06T20:15:00Z
+last_modified_utc: 2026-08-07T09:35:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,30 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.80.0 (2026-08-07): two feed-readability gaps raised directly by the operator watching a real
+    session's Telegram topic while it worked, both extensions of §5.3's one-card-per-turn design
+    rather than changes to it:
+    (1) **A very long turn edited the same card forever**, losing any sense of *when* things
+    happened relative to anything else in the topic. `feed-state.ts` gained `cardLineOffset`
+    (windows a card to `lines` since the last split, reset to 0 alongside `lines` on `turn_start`),
+    `MAX_LINES_PER_CARD` (20) and `shouldSplitCard`/`splitCard`; `index.ts`'s `handleHookEvent` now
+    splits into a fresh card once a turn's line count crosses the threshold, flushing the
+    boundary-crossing line into the card being frozen *before* moving the offset past it (same
+    flush-then-clear order as the existing turn-boundary fix, and for the same reason - reversed,
+    the line disappears from both cards). `feed-renderer.ts`'s `renderCard` slices from
+    `cardLineOffset` and marks a non-first card \"(cont'd)\"; `renderDetails`/`renderDetailsPlainText`
+    are unaffected - the `details` button still shows the whole turn regardless of how many cards it
+    spanned.
+    (2) **An operator message sent into a session's own topic mid-turn left the still-live card
+    visually stuck above it** - Telegram never repositions an edited message, so the next edit still
+    landed at the card's original position, under the operator's own newer text. `dispatchInboundMessage`
+    now marks the slug in a new `feedInterjected` set on any inbound message to a session topic; the
+    feed's own flush callback (`feedCoalescer`'s `onFlush` in `index.ts`) checks and clears that mark
+    first, dropping the cached message id so the flush posts a fresh message below the interjection
+    instead of editing the stale one. No forced immediate flush - nothing to show until the next hook
+    event anyway.
+    New coverage: `feed-state.test.ts` (`shouldSplitCard`/`splitCard`, offset reset on `turn_start`),
+    `feed-renderer.test.ts` (window slicing, \"(cont'd)\" marker); 867 pass, `tsc --noEmit` clean."
   - "0.79.0 (2026-08-06): §7.5's `/new <repo>` failed outright on a voice-transcribed repo name that
     didn't match any `repos.toml` entry verbatim (e.g. \"aibridge\" heard back as \"eI-Bridge\") -
     raised directly by the operator hitting exactly that case live. Added

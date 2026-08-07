@@ -92,7 +92,7 @@ import {
   stripBotMention,
 } from "./fleet-commands.ts";
 import { renderCard, renderDetails, renderDetailsPlainText } from "./feed-renderer.ts";
-import { applyEvent, createFeedState, promptsInLastHour } from "./feed-state.ts";
+import { applyEvent, createFeedState, promptsInLastHour, shouldSplitCard, splitCard } from "./feed-state.ts";
 import { monotonicNowMs } from "./monotonic-clock.ts";
 import { normalizeHookEvent } from "./hook-events.ts";
 import { CostTracker, FIVE_HOURS_MS, ONE_WEEK_MS } from "./cost-tracker.ts";
@@ -452,6 +452,13 @@ async function main(): Promise<void> {
   // control bot are deliberately left as direct calls for this pass - see Phase 3's own note.
   const feedStates = new Map<string, ReturnType<typeof createFeedState>>();
   const feedMessageIds = new Map<string, number>();
+  // A message landing in a session's own topic after the card's last edit leaves the still-live
+  // card visually "stuck" above it - Telegram never repositions an edited message, the same fact
+  // behind the turn/split boundaries above, just triggered by the *operator* instead of a hook
+  // event (live-observed complaint, 2026-08-07). Marked in dispatchInboundMessage, consumed (and
+  // cleared) by the next flush below - no need to force an immediate one, since there's nothing new
+  // to show until the next hook event anyway.
+  const feedInterjected = new Set<string>();
   const feedGovernor = new RateGovernor({ log });
   const feedCoalescer = new FeedCoalescer({
     activeSessionCount: () => routing.all().length,
@@ -462,6 +469,7 @@ async function main(): Promise<void> {
         if (sessionStore.get(slug)?.paused) return;
         const route = routing.get(slug);
         if (!route) return;
+        if (feedInterjected.delete(slug)) feedMessageIds.delete(slug);
         const existingMessageId = feedMessageIds.get(slug);
         if (existingMessageId !== undefined && feedBot.editMessageText) {
           try {
@@ -572,8 +580,9 @@ async function main(): Promise<void> {
 
     const nowMs = Date.now();
     const previous = feedStates.get(msg.slug) ?? createFeedState(msg.slug);
-    const next = applyEvent(previous, event, nowMs);
+    let next = applyEvent(previous, event, nowMs);
     feedStates.set(msg.slug, next);
+    const feedSettings = row ? { detail: row.feedDetail, verbose: row.feedVerbose } : undefined;
 
     if (event.kind === "turn_start") {
       // §5.3/§5.4 are explicit that the card is *one message per turn*, edited in place - so a new
@@ -595,9 +604,21 @@ async function main(): Promise<void> {
         log("WARN", `session "${msg.slug}" started ${promptCount} turns in the last hour - check whether its allowlist has grown too broad (§10.4.1)`);
       }
       postDetailsButton(msg.slug, next.turnSeq);
+    } else if (shouldSplitCard(next)) {
+      // A very long turn (many tool calls) otherwise edits the same message forever, which loses
+      // any sense of *when* things happened relative to anything else in the topic (live-observed
+      // complaint, 2026-08-07) - same underlying Telegram fact as the turn boundary above (edits
+      // never reposition), just crossed mid-turn instead of between turns. Same flush-then-clear
+      // order and the same reason: render (and let this notify carry) the boundary-crossing line
+      // into the card about to be frozen *before* moving `cardLineOffset` past it, or that line
+      // never appears in either card.
+      feedCoalescer.notify(msg.slug, renderCard(next, nowMs, feedSettings));
+      feedCoalescer.reset(msg.slug);
+      feedMessageIds.delete(msg.slug);
+      next = splitCard(next);
+      feedStates.set(msg.slug, next);
     }
 
-    const feedSettings = row ? { detail: row.feedDetail, verbose: row.feedVerbose } : undefined;
     feedCoalescer.notify(msg.slug, renderCard(next, nowMs, feedSettings));
   }
 
@@ -2529,6 +2550,11 @@ async function main(): Promise<void> {
     // Strip a Telegram-inserted "@botusername" before any command parsing below - see
     // stripBotMention's doc comment for why this has to happen exactly once, here.
     const text = stripBotMention(rawText.trim());
+
+    // Any message landing in a session's own topic (chat, command, whatever) pushes the feed
+    // card's already-fixed position further up the topic - see feedInterjected's own doc comment
+    // above for why the *next* card flush needs to know this happened.
+    if (route && !isControl) feedInterjected.add(route.slug);
 
     const fleetCmd = parseFleetCommand(text);
     if (fleetCmd) {
