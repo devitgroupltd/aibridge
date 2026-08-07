@@ -9,6 +9,7 @@ function entry(overrides: Partial<Parameters<VoiceConfirmRegistry["add"]>[0]> = 
     transcript: "push the fix now",
     from: "operator",
     confirmCardMessageId: 100,
+    origin: {},
     ...overrides,
   };
 }

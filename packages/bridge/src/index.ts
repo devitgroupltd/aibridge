@@ -72,6 +72,8 @@ import { startWhisperServer, transcribeVoiceNote } from "./voice-transcribe.ts";
 import { buildNlConfirmKeyboard, NlConfirmRegistry, resolveNlConfirmCallback } from "./nl-confirm.ts";
 import type { PendingNlConfirm } from "./nl-confirm.ts";
 import { isRetryPhrase, retryTopicKey, RetryStore } from "./retry-store.ts";
+import { buildContextPrefix } from "./message-context.ts";
+import type { MessageOrigin } from "./message-context.ts";
 import { routeText } from "./nl-router.ts";
 import type { RouterAction } from "./nl-router.ts";
 import { SettingsStore } from "./settings-store.ts";
@@ -1566,14 +1568,14 @@ async function main(): Promise<void> {
   /** §7.4's stale-inbound path: posts the "received while offline, still want this?" card instead
    * of dispatching a backlog message directly, and registers the replay payload. Mirrors
    * `postFleetConfirm`'s shape exactly. */
-  async function postStaleConfirm(threadId: number | undefined, messageId: number, rawText: string, from: string, ageLabel: string): Promise<void> {
+  async function postStaleConfirm(threadId: number | undefined, messageId: number, rawText: string, from: string, ageLabel: string, origin: MessageOrigin): Promise<void> {
     const id = randomUUID().slice(0, 8);
     const preview = rawText.length > 200 ? `${rawText.slice(0, 200)}…` : rawText;
     try {
       const sent = await controlBot.sendMessage(config.supergroupChatId, threadId, `⏳ received while offline (${ageLabel}) - still want this?\n\n${preview}`, {
         inline_keyboard: buildStaleConfirmKeyboard(id),
       });
-      staleConfirmRegistry.add({ id, threadId, messageId, rawText, from, confirmCardMessageId: sent.message_id });
+      staleConfirmRegistry.add({ id, threadId, messageId, rawText, from, confirmCardMessageId: sent.message_id, origin });
     } catch (err) {
       log("WARN", `failed to post stale-inbound confirmation: ${(err as Error).message}`);
     }
@@ -1600,7 +1602,14 @@ async function main(): Promise<void> {
    * turn, and observed live the same way (an 8s voice note with no feedback at all reads as
    * "did this even work?"). Same fix: post a "🎤 Transcribing..." placeholder immediately, then
    * edit that same message into the real confirm card - one message per voice note, not two. */
-  async function handleVoiceMessage(voice: { file_id: string; duration: number }, threadId: number | undefined, messageId: number, from: string, messageDate: number): Promise<void> {
+  async function handleVoiceMessage(
+    voice: { file_id: string; duration: number },
+    threadId: number | undefined,
+    messageId: number,
+    from: string,
+    messageDate: number,
+    origin: MessageOrigin,
+  ): Promise<void> {
     if (!config.voice.enabled) {
       confirmSessionCommand(threadId, "Voice input isn't set up on this Bridge yet - see scripts/setup-windows.ps1's voice step, then set VOICE_ENABLED=true.");
       return;
@@ -1632,7 +1641,7 @@ async function main(): Promise<void> {
             controlBot.editMessageText!(config.supergroupChatId, placeholderId!, `🎤 ${preview}`, { inline_keyboard: buildVoiceConfirmKeyboard(id) }),
           );
         }
-        voiceConfirmRegistry.add({ id, threadId, messageId, transcript: text, from, confirmCardMessageId: placeholderId });
+        voiceConfirmRegistry.add({ id, threadId, messageId, transcript: text, from, confirmCardMessageId: placeholderId, origin });
         return;
       }
       // Confirmation is off - send straight through, but the transcript stays visible on the
@@ -1650,7 +1659,7 @@ async function main(): Promise<void> {
       }
       const autoIsControl = isControlTopic(threadId);
       const autoRoute = threadId !== undefined ? routing.getByTopicId(threadId) : undefined;
-      void dispatchInboundMessage(messageId, text, threadId, autoIsControl, autoRoute, autoRoute?.slug, from);
+      void dispatchInboundMessage(messageId, text, threadId, autoIsControl, autoRoute, autoRoute?.slug, from, buildContextPrefix(origin));
     } catch (err) {
       log("WARN", `voice transcription failed: ${(err as Error).message}`);
       const failText = "Couldn't transcribe that voice note - try again, or just type it.";
@@ -1681,6 +1690,7 @@ async function main(): Promise<void> {
     messageId: number,
     caption: string | undefined,
     from: string,
+    origin: MessageOrigin,
   ): Promise<void> {
     if (!route) {
       if (isControl) confirmSessionCommand(threadId, `Send ${attachmentKindLabel(kind)} in a session topic - the control topic has no session to hand it to.`);
@@ -1696,7 +1706,7 @@ async function main(): Promise<void> {
       const suggestedName = guessAttachmentFilename(kind, fileName, mimeType);
       const absPath = writeAttachmentToInbox(STATE_DIR, route.slug, suggestedName, bytes);
       const announcement = buildAttachmentAnnouncement(kind, absPath, caption);
-      void dispatchInboundMessage(messageId, announcement, threadId, isControl, route, route.slug, from);
+      void dispatchInboundMessage(messageId, announcement, threadId, isControl, route, route.slug, from, buildContextPrefix(origin));
     } catch (err) {
       log("WARN", `attachment download failed: ${(err as Error).message}`);
       confirmSessionCommand(threadId, `Couldn't download that ${kind} - try sending it again.`);
@@ -2771,6 +2781,12 @@ async function main(): Promise<void> {
     route: ReturnType<typeof routing.getByTopicId>,
     currentSlug: string | undefined,
     from: string,
+    // §5.x (message-context.ts): built once by the caller from the *original* Telegram message's
+    // `forward_origin`/`reply_to_message` (never re-derived from `rawText`, which by this point may
+    // already be a synthesized announcement/transcript with no such fields of its own). Applied only
+    // at the one "this reaches the session" send below - never mixed into `text`/`rawText` itself,
+    // which every `/command` parse in this function still needs byte-identical to what was typed.
+    contextPrefix = "",
   ): Promise<void> {
     // Strip a Telegram-inserted "@botusername" before any command parsing below - see
     // stripBotMention's doc comment for why this has to happen exactly once, here.
@@ -2998,7 +3014,7 @@ async function main(): Promise<void> {
       // never negotiates the capability), so inbound delivery writes the same <channel> tag
       // Claude Code would have rendered itself directly to the session's PTY, exactly as an
       // operator typing it and pressing Enter would.
-      sendChannelText(currentSlug, threadId, rawText, String(messageId), from);
+      sendChannelText(currentSlug, threadId, contextPrefix + rawText, String(messageId), from);
     });
   }
 
@@ -3287,7 +3303,7 @@ async function main(): Promise<void> {
           void finalizeStaleConfirmMessage(pending, "✅ Confirmed - processing now.");
           const pendingIsControl = isControlTopic(pending.threadId);
           const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
-          void dispatchInboundMessage(pending.messageId, pending.rawText, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from);
+          void dispatchInboundMessage(pending.messageId, pending.rawText, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin));
           return;
         }
 
@@ -3317,7 +3333,7 @@ async function main(): Promise<void> {
             void finalizeVoiceConfirmMessage(pending, voiceConfirmAction.action === "send_and_stop_asking" ? "✅ Sent (confirmation now off - /voiceconfirm on to re-enable)." : "✅ Sent.");
             const pendingIsControl = isControlTopic(pending.threadId);
             const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
-            void dispatchInboundMessage(pending.messageId, pending.transcript, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from);
+            void dispatchInboundMessage(pending.messageId, pending.transcript, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin));
             return;
           }
           const doneText =
@@ -3500,7 +3516,7 @@ async function main(): Promise<void> {
       const hasActionableContent = message.text !== undefined || hasAttachment(message);
       if (hasActionableContent && !message.voice && isStaleInbound(message.date, nowMs)) {
         if (message.text !== undefined) {
-          void postStaleConfirm(threadId, message.message_id, message.text, from, formatStaleAge(message.date, nowMs));
+          void postStaleConfirm(threadId, message.message_id, message.text, from, formatStaleAge(message.date, nowMs), message);
         } else {
           // An attachment gets a plain notice rather than a replayable confirm card: replaying one
           // would mean holding its `file_id` and re-running the download later, and a re-send from
@@ -3517,7 +3533,7 @@ async function main(): Promise<void> {
       // own TTL) is what matters, not staleness of when the note was recorded, because nothing
       // reaches the session until the operator taps Send on a transcript they can read.
       if (message.voice) {
-        void handleVoiceMessage(message.voice, threadId, message.message_id, from, message.date);
+        void handleVoiceMessage(message.voice, threadId, message.message_id, from, message.date, message);
         return;
       }
 
@@ -3528,27 +3544,27 @@ async function main(): Promise<void> {
       // with `voice`/`text` above - order here doesn't matter beyond that.
       if (message.photo && message.photo.length > 0) {
         const largest = message.photo[message.photo.length - 1]!;
-        void handleAttachmentMessage("image", largest.file_id, largest.file_size, undefined, undefined, threadId, route, isControl, message.message_id, message.caption, from);
+        void handleAttachmentMessage("image", largest.file_id, largest.file_size, undefined, undefined, threadId, route, isControl, message.message_id, message.caption, from, message);
         return;
       }
       if (message.document) {
         const doc = message.document;
-        void handleAttachmentMessage("document", doc.file_id, doc.file_size, doc.file_name, doc.mime_type, threadId, route, isControl, message.message_id, message.caption, from);
+        void handleAttachmentMessage("document", doc.file_id, doc.file_size, doc.file_name, doc.mime_type, threadId, route, isControl, message.message_id, message.caption, from, message);
         return;
       }
       if (message.video) {
         const video = message.video;
-        void handleAttachmentMessage("video", video.file_id, video.file_size, video.file_name, video.mime_type, threadId, route, isControl, message.message_id, message.caption, from);
+        void handleAttachmentMessage("video", video.file_id, video.file_size, video.file_name, video.mime_type, threadId, route, isControl, message.message_id, message.caption, from, message);
         return;
       }
       if (message.audio) {
         const audio = message.audio;
-        void handleAttachmentMessage("audio", audio.file_id, audio.file_size, audio.file_name, audio.mime_type, threadId, route, isControl, message.message_id, message.caption, from);
+        void handleAttachmentMessage("audio", audio.file_id, audio.file_size, audio.file_name, audio.mime_type, threadId, route, isControl, message.message_id, message.caption, from, message);
         return;
       }
       if (message.video_note) {
         const note = message.video_note;
-        void handleAttachmentMessage("video note", note.file_id, note.file_size, undefined, undefined, threadId, route, isControl, message.message_id, message.caption, from);
+        void handleAttachmentMessage("video note", note.file_id, note.file_size, undefined, undefined, threadId, route, isControl, message.message_id, message.caption, from, message);
         return;
       }
 
@@ -3556,7 +3572,7 @@ async function main(): Promise<void> {
 
       // §7.4's gate already ran above, before any content branch - nothing below ever sees a stale
       // message.
-      void dispatchInboundMessage(message.message_id, message.text, threadId, isControl, route, currentSlug, from);
+      void dispatchInboundMessage(message.message_id, message.text, threadId, isControl, route, currentSlug, from, buildContextPrefix(message));
     },
     onError: (err) => {
       log("WARN", `getUpdates failed, retrying: ${(err as Error).message}`);

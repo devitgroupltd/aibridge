@@ -1,4 +1,5 @@
 import { ConfirmRegistry, type ConfirmRegistryOptions } from "./confirm-registry.ts";
+import type { MessageOrigin } from "./message-context.ts";
 import type { InlineKeyboardButton } from "./telegram.ts";
 
 /**
@@ -19,6 +20,10 @@ export interface PendingVoiceConfirm {
   transcript: string;
   from: string;
   confirmCardMessageId: number;
+  /** The original message's `forward_origin`/`reply_to_message` (message-context.ts), carried
+   * through so a tap on "Send" - minutes later - still prepends the same forwarded-from/replying-to
+   * context the transcript would have gotten on an immediate auto-send. */
+  origin: MessageOrigin;
   createdAt: number;
 }
 

@@ -1,11 +1,36 @@
 import { RateLimitedError } from "./rate-governor.ts";
 
+/** Bot API 7.0+'s `forward_origin` (replaced the older flat `forward_from`/`forward_from_chat`/
+ * `forward_date` fields, which this client never supported so there's nothing to migrate). Only
+ * the sub-fields `message-context.ts` actually reads are declared - the real payload carries more
+ * (dates, chat ids, ...) that nothing here needs yet. */
+export type TelegramForwardOrigin =
+  | { type: "user"; sender_user: { username?: string; first_name?: string } }
+  | { type: "hidden_user"; sender_user_name: string }
+  | { type: "chat"; sender_chat: { title?: string; username?: string } }
+  | { type: "channel"; chat: { title?: string; username?: string } };
+
+/** The message a reply quotes. Telegram itself never nests a second `reply_to_message` inside this
+ * one (a reply to a reply only ever carries its immediate parent), so a shallow shape is safe -
+ * no recursive type needed. */
+export interface TelegramReplyTarget {
+  message_id: number;
+  text?: string;
+  caption?: string;
+}
+
 export interface TelegramMessage {
   message_id: number;
   chat: { id: number };
   message_thread_id?: number;
   text?: string;
   from?: { id: number; username?: string; first_name?: string };
+  /** Set when this message was forwarded from elsewhere (another chat, channel, or user) rather
+   * than typed fresh - see `message-context.ts`'s `buildContextPrefix`, which is the one consumer. */
+  forward_origin?: TelegramForwardOrigin;
+  /** Set when this message is a Telegram-native "swipe to reply" quoting an earlier message in the
+   * same topic - see `message-context.ts`'s `buildContextPrefix`, which is the one consumer. */
+  reply_to_message?: TelegramReplyTarget;
   /** Unix seconds (UTC), set by Telegram's servers when the message was sent - always present on
    * a real message, per the Bot API. §7.4's stale-inbound check (`stale-inbound.ts`) is the only
    * consumer so far. */

@@ -1,7 +1,7 @@
 ---
-version: 0.94.1
+version: 0.95.0
 status: solid
-last_modified_utc: 2026-08-07T16:15:00Z
+last_modified_utc: 2026-08-07T16:45:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,26 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.95.0 (2026-08-07): operator asked whether forwarded messages and Telegram's own swipe-to-reply
+    were handled - content-wise (text/voice/photo/document/video/audio) they always were, since every
+    handler only ever branched on the content fields, never on `forward_origin`/`reply_to_message`
+    (not even present in `TelegramMessage`'s type). But the *provenance* was silently dropped: a
+    forwarded message read to Claude exactly like the operator's own words, and a reply quoting a
+    specific earlier message carried no indication of which one. Operator confirmed wanting both
+    surfaced, concretely for the 'I reply to an earlier useful message for additional context' case.
+    New `message-context.ts`: `buildContextPrefix(origin)` builds a `[Forwarded from X]`/`[Replying to
+    an earlier message: \"...\"]` prefix (200-char quote preview, same length `postStaleConfirm`
+    already uses) from a `MessageOrigin` (`forward_origin`/`reply_to_message`, added to
+    `TelegramMessage` in telegram.ts). Applied only at the genuine 'this reaches the session' send
+    (`dispatchInboundMessage`'s new `contextPrefix` parameter, used solely at its final
+    `sendChannelText` call) - never mixed into the text every `/command` parse in that same function
+    runs against, so a reply-quoting a real command doesn't stop parsing as one. Threaded through
+    every path that eventually reaches a session: the main text handler, `handleAttachmentMessage`
+    (photo/document/video/audio/video-note), `handleVoiceMessage` (both the immediate auto-send path
+    and the confirm-card 'Send' tap, which needed `PendingVoiceConfirm` to carry `origin` since the
+    tap can land minutes later), and the stale-inbound replay path (`PendingStaleConfirm` gained the
+    same `origin` field). New tests: 11 in `message-context.test.ts`. 927 total passing (up from 916),
+    `tsc --noEmit` clean."
   - "0.94.1 (2026-08-07): follow-up to 0.94.0 below, prompted by the operator asking whether the fix
     had tests - it didn't, and 'not independently unit-testable' was the wrong call: this codebase's
     own established pattern (`session-launcher.ts`'s `buildClaudeSpawnArgs`) is to pull the exec

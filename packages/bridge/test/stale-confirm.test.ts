@@ -9,6 +9,7 @@ function entry(overrides: Partial<Parameters<StaleConfirmRegistry["add"]>[0]> = 
     rawText: "push it",
     from: "operator",
     confirmCardMessageId: 100,
+    origin: {},
     ...overrides,
   };
 }

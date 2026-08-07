@@ -1,4 +1,5 @@
 import { ConfirmRegistry, type ConfirmRegistryOptions } from "./confirm-registry.ts";
+import type { MessageOrigin } from "./message-context.ts";
 import type { InlineKeyboardButton } from "./telegram.ts";
 
 /**
@@ -22,6 +23,10 @@ export interface PendingStaleConfirm {
   rawText: string;
   from: string;
   confirmCardMessageId: number;
+  /** The original message's `forward_origin`/`reply_to_message` (message-context.ts), carried
+   * through so a replay - minutes later - still prepends the same forwarded-from/replying-to
+   * context an immediate dispatch would have gotten. */
+  origin: MessageOrigin;
   createdAt: number;
 }
 
