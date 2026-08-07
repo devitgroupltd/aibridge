@@ -212,6 +212,36 @@ export function stripAnsi(text: string): string {
  * reply forever, since the original prompt was never resent into the fresh conversation either. */
 const RESUME_FAILURE_PATTERN = /no conversation found with session id/i;
 
+/** Nothing else in the Bridge tells Claude what language to reply in (checked - `nl-router.ts`'s
+ * classification prompt doesn't count, it governs command-extraction, not conversational replies;
+ * confirmed via a full search of the package for "language"/"locale"/"respond in"). Installed once
+ * per spawn via `--append-system-prompt` so it survives `--resume` relaunches too, since a resumed
+ * PTY re-spawns the same `claude` CLI from scratch (§4.5) rather than continuing an existing process. */
+const LANGUAGE_MIRROR_SYSTEM_PROMPT =
+  "You're being operated over a Telegram bridge. The operator may write in any language and may " +
+  "switch languages between messages within the same conversation. Always reply in the same " +
+  "language as the operator's most recent message - never default to English just because the " +
+  "session's slug, worktree/folder name, git branch, or earlier turns happen to be in English. " +
+  "Code, filenames, commit messages, and identifiers should stay in whatever language the project " +
+  "itself already uses (normally English), independent of the conversation's language.";
+
+/** Extracted from `launchSession`'s `pty.spawn` call so it's unit-testable without touching
+ * `pty.spawn` itself - mirrors this file's existing pattern of pulling pure logic (`stripAnsi`,
+ * `waitForStartupPrompt`) out into its own exported piece. */
+export function buildClaudeSpawnArgs(opts: { model: string; settingsPath: string; resumeSessionId?: string }): string[] {
+  return [
+    "--channels",
+    "plugin:aibridge-telegram@devitgroup-plugins",
+    "--model",
+    opts.model,
+    "--settings",
+    opts.settingsPath,
+    "--append-system-prompt",
+    LANGUAGE_MIRROR_SYSTEM_PROMPT,
+    ...(opts.resumeSessionId ? ["--resume", opts.resumeSessionId] : []),
+  ];
+}
+
 export function waitForStartupPrompt(ptyProcess: pty.IPty, log: LogFn, resumeSessionId?: string): Promise<{ resumeFailed: boolean }> {
   return new Promise((resolve) => {
     let done = false;
@@ -303,15 +333,7 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   // carry a per-session `AIBRIDGE_SLUG` the way a per-worktree `.mcp.json` env block used to.
   const ptyProcess = pty.spawn(
     resolveClaudeExecutable(),
-    [
-      "--channels",
-      "plugin:aibridge-telegram@devitgroup-plugins",
-      "--model",
-      opts.model ?? "sonnet",
-      "--settings",
-      settingsPath,
-      ...(opts.resumeSessionId ? ["--resume", opts.resumeSessionId] : []),
-    ],
+    buildClaudeSpawnArgs({ model: opts.model ?? "sonnet", settingsPath, resumeSessionId: opts.resumeSessionId }),
     {
       name: "xterm-256color",
       cols: 120,

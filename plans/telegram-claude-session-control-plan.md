@@ -1,7 +1,7 @@
 ---
-version: 0.87.0
+version: 0.88.0
 status: solid
-last_modified_utc: 2026-08-07T12:09:00Z
+last_modified_utc: 2026-08-07T13:20:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,32 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.88.0 (2026-08-07): operator request - a Russian voice-triggered `/new` created an English-
+    titled session (fine, matches the operator's own preference) but then talked English for the
+    whole conversation instead of Russian. Root-caused to two independent gaps, both fixed together
+    since fixing only the first would have introduced the second as a visible regression: (1)
+    `handleNewCommand` sent the NL router's own `prompt` field - an emergent English paraphrase
+    (`nl-router.ts`'s classification prompt is all-English with no language-preservation
+    instruction) - as the session's actual first turn, discarding the operator's original wording;
+    fixed by threading the raw incoming message through as `sourceText` (`routeOrFallback` in
+    index.ts, only for NL-router-matched `/new` - a typed `/new <repo> <task>` already sends its own
+    verbatim text) and preferring it via a new `newSessionContent` helper (fleet-commands.ts), while
+    slug/topic-title generation keep using `prompt` unchanged (both meant to stay English). (2)
+    nothing anywhere told Claude to reply in the operator's language at all, so even a same-language
+    first turn wouldn't survive an operator switching languages mid-conversation (an explicitly
+    called-out use case) - fixed with a standing `LANGUAGE_MIRROR_SYSTEM_PROMPT` installed via
+    `--append-system-prompt` on every spawn (`session-launcher.ts`'s new exported
+    `buildClaudeSpawnArgs`, covering both fresh `/new` and `--resume` relaunches since both go through
+    the same `pty.spawn` call). Fixing both surfaced a third, second-order issue caught only by asking
+    the operator directly: the pre-existing 'rename-once' feature (§4.4) overwrites a topic's title
+    with its first real reply's own text - previously invisible since that reply was always English -
+    which would now flip the (deliberately English) topic title to the operator's language too; guarded
+    with a new cheap ASCII-letter-ratio heuristic, `looksEnglishEnough` (`language-heuristic.ts`), that
+    skips the rename (leaving the topic on its original English title) when the reply isn't English
+    enough. New tests: 2 for `newSessionContent`, 3 for `buildClaudeSpawnArgs` (model/settings/
+    append-system-prompt always present, `--resume` only when requested), 5 for `looksEnglishEnough`
+    (plain English, symbols-only, Cyrillic, mostly-Cyrillic-with-code-mixed-in, English-with-foreign-
+    proper-nouns) - 902 total passing, 0 failures, `tsc --noEmit` clean."
   - "0.87.0 (2026-08-07): operator request - a single dash before a recognised flag word
     (`/rm -all`, `/kill -all`, `/rm -dead`, `/rm -prefix <text>`, `/new -opus`, `/repos add
     ... -base|-model`) now parses the same as the double-dash form, everywhere one of these flags is

@@ -80,6 +80,7 @@ import {
   isKnownCommandText,
   isHelpCommand,
   buildLsDetail,
+  newSessionContent,
   parseCommandsQuery,
   parseFleetCommand,
   parseSkillsQuery,
@@ -152,6 +153,7 @@ import type { DefaultCategory, Effort, Mode, Model, SessionCommand } from "./ses
 import { stateForHookEvent } from "./session-state-transitions.ts";
 import { formatUsagePanel } from "./usage-panel.ts";
 import { isValidTransition, SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
+import { looksEnglishEnough } from "./language-heuristic.ts";
 import { slugFromPrompt, uniqueSlug } from "./slug.ts";
 import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
 import { isPermanentEditFailure, startPolling, TelegramClient, validateTokens } from "./telegram.ts";
@@ -738,10 +740,16 @@ async function main(): Promise<void> {
       // `/new`-prompt title, capped so a later reply never renames it again.
       const row = sessionStore.getByTopicId(Number(topicId));
       if (row && !row.renamed) {
-        sessionStore.setRenamed(row.slug);
-        controlBot
-          .editForumTopic(config.supergroupChatId, Number(topicId), text.slice(0, 128) || row.slug)
-          .catch((err: unknown) => log("WARN", `editForumTopic (rename-once) failed for "${row.slug}": ${(err as Error).message}`));
+        sessionStore.setRenamed(row.slug); // marked regardless - a one-shot decision, not a retry loop
+        // The reply may now be in the operator's own language (the language-mirroring system
+        // prompt), but the topic title is meant to stay a stable English label like the
+        // slug/worktree/branch already do - so a reply that isn't English enough leaves the topic
+        // on its original /new-derived (English) title instead of flipping it to another script.
+        if (looksEnglishEnough(text)) {
+          controlBot
+            .editForumTopic(config.supergroupChatId, Number(topicId), text.slice(0, 128) || row.slug)
+            .catch((err: unknown) => log("WARN", `editForumTopic (rename-once) failed for "${row.slug}": ${(err as Error).message}`));
+        }
       }
     },
     onHookEvent: handleHookEvent,
@@ -1272,7 +1280,7 @@ async function main(): Promise<void> {
     // post - so without this, the topic opened straight into Claude's tool-call feed with no visible
     // record of what was actually asked for. Posted as a plain message (not `confirmSessionCommand`,
     // which targets `controlTopicId`) since this belongs in the new topic itself.
-    confirmSessionCommand(topic.message_thread_id, cmd.prompt);
+    confirmSessionCommand(topic.message_thread_id, newSessionContent(cmd));
 
     let session: ReturnType<typeof launchSession>;
     try {
@@ -1341,7 +1349,7 @@ async function main(): Promise<void> {
     // isn't even a true no-op, just zero `buildModeKeystrokes` steps.
     if (defaultSessionMode !== DEFAULT_MODE) writeModeKeystrokes(slug, defaultSessionMode);
     if (defaultSessionEffort !== DEFAULT_EFFORT) sendEffortCommand(slug, defaultSessionEffort);
-    sendChannelText(slug, topic.message_thread_id, cmd.prompt, "new-1", "telegram");
+    sendChannelText(slug, topic.message_thread_id, newSessionContent(cmd), "new-1", "telegram");
   }
 
   function handleLsCommand(topicId: number | undefined): void {
@@ -2592,6 +2600,13 @@ async function main(): Promise<void> {
       onNoMatch();
       return;
     }
+    // The router's own `prompt` field is an emergent English paraphrase (its classification prompt
+    // is all-English with no language-preservation instruction) - fine for the slug/topic title,
+    // wrong for what the session actually sees as its first turn. Attaching the raw message here
+    // (before the destructive/confirm branch, so a deferred `/new` would carry it too - moot today
+    // since 'new' is never destructive, but this keeps the guarantee in one place) lets
+    // `handleNewCommand` recover the operator's own words via `newSessionContent`.
+    if (result.command.kind === "new") result.command = { ...result.command, sourceText: text };
     if (result.destructive && assistEnabled) {
       void postNlConfirm(result.command, threadId, currentSlug);
       return;

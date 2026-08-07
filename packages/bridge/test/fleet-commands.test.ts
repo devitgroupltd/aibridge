@@ -4,6 +4,7 @@ import {
   buildLsDetail,
   isKnownCommandText,
   isHelpCommand,
+  newSessionContent,
   normalizeDashFlags,
   parseCommandsQuery,
   parseFleetCommand,
@@ -141,6 +142,23 @@ describe("stripBotMention", () => {
 
   test("only strips a mention immediately after the leading command, not one later in the text", () => {
     expect(stripBotMention("/new seowrite ask @alice to review")).toBe("/new seowrite ask @alice to review");
+  });
+});
+
+describe("newSessionContent", () => {
+  // The 2026-08-07 language-mirroring fix: an NL-router-matched `/new` attaches the operator's raw
+  // original message as `sourceText` (index.ts's routeOrFallback) precisely because `prompt` is an
+  // emergent English paraphrase - so the session's actual first turn must prefer `sourceText`.
+  test("prefers sourceText over prompt when both are present", () => {
+    expect(newSessionContent({ prompt: "check what still needs to be done", sourceText: "проверь, что еще нужно сделать" })).toBe(
+      "проверь, что еще нужно сделать",
+    );
+  });
+
+  // A typed `/new <repo> <task>` command never sets sourceText - prompt there is already the
+  // operator's verbatim text (parseNew), so falling back to it is correct, not a compromise.
+  test("falls back to prompt when sourceText is absent", () => {
+    expect(newSessionContent({ prompt: "fix the login bug" })).toBe("fix the login bug");
   });
 });
 

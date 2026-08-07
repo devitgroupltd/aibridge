@@ -22,7 +22,7 @@ import type { SessionRow } from "./session-store.ts";
 export type RmBulkFilter = { mode: "dead" } | { mode: "prefix"; prefix: string } | { mode: "all" };
 
 export type FleetCommand =
-  | { kind: "new"; repo: string; prompt: string; model?: Model }
+  | { kind: "new"; repo: string; prompt: string; model?: Model; sourceText?: string }
   | { kind: "ls" }
   | { kind: "kill"; slug?: string; all?: boolean }
   | { kind: "rm"; slug?: string; bulk?: RmBulkFilter }
@@ -96,6 +96,16 @@ function parseNew(rest: string): FleetCommand | null {
   const prompt = tokens.join(" ");
   if (!repo || !prompt) return null;
   return { kind: "new", repo, prompt, model };
+}
+
+/** What actually gets shown in-topic and sent as the session's first turn: the operator's own words
+ * when known (`sourceText`, threaded through only for an NL-router-matched `/new` - `index.ts`'s
+ * `routeOrFallback` attaches it from the raw incoming message), never the router's English paraphrase
+ * (`prompt`) - that stays reserved for the slug/topic title, which are meant to stay English
+ * regardless of what language the conversation itself runs in. A typed `/new <repo> <task>` command
+ * never sets `sourceText` at all, since `prompt` there is already the operator's verbatim text. */
+export function newSessionContent(cmd: { prompt: string; sourceText?: string }): string {
+  return cmd.sourceText ?? cmd.prompt;
 }
 
 function parseSlugArg(kind: "attach" | "pause" | "usage", rest: string): FleetCommand {

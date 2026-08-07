@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type * as pty from "node-pty";
-import { stripAnsi, waitForStartupPrompt } from "../src/session-launcher.ts";
+import { buildClaudeSpawnArgs, stripAnsi, waitForStartupPrompt } from "../src/session-launcher.ts";
 
 /** A minimal stand-in for `pty.IPty` - `waitForStartupPrompt` only ever calls `.onData`. */
 class FakePty {
@@ -70,5 +70,30 @@ describe("waitForStartupPrompt", () => {
     fake.emit("No conversation found with session ID: whatever\r\n");
     fake.emit("  ⏸ manual mode on · ? for shortcuts · ← for agents◐ medium · /effort  ");
     expect(await result).toEqual({ resumeFailed: false });
+  });
+});
+
+describe("buildClaudeSpawnArgs", () => {
+  test("always includes --model, --settings, and a language-mirroring --append-system-prompt", () => {
+    const args = buildClaudeSpawnArgs({ model: "sonnet", settingsPath: "C:\\state\\sessions\\foo\\settings.json" });
+    expect(args).toContain("--model");
+    expect(args[args.indexOf("--model") + 1]).toBe("sonnet");
+    expect(args).toContain("--settings");
+    expect(args[args.indexOf("--settings") + 1]).toBe("C:\\state\\sessions\\foo\\settings.json");
+    const systemPromptIdx = args.indexOf("--append-system-prompt");
+    expect(systemPromptIdx).toBeGreaterThan(-1);
+    expect(args[systemPromptIdx + 1]).toContain("Always reply in the same language as the operator's most recent message");
+  });
+
+  test("omits --resume when no resumeSessionId is given", () => {
+    const args = buildClaudeSpawnArgs({ model: "sonnet", settingsPath: "settings.json" });
+    expect(args).not.toContain("--resume");
+  });
+
+  test("appends --resume <id> when resumeSessionId is given", () => {
+    const args = buildClaudeSpawnArgs({ model: "opus", settingsPath: "settings.json", resumeSessionId: "abc-123" });
+    const resumeIdx = args.indexOf("--resume");
+    expect(resumeIdx).toBeGreaterThan(-1);
+    expect(args[resumeIdx + 1]).toBe("abc-123");
   });
 });
