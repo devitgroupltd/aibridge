@@ -20,7 +20,7 @@ export interface DetailsCallback {
 const DETAILS_CALLBACK_RE = /^d:([a-z0-9-]{1,40}):(\d{1,10})$/;
 
 export function buildDetailsKeyboard(slug: string, turnSeq: number): InlineKeyboardButton[][] {
-  return [[{ text: "📋 Details", callback_data: `d:${slug}:${turnSeq}` }]];
+  return [[{ text: "Details", callback_data: `d:${slug}:${turnSeq}` }]];
 }
 
 /** Re-validates the format rather than trusting the tap, same defensive pattern as every other

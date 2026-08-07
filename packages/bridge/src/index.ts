@@ -546,7 +546,9 @@ async function main(): Promise<void> {
     if (!route) return;
     feedGovernor
       .scheduleAsync("P1", () =>
-        controlBot.sendMessage(config.supergroupChatId, route.topicId, "📋", { inline_keyboard: buildDetailsKeyboard(slug, turnSeq) }),
+        controlBot.sendMessage(config.supergroupChatId, route.topicId, "Click Details to see this turn's full log.", {
+          inline_keyboard: buildDetailsKeyboard(slug, turnSeq),
+        }),
       )
       .then((sent) => detailsAnchorStore.set(slug, turnSeq, sent.message_id, Date.now()))
       .catch((err) => log("WARN", `failed to post details button for "${slug}": ${(err as Error).message}`));

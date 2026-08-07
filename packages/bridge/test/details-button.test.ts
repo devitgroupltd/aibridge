@@ -4,7 +4,7 @@ import { buildDetailsKeyboard, parseDetailsCallback } from "../src/details-butto
 describe("buildDetailsKeyboard", () => {
   test("encodes slug and turn as §5.5's d:<slug>:<turn>", () => {
     const keyboard = buildDetailsKeyboard("fix-login-bug", 3);
-    expect(keyboard).toEqual([[{ text: "📋 Details", callback_data: "d:fix-login-bug:3" }]]);
+    expect(keyboard).toEqual([[{ text: "Details", callback_data: "d:fix-login-bug:3" }]]);
   });
 
   test("stays well inside the 64-byte callback_data cap even at the max slug length", () => {

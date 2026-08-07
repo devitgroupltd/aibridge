@@ -1,7 +1,7 @@
 ---
-version: 0.82.0
+version: 0.83.0
 status: solid
-last_modified_utc: 2026-08-07T10:18:00Z
+last_modified_utc: 2026-08-07T10:50:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,11 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.83.0 (2026-08-07): §5.5's details anchor now reads as plain, self-explanatory text -
+    \"Click Details to see this turn's full log.\" with a bare \"Details\" button label - instead of
+    a lone clipboard emoji, per direct operator feedback that the emoji-only anchor wasn't obvious at
+    a glance. No behavioural change: tapping the button still edits that same message into the full
+    log in place (`details-button.ts`, `index.ts`'s `postDetailsButton`)."
   - "0.82.0 (2026-08-07): consolidated 0.81.0's two separately-named commands into one -
     `/default [mode|effort] [<value>]` - per direct operator feedback right after that version
     shipped (\"I just want one /default I can remember, that shows me what I can set\"). Bare
