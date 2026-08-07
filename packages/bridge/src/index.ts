@@ -1152,7 +1152,36 @@ async function main(): Promise<void> {
       // a resumed session answered /ls (control topic, doesn't need routing) but never replied to
       // anything sent in its own topic - not the command being wrong, the route being missing.
       routing.add({ slug, topicId, worktreePath: row.worktreePath });
-      confirmSessionCommand(topicId, `Session "${slug}" resumed.`);
+      // `claude --resume` failing (`RESUME_FAILURE_PATTERN`) doesn't throw or exit the process - it
+      // silently falls through to a brand-new conversation in the same PTY - so this must be checked
+      // rather than assumed: found live 2026-08-07, a session whose crash-before-first-transcript-
+      // write left `row.sessionId` pointing at a conversation Claude Code could never find again sat
+      // "resumed" in the topic forever with no further reply, since the operator's original prompt
+      // was never resent into the fresh conversation underneath.
+      const { resumeFailed } = await session.ready;
+      if (resumeFailed) {
+        log("WARN", `session "${slug}"'s claude --resume ${row.sessionId} failed (no matching conversation) - it started a fresh conversation instead`);
+        // That fresh conversation has no relation to what was actually asked for, and `dead` is
+        // `session-store.ts`'s own terminal state (no path back from it) - the row is very likely
+        // already `dead` by now anyway, from the `SessionEnd` hook that fires for the abandoned
+        // resume racing this very check (confirmed live 2026-08-07). Killing the pty here, rather
+        // than leaving Claude Code's own fresh-start running, is what makes §4.3's "This session
+        // has ended" reply true instead of a lie: an untracked live PTY behind a `dead` row would
+        // otherwise burn a Claude Code seat and a worktree forever with no way for the operator to
+        // reach or reclaim it. Same kill-then-delete ordering `killSessionRow` uses, so the async
+        // `onExit` this fires sees the map entry already gone and treats it as a deliberate kill,
+        // not a crash to auto-resume.
+        session.ptyProcess.kill();
+        ptyProcessBySlug.delete(slug);
+        routing.clearPtyWrite(slug);
+        if (sessionStore.get(slug)?.state !== "dead") sessionStore.setState(slug, "dead", nowIso());
+        confirmSessionCommand(
+          topicId,
+          `⚠️ Session "${slug}" couldn't resume its prior conversation (Claude reported no matching session) - this session has ended. Worktree preserved at ${row.worktreePath}; /new to start a fresh one.`,
+        );
+      } else {
+        confirmSessionCommand(topicId, `Session "${slug}" resumed.`);
+      }
     } catch (err) {
       sessionStore.setState(slug, "dead", nowIso());
       confirmSessionCommand(topicId, `Failed to resume "${slug}": ${(err as Error).message}. Worktree preserved at ${row.worktreePath}.`);

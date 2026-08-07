@@ -6,6 +6,8 @@ import * as pty from "node-pty";
 import { canonicalizeWindowsPath, ensurePlaywrightRegistration, ensureTrustDialogAccepted } from "./claude-config.ts";
 import { STATE_DIR } from "./config.ts";
 import { ensureOutboxDir, ensurePlaywrightSharedDir } from "./outbox.ts";
+import { attachPtyErrorSuppression } from "./pty-write-guard.ts";
+import type { PtyLike } from "./pty-write-guard.ts";
 import { generateSettings, writeSettingsFile } from "./settings.ts";
 import { ensureWorktree } from "./worktree.ts";
 
@@ -148,9 +150,10 @@ export interface LaunchedSession {
    * startup: confirmed live 2026-08-04 (back when a startup dialog sat in that window too), a
    * `/new` prompt sent too early corrupted in-flight input and the session never got past it at
    * all, with no error anywhere. Everyone who writes to a freshly-launched PTY must await this
-   * first.
+   * first. `resumeFailed` is only ever true for a `resumeSessionId` launch - see
+   * `RESUME_FAILURE_PATTERN`'s own doc comment.
    */
-  ready: Promise<void>;
+  ready: Promise<{ resumeFailed: boolean }>;
 }
 
 function ptyEnv(extra: Record<string, string>): Record<string, string> {
@@ -199,7 +202,17 @@ export function stripAnsi(text: string): string {
  * connected` event from the pipe server instead (`index.ts`'s `waitForChannelConnected`), which is
  * what actually closes that race deterministically rather than guessing a delay.
  */
-function waitForStartupPrompt(ptyProcess: pty.IPty, log: LogFn): Promise<void> {
+/** Matches Claude Code's own message when `--resume <id>` is given a session id it can't find a
+ * transcript for (a stale id, or - found live 2026-08-07 - one recorded for a session that crashed
+ * before its first transcript write ever completed). Confirmed live: the CLI does *not* exit on this
+ * - it prints the line and falls through to a brand-new conversation in the same PTY, so nothing
+ * about the process exiting (§4.5's `handleUnexpectedExit` safety net) ever catches it. Without this
+ * check, `resumeSession` had no way to know its `claude --resume` had silently failed, so it declared
+ * "resumed" over a conversation that had actually been thrown away - the topic then sat with no
+ * reply forever, since the original prompt was never resent into the fresh conversation either. */
+const RESUME_FAILURE_PATTERN = /no conversation found with session id/i;
+
+export function waitForStartupPrompt(ptyProcess: pty.IPty, log: LogFn, resumeSessionId?: string): Promise<{ resumeFailed: boolean }> {
   return new Promise((resolve) => {
     let done = false;
     let rawBuffer = "";
@@ -211,16 +224,22 @@ function waitForStartupPrompt(ptyProcess: pty.IPty, log: LogFn): Promise<void> {
       if (done) return;
       done = true;
       log("WARN", "timed out waiting for the startup prompt to settle - proceeding anyway");
-      resolve();
+      resolve({ resumeFailed: false });
     }, 30_000);
     ptyProcess.onData((data) => {
       if (done) return;
       rawBuffer = (rawBuffer + data).slice(-8000);
       const plain = stripAnsi(rawBuffer);
+      if (resumeSessionId && RESUME_FAILURE_PATTERN.test(plain)) {
+        done = true;
+        clearTimeout(timeout);
+        resolve({ resumeFailed: true });
+        return;
+      }
       if (/for shortcuts/i.test(plain) || /for agents/i.test(plain)) {
         done = true;
         clearTimeout(timeout);
-        resolve();
+        resolve({ resumeFailed: false });
       }
     });
   });
@@ -314,7 +333,7 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
 
   log("INFO", `spawned claude (pid ${ptyProcess.pid}) for slug "${opts.slug}"`);
 
-  const ready = waitForStartupPrompt(ptyProcess, log);
+  const ready = waitForStartupPrompt(ptyProcess, log, opts.resumeSessionId);
 
   if (process.env.AIBRIDGE_DEBUG_PTY_LOG === "1") {
     ptyProcess.onData((data) => log("INFO", `[pty:${opts.slug}] ${JSON.stringify(stripAnsi(data))}`));
@@ -324,9 +343,14 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
     ptyProcess.onData((data) => process.stdout.write(data));
     process.stdin.setRawMode?.(true);
     process.stdin.resume();
-    // Same guard as pty-write-guard.ts's write wrapper (this bypasses it - it's wired onto the
-    // routing table's write function, not this raw stdin passthrough): a keystroke landing after
-    // the PTY has already gone must not crash the dev-mirror session.
+    // This bypasses attachPtyWriteGuard's wrapped write - it's wired onto the routing table's write
+    // function, not this raw stdin passthrough - but still needs the same protection: found live
+    // 2026-08-07 that the try/catch below alone is not enough, since a write to the underlying
+    // process after it has already died can throw asynchronously (an unhandled 'error' emitted on
+    // the private write-side socket, past any try/catch around the call site - see
+    // pty-write-guard.ts's own doc comment). attachPtyErrorSuppression is the same fix
+    // attachPtyWriteGuard applies, without its write wrapper.
+    attachPtyErrorSuppression(ptyProcess as unknown as PtyLike, opts.slug, { log });
     process.stdin.on("data", (data) => {
       try {
         ptyProcess.write(data.toString());

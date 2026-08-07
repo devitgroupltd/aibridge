@@ -1,7 +1,7 @@
 ---
-version: 0.85.0
+version: 0.86.0
 status: solid
-last_modified_utc: 2026-08-07T11:10:00Z
+last_modified_utc: 2026-08-07T11:56:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,47 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.86.0 (2026-08-07): a newly-`/new`'d session ('check-what-still-needs-to') sat 'Thinking...'
+    forever with no reply - root-caused to a second live daemon-killing crash, same class as
+    0.83's-era pty-write-guard.ts fix but a different gap in it: `writeModeKeystrokes` writes through
+    the guarded `routing.getPtyWrite`, but node-pty's Windows backend has *two* independent internal
+    sockets, and the guard's `'error'` listener only ever covered the read side (`_agent.outSocket`,
+    the one node-pty itself half-protects via its own `< 2 listeners` check) - the write side
+    (`_agent.inSocket`) has no such protection at all, so a write after the underlying process died
+    threw an unhandled 'error' asynchronously, past the write wrapper's try/catch, straight into
+    `uncaughtException` -> `process.exit(1)`, taking the whole fleet down (confirmed via Task
+    Scheduler's own 'Last Result: 1' on the self-respawn task, and `bridge.log`'s persistent sink -
+    unaffected by the self-respawn's `stdio: 'ignore'` - showing the exact stack). Fixed by also
+    attaching the suppressing listener to `_agent.inSocket` (pty-write-guard.ts, reached into via an
+    undocumented private field - there is no public API for it), extracted the two-listener wiring
+    into its own `attachPtyErrorSuppression` so `session-launcher.ts`'s dev-only `mirrorPtyToConsole`
+    stdin passthrough - which bypasses the guard's write wrapper by design - gets the same protection
+    instead of relying on its own (equally insufficient) try/catch alone. Second, independent bug
+    found while root-causing the same incident: the crash had left `row.sessionId` pointing at a
+    conversation transcript that was never fully written, so the post-restart `claude --resume`
+    failed - but Claude Code doesn't exit or throw on that, it silently falls through to a brand-new
+    conversation in the same PTY, so `resumeSession` had no signal that its resume had actually failed
+    and declared 'Session ... resumed.' over a conversation that had actually been discarded, with the
+    operator's original prompt never resent into the fresh one underneath - indistinguishable from the
+    first bug from the operator's chair (topic goes silent forever either way). `waitForStartupPrompt`
+    now also watches for Claude's own 'No conversation found with session ID' text (only when a resume
+    was actually requested, so an unrelated echo of similar wording from a fresh `/new` can't false-
+    positive) and reports `resumeFailed` back through `LaunchedSession.ready`. A further race this
+    surfaced: the abandoned resume's own `SessionEnd` hook marks the row `dead` (session-store.ts's
+    own terminal state) essentially concurrently with this detection, while Claude Code's fresh
+    conversation keeps running live and untracked underneath - so `resumeSession` now kills that pty
+    outright on `resumeFailed` (same kill-then-delete-from-map ordering `killSessionRow` already uses,
+    so the async `onExit` reads as a deliberate kill rather than a crash to auto-resume) rather than
+    leaving a live, un-tracked process behind a `dead` row burning a Claude Code seat and a worktree
+    forever with no way for the operator to reach or reclaim it - and tells the operator the session
+    has ended and to `/new` again, instead of the misleading 'resumed'. New tests: 3 for
+    `pty-write-guard.ts` (`attachPtyErrorSuppression`'s inSocket coverage, the Unix-backend no-`_agent`
+    case), 3 for `session-launcher.ts`'s exported `waitForStartupPrompt` (resume-failure detection,
+    and that unrelated text without a resume requested is correctly ignored) - `index.ts`'s own
+    `resumeSession` wiring has no test coverage, consistent with `index.ts` having no test file at all
+    yet (same honest gap as 0.84.0's confirm-registry fix). Checked other write call sites for the
+    same gap per operator instruction (routing.getPtyWrite is the only production write path into a
+    session's pty; every caller already went through it, so this single fix covers all of them)."
   - "0.85.0 (2026-08-07): fixed another live-observed nl-router gap, same class as 0.82's `kind='new'`
     fix - a bare one-word voice transcript ('Restart.') fell through to 'Unrecognised control-topic
     command' because `restart`/`deploy`/`kill`/`rm` (all destructive) had no positive trigger

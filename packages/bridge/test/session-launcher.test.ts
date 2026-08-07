@@ -1,5 +1,18 @@
 import { describe, expect, test } from "bun:test";
-import { stripAnsi } from "../src/session-launcher.ts";
+import type * as pty from "node-pty";
+import { stripAnsi, waitForStartupPrompt } from "../src/session-launcher.ts";
+
+/** A minimal stand-in for `pty.IPty` - `waitForStartupPrompt` only ever calls `.onData`. */
+class FakePty {
+  private handler: ((data: string) => void) | undefined;
+  onData(fn: (data: string) => void): { dispose: () => void } {
+    this.handler = fn;
+    return { dispose: () => {} };
+  }
+  emit(data: string): void {
+    this.handler?.(data);
+  }
+}
 
 describe("stripAnsi", () => {
   test("collapses CSI-coloured words back into contiguous plain text", () => {
@@ -30,5 +43,32 @@ describe("stripAnsi", () => {
     const plain = stripAnsi(raw);
     expect(plain).toContain("New MCP server found in this project");
     expect(plain).toContain("Enter to confirm");
+  });
+});
+
+describe("waitForStartupPrompt", () => {
+  test("resolves resumeFailed: false once the settle markers appear", async () => {
+    const fake = new FakePty();
+    const result = waitForStartupPrompt(fake as unknown as pty.IPty, () => {});
+    fake.emit("some banner\r\n  ⏸ manual mode on · ? for shortcuts · ← for agents◐ medium · /effort  ");
+    expect(await result).toEqual({ resumeFailed: false });
+  });
+
+  // The live 2026-08-07 regression: `claude --resume <id>` failing doesn't exit the process or throw
+  // - it prints this line and falls through to a fresh conversation - so `resumeSession` had no way
+  // to tell "resumed" from "silently gave up and started over" without this check.
+  test("resolves resumeFailed: true when a resume was requested and Claude reports no matching conversation", async () => {
+    const fake = new FakePty();
+    const result = waitForStartupPrompt(fake as unknown as pty.IPty, () => {}, "4885934b-a516-49b3-8c38-306373f27ba0");
+    fake.emit("No conversation found with session ID: 4885934b-a516-49b3-8c38-306373f27ba0\r\n");
+    expect(await result).toEqual({ resumeFailed: true });
+  });
+
+  test("the same failure text is ignored when no resume was requested - a fresh /new session's prompt could plausibly echo similar wording without it meaning anything", async () => {
+    const fake = new FakePty();
+    const result = waitForStartupPrompt(fake as unknown as pty.IPty, () => {});
+    fake.emit("No conversation found with session ID: whatever\r\n");
+    fake.emit("  ⏸ manual mode on · ? for shortcuts · ← for agents◐ medium · /effort  ");
+    expect(await result).toEqual({ resumeFailed: false });
   });
 });
