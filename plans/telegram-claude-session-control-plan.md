@@ -25,22 +25,33 @@ changelog:
     CPU, so this is the same independently-dying node-pty/ConPTY write-socket bug `pty-write-guard.ts`
     already documented finding live on 2026-08-06/07 - back then it crashed the daemon, the guard added
     since stops that crash, but left the session a permanent zombie with no recovery path beyond the
-    operator noticing and typing `/kill` + `/new` by hand. Two fixes: (1) new
+    operator noticing and typing `/kill` + `/new` by hand - which also throws the conversation away
+    (a fresh slug/topic/worktree, not a continuation). Two fixes: (1) new
     `channel-connect-coordinator.ts` (`ChannelConnectCoordinator`) replaces the old waiter map -
     `onConnected` firing before `waitFor` is called now records the signal (lazily expired via an
     injected clock rather than its own timer, same TTL convention as confirm-registry.ts) instead of
     losing it, closing the avoidable 15s stall. (2) `index.ts`'s `confirmSubmitted` - which already
     detects \"produced no output after 2 attempts - likely wedged\" - now calls a new
-    `autoRecoverWedgedSession`, reusing `/kill`'s own `killSessionRow` teardown, instead of only
-    logging and telling the operator to do it themselves; the operator is told the session was
-    auto-killed and to `/new` again, rather than being left to diagnose and act on a silent topic.
-    Does not fix the underlying ConPTY write-socket death itself (a real, still-open Windows/node-pty
-    bug outside this codebase's control) - only makes the Bridge self-heal once it happens instead of
-    zombie-ing. 7 new tests in `channel-connect-coordinator.test.ts` (940 total, up from 933),
-    `tsc --noEmit` clean. `autoRecoverWedgedSession`/the `confirmSubmitted` wiring itself stays
-    untestable in isolation (same pre-existing closures-inside-main() gap §9 already accepts for
-    `handleNewCommand` et al.) - covered indirectly via the now-tested coordinator plus a live restart
-    to confirm clean startup."
+    `autoRecoverWedgedSession`. First cut reused `/kill`'s own `killSessionRow` teardown and told the
+    operator to `/new` again - asked directly \"is there a way to restore/fix and continue\" instead,
+    which surfaced that this project already has exactly that primitive: `handleUnexpectedExit`
+    (§12 Phase 5's crash supervisor, wired to every PTY's `onExit`) already does `claude --resume
+    <session_id>` on a fresh PTY - same slug/topic/worktree - whenever a session's process exits
+    without `ptyProcessBySlug`'s entry having been cleared first (the one thing `/kill`/`/rm`
+    deliberately do *before* their own `.kill()`, specifically to mark that exit as deliberate and
+    skip resuming it). So `autoRecoverWedgedSession` now just calls `.kill()` on the wedged PTY
+    *without* clearing that map entry first - indistinguishable from a real crash to the existing
+    handler, which resumes it in place (with its own already-tested backoff/give-up safety net,
+    `MAX_CONSECUTIVE_RESUME_ATTEMPTS`, for the rarer case where even a resume immediately re-exits)
+    instead of a hand-rolled kill-and-ask-for-`/new`. Does not fix the underlying ConPTY write-socket
+    death itself (a real, still-open Windows/node-pty bug outside this codebase's control) - only
+    makes the Bridge self-heal once it happens, continuing the same conversation instead of
+    zombie-ing or discarding it. 7 new tests in `channel-connect-coordinator.test.ts` (940 total, up
+    from 933), `tsc --noEmit` clean. `autoRecoverWedgedSession`/the `confirmSubmitted` wiring itself
+    stays untestable in isolation (same pre-existing closures-inside-main() gap §9 already accepts
+    for `handleNewCommand` et al.) - covered indirectly via the now-tested coordinator, the
+    already-live-exercised `resumeSession`/`handleUnexpectedExit` path it now deliberately falls
+    into, and a live restart to confirm clean startup."
   - "0.95.1 (2026-08-07): follow-up to 0.95.0 below, prompted by being asked directly whether it was
     fully tested - it wasn't. Added the pure-logic edge cases the first pass missed in
     `message-context.test.ts`: the exact 200-char preview boundary (not just 'over it'), an

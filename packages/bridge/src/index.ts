@@ -1028,7 +1028,7 @@ async function main(): Promise<void> {
         if (lastActivity > baseline) return; // real activity happened after the echo settled
         if (attempt >= 2) {
           log("ERROR", `session "${slug}" produced no output after ${attempt} attempts to submit an inbound message - likely wedged`);
-          void autoRecoverWedgedSession(slug, topicId);
+          autoRecoverWedgedSession(slug);
           return;
         }
         log("WARN", `session "${slug}" produced no output ${SUBMIT_CONFIRM_WINDOW_MS}ms after an inbound message - retrying the Enter`);
@@ -1042,24 +1042,32 @@ async function main(): Promise<void> {
    * Self-heals the wedged-PTY failure mode `confirmSubmitted` detects, found live 2026-08-07
    * ("check-what-is-left-to"): `pty-write-guard.ts` already stops a dead node-pty write-socket from
    * crashing the daemon, but left alone that left the session a permanent zombie - its `claude`
-   * process and channel server can both stay alive and burning CPU while the Bridge's own link into
-   * them is dead, with no output ever again and no recovery short of the operator noticing a silent
-   * topic and typing `/kill` + `/new` by hand. Reuses the exact teardown `/kill` already does
-   * (`killSessionRow`) so the two paths can't drift, then reports plainly what happened - "may be
-   * wedged, try /kill" left the operator to do the diagnosis this function has already just done.
+   * process can stay alive and burning CPU while the Bridge's own link into it is dead, with no
+   * output ever again and no recovery short of the operator noticing a silent topic and typing
+   * `/kill` + `/new` by hand - which also throws the conversation away (a fresh slug/topic/worktree,
+   * not a continuation).
+   *
+   * Deliberately does *not* reuse `/kill`'s `killSessionRow` (that marks the row "dead" and closes
+   * the topic - a dead end, not a recovery) or duplicate any resume logic of its own. Instead it
+   * terminates just the wedged PTY *without* first clearing `ptyProcessBySlug` - the one thing
+   * `/kill`/`/rm` deliberately do first (see `handleUnexpectedExit`'s own doc comment) specifically
+   * to mark a kill as "deliberate, don't resume". Leaving the map entry in place makes this
+   * indistinguishable from a real crash to `handleUnexpectedExit`, which already does exactly
+   * "restore/fix and continue" right: same slug, same topic, same worktree, `claude --resume
+   * <session_id>` on a fresh PTY, with its own backoff/give-up safety net
+   * (`MAX_CONSECUTIVE_RESUME_ATTEMPTS`) already in place for the rarer case where the underlying
+   * process is now so broken even a resume immediately re-exits.
    */
-  async function autoRecoverWedgedSession(slug: string, topicId: number): Promise<void> {
-    const row = sessionStore.get(slug);
-    if (!row) return; // already gone - a manual /kill or /rm raced this same detection
-    try {
-      await killSessionRow(row);
-    } catch (err) {
-      log("WARN", `auto-recovery teardown failed for wedged session "${slug}": ${(err as Error).message}`);
-    }
-    confirmSessionCommand(
-      topicId,
-      `⚠️ "${slug}" stopped responding (its PTY link died) and has been automatically killed. Worktree left in place - run /new to start a fresh session.`,
+  function autoRecoverWedgedSession(slug: string): void {
+    const ptyProcess = ptyProcessBySlug.get(slug);
+    if (!ptyProcess) return; // already gone - a manual /kill/rm, or a real crash, raced this same detection
+    log(
+      "WARN",
+      `session "${slug}"'s PTY write-socket is dead but its process is still alive - killing it so the existing crash-resume path (§12 Phase 5) can relaunch it via claude --resume instead of leaving a zombie`,
     );
+    ptyProcess.kill();
+    // handleUnexpectedExit (wired in wireSession's onExit) takes over from here - it posts its own
+    // "attempting to resume" notice, so no separate confirmSessionCommand here would just double up.
   }
 
   // A normal inbound turn: wrapped in the <channel> tag Claude Code would have rendered itself,
