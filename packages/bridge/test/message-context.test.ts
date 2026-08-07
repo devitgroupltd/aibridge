@@ -62,4 +62,35 @@ describe("buildContextPrefix", () => {
     });
     expect(prefix).toBe('[Forwarded from Carol]\n[Replying to an earlier message: "earlier point"]\n\n');
   });
+
+  test("exactly at the preview boundary (200 chars) is not truncated", () => {
+    const exact = "x".repeat(200);
+    const prefix = buildContextPrefix({ reply_to_message: { message_id: 42, text: exact } });
+    expect(prefix).toBe(`[Replying to an earlier message: "${exact}"]\n\n`);
+    expect(prefix).not.toContain("…");
+  });
+
+  test("one character past the boundary (201 chars) is truncated", () => {
+    const overBy1 = "x".repeat(201);
+    const prefix = buildContextPrefix({ reply_to_message: { message_id: 42, text: overBy1 } });
+    expect(prefix).toBe(`[Replying to an earlier message: "${"x".repeat(200)}…"]\n\n`);
+  });
+
+  test("an empty-string text/caption is treated the same as no text/caption at all", () => {
+    expect(buildContextPrefix({ reply_to_message: { message_id: 42, text: "" } })).toBe("[Replying to an earlier message with no text/caption]\n\n");
+    expect(buildContextPrefix({ reply_to_message: { message_id: 42, caption: "" } })).toBe("[Replying to an earlier message with no text/caption]\n\n");
+  });
+
+  test("text is preferred over caption when a message somehow carries both", () => {
+    const prefix = buildContextPrefix({ reply_to_message: { message_id: 42, text: "the text", caption: "the caption" } });
+    expect(prefix).toBe('[Replying to an earlier message: "the text"]\n\n');
+  });
+
+  test("an unrecognised forward_origin.type (a future Bot API addition) is inert, not a throw", () => {
+    // Cast past the known union - this is exactly the shape a Telegram API upgrade could add before
+    // this file's own union is updated to match; it must degrade to "no forward line", not crash.
+    const futureOrigin = { type: "supergroup_chat" } as unknown as Parameters<typeof buildContextPrefix>[0]["forward_origin"];
+    expect(() => buildContextPrefix({ forward_origin: futureOrigin })).not.toThrow();
+    expect(buildContextPrefix({ forward_origin: futureOrigin })).toBe("");
+  });
 });
