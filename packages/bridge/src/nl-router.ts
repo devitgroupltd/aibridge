@@ -254,15 +254,31 @@ const SYSTEM_INSTRUCTIONS_BASE =
   "deploy/repos-rm) means don't infer one from a joke or unrelated chatter, not that an unambiguous " +
   "short command naming the action should be refused.";
 
+/** Live-observed gap (2026-08-07): the base instructions above only ever describe kill/rm as
+ * naming "a specific named session" or "all" - an operator typing "delete this session"/"kill
+ * yourself" *inside that session's own topic* names neither, so it fell through to kind='forward'
+ * and landed on Claude itself, which has no way to actually remove its own session and could only
+ * point the operator back to the control topic - even though `handleKillCommand`/`handleRmCommand`
+ * (index.ts) already resolve a slug-less kill/rm to whichever session's topic the message arrived
+ * in (`resolveTargetSlug`). Only appended when `ctx.hasSession` - self-reference is meaningless
+ * without a current session to refer to, and `hasSession` is only ever true from inside one. */
+const SELF_REFERENCE_KILL_RM_HINT =
+  " A request to kill, remove, delete, or end *this* session, sent from inside that session's own " +
+  "topic (e.g. 'delete this session', 'kill yourself', 'remove this one') - with no other session " +
+  "named - is still kind='kill'/'rm', just with 'slug' left unset: the topic itself already " +
+  "identifies which session is meant, so don't respond with kind='forward' just because no slug or " +
+  "'all' was said.";
+
 /** Appends the operator's actual `repos.toml` short names, when known, as a closing hint - added
  * 2026-08-07 alongside the `kind='new'` trigger sentence above, for the same live-observed gap.
  * Naming one of these repos is strong evidence the message is fleet-directed (→ 'new', not
  * 'forward'), and giving the real names up front means `repo` comes back already correct instead of
  * relying on `handleNewCommand`'s post-hoc fuzzy match (index.ts) to rescue a garbled one. */
-function buildSystemInstructions(ctx: RouterContext): string {
-  if (!ctx.repoNames || ctx.repoNames.length === 0) return SYSTEM_INSTRUCTIONS_BASE;
+export function buildSystemInstructions(ctx: RouterContext): string {
+  const base = ctx.hasSession ? SYSTEM_INSTRUCTIONS_BASE + SELF_REFERENCE_KILL_RM_HINT : SYSTEM_INSTRUCTIONS_BASE;
+  if (!ctx.repoNames || ctx.repoNames.length === 0) return base;
   return (
-    SYSTEM_INSTRUCTIONS_BASE +
+    base +
     ` The operator's registered repos are: ${ctx.repoNames.join(", ")}. A message naming one of these ` +
     "(even mangled by voice transcription/autocorrect) is almost certainly kind='new' with that repo, " +
     "not 'forward' - pick the closest matching name for 'repo'."

@@ -1,7 +1,7 @@
 ---
-version: 0.91.0
+version: 0.92.0
 status: solid
-last_modified_utc: 2026-08-07T14:10:00Z
+last_modified_utc: 2026-08-07T15:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,24 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.92.0 (2026-08-07): operator asked why they couldn't kill/remove a session from inside its own
+    topic - had to go to the control topic and name it by slug instead. Investigation found the
+    mechanism already exists: a slug-less `/kill`/`/rm` typed as an exact command already resolves to
+    the current topic's own session (`resolveTargetSlug`, index.ts), and `removeSessionRow` already
+    tears down the live PTY and deletes the topic itself either way. The actual gap was one level up,
+    in `nl-router.ts`: its instructions only ever described kill/rm as naming 'a specific named
+    session' or explicitly 'all', so a natural-language 'delete this session'/'kill yourself' (no
+    slug, no 'all') matched neither, fell through to kind='forward', and was handed to Claude itself
+    as ordinary chat - which has no way to remove its own session and could only tell the operator to
+    go type a command in the control topic (confirmed live: exactly the reply screenshotted). Fixed
+    by making `buildSystemInstructions` context-aware: when `ctx.hasSession` (i.e. sent from inside a
+    session's own topic), it now appends a sentence telling the classifier that a self-referential
+    kill/rm ('this session', 'kill yourself', 'remove this one') with no other session named is still
+    kind='kill'/'rm' with 'slug' left unset, not kind='forward' - the topic itself already identifies
+    the target, matching what `resolveTargetSlug` already does for the typed-command form. Exported
+    `buildSystemInstructions` (previously module-private) so this is unit-testable. New tests: 2 in
+    `nl-router.test.ts` (hint present only when `hasSession`, still composes correctly with the
+    repo-names hint). 905 total passing, 0 failures, `tsc --noEmit` clean."
   - "0.91.0 (2026-08-07): two operator-observed feed-card oddities in the same live topic. (1) A
     session's final `reply` routinely landed in Telegram *before* the 'working...' activity card
     describing the tool calls it was actually summarising - causally backwards, since the reply's

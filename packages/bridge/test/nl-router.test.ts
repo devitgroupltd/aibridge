@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { botCommandList } from "../src/fleet-commands.ts";
-import { mapRouterOutput, ROUTER_KINDS } from "../src/nl-router.ts";
+import { buildSystemInstructions, mapRouterOutput, ROUTER_KINDS } from "../src/nl-router.ts";
 
 const CONTROL: { isControl: true; hasSession: false } = { isControl: true, hasSession: false };
 const SESSION: { isControl: false; hasSession: true } = { isControl: false, hasSession: true };
@@ -353,5 +353,22 @@ describe("mapRouterOutput - one case per kind", () => {
     expect(() => mapRouterOutput({}, CONTROL)).not.toThrow();
     expect(mapRouterOutput({}, CONTROL)).toEqual({ matched: false });
     expect(mapRouterOutput({ kind: "not-a-real-kind" }, CONTROL)).toEqual({ matched: false });
+  });
+});
+
+describe("buildSystemInstructions", () => {
+  // 2026-08-07: a bare "delete this session"/"kill yourself" typed inside a session's own topic
+  // named no slug and no "all", so it fell through to kind='forward' and landed on Claude itself -
+  // which has no way to remove its own session - instead of resolving to that topic's own slug the
+  // way a typed slug-less `/kill`/`/rm` already does (index.ts's resolveTargetSlug).
+  test("only mentions self-referential kill/rm ('this session') when a session is in context", () => {
+    expect(buildSystemInstructions(SESSION)).toContain("kill yourself");
+    expect(buildSystemInstructions(CONTROL)).not.toContain("kill yourself");
+  });
+
+  test("repo-name hint still appends after the self-reference hint, when both apply", () => {
+    const withRepos = buildSystemInstructions({ ...SESSION, repoNames: ["aibridge"] });
+    expect(withRepos).toContain("kill yourself");
+    expect(withRepos).toContain("aibridge");
   });
 });
