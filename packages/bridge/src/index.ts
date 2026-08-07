@@ -74,6 +74,7 @@ import type { PendingNlConfirm } from "./nl-confirm.ts";
 import { isRetryPhrase, retryTopicKey, RetryStore } from "./retry-store.ts";
 import { buildContextPrefix } from "./message-context.ts";
 import type { MessageOrigin } from "./message-context.ts";
+import { ChannelConnectCoordinator } from "./channel-connect-coordinator.ts";
 import { routeText } from "./nl-router.ts";
 import type { RouterAction } from "./nl-router.ts";
 import { SettingsStore } from "./settings-store.ts";
@@ -662,26 +663,21 @@ async function main(): Promise<void> {
 
   // The deterministic half of `/new`'s first-write race (§4.5's dev-channels dialog is the other
   // half, handled in `session-launcher.ts`): a slug can have at most one pending waiter at a time,
-  // since nothing writes a session's first message before it's even launched.
-  const channelConnectedWaiters = new Map<string, () => void>();
+  // since nothing writes a session's first message before it's even launched. Delegated to
+  // `ChannelConnectCoordinator` rather than a plain waiter map - confirmed live 2026-08-07
+  // ("check-what-is-left-to") that a fast-connecting channel can complete its handshake before this
+  // function even gets called, silently losing the resolve on a plain map with no way to represent
+  // "this already happened"; see that module's own doc comment for the full story.
+  const channelConnectCoordinator = new ChannelConnectCoordinator();
 
   /** Resolves once the channel server for `slug` has completed its MCP handshake with this Claude
    * Code process, or after `timeoutMs` if it never does (a misconfigured `.mcp.json`, say) - a
    * caller that needs this settled before writing must not wedge forever over a signal that never
    * arrives. Replaces a guessed fixed delay after the dev-channels dialog (confirmed live
    * 2026-08-04 to be unreliable) with the real event that delay was standing in for. */
-  function waitForChannelConnected(slug: string, timeoutMs = 15_000): Promise<void> {
-    return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
-        channelConnectedWaiters.delete(slug);
-        log("WARN", `timed out waiting for the channel server to connect for "${slug}" - proceeding anyway`);
-        resolve();
-      }, timeoutMs);
-      channelConnectedWaiters.set(slug, () => {
-        clearTimeout(timeout);
-        resolve();
-      });
-    });
+  async function waitForChannelConnected(slug: string, timeoutMs = 15_000): Promise<void> {
+    const connected = await channelConnectCoordinator.waitFor(slug, timeoutMs);
+    if (!connected) log("WARN", `timed out waiting for the channel server to connect for "${slug}" - proceeding anyway`);
   }
 
   // `/usage` (§4.2, added 2026-08-04): a slug can have at most one pending capture at a time - a
@@ -771,8 +767,7 @@ async function main(): Promise<void> {
     onHookEvent: handleHookEvent,
     onAwaitingInput: (slug) => maybeSetState(slug, "awaiting_input"),
     onChannelConnected: (slug) => {
-      channelConnectedWaiters.get(slug)?.();
-      channelConnectedWaiters.delete(slug);
+      channelConnectCoordinator.onConnected(slug);
     },
     log,
   });
@@ -1033,7 +1028,7 @@ async function main(): Promise<void> {
         if (lastActivity > baseline) return; // real activity happened after the echo settled
         if (attempt >= 2) {
           log("ERROR", `session "${slug}" produced no output after ${attempt} attempts to submit an inbound message - likely wedged`);
-          confirmSessionCommand(topicId, `⚠️ "${slug}" isn't responding to its last message - it may be wedged. Try /kill then /new again, or check /attach.`);
+          void autoRecoverWedgedSession(slug, topicId);
           return;
         }
         log("WARN", `session "${slug}" produced no output ${SUBMIT_CONFIRM_WINDOW_MS}ms after an inbound message - retrying the Enter`);
@@ -1041,6 +1036,30 @@ async function main(): Promise<void> {
         confirmSubmitted(slug, topicId, write, attempt + 1);
       }, SUBMIT_CONFIRM_WINDOW_MS);
     }, ECHO_SETTLE_MS);
+  }
+
+  /**
+   * Self-heals the wedged-PTY failure mode `confirmSubmitted` detects, found live 2026-08-07
+   * ("check-what-is-left-to"): `pty-write-guard.ts` already stops a dead node-pty write-socket from
+   * crashing the daemon, but left alone that left the session a permanent zombie - its `claude`
+   * process and channel server can both stay alive and burning CPU while the Bridge's own link into
+   * them is dead, with no output ever again and no recovery short of the operator noticing a silent
+   * topic and typing `/kill` + `/new` by hand. Reuses the exact teardown `/kill` already does
+   * (`killSessionRow`) so the two paths can't drift, then reports plainly what happened - "may be
+   * wedged, try /kill" left the operator to do the diagnosis this function has already just done.
+   */
+  async function autoRecoverWedgedSession(slug: string, topicId: number): Promise<void> {
+    const row = sessionStore.get(slug);
+    if (!row) return; // already gone - a manual /kill or /rm raced this same detection
+    try {
+      await killSessionRow(row);
+    } catch (err) {
+      log("WARN", `auto-recovery teardown failed for wedged session "${slug}": ${(err as Error).message}`);
+    }
+    confirmSessionCommand(
+      topicId,
+      `⚠️ "${slug}" stopped responding (its PTY link died) and has been automatically killed. Worktree left in place - run /new to start a fresh session.`,
+    );
   }
 
   // A normal inbound turn: wrapped in the <channel> tag Claude Code would have rendered itself,

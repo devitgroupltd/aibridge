@@ -1,7 +1,7 @@
 ---
-version: 0.95.1
+version: 0.96.0
 status: solid
-last_modified_utc: 2026-08-07T17:15:00Z
+last_modified_utc: 2026-08-07T21:30:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,34 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.96.0 (2026-08-07): investigated a live report - session \"check-what-is-left-to\" wedged
+    (Telegram: \"isn't responding to its last message ... Try /kill then /new again\"). Root-caused via
+    bridge.log (not bridge-dev.log - this instance was started via `bun run`, not the dev script, so
+    its stdout landed in the plain log file instead): the channel server connected in well under a
+    second, but `waitForChannelConnected`'s 15s wait still timed out and \"proceeded anyway\" - the
+    connect event fired before the waiter was even registered, an unhandled two-sided race with the
+    old plain `Map<string, () => void>` (no way to represent \"this already happened\", only \"someone
+    is waiting\"). Right after, the very first write into the PTY hit `Socket is closed` - confirmed
+    live that both the `claude` process and its channel server (bun) were still running and burning
+    CPU, so this is the same independently-dying node-pty/ConPTY write-socket bug `pty-write-guard.ts`
+    already documented finding live on 2026-08-06/07 - back then it crashed the daemon, the guard added
+    since stops that crash, but left the session a permanent zombie with no recovery path beyond the
+    operator noticing and typing `/kill` + `/new` by hand. Two fixes: (1) new
+    `channel-connect-coordinator.ts` (`ChannelConnectCoordinator`) replaces the old waiter map -
+    `onConnected` firing before `waitFor` is called now records the signal (lazily expired via an
+    injected clock rather than its own timer, same TTL convention as confirm-registry.ts) instead of
+    losing it, closing the avoidable 15s stall. (2) `index.ts`'s `confirmSubmitted` - which already
+    detects \"produced no output after 2 attempts - likely wedged\" - now calls a new
+    `autoRecoverWedgedSession`, reusing `/kill`'s own `killSessionRow` teardown, instead of only
+    logging and telling the operator to do it themselves; the operator is told the session was
+    auto-killed and to `/new` again, rather than being left to diagnose and act on a silent topic.
+    Does not fix the underlying ConPTY write-socket death itself (a real, still-open Windows/node-pty
+    bug outside this codebase's control) - only makes the Bridge self-heal once it happens instead of
+    zombie-ing. 7 new tests in `channel-connect-coordinator.test.ts` (940 total, up from 933),
+    `tsc --noEmit` clean. `autoRecoverWedgedSession`/the `confirmSubmitted` wiring itself stays
+    untestable in isolation (same pre-existing closures-inside-main() gap §9 already accepts for
+    `handleNewCommand` et al.) - covered indirectly via the now-tested coordinator plus a live restart
+    to confirm clean startup."
   - "0.95.1 (2026-08-07): follow-up to 0.95.0 below, prompted by being asked directly whether it was
     fully tested - it wasn't. Added the pure-logic edge cases the first pass missed in
     `message-context.test.ts`: the exact 200-char preview boundary (not just 'over it'), an
