@@ -1725,7 +1725,12 @@ async function main(): Promise<void> {
 
   async function handleKillCommand(cmd: Extract<FleetCommand, { kind: "kill" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
     if (cmd.all) {
-      const targets = sessionStore.all().filter((r) => r.state !== "dead");
+      // Excludes config.phase1.slug the same way runStartupReconciliation already does (index.ts's
+      // reconciliation filter) - it's the Bridge's own hardcoded dev/self-check session (a fixed
+      // PHASE1_TOPIC_ID from .env, always relaunched on the next restart regardless), not a real
+      // operator-created session with its own discoverable Telegram topic, so a blanket "kill
+      // everything" must not sweep it in.
+      const targets = sessionStore.all().filter((r) => r.state !== "dead" && r.slug !== config.phase1.slug);
       await postFleetConfirm("kill", topicId, targets, `Kill ${targets.length} live session${targets.length === 1 ? "" : "s"}?`);
       return;
     }
@@ -1791,7 +1796,12 @@ async function main(): Promise<void> {
     // remove live sessions too, so it goes through the same confirm-button flow as `/kill --all`
     // rather than executing on the same message (fleet-commands.ts's RmBulkFilter note).
     if (cmd.bulk?.mode === "all") {
-      const targets = sessionStore.all();
+      // Same exclusion as /kill --all just above (and runStartupReconciliation's own filter) -
+      // config.phase1.slug is the Bridge's own hardcoded dev/self-check session, not a real
+      // operator-created one, and removeSessionRow would delete its worktree and try to
+      // deleteForumTopic against a hardcoded PHASE1_TOPIC_ID that was never actually created via
+      // createForumTopic in the first place.
+      const targets = sessionStore.all().filter((r) => r.slug !== config.phase1.slug);
       await postFleetConfirm("rm", topicId, targets, `Remove ALL ${targets.length} session${targets.length === 1 ? "" : "s"} - worktrees and topics deleted, live ones killed first?`);
       return;
     }

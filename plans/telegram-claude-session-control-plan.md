@@ -1,7 +1,7 @@
 ---
-version: 0.88.0
+version: 0.89.0
 status: solid
-last_modified_utc: 2026-08-07T13:20:00Z
+last_modified_utc: 2026-08-07T13:30:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,19 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.89.0 (2026-08-07): operator report - `/rm --all` proposed removing 1 session ('test-session')
+    the operator couldn't find anywhere in Telegram. Root cause: `test-session` is `config.phase1.slug`
+    - the Bridge's own hardcoded Phase-1 dev/self-check session, bound to a fixed `PHASE1_TOPIC_ID`
+    from `.env` and always relaunched on the next restart regardless, never created via
+    `createForumTopic` and so with no discoverable named topic in the group's sidebar at all (live-
+    confirmed via `list-topics.js`/`check-topic.js` - only 'General' exists). `runStartupReconciliation`
+    already excludes it (`.filter(r => r.slug !== config.phase1.slug)`) but `/kill --all` and
+    `/rm --all` didn't, so a blanket 'remove/kill everything' would tear down the Bridge's own
+    permanent dev worktree and call `deleteForumTopic` against a hardcoded topic id that was never
+    actually one of ours. Fixed by adding the same exclusion filter to both. Checked the other
+    `sessionStore.all()` call sites (`/ls`, the concurrency-cap check) for the same gap and left them
+    as-is deliberately - both are informational/accounting, not destructive, so surfacing the phase1
+    session there is correct, not a bug."
   - "0.88.0 (2026-08-07): operator request - a Russian voice-triggered `/new` created an English-
     titled session (fine, matches the operator's own preference) but then talked English for the
     whole conversation instead of Russian. Root-caused to two independent gaps, both fixed together
