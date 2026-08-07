@@ -2,12 +2,19 @@ import { escapeForFeed } from "./feed-escape.ts";
 import type { ActivityLine, FeedState } from "./feed-state.ts";
 import type { FeedDetailLevel } from "./session-store.ts";
 
-/** §5.3: at most 8 activity lines render on the card itself; anything older rolls into a counter.
- * The full log always exists in `state.lines` - `renderDetails` below is the only thing that
- * reads past this cap (§5.5's `details` button). Applies to `detail: "compact"` only - "full"'s
- * lines are each bigger (an expandable blockquote per line), so it's bounded by `MAX_CARD_CHARS`
- * below instead of a fixed count. */
+/** §5.3: at most 8 activity lines render on the card itself; anything past that splits into a
+ * head + tail (see `HEAD_LINES`) with the gap reported as a counter. The full log always exists in
+ * `state.lines` - `renderDetails` below is the only thing that reads past this cap (§5.5's `details`
+ * button). Applies to `detail: "compact"` only - "full"'s lines are each bigger (an expandable
+ * blockquote per line), so it's bounded by `MAX_CARD_CHARS` below instead of a fixed count. */
 const MAX_VISIBLE_LINES = 8;
+
+/** How many of the *oldest* visible lines lead the card once there are more lines than fit.
+ * Operator feedback (2026-08-07): a long turn's card showing only its newest lines behind an opaque
+ * "…and N earlier steps" counter, with no hint of how the turn actually started, was hard to follow.
+ * Splitting into head + tail keeps that starting context alongside the most recent activity, at the
+ * cost of a few tail lines (`MAX_VISIBLE_LINES - HEAD_LINES` remain for the tail in compact mode). */
+const HEAD_LINES = 3;
 
 /** §5.9's `/detail full`: how many lines fit is size-driven, not count-driven, since each one now
  * carries a blockquote of unpredictable length. Comfortably under Telegram's real 4096-UTF-16-unit
@@ -71,35 +78,56 @@ export function renderCard(state: FeedState, nowMs: number, settings: FeedRender
   const header = `🔨 <b>${escapeForFeed(state.slug)}</b> · ${stateWord} (${formatDuration(durationMs)})${continued}`;
   const currentCardLines = state.lines.slice(state.cardLineOffset ?? 0);
 
+  /** `  …N additional steps…` between a head and tail slice, or nothing when there's no gap. */
+  function gapLine(omitted: number): string[] {
+    return omitted > 0 ? [`  …${omitted} additional step${omitted === 1 ? "" : "s"}…`] : [];
+  }
+
   if (settings.detail === "compact") {
     const total = currentCardLines.length;
-    const visible = total > MAX_VISIBLE_LINES ? currentCardLines.slice(total - MAX_VISIBLE_LINES) : currentCardLines;
-    const overflow = total - visible.length;
     const parts = [header, ""];
-    if (overflow > 0) parts.push(`  …and ${overflow} earlier steps`);
-    parts.push(...visible.map(renderLine));
+    if (total <= MAX_VISIBLE_LINES) {
+      parts.push(...currentCardLines.map(renderLine));
+      return parts.join("\n");
+    }
+    const tailCount = MAX_VISIBLE_LINES - HEAD_LINES;
+    const head = currentCardLines.slice(0, HEAD_LINES);
+    const tail = currentCardLines.slice(total - tailCount);
+    parts.push(...head.map(renderLine), ...gapLine(total - HEAD_LINES - tailCount), ...tail.map(renderLine));
     return parts.join("\n");
   }
 
-  // "full": size-driven instead of count-driven (see MAX_CARD_CHARS) - walk from the most recent
-  // line backwards, keep whatever fits, and roll the rest into the same overflow counter compact
-  // mode already uses, just decided by length instead of a fixed 8.
+  // "full": size-driven instead of count-driven (see MAX_CARD_CHARS), but the same head + tail idea
+  // as compact - a small anchor from the start (capped at 30% of the budget, so it can't crowd out
+  // the tail, which matters more) plus as much of the end as still fits, walked backwards same as
+  // before this changed. Renders everything with no split at all when it simply all fits.
   const budget = MAX_CARD_CHARS - header.length;
-  const rendered: string[] = [];
-  let used = 0;
-  let overflow = 0;
-  for (let i = currentCardLines.length - 1; i >= 0; i--) {
-    const text = renderLineFull(currentCardLines[i] as ActivityLine, settings.verbose);
-    if (rendered.length > 0 && used + text.length + 1 > budget) {
-      overflow = i + 1;
-      break;
-    }
-    rendered.unshift(text);
-    used += text.length + 1;
-  }
+  const rendered = currentCardLines.map((line) => renderLineFull(line, settings.verbose));
+  const totalLen = rendered.reduce((sum, text) => sum + text.length + 1, 0);
   const parts = [header, ""];
-  if (overflow > 0) parts.push(`  …and ${overflow} earlier steps`);
-  parts.push(...rendered);
+  if (totalLen <= budget) {
+    parts.push(...rendered);
+    return parts.join("\n");
+  }
+
+  const headBudget = budget * 0.3;
+  let headUsed = 0;
+  let headCount = 0;
+  while (headCount < HEAD_LINES && headCount < rendered.length) {
+    const len = (rendered[headCount] as string).length + 1;
+    if (headUsed + len > headBudget) break;
+    headUsed += len;
+    headCount += 1;
+  }
+  let tailUsed = 0;
+  let tailCount = 0;
+  for (let i = rendered.length - 1; i >= headCount; i--) {
+    const len = (rendered[i] as string).length + 1;
+    if (headUsed + tailUsed + len > budget) break;
+    tailUsed += len;
+    tailCount += 1;
+  }
+  parts.push(...rendered.slice(0, headCount), ...gapLine(rendered.length - headCount - tailCount), ...rendered.slice(rendered.length - tailCount));
   return parts.join("\n");
 }
 

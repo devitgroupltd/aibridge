@@ -35,23 +35,32 @@ describe("renderCard", () => {
     expect(renderCard(state, T0 + 5000)).toContain("idle");
   });
 
-  test("§9 scenario 20: 40 lines render at most 8 plus an accurate overflow counter", () => {
+  test("§9 scenario 20 (revised 2026-08-07 for head+tail): 40 lines render at most 8 plus an accurate gap counter", () => {
     const state = stateWithLines(40);
     const card = renderCard(state, T0);
     const renderedLineCount = card.split("\n").filter((l) => l.includes("<code>")).length;
     expect(renderedLineCount).toBe(8);
-    expect(card).toContain("…and 32 earlier steps");
+    expect(card).toContain("…32 additional steps…");
   });
 
-  test("no overflow line when there are 8 or fewer activity lines", () => {
+  test("no gap line when there are 8 or fewer activity lines", () => {
     const card = renderCard(stateWithLines(8), T0);
-    expect(card).not.toContain("earlier steps");
+    expect(card).not.toContain("additional step");
   });
 
-  test("the 8 visible lines are the most recent, not the oldest", () => {
+  // 2026-08-07: a long turn's card now leads with a few of its oldest lines (so the turn's start is
+  // still visible) and ends with its most recent ones, rather than showing only the tail behind an
+  // opaque counter - the operator feedback this addressed was "what was it even doing at the start?"
+  test("beyond the cap, the card shows the first HEAD_LINES and the most recent tail lines, with the middle omitted", () => {
     const card = renderCard(stateWithLines(10), T0);
-    expect(card).toContain("file-9.ts");
-    expect(card).not.toContain("file-0.ts");
+    expect(card).toContain("file-0.ts"); // head
+    expect(card).toContain("file-1.ts"); // head
+    expect(card).toContain("file-2.ts"); // head
+    expect(card).not.toContain("file-3.ts"); // omitted
+    expect(card).not.toContain("file-4.ts"); // omitted
+    expect(card).toContain("file-5.ts"); // tail
+    expect(card).toContain("file-9.ts"); // tail
+    expect(card).toContain("…2 additional steps…");
   });
 
   test("cardLineOffset windows the rendered lines to the current (split) card only", () => {
@@ -59,7 +68,7 @@ describe("renderCard", () => {
     const card = renderCard(state, T0);
     expect(card).toContain("file-9.ts");
     expect(card).not.toContain("file-4.ts");
-    expect(card).not.toContain("earlier steps"); // 5 lines in the window, well under the 8 cap
+    expect(card).not.toContain("additional step"); // 5 lines in the window, well under the 8 cap
   });
 
   test("a card past the first for its turn is marked (cont'd)", () => {
@@ -124,7 +133,7 @@ describe("renderCard", () => {
       state = applyEvent(state, { kind: "tool_end", toolUseId: `t${i}`, success: true }, T0);
     }
     const card = renderCard(state, T0, { detail: "full", verbose: false });
-    expect(card).toContain("earlier steps");
+    expect(card).toContain("additional step");
     expect(card.length).toBeLessThan(4096);
   });
 });

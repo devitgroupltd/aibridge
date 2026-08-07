@@ -90,14 +90,18 @@ export class FeedCoalescer {
     this.forget(slug);
   }
 
-  /** Turn boundary (§5.3: one card per turn). The next turn posts a *new* message, so the
-   * "unchanged since the last frame sent" skip must not carry across it - the first render of turn
-   * N+1 is frequently byte-identical to the last render of turn N (same header, same first step),
-   * and skipping it would leave the new card empty until something else changed.
+  /** Turn boundary (§5.3: one card per turn) - also reused (2026-08-07) right before a `reply` is
+   * sent (`pipe-server.ts`'s `onBeforeReply`), to force-flush the activity that produced it ahead of
+   * the reply's own (much less throttled) send lane, rather than leaving it to whenever this slug's
+   * next coalescing timer happens to fire. Either way, the next turn (or the reply) needs a *new*
+   * message identity going forward, so the "unchanged since the last frame sent" skip must not carry
+   * across it - the first render after this is frequently byte-identical to the last one flushed
+   * (same header, same first step), and skipping it would leave the new card empty until something
+   * else changed.
    *
-   * Flushes any armed timer *first*, into the outgoing turn's own card. Without that, a render
-   * pending when the turn ended would instead fire after the boundary and carry the *new* turn's
-   * text, leaving the old card permanently missing everything after its last flush. */
+   * Flushes any armed timer *first*, into the outgoing card. Without that, a render pending at the
+   * moment this fires would instead go out afterward carrying the *next* card's text, leaving the
+   * old one permanently missing everything after its last flush. */
   reset(slug: string): void {
     const armed = this.pendingTimers.get(slug);
     if (armed !== undefined) {

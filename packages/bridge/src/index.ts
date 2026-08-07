@@ -734,6 +734,14 @@ async function main(): Promise<void> {
     chatId: config.supergroupChatId,
     stateDir: STATE_DIR,
     thinkingPlaceholder,
+    // Live-observed 2026-08-07: a reply routinely landed in its topic *before* the "working..."
+    // feed card describing the tool calls it was actually summarising - the P1 reply lane is
+    // deliberately unthrottled (§5.4) while the feed card sits behind FeedCoalescer's own
+    // several-second interval. Reusing `reset` (already the turn-boundary flush) here forces
+    // whatever's pending for this slug to flush/queue right before the reply's own send, giving the
+    // feed card a head start instead of none - not a hard ordering guarantee (still two independent
+    // rate-governor lanes), just a much better common case.
+    onBeforeReply: (slug) => feedCoalescer.reset(slug),
     onReplySent: (topicId, text) => {
       typingIndicator.stop(topicId);
       // §4.4's rename-once: the first real reply upgrades the topic off its provisional

@@ -1,7 +1,7 @@
 ---
-version: 0.90.0
+version: 0.91.0
 status: solid
-last_modified_utc: 2026-08-07T13:40:00Z
+last_modified_utc: 2026-08-07T14:10:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,26 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.91.0 (2026-08-07): two operator-observed feed-card oddities in the same live topic. (1) A
+    session's final `reply` routinely landed in Telegram *before* the 'working...' activity card
+    describing the tool calls it was actually summarising - causally backwards, since the reply's
+    content depended on that investigation. Root cause: the P1 (reply) lane is deliberately
+    unthrottled (§5.4 - a reply/permission-prompt must never wait on feed traffic) while the feed
+    card sits behind `feed-coalescer.ts`'s own several-second coalescing interval on the fully
+    independent P2 lane - nothing forced that turn's final card frame to flush before the reply that
+    summarised it. Fixed with a new `onBeforeReply` pipe-server hook, fired right before a reply's
+    text is sent, wired to `feedCoalescer.reset(slug)` (the same force-flush `reset` already used at
+    turn boundaries) - gives the feed card a head start instead of none; not a hard ordering
+    guarantee (still two independent rate-governor lanes), just a much better common case. (2) A long
+    turn's compact card showed only its newest 8 lines behind an opaque '…and N earlier steps'
+    counter, with no hint of how the turn actually started. Changed `feed-renderer.ts`'s `renderCard`
+    to a head + tail split once a turn exceeds the visible-line cap: the first 3 lines (`HEAD_LINES`)
+    lead the card, the most recent 5 close it, and the gap in between is reported as '…N additional
+    steps…' - applied to both `detail: compact` (fixed line counts) and `detail: full` (the same idea
+    budgeted by character length, with the head capped at 30% of the budget so it can't crowd out the
+    tail). New/updated tests: 1 for `pipe-server.ts`'s `onBeforeReply` firing-before-send ordering, 4
+    updated + 1 new in `feed-renderer.test.ts` for the head+tail split (compact and full detail). 903
+    total passing, 0 failures, `tsc --noEmit` clean."
   - "0.90.0 (2026-08-07): operator feedback on the 0.89.0 entry just below - 'config.phase1.slug' is
     a strange name. Confirmed the identifier was confined to exactly two files (config.ts, index.ts -
     every other 'phase1'/'Phase 1' hit elsewhere in the repo was prose about the design stage, not

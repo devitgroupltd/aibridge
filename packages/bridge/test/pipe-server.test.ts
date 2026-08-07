@@ -193,6 +193,41 @@ describe("startPipeServer", () => {
     expect(fired).toEqual([]);
   });
 
+  // The 2026-08-07 reply-vs-feed-card ordering fix: onBeforeReply must fire with the slug (not the
+  // topic_id - the caller needs it to key FeedCoalescer.reset) and, critically, before the reply's
+  // own send goes out, not after (unlike onReplySent).
+  test("onBeforeReply fires with the slug before the reply is actually sent", async () => {
+    const path = pipePath();
+    const routing = new Routing();
+    routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+    const order: string[] = [];
+    const controlBot: SendMessageSource = {
+      sendMessage: async () => {
+        order.push("sent");
+        return { message_id: 1 };
+      },
+    };
+
+    const handle = startPipeServer({
+      pipePath: path,
+      routing,
+      controlBot,
+      chatId: "-1",
+      onBeforeReply: (slug) => order.push(`before:${slug}`),
+    });
+    servers.push(handle.server);
+    await waitFor(() => handle.server.listening);
+
+    const { socket } = connectClient(path);
+    await waitFor(() => socket.readyState === "open");
+    socket.write(
+      encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "hi" } satisfies ReplyMessage),
+    );
+
+    await waitFor(() => order.length >= 2);
+    expect(order).toEqual(["before:test-session", "sent"]);
+  });
+
   describe("thinking placeholder", () => {
     test("a reply edits the pending placeholder instead of sending a second message", async () => {
       const path = pipePath();

@@ -54,6 +54,19 @@ export interface PipeServerOptions {
    * is passed through too so a caller can drive §4.4's rename-once off the session's first reply
    * without this module needing to know anything about topics or the routing table. */
   onReplySent?: (topicId: string, text: string) => void;
+  /**
+   * Fires right before a `reply`'s text is actually sent (before the first `p1(...)` call below) -
+   * lets a caller force-flush this slug's coalesced feed card first (`feed-coalescer.ts`'s `reset`),
+   * so the tool-call activity that causally produced this reply has at least started its own send
+   * before the reply's does. Live-observed 2026-08-07: without this, a reply routinely lands in the
+   * topic *before* the "working..." card describing the investigation it's actually summarising,
+   * since the feed card sits behind `FeedCoalescer`'s own several-second interval while the reply's
+   * P1 lane is deliberately unthrottled (§5.4 - P1 must never wait on P2's traffic). This doesn't
+   * make the ordering a hard guarantee (P1 and P2 are still two independent rate-governor lanes with
+   * no shared queue - see rate-governor.ts's own module doc comment), just gives the feed card a
+   * head start instead of none at all.
+   */
+  onBeforeReply?: (slug: string) => void;
   /** §5.1: every hook firing forwards one `event` message here. The hook client is a one-shot
    * process (a fresh connection per firing, no persistent registration to track), so this is the
    * only wiring needed on this side - there is no per-hook `hello_ack` to send back. */
@@ -206,6 +219,7 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       }
       const topicId = topicFor(msg.slug, msg.topic_id, "reply");
       if (topicId === undefined) return;
+      opts.onBeforeReply?.(msg.slug);
       // Telegram rejects both an empty message and one over 4096 code units with a 400, which the
       // governor cannot retry its way out of - and since the placeholder is consumed either way,
       // the failure used to leave a permanent "🤔 Thinking..." and no answer at all in the topic.
