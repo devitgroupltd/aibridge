@@ -14,10 +14,16 @@ LOG_FILE="$STATE_DIR/bridge-dev.log"
 PID_FILE="$STATE_DIR/bridge-dev.pid"
 
 find_pid() {
-  # Matches the Bridge's own node process by command line, not just "any node.exe" - this machine
+  # Matches the Bridge's own process by command line, not just "any node.exe" - this machine
   # routinely has other Node processes running (editor extensions, this very tool) at the same time.
+  # Checks both node.exe AND bun.exe - confirmed live 2026-08-07: a Bridge restarted from inside
+  # Telegram itself (the operator's own `/restart`) launches via `bun run .../src/index.ts`, not this
+  # script's `node --experimental-strip-types`. A node.exe-only filter left that instance invisible
+  # here, so `restart` couldn't stop it and the fresh `node` process it then started immediately died
+  # on EADDRINUSE against the pipe the still-running bun.exe instance already held - twice, both
+  # requiring a manual `Stop-Process` outside this script to recover from.
   powershell -NoProfile -Command \
-    "Get-CimInstance Win32_Process -Filter \"Name='node.exe'\" | Where-Object { \$_.CommandLine -like '*packages\\bridge\\src\\index.ts*' -or \$_.CommandLine -like '*src/index.ts*' } | Select-Object -First 1 -ExpandProperty ProcessId" \
+    "Get-CimInstance Win32_Process -Filter \"Name='node.exe' OR Name='bun.exe'\" | Where-Object { \$_.CommandLine -like '*packages\\bridge\\src\\index.ts*' -or \$_.CommandLine -like '*src/index.ts*' } | Select-Object -First 1 -ExpandProperty ProcessId" \
     2>/dev/null | tr -d '\r'
 }
 
