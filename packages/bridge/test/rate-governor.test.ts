@@ -363,6 +363,71 @@ describe("RateGovernor self-rearming (no external pump)", () => {
   });
 });
 
+/**
+ * 0.97.0: `schedule()`'s return value used to be `void` and every existing caller above ignores
+ * it, but `pipe-server.ts`'s reply/feed ordering barrier now needs to know when a P2 send has
+ * actually settled, not merely been scheduled - these lock in the contract that change relies on.
+ */
+describe("schedule()'s promise return (0.97.0 ordering barrier)", () => {
+  test("a P2 send that succeeds resolves the returned promise only once the send itself completes", async () => {
+    const clock = makeClock(0);
+    const governor = new RateGovernor({ capacity: 20, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+    let sendCompleted = false;
+    const promise = governor.schedule("P2", async () => {
+      await flushMicrotasks();
+      sendCompleted = true;
+    });
+    expect(sendCompleted).toBe(false); // not yet - the send is still in flight
+    await promise;
+    expect(sendCompleted).toBe(true);
+  });
+
+  test("a P2 send dropped for an empty bucket resolves immediately - nothing to wait for", async () => {
+    const clock = makeClock(0);
+    const governor = new RateGovernor({ capacity: 0, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+    let ran = false;
+    const promise = governor.schedule("P2", async () => {
+      ran = true;
+    });
+    await promise;
+    expect(ran).toBe(false); // dropped, not attempted
+    expect(governor.droppedP2Count).toBe(1);
+  });
+
+  test("a P2 send that throws still resolves (never rejects) the returned promise", async () => {
+    const clock = makeClock(0);
+    const governor = new RateGovernor({ capacity: 20, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+    const promise = governor.schedule("P2", async () => {
+      throw new Error("network error");
+    });
+    await expect(promise).resolves.toBeUndefined();
+  });
+
+  test("a P1 send's returned promise resolves once actually delivered, and never rejects even on exhausted retries", async () => {
+    const clock = makeClock(0);
+    const governor = new RateGovernor({ capacity: 20, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+    let delivered = false;
+    const promise = governor.schedule("P1", async () => {
+      delivered = true;
+    });
+    await flushMicrotasks();
+    await promise;
+    expect(delivered).toBe(true);
+
+    const failing = governor.schedule("P1", async () => {
+      throw new Error("network error");
+    });
+    await flushMicrotasks();
+    clock.advance(1000);
+    await flushMicrotasks();
+    clock.advance(2000);
+    await flushMicrotasks();
+    clock.advance(4000);
+    await flushMicrotasks();
+    await expect(failing).resolves.toBeUndefined(); // exhausted its retries, but schedule() never rejects
+  });
+});
+
 describe("clampRetryAfterMs", () => {
   // §5.4 says honour retry_after exactly, but a bucket paused on an unbounded number taken straight
   // off the wire may never resume - a garbled retry_after of 10^9 would mute the fleet for the

@@ -501,8 +501,11 @@ async function main(): Promise<void> {
   const feedCoalescer = new FeedCoalescer({
     activeSessionCount: () => routing.all().length,
     quietMode: () => feedGovernor.p2PressureExceeded(),
+    // Returns `feedGovernor.schedule`'s own promise (0.97.0) rather than firing it and returning
+    // nothing - `reset()` propagates this back out to `onBeforeReply`, so awaiting a reply's
+    // ordering barrier actually awaits this call's underlying Telegram send, not just its scheduling.
     onFlush: (slug, text) => {
-      feedGovernor.schedule("P2", async () => {
+      return feedGovernor.schedule("P2", async () => {
         // §4.2's /pause: replies and prompts still flow, only the feed card stops updating.
         if (sessionStore.get(slug)?.paused) return;
         const route = routing.get(slug);
@@ -742,10 +745,10 @@ async function main(): Promise<void> {
     // Live-observed 2026-08-07: a reply routinely landed in its topic *before* the "working..."
     // feed card describing the tool calls it was actually summarising - the P1 reply lane is
     // deliberately unthrottled (§5.4) while the feed card sits behind FeedCoalescer's own
-    // several-second interval. Reusing `reset` (already the turn-boundary flush) here forces
-    // whatever's pending for this slug to flush/queue right before the reply's own send, giving the
-    // feed card a head start instead of none - not a hard ordering guarantee (still two independent
-    // rate-governor lanes), just a much better common case.
+    // several-second interval. `reset` (already the turn-boundary flush) forces whatever's pending
+    // for this slug to flush right before the reply's own send - and since 0.97.0, `reset`'s return
+    // (via `onFlush` below, now itself promise-returning) is a promise `pipe-server.ts` actually
+    // awaits (bounded by its own timeout), not just a fire-and-forget head start.
     onBeforeReply: (slug) => feedCoalescer.reset(slug),
     onReplySent: (topicId, text) => {
       typingIndicator.stop(topicId);

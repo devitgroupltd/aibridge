@@ -55,18 +55,33 @@ export interface PipeServerOptions {
    * without this module needing to know anything about topics or the routing table. */
   onReplySent?: (topicId: string, text: string) => void;
   /**
-   * Fires right before a `reply`'s text is actually sent (before the first `p1(...)` call below) -
-   * lets a caller force-flush this slug's coalesced feed card first (`feed-coalescer.ts`'s `reset`),
-   * so the tool-call activity that causally produced this reply has at least started its own send
-   * before the reply's does. Live-observed 2026-08-07: without this, a reply routinely lands in the
-   * topic *before* the "working..." card describing the investigation it's actually summarising,
-   * since the feed card sits behind `FeedCoalescer`'s own several-second interval while the reply's
-   * P1 lane is deliberately unthrottled (§5.4 - P1 must never wait on P2's traffic). This doesn't
-   * make the ordering a hard guarantee (P1 and P2 are still two independent rate-governor lanes with
-   * no shared queue - see rate-governor.ts's own module doc comment), just gives the feed card a
-   * head start instead of none at all.
+   * Fires right before a `reply`'s text is actually sent (before the first `p1(...)` call below),
+   * and is *awaited* (bounded by `onBeforeReplyTimeoutMs`) - lets a caller force-flush this slug's
+   * coalesced feed card first (`feed-coalescer.ts`'s `reset`) and hold the reply back until that
+   * flush's own send has actually completed, not merely started.
+   *
+   * Live-observed 2026-08-07: a reply routinely landed in the topic *before* the "working..." card
+   * describing the investigation it's actually summarising, since the feed card sits behind
+   * `FeedCoalescer`'s own several-second interval while the reply's P1 lane is deliberately
+   * unthrottled (§5.4 - P1 must never wait on P2's traffic in general). The first fix (0.91.0) only
+   * force-started that flush a few microtasks earlier - a head start, still a race, since nothing
+   * stopped the reply's own send from completing first. 0.97.0 (this version) closes that race for
+   * the case that actually matters - the one turn boundary immediately before a reply - by awaiting
+   * the flush itself: every Telegram bot library's own recommended fix for out-of-order delivery is
+   * "await each send before issuing the next" (there is no server-side ordering guarantee across
+   * independent `sendMessage` calls, confirmed against the Bot API's own docs and multiple client
+   * libraries' issue trackers), and this is that discipline applied across the P1/P2 boundary at the
+   * one moment they're causally linked. Still bounded by a timeout rather than a truly hard
+   * guarantee - a wedged or heavily rate-limited feed bot must never be able to stall a reply
+   * indefinitely - but the common case (the near-totality of real turns) now has a real ordering
+   * guarantee instead of a better-odds race.
    */
-  onBeforeReply?: (slug: string) => void;
+  onBeforeReply?: (slug: string) => Promise<void> | void;
+  /** Upper bound on how long `handleReply` will wait on `onBeforeReply` before sending anyway.
+   * Default 1500ms - comfortably past a normal Telegram round trip, short enough that a genuinely
+   * stuck feed bot (empty-bucket P2 already resolves immediately, so this only bites on real network
+   * stalls) never turns into a visibly "hung" reply. */
+  onBeforeReplyTimeoutMs?: number;
   /** §5.1: every hook firing forwards one `event` message here. The hook client is a one-shot
    * process (a fresh connection per firing, no persistent registration to track), so this is the
    * only wiring needed on this side - there is no per-hook `hello_ack` to send back. */
@@ -122,6 +137,9 @@ const TELEGRAM_TEXT_LIMIT = 3900;
 /** Telegram rejects a `sendDocument` over 50MB outright, so reading a larger file into memory only
  * to have the upload 400 (three times, once per retry) is pure waste. */
 const MAX_SEND_FILE_BYTES = 50 * 1024 * 1024;
+
+/** See `PipeServerOptions.onBeforeReplyTimeoutMs`'s own doc comment. */
+const DEFAULT_ONBEFOREREPLY_TIMEOUT_MS = 1500;
 
 /** Splits at line boundaries where it can, mid-line only when a single line is itself too long.
  * Returns `[]` for text that is empty or whitespace-only - Telegram 400s on that too. */
@@ -219,7 +237,30 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       }
       const topicId = topicFor(msg.slug, msg.topic_id, "reply");
       if (topicId === undefined) return;
-      opts.onBeforeReply?.(msg.slug);
+      // Awaited, bounded by a timeout - see `onBeforeReply`'s own doc comment for why this changed
+      // from fire-and-forget (0.91.0) to an actual barrier (0.97.0). The whole thing is wrapped so a
+      // *rejecting* onBeforeReply can never take the reply down with it: this call sits inside
+      // handleReply's own try/catch, and an unswallowed rejection here would propagate to that catch
+      // and skip sending the reply entirely - a wholly unrelated ordering-barrier failure silently
+      // dropping the operator's actual answer. Today's real wiring (`scheduleP2Async`) is already
+      // built to never reject, so this is a defensive backstop against a future change to that chain
+      // breaking that contract, not a currently-reachable path - but it's exactly the "silent-wrong"
+      // failure mode worth guarding against regardless (§9's own discipline).
+      const beforeReply = opts.onBeforeReply?.(msg.slug);
+      if (beforeReply) {
+        const timeoutMs = opts.onBeforeReplyTimeoutMs ?? DEFAULT_ONBEFOREREPLY_TIMEOUT_MS;
+        let timer: ReturnType<typeof setTimeout>;
+        const timeout = new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, timeoutMs);
+        });
+        await Promise.race([
+          Promise.resolve(beforeReply).catch((err) => {
+            log("WARN", `onBeforeReply failed for slug "${msg.slug}" - sending the reply anyway: ${(err as Error).message}`);
+          }),
+          timeout,
+        ]);
+        clearTimeout(timer!);
+      }
       // Telegram rejects both an empty message and one over 4096 code units with a 400, which the
       // governor cannot retry its way out of - and since the placeholder is consumed either way,
       // the failure used to leave a permanent "🤔 Thinking..." and no answer at all in the topic.

@@ -213,7 +213,7 @@ describe("startPipeServer", () => {
       routing,
       controlBot,
       chatId: "-1",
-      onBeforeReply: (slug) => order.push(`before:${slug}`),
+      onBeforeReply: (slug) => { order.push(`before:${slug}`); },
     });
     servers.push(handle.server);
     await waitFor(() => handle.server.listening);
@@ -226,6 +226,130 @@ describe("startPipeServer", () => {
 
     await waitFor(() => order.length >= 2);
     expect(order).toEqual(["before:test-session", "sent"]);
+  });
+
+  // 0.97.0: the fix above only proved onBeforeReply is *invoked* first - not that the reply
+  // actually waits for it. An async onBeforeReply that resolves after its own send completes is
+  // the case that matters: without the await added in this version, "sent" could still land before
+  // "flushed" below, since firing a call and awaiting its completion are different things.
+  test("an async onBeforeReply is awaited - the reply cannot be sent until it resolves", async () => {
+    const path = pipePath();
+    const routing = new Routing();
+    routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+    const order: string[] = [];
+    const controlBot: SendMessageSource = {
+      sendMessage: async () => {
+        order.push("sent");
+        return { message_id: 1 };
+      },
+    };
+
+    const handle = startPipeServer({
+      pipePath: path,
+      routing,
+      controlBot,
+      chatId: "-1",
+      onBeforeReply: async () => {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        order.push("flushed");
+      },
+    });
+    servers.push(handle.server);
+    await waitFor(() => handle.server.listening);
+
+    const { socket } = connectClient(path);
+    await waitFor(() => socket.readyState === "open");
+    socket.write(
+      encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "hi" } satisfies ReplyMessage),
+    );
+
+    await waitFor(() => order.length >= 2);
+    expect(order).toEqual(["flushed", "sent"]);
+  });
+
+  // The bounded half of the same fix: a wedged/rate-limited feed send must never hang a reply
+  // forever. onBeforeReplyTimeoutMs caps the wait, so the reply still goes out - just without the
+  // ordering guarantee for that one turn, which is the documented, accepted trade-off.
+  test("a never-resolving onBeforeReply does not block the reply past its timeout", async () => {
+    const path = pipePath();
+    const routing = new Routing();
+    routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+    const sent: string[] = [];
+    const controlBot: SendMessageSource = {
+      sendMessage: async (_chatId, _threadId, text) => {
+        sent.push(text);
+        return { message_id: 1 };
+      },
+    };
+
+    const handle = startPipeServer({
+      pipePath: path,
+      routing,
+      controlBot,
+      chatId: "-1",
+      onBeforeReply: () => new Promise(() => {}), // never settles
+      onBeforeReplyTimeoutMs: 30,
+    });
+    servers.push(handle.server);
+    await waitFor(() => handle.server.listening);
+
+    const { socket } = connectClient(path);
+    await waitFor(() => socket.readyState === "open");
+    socket.write(
+      encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "hi" } satisfies ReplyMessage),
+    );
+
+    // A short waitFor budget: this only passes if the reply proceeds once the much shorter
+    // onBeforeReplyTimeoutMs elapses, rather than staying stuck behind a barrier that never settles.
+    await waitFor(() => sent.length >= 1, 500);
+    expect(sent).toEqual(["hi"]);
+  });
+
+  // The gap the two tests above don't cover: what if onBeforeReply itself *rejects*? Without an
+  // explicit catch, that rejection propagates through handleReply's own try/catch and skips
+  // sending the reply entirely - an unrelated ordering-barrier failure silently dropping the
+  // operator's actual answer. Today's real wiring can't reject (RateGovernor.schedule/
+  // scheduleP2Async never do), but this is a defensive backstop, not a currently-reachable path.
+  test("a rejecting onBeforeReply logs a warning but still lets the reply through", async () => {
+    const path = pipePath();
+    const routing = new Routing();
+    routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+    const sent: string[] = [];
+    const warnings: string[] = [];
+    const errors: string[] = [];
+    const controlBot: SendMessageSource = {
+      sendMessage: async (_chatId, _threadId, text) => {
+        sent.push(text);
+        return { message_id: 1 };
+      },
+    };
+
+    const handle = startPipeServer({
+      pipePath: path,
+      routing,
+      controlBot,
+      chatId: "-1",
+      onBeforeReply: async () => {
+        throw new Error("feed flush blew up");
+      },
+      log: (level, message) => {
+        if (level === "WARN") warnings.push(message);
+        if (level === "ERROR") errors.push(message);
+      },
+    });
+    servers.push(handle.server);
+    await waitFor(() => handle.server.listening);
+
+    const { socket } = connectClient(path);
+    await waitFor(() => socket.readyState === "open");
+    socket.write(
+      encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "hi" } satisfies ReplyMessage),
+    );
+
+    await waitFor(() => sent.length >= 1);
+    expect(sent).toEqual(["hi"]); // the reply still went out despite the barrier failing
+    expect(warnings.some((w) => w.includes("feed flush blew up"))).toBe(true);
+    expect(errors).toEqual([]); // not swallowed into the generic ERROR path - it's a known, named failure mode
   });
 
   describe("thinking placeholder", () => {

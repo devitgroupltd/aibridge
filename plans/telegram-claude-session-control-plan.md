@@ -1,7 +1,7 @@
 ---
-version: 0.96.1
+version: 0.97.0
 status: solid
-last_modified_utc: 2026-08-07T21:45:00Z
+last_modified_utc: 2026-08-07T22:30:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,34 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.97.0 (2026-08-07): operator asked to actually close the reply-vs-feed-card ordering gap
+    0.91.0 only narrowed, rather than accept it as a permanent workaround. Web/GitHub research
+    confirmed there is no server-side ordering guarantee across independent Telegram `sendMessage`
+    calls at all (core.telegram.org/bots/faq; yagop/node-telegram-bot-api#192 and #240) - every
+    client library's own recommended fix is the same: await each send's completion before issuing
+    the next one. 0.91.0's `onBeforeReply` only *started* the feed's flush a few microtasks earlier
+    (`feedCoalescer.reset(slug)`, fire-and-forget) - nothing stopped the reply's own, separately-
+    throttled P1 send from completing first anyway, so it stayed a race, just a narrower one.
+    Closed it by making the barrier a real await instead: `FeedCoalescer.reset`/`flush` and
+    `RateGovernor.schedule`/new `scheduleP2Async` now return (never-rejecting) promises that
+    resolve once the underlying send actually settles, not merely starts; `pipe-server.ts`'s
+    `handleReply` awaits `onBeforeReply`'s result before building/sending its own chunks, bounded
+    by a new `onBeforeReplyTimeoutMs` (default 1500ms) so a wedged or heavily rate-limited feed bot
+    can never stall a reply indefinitely - that bound is the one remaining non-guarantee, and only
+    bites on a genuine network stall (an empty feed bucket already resolves immediately, since P2
+    is still droppable-not-queued). The common case - the near-totality of real turns - now has an
+    actual ordering guarantee: the reply's HTTP request cannot even begin until Telegram has already
+    accepted the feed card describing what produced it. Self-review before shipping surfaced one
+    more real gap: `handleReply`'s new await sat inside its own try/catch with no `.catch()` on
+    `onBeforeReply`'s promise - a future change to the feed-flush chain that let a rejection through
+    (today's `scheduleP2Async` deliberately never does) would propagate to that catch and skip
+    sending the reply entirely, silently dropping the operator's actual answer over a wholly
+    unrelated ordering-barrier failure. Added the missing catch (logs a named WARN, lets the reply
+    through regardless) plus a regression test; also cleared the timeout race's timer handle on the
+    non-timeout path rather than leaving it armed for up to 1500ms doing nothing. 9 new tests
+    (`rate-governor.test.ts`'s schedule()-promise contract, `feed-coalescer.test.ts`'s
+    reset()-promise propagation, `pipe-server.test.ts`'s awaited-barrier, bounded-timeout, and
+    rejecting-barrier cases). 953 total (up from 944), `tsc --noEmit` clean."
   - "0.96.1 (2026-08-07): follow-up to 0.96.0 below, prompted by being asked directly whether the
     resume-in-place rewrite was covered by tests - it wasn't; `autoRecoverWedgedSession` had gone from
     zero tests to zero tests across that rewrite, covered only by \"restart and confirm clean

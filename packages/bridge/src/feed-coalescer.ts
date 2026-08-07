@@ -19,8 +19,11 @@ export interface FeedCoalescerOptions {
   clearTimeoutFn?: (handle: unknown) => void;
   /** Called at most once per flush, with the latest text at the time of the flush - never the
    * text captured when the timer was originally armed, so a rapid burst always sends the final
-   * state rather than a stale intermediate one. */
-  onFlush: (slug: string, text: string) => void;
+   * state rather than a stale intermediate one. May return a promise (0.97.0): `reset()` propagates
+   * it so a caller forcing a turn-boundary/pre-reply flush can await the actual send completing,
+   * not just starting. Untyped callers that return nothing keep working unchanged - `reset()`'s own
+   * return is `Promise<void> | void` either way. */
+  onFlush: (slug: string, text: string) => Promise<void> | void;
 }
 
 export class FeedCoalescer {
@@ -69,12 +72,12 @@ export class FeedCoalescer {
     this.pendingTimers.set(slug, handle);
   }
 
-  private flush(slug: string): void {
+  private flush(slug: string): Promise<void> | void {
     const text = this.latestText.get(slug);
     if (text === undefined || text === this.lastSentText.get(slug)) return;
     this.lastSentText.set(slug, text);
     this.lastSentAtMs.set(slug, this.now());
-    this.opts.onFlush(slug, text);
+    return this.opts.onFlush(slug, text);
   }
 
   /** For session teardown - drops any armed timer without flushing, and forgets every per-slug
@@ -101,13 +104,20 @@ export class FeedCoalescer {
    *
    * Flushes any armed timer *first*, into the outgoing card. Without that, a render pending at the
    * moment this fires would instead go out afterward carrying the *next* card's text, leaving the
-   * old one permanently missing everything after its last flush. */
-  reset(slug: string): void {
+   * old one permanently missing everything after its last flush.
+   *
+   * Returns whatever the resulting flush returns (0.97.0) - `undefined`/void if nothing was armed,
+   * so a caller can tell "nothing to wait for" apart from "wait for this". `pipe-server.ts`'s
+   * `onBeforeReply` awaits this (bounded by its own timeout) specifically so the reply it's about
+   * to send can't begin until the feed card describing what produced it has actually reached
+   * Telegram - not merely been kicked off. */
+  reset(slug: string): Promise<void> | void {
     const armed = this.pendingTimers.get(slug);
+    let flushed: Promise<void> | void = undefined;
     if (armed !== undefined) {
       this.clearTimeoutFn(armed);
       this.pendingTimers.delete(slug);
-      this.flush(slug);
+      flushed = this.flush(slug);
     }
     // `lastSentText` and `latestText` only - `lastSentAtMs` deliberately survives, so §5.4's
     // `max(3s, 3s × sessions)` interval still governs the new turn's first send. Clearing it too would
@@ -115,6 +125,7 @@ export class FeedCoalescer {
     // exists to enforce.
     this.lastSentText.delete(slug);
     this.latestText.delete(slug);
+    return flushed;
   }
 
   private forget(slug: string): void {

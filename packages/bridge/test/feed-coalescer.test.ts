@@ -44,7 +44,7 @@ describe("FeedCoalescer", () => {
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
       clearTimeoutFn: clock.clearTimeoutFn,
-      onFlush: (_slug, text) => flushes.push(text),
+      onFlush: (_slug, text) => { flushes.push(text); },
     });
 
     for (let i = 0; i < 50; i++) {
@@ -134,7 +134,7 @@ describe("FeedCoalescer", () => {
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
       clearTimeoutFn: clock.clearTimeoutFn,
-      onFlush: (_slug, text) => flushes.push(text),
+      onFlush: (_slug, text) => { flushes.push(text); },
     });
 
     coalescer.notify("s1", "a"); // the first notify for a fresh slug always flushes immediately
@@ -158,7 +158,7 @@ describe("FeedCoalescer", () => {
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
       clearTimeoutFn: clock.clearTimeoutFn,
-      onFlush: (_slug, text) => flushes.push(text),
+      onFlush: (_slug, text) => { flushes.push(text); },
     });
 
     coalescer.notify("s1", "a"); // the first notify for a fresh slug always flushes immediately
@@ -188,7 +188,7 @@ describe("FeedCoalescer.reset (turn boundary)", () => {
       activeSessionCount: () => 1,
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
-      onFlush: (_slug, text) => flushes.push(text),
+      onFlush: (_slug, text) => { flushes.push(text); },
     });
 
     coalescer.notify("s", "🔧 Bash");
@@ -214,7 +214,7 @@ describe("FeedCoalescer.reset (turn boundary)", () => {
       activeSessionCount: () => 1,
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
-      onFlush: (_slug, text) => flushes.push(text),
+      onFlush: (_slug, text) => { flushes.push(text); },
     });
 
     coalescer.notify("s", "first");
@@ -235,7 +235,7 @@ describe("FeedCoalescer.reset (turn boundary)", () => {
       activeSessionCount: () => 1,
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
-      onFlush: (slug, text) => flushes.push([slug, text]),
+      onFlush: (slug, text) => { flushes.push([slug, text]); },
     });
 
     coalescer.notify("a", "same");
@@ -263,7 +263,7 @@ describe("FeedCoalescer.cancel (session teardown)", () => {
       activeSessionCount: () => 1,
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
-      onFlush: (_slug, text) => flushes.push(text),
+      onFlush: (_slug, text) => { flushes.push(text); },
     });
 
     coalescer.notify("reused-slug", "🔧 Bash");
@@ -285,7 +285,7 @@ describe("FeedCoalescer.cancel (session teardown)", () => {
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
       clearTimeoutFn: clock.clearTimeoutFn,
-      onFlush: (_slug, text) => flushes.push(text),
+      onFlush: (_slug, text) => { flushes.push(text); },
     });
 
     coalescer.notify("s", "a"); // flushes immediately - nothing sent yet for this slug
@@ -317,7 +317,7 @@ describe("FeedCoalescer.reset flushes into the outgoing turn, not the new one", 
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
       clearTimeoutFn: clock.clearTimeoutFn,
-      onFlush: (_slug, text) => flushed.push(text),
+      onFlush: (_slug, text) => { flushed.push(text); },
     });
 
     coalescer.notify("s", "turn1-frame1"); // sent immediately
@@ -342,13 +342,57 @@ describe("FeedCoalescer.reset flushes into the outgoing turn, not the new one", 
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
       clearTimeoutFn: clock.clearTimeoutFn,
-      onFlush: (_slug, text) => flushed.push(text),
+      onFlush: (_slug, text) => { flushed.push(text); },
     });
 
     coalescer.notify("s", "only-frame");
     expect(flushed).toEqual(["only-frame"]);
     coalescer.reset("s");
     expect(flushed).toEqual(["only-frame"]);
+  });
+
+  /**
+   * 0.97.0: `reset()`'s return value used to be discarded by every caller - `pipe-server.ts`'s
+   * `onBeforeReply` now awaits it (bounded by its own timeout) so a reply can't be sent until the
+   * feed card describing what produced it has actually reached Telegram, not merely been kicked off.
+   */
+  test("reset propagates onFlush's promise, resolving only once the flush itself settles", async () => {
+    const clock = makeClock(0);
+    let sendCompleted = false;
+    const coalescer = new FeedCoalescer({
+      activeSessionCount: () => 1,
+      now: clock.now,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+      onFlush: async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        sendCompleted = true;
+      },
+    });
+
+    coalescer.notify("s", "pending frame"); // sent immediately (first notify for a fresh slug)
+    clock.advance(1000);
+    coalescer.notify("s", "final frame"); // deferred onto a timer, still pending when reset() fires
+
+    const flushed = coalescer.reset("s");
+    expect(sendCompleted).toBe(false); // reset() returned, but onFlush's own promise hasn't settled yet
+    await flushed;
+    expect(sendCompleted).toBe(true);
+  });
+
+  test("reset with nothing armed returns undefined - nothing for a caller to await", () => {
+    const clock = makeClock(0);
+    const coalescer = new FeedCoalescer({
+      activeSessionCount: () => 1,
+      now: clock.now,
+      setTimeoutFn: clock.setTimeoutFn,
+      clearTimeoutFn: clock.clearTimeoutFn,
+      onFlush: () => {},
+    });
+
+    coalescer.notify("s", "only-frame"); // sent immediately - nothing left armed
+    expect(coalescer.reset("s")).toBeUndefined();
   });
 
   test("the new turn's first send still respects §5.4's interval", () => {
@@ -361,7 +405,7 @@ describe("FeedCoalescer.reset flushes into the outgoing turn, not the new one", 
       now: clock.now,
       setTimeoutFn: clock.setTimeoutFn,
       clearTimeoutFn: clock.clearTimeoutFn,
-      onFlush: (_slug, text) => flushed.push(text),
+      onFlush: (_slug, text) => { flushed.push(text); },
     });
 
     coalescer.notify("s", "turn1");

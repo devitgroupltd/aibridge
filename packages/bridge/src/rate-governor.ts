@@ -155,16 +155,24 @@ export class RateGovernor {
   }
 
   /** P0/P1 are queued when their bucket is empty and drained as tokens free up (never dropped);
-   * P2 is attempted once and discarded on failure to acquire a token (§9 scenario 16). */
-  schedule(lane: Lane, fn: () => Promise<void>): void {
-    if (lane === "P2") {
-      this.scheduleP2(fn);
-      return;
-    }
+   * P2 is attempted once and discarded on failure to acquire a token (§9 scenario 16).
+   *
+   * Returns a promise that resolves once this attempt settles (0.97.0, for `FeedCoalescer.onFlush`
+   * callers that want to await it - see `scheduleP2Async`'s own doc comment) - existing callers that
+   * treated this as fire-and-forget are unaffected, since they never captured the old `void` return
+   * either. Never rejects, on any lane: that was already true for P2, and for P0/P1 this keeps the
+   * exact "swallow the rejection, the ERROR log inside `runControlTask` is the record of a real
+   * failure" contract `schedule()` always had, rather than newly surfacing an unhandled rejection to
+   * whichever caller happens to be the first to await it. */
+  schedule(lane: Lane, fn: () => Promise<void>): Promise<void> {
+    if (lane === "P2") return this.scheduleP2Async(fn);
     // Fire-and-forget: swallow the rejection `scheduleAsync` would otherwise surface, so a
     // caller that doesn't need the result (and doesn't await anything) never sees an unhandled
     // rejection - the ERROR log inside `runControlTask` is still the record of a real failure.
-    this.scheduleAsync(lane, fn).catch(() => {});
+    return this.scheduleAsync(lane, fn).then(
+      () => undefined,
+      () => undefined,
+    );
   }
 
   /** Same P0/P1 semantics as `schedule()`, but returns a promise resolving to `fn`'s own result
@@ -184,15 +192,29 @@ export class RateGovernor {
     });
   }
 
-  private scheduleP2(fn: () => Promise<void>): void {
+  /** Same P2 semantics as `schedule("P2", fn)` (attempted once, dropped outright - never queued,
+   * never retried - if the feed bucket is empty), but returns a promise that resolves once this
+   * attempt is actually *settled*, not merely scheduled. A dropped attempt resolves immediately -
+   * there is nothing in flight to wait for. Never rejects: a P2 failure has nothing for a waiter to
+   * react to (§5.4 - a newer frame supersedes a dropped one either way), so the only thing this
+   * promise communicates is "this attempt is over, one way or another".
+   *
+   * Exists for 0.97.0's reply/feed ordering fix: `onBeforeReply` (pipe-server.ts) used to fire this
+   * lane's send fire-and-forget, which only gave the feed card a *head start* on the reply's own,
+   * separately-throttled P1 lane - still a race, just a narrower one (§9's live-observed 0.91.0
+   * report). Awaiting this instead means the reply's own send genuinely cannot begin until the feed
+   * bot's HTTP call for the card describing it has already completed - the same "await each send
+   * before issuing the next" discipline every Telegram bot library recommends for in-order delivery,
+   * extended across the P1/P2 boundary specifically at the one moment they're causally linked. */
+  scheduleP2Async(fn: () => Promise<void>): Promise<void> {
     if (!this.feedBucket.tryTake()) {
       this.p2DroppedCount += 1;
       this.recordP2Outcome(true);
       this.log("WARN", "P2 feed edit dropped - feed bucket empty");
-      return;
+      return Promise.resolve();
     }
     this.recordP2Outcome(false);
-    fn().catch((err) => {
+    return fn().catch((err) => {
       if (err instanceof RateLimitedError) {
         this.feedBucket.pauseFor(clampRetryAfterMs(err.retryAfterSec));
       }
