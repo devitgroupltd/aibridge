@@ -125,6 +125,8 @@ import {
   buildModeKeyboard,
   buildModeKeystrokes,
   buildModelKeyboard,
+  DEFAULT_EFFORT,
+  DEFAULT_MODE,
   EFFORTS,
   isEffortCancelCallback,
   isModeCancelCallback,
@@ -269,6 +271,21 @@ async function main(): Promise<void> {
   // reads" shape as assistEnabled above. Default on: Whisper's accuracy varies enough by language
   // that skipping the review step should be an explicit opt-in, not the out-of-the-box behavior.
   let voiceConfirmEnabled = settingsStore.get("voice_confirm_enabled", "true") !== "false";
+  // `/defaultmode` - the permission mode every *new* session starts in, before its own first turn
+  // (handleNewCommand below). Same in-memory-for-reads, persisted-on-write shape as the two above.
+  // Falls back to DEFAULT_MODE ("manual", the CLI's own real spawn default) if the stored value is
+  // ever something MODES no longer recognises (a downgrade after a value was added then removed,
+  // say) - same defensive re-validation `isModel`/`isMode`/`isEffort` already apply to callback data.
+  let defaultSessionMode: Mode = (() => {
+    const stored = settingsStore.get("default_session_mode", DEFAULT_MODE);
+    return (MODES as readonly string[]).includes(stored) ? (stored as Mode) : DEFAULT_MODE;
+  })();
+  // `/defaulteffort` - same in-memory-for-reads, persisted-on-write, re-validated-on-load shape as
+  // defaultSessionMode above.
+  let defaultSessionEffort: Effort = (() => {
+    const stored = settingsStore.get("default_session_effort", DEFAULT_EFFORT);
+    return (EFFORTS as readonly string[]).includes(stored) ? (stored as Effort) : DEFAULT_EFFORT;
+  })();
   if (!sessionStore.get(config.phase1.slug)) {
     sessionStore.insert({
       slug: config.phase1.slug,
@@ -1139,7 +1156,11 @@ async function main(): Promise<void> {
     confirmSessionCommand(topicId, `Switched ${slug} to ${model}`);
   }
 
-  function applyModeSwitch(slug: string, topicId: number, mode: Mode): void {
+  // Shared by applyModeSwitch (an operator-visible switch, with its own confirmation) and
+  // handleNewCommand's `/defaultmode` application (silent - the new topic already gets its own
+  // "Created ..." confirmation, and a second "Switched ... mode" message right after would just be
+  // noise for something the operator already configured, not something they just asked for here).
+  function writeModeKeystrokes(slug: string, mode: Mode): void {
     const current = routing.getMode(slug);
     const keystrokes = buildModeKeystrokes(current, mode);
     // Already at the target mode: no keystroke to send, and sendRaw("") would still submit a
@@ -1148,6 +1169,10 @@ async function main(): Promise<void> {
       routing.getPtyWrite(slug)?.(keystrokes);
     }
     routing.setMode(slug, mode);
+  }
+
+  function applyModeSwitch(slug: string, topicId: number, mode: Mode): void {
+    writeModeKeystrokes(slug, mode);
     confirmSessionCommand(topicId, `Switched ${slug} to ${mode} mode`);
   }
 
@@ -1262,10 +1287,20 @@ async function main(): Promise<void> {
     // must be confirmed (`session.ready` - otherwise the write lands on the still-open dialog and
     // corrupts it, confirmed live 2026-08-04), and the channel server's own MCP handshake must have
     // completed (`waitForChannelConnected` - otherwise the write's trailing Enter can be silently
-    // lost even with the dialog long since confirmed, also confirmed live 2026-08-04). `/new`'s
-    // initial prompt is the only write this codebase ever makes to a session this early.
+    // lost even with the dialog long since confirmed, also confirmed live 2026-08-04).
     await session.ready;
     await waitForChannelConnected(slug);
+    // `/defaultmode`/`/defaulteffort`: applied before the initial prompt, not after, so the very
+    // first turn already runs under the configured defaults rather than starting under the CLI's
+    // own "manual"/"medium" spawn default and switching mid-turn. Silent (no confirmSessionCommand)
+    // - see writeModeKeystrokes's own doc comment for why a second "Switched..." message here would
+    // just be noise on top of the "Created ..." confirmation already sent above. Skipped entirely
+    // when a default is still at the CLI's own spawn default, rather than relying on either write
+    // being a harmless no-op at that value - unverified for `/effort`, and `routing.getMode`'s
+    // default already assumes "manual" until the first real switch, so a same-value keystroke send
+    // isn't even a true no-op, just zero `buildModeKeystrokes` steps.
+    if (defaultSessionMode !== DEFAULT_MODE) writeModeKeystrokes(slug, defaultSessionMode);
+    if (defaultSessionEffort !== DEFAULT_EFFORT) sendEffortCommand(slug, defaultSessionEffort);
     sendChannelText(slug, topic.message_thread_id, cmd.prompt, "new-1", "telegram");
   }
 
@@ -2152,6 +2187,43 @@ async function main(): Promise<void> {
     );
   }
 
+  /** `/defaultmode [manual|acceptEdits|plan|auto]` - the permission mode `handleNewCommand` puts
+   * every *new* session into, before its own first turn. Same in-memory-for-reads,
+   * persisted-on-write shape as `handleAssistCommand`/`handleVoiceConfirmCommand`.
+   *
+   * `auto` gets its own explicit warning in the confirmation text (unlike the other three modes) -
+   * it's the one `nl-router.ts`'s `isDestructive` already treats as security-sensitive when reached
+   * via natural language, and setting it here has a wider blast radius than that single-session
+   * case: every session launched from this point on starts with no permission prompts at all, not
+   * just the one the operator is looking at right now, until this is explicitly changed back. */
+  function handleDefaultModeCommand(cmd: Extract<FleetCommand, { kind: "defaultmode" }>, topicId: number | undefined): void {
+    if (cmd.action === "status") {
+      confirmSessionCommand(topicId, `New sessions currently start in ${defaultSessionMode} mode.`);
+      return;
+    }
+    defaultSessionMode = cmd.action;
+    settingsStore.set("default_session_mode", defaultSessionMode);
+    confirmSessionCommand(
+      topicId,
+      defaultSessionMode === "auto"
+        ? `New sessions will now start in auto mode - no permission prompts at all for any tool call, including git commit/push, until this is changed back. /defaultmode manual to revert.`
+        : `New sessions will now start in ${defaultSessionMode} mode.`,
+    );
+  }
+
+  /** `/defaulteffort [low|medium|high|xhigh|max]` - the reasoning effort `handleNewCommand` puts
+   * every *new* session into. Same shape as `handleDefaultModeCommand`, minus that one's `auto`
+   * warning - an effort level has no safety implication, only a cost/latency one. */
+  function handleDefaultEffortCommand(cmd: Extract<FleetCommand, { kind: "defaulteffort" }>, topicId: number | undefined): void {
+    if (cmd.action === "status") {
+      confirmSessionCommand(topicId, `New sessions currently start at ${defaultSessionEffort} effort.`);
+      return;
+    }
+    defaultSessionEffort = cmd.action;
+    settingsStore.set("default_session_effort", defaultSessionEffort);
+    confirmSessionCommand(topicId, `New sessions will now start at ${defaultSessionEffort} effort.`);
+  }
+
   /** `/router [api|cli]` - live switch for the NL-router backend, no restart needed either
    * direction. Switching to "api" is refused (not silently downgraded to "cli") when no key is
    * configured - the operator asked for the fast/paid path specifically, so a silent no-op would
@@ -2517,6 +2589,22 @@ async function main(): Promise<void> {
     }
     if (fleetCmd.kind === "voiceconfirm") {
       handleVoiceConfirmCommand(fleetCmd, threadId);
+      return;
+    }
+    if (fleetCmd.kind === "defaultmode") {
+      if (!isControl) {
+        confirmSessionCommand(threadId, "/defaultmode only works from the control topic.");
+        return;
+      }
+      handleDefaultModeCommand(fleetCmd, threadId);
+      return;
+    }
+    if (fleetCmd.kind === "defaulteffort") {
+      if (!isControl) {
+        confirmSessionCommand(threadId, "/defaulteffort only works from the control topic.");
+        return;
+      }
+      handleDefaultEffortCommand(fleetCmd, threadId);
       return;
     }
     handlePauseCommand(fleetCmd, threadId, currentSlug);

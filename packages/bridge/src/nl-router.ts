@@ -118,6 +118,8 @@ export const ROUTER_KINDS = [
   "voiceconfirm",
   "assist",
   "router",
+  "defaultmode",
+  "defaulteffort",
   "session_model",
   "session_mode",
   "session_effort",
@@ -135,15 +137,16 @@ type RouterKind = (typeof ROUTER_KINDS)[number];
 
 /** Narrows the offered `kind` values to what `dispatchInboundMessage` (index.ts) would actually
  * accept in this context - mirrors that function's own inline `isControl`/`currentSlug` checks
- * rather than inventing separate rules. `/new` and `/budget` are the only fleet commands rejected
- * outright outside the control topic; the rest (kill/rm/attach/etc.) accept an optional slug from
- * either place, so they stay offered everywhere, as do `/help`/`/about`/`/assist`/`/router`.
+ * rather than inventing separate rules. `/new`, `/budget`, `/defaultmode` and `/defaulteffort` are
+ * the only fleet commands rejected outright outside the control topic (all four are fleet-wide, not
+ * scoped to any one session); the rest (kill/rm/attach/etc.) accept an optional slug from either
+ * place, so they stay offered everywhere, as do `/help`/`/about`/`/assist`/`/router`.
  * `/commands`/`/skills`/`/compact`/`/clear`/`/browse`/`/find` are all session-scoped in practice (no
  * worktree/PTY to act on without one - `dispatchInboundMessage`'s own `route`/`currentSlug` checks
  * agree), so they follow the same `hasSession` gate as the three session commands. */
 function allowedKinds(ctx: RouterContext): RouterKind[] {
   return ROUTER_KINDS.filter((kind) => {
-    if ((kind === "new" || kind === "budget") && !ctx.isControl) return false;
+    if ((kind === "new" || kind === "budget" || kind === "defaultmode" || kind === "defaulteffort") && !ctx.isControl) return false;
     if (
       (kind === "session_model" ||
         kind === "session_mode" ||
@@ -184,8 +187,8 @@ function buildSchema(ctx: RouterContext): Record<string, unknown> {
       reposBase: { type: "string", description: "For 'repos add', optional." },
       autostartAction: { type: "string", enum: ["status", "install", "uninstall"], description: "For 'autostart'." },
       voiceModel: { type: "string", description: "For 'voice', optional model name to switch to." },
-      mode: { type: "string", enum: [...MODES], description: "For 'session_mode'." },
-      effort: { type: "string", enum: [...EFFORTS], description: "For 'session_effort'." },
+      mode: { type: "string", enum: [...MODES], description: "For 'session_mode' (the current session) or 'defaultmode' (all future new sessions)." },
+      effort: { type: "string", enum: [...EFFORTS], description: "For 'session_effort' (the current session) or 'defaulteffort' (all future new sessions)." },
       assistAction: { type: "string", enum: ["status", "on", "off"], description: "For 'assist': confirm-before-destructive-NL-command toggle." },
       voiceConfirmAction: { type: "string", enum: ["status", "on", "off"], description: "For 'voiceconfirm': confirm-before-sending-a-transcribed-voice-note toggle." },
       routerAction: { type: "string", enum: ["status", "api", "cli"], description: "For 'router': NL-routing backend toggle." },
@@ -222,6 +225,11 @@ const SYSTEM_INSTRUCTIONS_BASE =
   "applies even when most of the message is really addressed to that future session rather than the " +
   "bot itself (e.g. 'create a session for X and check whether Y is done, give me a deep analysis'): " +
   "the leading 'create a session for X' clause is what makes it kind='new', not the tone of the rest. " +
+  "A request to change the permission mode or effort level for *future new sessions* (not the one " +
+  "the operator is currently in) is kind='defaultmode'/'defaulteffort' with 'mode'/'effort' set - " +
+  "look for words like 'default', 'new sessions', 'from now on', or 'every session'. A request to " +
+  "change the mode/effort for *this* session (no such wording) is kind='session_mode'/'session_effort' " +
+  "instead - do not confuse the two. " +
   "If it's ambiguous, conversational, or addressed to a coding assistant rather than the fleet itself, " +
   "respond with kind='forward' - never guess a destructive command (kill/rm/restart/deploy/repos-rm) " +
   "from a vague or joking message.";
@@ -351,6 +359,10 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
           : null;
       case "router":
         return raw.routerAction === "status" || raw.routerAction === "api" || raw.routerAction === "cli" ? { kind: "router", action: raw.routerAction } : null;
+      case "defaultmode":
+        return { kind: "defaultmode", action: isMode(raw.mode) ? raw.mode : "status" };
+      case "defaulteffort":
+        return { kind: "defaulteffort", action: isEffort(raw.effort) ? raw.effort : "status" };
       case "commands":
         return { kind: "commands", term: raw.term ?? "" };
       case "skills":

@@ -1,6 +1,6 @@
 import { escapeForFeed } from "./feed-escape.ts";
 import type { RepoEntry } from "./repos-registry.ts";
-import type { Model } from "./session-commands.ts";
+import type { Effort, Mode, Model } from "./session-commands.ts";
 import { EFFORTS, MODELS, MODES } from "./session-commands.ts";
 import type { SessionRow } from "./session-store.ts";
 
@@ -42,7 +42,9 @@ export type FleetCommand =
   | { kind: "voice"; model?: string }
   | { kind: "assist"; action: "status" | "on" | "off" }
   | { kind: "router"; action: "status" | "api" | "cli" }
-  | { kind: "voiceconfirm"; action: "status" | "on" | "off" };
+  | { kind: "voiceconfirm"; action: "status" | "on" | "off" }
+  | { kind: "defaultmode"; action: "status" | Mode }
+  | { kind: "defaulteffort"; action: "status" | Effort };
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
 
@@ -195,6 +197,41 @@ function parseVoiceConfirm(rest: string): FleetCommand | null {
   return { kind: "voiceconfirm", action };
 }
 
+/** `/defaultmode [manual|acceptEdits|plan|auto]` - the permission mode every *new* session
+ * launches into, before its own first turn (index.ts's `handleNewCommand` sends the Shift+Tab
+ * keystrokes to reach it, same mechanism `/mode` itself already uses, before the initial prompt is
+ * delivered). Bare `/defaultmode` reports the current setting, same "no argument defaults to
+ * status" shape as `/assist`/`/autostart`/`/router`/`/voiceconfirm`. Persisted the same way those
+ * are (`settings-store.ts`), so it survives a Bridge restart. Control-topic only - it's a fleet-wide
+ * setting, not something any one session's topic acts on (`nl-router.ts`'s `allowedKinds` mirrors
+ * this the same way it already does for `/new`/`/budget`).
+ *
+ * Setting this to `auto` is not specially confirmed here the way `/mode auto` typed inside a live
+ * session is treated as destructive by the NL router (`nl-router.ts`'s `isDestructive`) - a typed
+ * `/defaultmode auto` is an explicit, deliberate command, not a fuzzy natural-language guess, so the
+ * same "don't second-guess an exact command" posture every other bare fleet command already gets
+ * applies here too. The operator-facing risk (every future session starts with no permission
+ * prompts at all until this is changed back) is surfaced in the confirmation text instead
+ * (index.ts's `handleDefaultModeCommand`). */
+function parseDefaultMode(rest: string): FleetCommand | null {
+  const trimmed = rest.trim();
+  if (trimmed.length === 0) return { kind: "defaultmode", action: "status" };
+  return (MODES as readonly string[]).includes(trimmed) ? { kind: "defaultmode", action: trimmed as Mode } : null;
+}
+
+/** `/defaulteffort [low|medium|high|xhigh|max]` - the reasoning effort every *new* session
+ * launches into, before its own first turn (index.ts's `handleNewCommand` sends the same
+ * `/effort <level>` CLI command `/effort` itself already uses). Bare `/defaulteffort` reports the
+ * current setting - same shape as `/defaultmode` right above, and the same reasoning for being
+ * control-topic only. No `auto`-style special-cased warning here: unlike a permission mode, an
+ * effort level has no safety implication, only a cost/latency one, so every value gets the same
+ * plain confirmation. */
+function parseDefaultEffort(rest: string): FleetCommand | null {
+  const trimmed = rest.trim();
+  if (trimmed.length === 0) return { kind: "defaulteffort", action: "status" };
+  return (EFFORTS as readonly string[]).includes(trimmed) ? { kind: "defaulteffort", action: trimmed as Effort } : null;
+}
+
 /**
  * `/repos [list]` / `/repos add <name> [<path>|<git-url>] [--base <branch>] [--model <model>]` /
  * `/repos rm|remove <name>` - §7.5's registry, made mutable from Telegram (`repos-registry.ts`'s
@@ -293,7 +330,9 @@ export function parseSkillsQuery(text: string): { term: string } | null {
  * "for us, but invalid" split as `session-commands.ts`'s parser. */
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(/^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router)\b(.*)$/s);
+  const match = trimmed.match(
+    /^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|defaultmode|defaulteffort)\b(.*)$/s,
+  );
   if (!match) return null;
   const [, cmd, rawRest] = match as [string, string, string];
   const rest = normalizeDashFlags(rawRest);
@@ -324,6 +363,10 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return parseRouterBackend(rest);
     case "voiceconfirm":
       return parseVoiceConfirm(rest);
+    case "defaultmode":
+      return parseDefaultMode(rest);
+    case "defaulteffort":
+      return parseDefaultEffort(rest);
     case "repos":
       return parseRepos(rest);
     case "voice": {
@@ -572,6 +615,10 @@ export function renderHelp(): string {
     "    subscription (slower, no extra cost), 'api' uses a funded ANTHROPIC_API_KEY (faster, real",
     "    but small per-message cost). Defaults to 'cli' even if a key is configured - switch on",
     "    purpose, either direction, any time",
+    `  /defaultmode [${MODES.join("|")}] - the permission mode every new session starts in (default`,
+    "    manual); 'auto' skips permission prompts entirely for every future session until changed back",
+    `  /defaulteffort [${EFFORTS.join("|")}] - the reasoning effort every new session starts in`,
+    "    (default medium)",
     "",
     "You can also just say what you want in plain English (typed or a voice note) instead of the",
     "exact command above - e.g. \"show me the sessions\" or \"restart this session\".",
@@ -637,6 +684,8 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "voiceconfirm", description: "Confirm before sending a transcribed voice note: /voiceconfirm [on|off]" },
     { command: "assist", description: "Confirm before running a natural-language-matched destructive command: /assist [on|off]" },
     { command: "router", description: "NL-routing backend: /router [api|cli] - subscription (cli, default) or a funded API key (api)" },
+    { command: "defaultmode", description: `Permission mode new sessions start in: /defaultmode [${MODES.join("|")}] (default manual)` },
+    { command: "defaulteffort", description: `Reasoning effort new sessions start in: /defaulteffort [${EFFORTS.join("|")}] (default medium)` },
     { command: "help", description: "Show the full command list" },
     { command: "model", description: `Set model: /model <${MODELS.join("|")}>` },
     { command: "mode", description: `Set mode: /mode <${MODES.join("|")}>` },

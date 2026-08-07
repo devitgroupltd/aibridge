@@ -1,7 +1,7 @@
 ---
-version: 0.80.0
+version: 0.81.0
 status: solid
-last_modified_utc: 2026-08-07T09:35:00Z
+last_modified_utc: 2026-08-07T10:06:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,28 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.81.0 (2026-08-07): new fleet commands `/defaultmode [manual|acceptEdits|plan|auto]` and
+    `/defaulteffort [low|medium|high|xhigh|max]` - the permission mode/reasoning effort every *new*
+    session launches into, before its own first turn, requested directly by the operator after
+    asking about switching to auto mode by default. Persisted via `settings-store.ts` (same
+    in-memory-for-reads, persisted-on-write, re-validated-on-load shape as `/assist`/`/voiceconfirm`/
+    `/router`), applied in `handleNewCommand` right after the two startup gates
+    (`session.ready`/`waitForChannelConnected`) and before the initial prompt is delivered, so the
+    very first turn already runs under the configured defaults. `/defaultmode`/`/defaulteffort` are
+    control-topic only (fleet-wide, not scoped to any session) - `nl-router.ts`'s `allowedKinds`
+    gates them the same way `/new`/`/budget` already are, and its `SYSTEM_INSTRUCTIONS` gained an
+    explicit sentence distinguishing them from `session_mode`/`session_effort` (changing *this*
+    session vs. *future* ones), the same class of ambiguity that caused the `kind='new'` gap two
+    versions ago.
+    Deliberately *not* wired into `nl-router.ts`'s `isDestructive` the way a live `/mode auto` is -
+    an explicit typed `/defaultmode auto` is a deliberate command, not a fuzzy NL guess, so it gets
+    the same \"don't second-guess an exact command\" posture every other bare fleet command already
+    has. The risk (every future session starts with no permission prompts at all, until changed
+    back - CLAUDE.md's decision 3, with no OS-level sandbox yet on this native-Windows host) is
+    surfaced in the confirmation text instead of blocked outright, and the operator was walked
+    through that tradeoff (and Telegram's own group rate limits, verified directly against
+    core.telegram.org/bots/faq, for an unrelated question the same session) before building this.
+    874 pass, `tsc --noEmit` clean."
   - "0.80.0 (2026-08-07): two feed-readability gaps raised directly by the operator watching a real
     session's Telegram topic while it worked, both extensions of §5.3's one-card-per-turn design
     rather than changes to it:

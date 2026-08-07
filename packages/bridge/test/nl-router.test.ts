@@ -203,6 +203,31 @@ describe("mapRouterOutput - one case per kind", () => {
     });
   });
 
+  test("defaultmode/defaulteffort: control-topic only, status when no value given, never destructive (a deliberate typed command, not a fuzzy NL guess)", () => {
+    expect(mapRouterOutput({ kind: "defaultmode" }, CONTROL)).toEqual({
+      matched: true,
+      command: { kind: "defaultmode", action: "status" },
+      destructive: false,
+    });
+    expect(mapRouterOutput({ kind: "defaultmode", mode: "auto" }, CONTROL)).toEqual({
+      matched: true,
+      command: { kind: "defaultmode", action: "auto" },
+      destructive: false,
+    });
+    expect(mapRouterOutput({ kind: "defaultmode", mode: "auto" }, SESSION)).toEqual({ matched: false });
+    expect(mapRouterOutput({ kind: "defaulteffort" }, CONTROL)).toEqual({
+      matched: true,
+      command: { kind: "defaulteffort", action: "status" },
+      destructive: false,
+    });
+    expect(mapRouterOutput({ kind: "defaulteffort", effort: "xhigh" }, CONTROL)).toEqual({
+      matched: true,
+      command: { kind: "defaulteffort", action: "xhigh" },
+      destructive: false,
+    });
+    expect(mapRouterOutput({ kind: "defaulteffort", effort: "xhigh" }, SESSION)).toEqual({ matched: false });
+  });
+
   test("repos: list/add/rm, only rm is destructive", () => {
     expect(mapRouterOutput({ kind: "repos", reposAction: "list" }, CONTROL)).toEqual({
       matched: true,

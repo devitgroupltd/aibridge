@@ -287,6 +287,37 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/voiceconfirm off")).toEqual({ kind: "voiceconfirm", action: "off" });
   });
 
+  test("/defaultmode with no argument defaults to status", () => {
+    expect(parseFleetCommand("/defaultmode")).toEqual({ kind: "defaultmode", action: "status" });
+  });
+
+  test("/defaultmode accepts every real mode", () => {
+    expect(parseFleetCommand("/defaultmode manual")).toEqual({ kind: "defaultmode", action: "manual" });
+    expect(parseFleetCommand("/defaultmode acceptEdits")).toEqual({ kind: "defaultmode", action: "acceptEdits" });
+    expect(parseFleetCommand("/defaultmode plan")).toEqual({ kind: "defaultmode", action: "plan" });
+    expect(parseFleetCommand("/defaultmode auto")).toEqual({ kind: "defaultmode", action: "auto" });
+  });
+
+  test("/defaultmode with an unrecognised argument is invalid, not a different command", () => {
+    expect(parseFleetCommand("/defaultmode bogus")).toBeNull();
+  });
+
+  test("/defaulteffort with no argument defaults to status", () => {
+    expect(parseFleetCommand("/defaulteffort")).toEqual({ kind: "defaulteffort", action: "status" });
+  });
+
+  test("/defaulteffort accepts every real effort level", () => {
+    expect(parseFleetCommand("/defaulteffort low")).toEqual({ kind: "defaulteffort", action: "low" });
+    expect(parseFleetCommand("/defaulteffort medium")).toEqual({ kind: "defaulteffort", action: "medium" });
+    expect(parseFleetCommand("/defaulteffort high")).toEqual({ kind: "defaulteffort", action: "high" });
+    expect(parseFleetCommand("/defaulteffort xhigh")).toEqual({ kind: "defaulteffort", action: "xhigh" });
+    expect(parseFleetCommand("/defaulteffort max")).toEqual({ kind: "defaulteffort", action: "max" });
+  });
+
+  test("/defaulteffort with an unrecognised argument is invalid, not a different command", () => {
+    expect(parseFleetCommand("/defaulteffort bogus")).toBeNull();
+  });
+
   test("/repos with no argument, or 'list', means list", () => {
     expect(parseFleetCommand("/repos")).toEqual({ kind: "repos", action: "list" });
     expect(parseFleetCommand("/repos list")).toEqual({ kind: "repos", action: "list" });
@@ -401,6 +432,8 @@ describe("renderHelp", () => {
       "/autostart",
       "/assist",
       "/router",
+      "/defaultmode",
+      "/defaulteffort",
     ]) {
       expect(text).toContain(cmd);
     }
