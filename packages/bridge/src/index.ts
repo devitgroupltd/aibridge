@@ -1177,6 +1177,13 @@ async function main(): Promise<void> {
       return;
     }
 
+    // The topic's own title is truncated to 128 chars (Telegram's forum-topic-name limit) and the
+    // actual delivery further below is a raw PTY keystroke into Claude's context, not a Telegram
+    // post - so without this, the topic opened straight into Claude's tool-call feed with no visible
+    // record of what was actually asked for. Posted as a plain message (not `confirmSessionCommand`,
+    // which targets `controlTopicId`) since this belongs in the new topic itself.
+    confirmSessionCommand(topic.message_thread_id, cmd.prompt);
+
     let session: ReturnType<typeof launchSession>;
     try {
       session = launchSession({
