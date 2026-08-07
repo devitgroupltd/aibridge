@@ -324,7 +324,16 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
     ptyProcess.onData((data) => process.stdout.write(data));
     process.stdin.setRawMode?.(true);
     process.stdin.resume();
-    process.stdin.on("data", (data) => ptyProcess.write(data.toString()));
+    // Same guard as pty-write-guard.ts's write wrapper (this bypasses it - it's wired onto the
+    // routing table's write function, not this raw stdin passthrough): a keystroke landing after
+    // the PTY has already gone must not crash the dev-mirror session.
+    process.stdin.on("data", (data) => {
+      try {
+        ptyProcess.write(data.toString());
+      } catch (err) {
+        log("WARN", `dev-mirror write to session "${opts.slug}" dropped - its PTY is gone: ${(err as Error).message}`);
+      }
+    });
   }
 
   return { worktreePath, branch, ptyProcess, ready };

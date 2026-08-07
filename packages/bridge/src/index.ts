@@ -144,6 +144,9 @@ import { isPermanentEditFailure, startPolling, TelegramClient, validateTokens } 
 import { loadOffset, saveOffset } from "./telegram-offset.ts";
 import { createThinkingPlaceholder } from "./thinking-placeholder.ts";
 import { createTypingIndicator } from "./typing-indicator.ts";
+import { attachPtyWriteGuard } from "./pty-write-guard.ts";
+import type { PtyLike } from "./pty-write-guard.ts";
+import { restartSettleDelayMs } from "./restart-settle.ts";
 import { removeWorktree } from "./worktree.ts";
 
 /** Backoff before each automatic `claude --resume` after an unexpected exit, indexed by consecutive
@@ -178,6 +181,11 @@ function isControlTopic(threadId: number | undefined): boolean {
 }
 
 async function main(): Promise<void> {
+  // restart-settle.ts: unset until this boot's own reconciliation has resumed every live session -
+  // the stale-deploy rollback just below can respawn before that point, and has nothing of this
+  // boot's own to protect yet, so `respawnSelfAndExit` treats "still undefined" as "go immediately".
+  let bootReadyAt: number | undefined;
+
   const config = loadConfig();
   const baseUrl = process.env.AIBRIDGE_TELEGRAM_BASE_URL; // integration tests point this at the stub
 
@@ -887,6 +895,9 @@ async function main(): Promise<void> {
     // (nothing to reconcile, nothing posted) apart from one that's still coming up or crashed.
     confirmSessionCommand(undefined, "✅ Bridge is back up.");
   }
+  // restart-settle.ts: everything reconciliation just resumed is only milliseconds old from here -
+  // `respawnSelfAndExit` waits out RESTART_SETTLE_MS from this point rather than firing immediately.
+  bootReadyAt = Date.now();
 
   let seq = 0;
 
@@ -987,20 +998,11 @@ async function main(): Promise<void> {
    * plumbing, the `ptyProcessBySlug` liveness map, and the supervisor's crash detector. Shared by
    * the Phase 1 launch, `/new`, and every `resumeSession` relaunch so the three don't drift. */
   function wireSession(slug: string, ptyProcess: pty.IPty, topicId: number): void {
-    // Guarded at the one place every writer goes through. `node-pty`'s `write()` throws
-    // *synchronously* once the ConPTY socket has closed, and several writers here are deferred by a
-    // timer (the submit-confirmation retry ~3s later, `/effort`'s follow-up `\r`, `/usage`'s Esc) -
-    // a session exiting inside that window threw out of a `setTimeout` callback, which no
-    // try/catch covers, straight into the module-scope `uncaughtException` handler and its
-    // `process.exit(1)`. One stale keystroke took down the whole daemon and every other session
-    // with it; under the log-on autostart trigger, nothing restarts it until the next logon.
-    routing.setPtyWrite(slug, (text) => {
-      try {
-        ptyProcess.write(text);
-      } catch (err) {
-        log("WARN", `write to session "${slug}" dropped - its PTY is gone: ${(err as Error).message}`);
-      }
-    });
+    // See pty-write-guard.ts's own doc comment for why both the write try/catch and the `'error'`
+    // listener are required - one alone left one stale keystroke (or, live 2026-08-06, `/new`'s very
+    // first write into a session whose `waitForChannelConnected` wait had already given up) able to
+    // crash the whole daemon and every other session with it.
+    routing.setPtyWrite(slug, attachPtyWriteGuard(ptyProcess as unknown as PtyLike, slug, { log }));
     ptyProcess.onData((data) => {
       // An onData event alone is too loose a signal - confirmed live 2026-08-04 that a wedged
       // session still periodically emits ANSI-only chunks (cursor blink, resize repaint) with no
@@ -1848,8 +1850,23 @@ async function main(): Promise<void> {
    * stale-deploy rollback at boot). The latter two used the raw spawn directly, so on an
    * autostart-installed host a successful `/deploy` took the Bridge down permanently - and the
    * rollback path then did it again on the next manual start, immediately after rolling back.
+   *
+   * restart-settle.ts: found live 2026-08-06 that firing this within ~1s of `bootReadyAt` kills a
+   * session this same process's own boot reconciliation just resumed and immediately resumes the
+   * same `session_id` again in the successor - Claude Code's own resume bookkeeping doesn't
+   * tolerate two resumes that close together and the second one comes up dead. `bootReadyAt` is
+   * still `undefined` for the stale-deploy rollback (it fires before reconciliation ever runs, so
+   * there is nothing of this boot's own to protect yet) - only `/restart` and `/deploy` can ever
+   * see a defined, non-zero delay here.
    */
   async function respawnSelfAndExit(): Promise<never> {
+    if (bootReadyAt !== undefined) {
+      const delay = restartSettleDelayMs(bootReadyAt, Date.now());
+      if (delay > 0) {
+        log("INFO", `delaying self-respawn ${delay}ms so this boot's own just-resumed sessions can settle first (§4.5)`);
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
     const ranViaTask = !(await runSchtasks(buildRunArgs())).failed;
     if (!ranViaTask) {
       spawn(process.execPath, process.argv.slice(1), { detached: true, stdio: "ignore" }).unref();
