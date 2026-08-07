@@ -2350,7 +2350,7 @@ async function main(): Promise<void> {
    */
   async function routeOrFallback(
     text: string,
-    ctx: { isControl: boolean; hasSession: boolean },
+    ctx: { isControl: boolean; hasSession: boolean; repoNames?: string[] },
     threadId: number | undefined,
     isControl: boolean,
     currentSlug: string | undefined,
@@ -2656,7 +2656,7 @@ async function main(): Promise<void> {
       // Natural-language routing (nl-router.ts) - only reached once every exact-syntax check
       // above has already rejected this text. `hasSession: false` narrows the offered commands to
       // the control-topic-only subset (`/new`/`/budget`); on no match, today's exact behaviour.
-      await routeOrFallback(text, { isControl, hasSession: false }, threadId, isControl, undefined, () => {
+      await routeOrFallback(text, { isControl, hasSession: false, repoNames: reposRegistry?.names() }, threadId, isControl, undefined, () => {
         if (isControl) confirmSessionCommand(threadId, "Unrecognised control-topic command. Try /new, /ls or /help.");
       });
       return;
@@ -2704,7 +2704,7 @@ async function main(): Promise<void> {
     // Natural-language routing again - this time with a real session to either act on
     // (`hasSession: true`, so `/model`/`/mode`/`/effort` are also offered) or forward to on no
     // match, exactly as §10.1.2's note below always did.
-    await routeOrFallback(text, { isControl, hasSession: true }, threadId, isControl, currentSlug, () => {
+    await routeOrFallback(text, { isControl, hasSession: true, repoNames: reposRegistry?.names() }, threadId, isControl, currentSlug, () => {
       // §10.1.2: notifications/claude/channel is confirmed broken upstream (getClientCapabilities()
       // never negotiates the capability), so inbound delivery writes the same <channel> tag
       // Claude Code would have rendered itself directly to the session's PTY, exactly as an

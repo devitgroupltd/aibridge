@@ -27,6 +27,12 @@ export type RouterContext = {
   /** Whether `ctx`'s topic has a live session to act on - gates session commands and the slug-less
    * "act on the current session" reading of kill/rm/attach/pause/usage/detail/verbose. */
   hasSession: boolean;
+  /** The operator's `repos.toml` short names, if known - surfaced to the classifier so a message
+   * naming one of them reads as fleet-directed ("create a session for aibridge") rather than falling
+   * to the generic "addressed to a coding assistant → forward" clause, and so `repo` gets filled with
+   * the real short name instead of something `handleNewCommand`'s own fuzzy-match then has to rescue.
+   * Optional/empty is a legitimate value (e.g. `reposRegistry` unset) - just means no hint is given. */
+  repoNames?: string[];
 };
 
 /** Not real `FleetCommand`/`SessionCommand` kinds - each is handled by its own dedicated function
@@ -193,7 +199,13 @@ function buildSchema(ctx: RouterContext): Record<string, unknown> {
   };
 }
 
-const SYSTEM_INSTRUCTIONS =
+/** `kind='new'` got its own explicit trigger sentence below after a live-observed gap (2026-08-07):
+ * a voice transcript reading "create a session for X and [long task description]" fell through to
+ * "Unrecognised control-topic command" because `new` was covered only implicitly via the schema's
+ * per-field descriptions, and the catch-all "addressed to a coding assistant → forward" clause won
+ * out over it since most of the message's words were really the *task*, not the request to create
+ * a session. Same class of gap as the `help`/`browse`/`find` fixes noted on `RouterAction` above. */
+const SYSTEM_INSTRUCTIONS_BASE =
   "You classify one Telegram message sent to a fleet-control bot for developer Claude Code sessions. " +
   "If the message clearly requests one of the listed commands, respond with that kind and its fields. " +
   "A request to see what commands exist, what the bot can do, or how to use it (in any language) is " +
@@ -205,9 +217,29 @@ const SYSTEM_INSTRUCTIONS =
   "folder is kind='browse' (optionally with 'path'). A request to find, search for, or get/show a " +
   "file by name or by content (e.g. 'give me package.json', 'find the file with the API key') is " +
   "kind='find' with the search text as 'query'. " +
+  "A request to start, create, or spin up a new session or task for a given repo is kind='new', with " +
+  "'repo' set to the short repo name and 'prompt' set to the task the new session should do - this " +
+  "applies even when most of the message is really addressed to that future session rather than the " +
+  "bot itself (e.g. 'create a session for X and check whether Y is done, give me a deep analysis'): " +
+  "the leading 'create a session for X' clause is what makes it kind='new', not the tone of the rest. " +
   "If it's ambiguous, conversational, or addressed to a coding assistant rather than the fleet itself, " +
   "respond with kind='forward' - never guess a destructive command (kill/rm/restart/deploy/repos-rm) " +
   "from a vague or joking message.";
+
+/** Appends the operator's actual `repos.toml` short names, when known, as a closing hint - added
+ * 2026-08-07 alongside the `kind='new'` trigger sentence above, for the same live-observed gap.
+ * Naming one of these repos is strong evidence the message is fleet-directed (→ 'new', not
+ * 'forward'), and giving the real names up front means `repo` comes back already correct instead of
+ * relying on `handleNewCommand`'s post-hoc fuzzy match (index.ts) to rescue a garbled one. */
+function buildSystemInstructions(ctx: RouterContext): string {
+  if (!ctx.repoNames || ctx.repoNames.length === 0) return SYSTEM_INSTRUCTIONS_BASE;
+  return (
+    SYSTEM_INSTRUCTIONS_BASE +
+    ` The operator's registered repos are: ${ctx.repoNames.join(", ")}. A message naming one of these ` +
+    "(even mangled by voice transcription/autocorrect) is almost certainly kind='new' with that repo, " +
+    "not 'forward' - pick the closest matching name for 'repo'."
+  );
+}
 
 /** Raw shape returned by either backend, before per-kind validation. Every field optional except
  * `kind` - matches `buildSchema`'s own looseness. */
@@ -359,7 +391,7 @@ async function routeViaApi(text: string, ctx: RouterContext, apiKey: string, mod
     const response = await client.messages.create({
       model,
       max_tokens: 512,
-      system: SYSTEM_INSTRUCTIONS,
+      system: buildSystemInstructions(ctx),
       messages: [{ role: "user", content: text }],
       tools: [{ name: "route", description: "Classify the message.", input_schema: buildSchema(ctx) as Anthropic.Tool.InputSchema }],
       tool_choice: { type: "tool", name: "route" },
@@ -383,7 +415,7 @@ function routeViaCli(text: string, ctx: RouterContext, model: string, log: Route
     const schema = JSON.stringify(buildSchema(ctx));
     execFile(
       "claude",
-      ["-p", `${SYSTEM_INSTRUCTIONS}\n\nMessage: ${text}`, "--output-format", "json", "--json-schema", schema, "--model", model],
+      ["-p", `${buildSystemInstructions(ctx)}\n\nMessage: ${text}`, "--output-format", "json", "--json-schema", schema, "--model", model],
       { cwd: os.tmpdir(), timeout: 30_000 },
       (err, stdout) => {
         if (err) {
