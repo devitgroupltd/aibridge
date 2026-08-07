@@ -1486,6 +1486,19 @@ async function main(): Promise<void> {
     return finalizeCard(messageId, "⌛ This confirmation expired - send it again if you still want it.");
   }
 
+  /** What a tap on an id `registry.take()` no longer has leaves behind. Two causes look identical
+   * to `take` once the entry is gone - a duplicate tap racing its own already-in-flight answer, or
+   * a tap left over from before a Bridge restart wiped every in-memory confirmation - and only the
+   * second should edit the card, since re-editing the first would clobber the real result with a
+   * misleading "no longer valid" a moment after it was correctly answered. `wasRecentlyAnswered`
+   * tells the two apart. Restart is the far more common case in practice (§4.5.1: the operator
+   * restarts, then taps a button that was already on screen), and leaving it silent - Telegram's
+   * spinner already cleared - was the exact §6.5 failure mode this project works to avoid elsewhere. */
+  function notifyConfirmGone(registry: { wasRecentlyAnswered(id: string): boolean }, id: string, messageId: number | undefined): void {
+    if (registry.wasRecentlyAnswered(id) || messageId === undefined) return;
+    void finalizeCard(messageId, "⌛ This confirmation is no longer valid - most likely the Bridge restarted since it was posted. Resend the command to try again.");
+  }
+
   async function finalizeFleetConfirmMessage(pending: PendingFleetConfirm, text: string): Promise<void> {
     await finalizeCard(pending.messageId, text);
   }
@@ -3026,7 +3039,10 @@ async function main(): Promise<void> {
           // above already cleared the spinner, so returning silently here left the operator with a
           // tap that visibly did nothing - §6.5's stated failure mode.
           const fleetTaken = fleetConfirmRegistry.take(fleetConfirmAction.id);
-          if (!fleetTaken) return;
+          if (!fleetTaken) {
+            notifyConfirmGone(fleetConfirmRegistry, fleetConfirmAction.id, callbackQuery.message?.message_id);
+            return;
+          }
           if (fleetTaken.expired) {
             void markConfirmCardExpired(fleetTaken.entry.messageId);
             return;
@@ -3132,7 +3148,10 @@ async function main(): Promise<void> {
         const nlConfirmAction = callbackQuery.data ? resolveNlConfirmCallback(callbackQuery.data) : null;
         if (nlConfirmAction) {
           const nlTaken = nlConfirmRegistry.take(nlConfirmAction.id);
-          if (!nlTaken) return;
+          if (!nlTaken) {
+            notifyConfirmGone(nlConfirmRegistry, nlConfirmAction.id, callbackQuery.message?.message_id);
+            return;
+          }
           if (nlTaken.expired) {
             void markConfirmCardExpired(nlTaken.entry.messageId);
             return;
@@ -3161,7 +3180,10 @@ async function main(): Promise<void> {
         const staleConfirmAction = callbackQuery.data ? resolveStaleConfirmCallback(callbackQuery.data) : null;
         if (staleConfirmAction) {
           const staleTaken = staleConfirmRegistry.take(staleConfirmAction.id);
-          if (!staleTaken) return;
+          if (!staleTaken) {
+            notifyConfirmGone(staleConfirmRegistry, staleConfirmAction.id, callbackQuery.message?.message_id);
+            return;
+          }
           if (staleTaken.expired) {
             void markConfirmCardExpired(staleTaken.entry.confirmCardMessageId);
             return;
@@ -3187,7 +3209,10 @@ async function main(): Promise<void> {
         const voiceConfirmAction = callbackQuery.data ? resolveVoiceConfirmCallback(callbackQuery.data) : null;
         if (voiceConfirmAction) {
           const voiceTaken = voiceConfirmRegistry.take(voiceConfirmAction.id);
-          if (!voiceTaken) return;
+          if (!voiceTaken) {
+            notifyConfirmGone(voiceConfirmRegistry, voiceConfirmAction.id, callbackQuery.message?.message_id);
+            return;
+          }
           if (voiceTaken.expired) {
             void markConfirmCardExpired(voiceTaken.entry.confirmCardMessageId);
             return;

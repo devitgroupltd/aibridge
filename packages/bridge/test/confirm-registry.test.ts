@@ -54,6 +54,54 @@ describe("ConfirmRegistry.take", () => {
   });
 });
 
+describe("ConfirmRegistry.wasRecentlyAnswered", () => {
+  // The bug a real operator hit: /rm --all's Yes button did nothing after a Bridge restart wiped
+  // the pending confirm, with no feedback at all - `take` returning undefined for "never existed"
+  // was indistinguishable from a duplicate tap on an already-answered card, so callers stayed
+  // silent for both. `wasRecentlyAnswered` lets a caller edit the card for the restart case while
+  // still staying silent for the duplicate-tap race, so it must not itself be true before any tap.
+  test("false for an id that was never added", () => {
+    const registry = new ConfirmRegistry<TestEntry>(1000, { now: () => 0 });
+    expect(registry.wasRecentlyAnswered("never-existed")).toBe(false);
+  });
+
+  test("true immediately after take, for a live entry or an expired one", () => {
+    let now = 0;
+    const registry = new ConfirmRegistry<TestEntry>(1000, { now: () => now });
+    registry.add({ id: "live", payload: "x" });
+    registry.add({ id: "stale", payload: "y" });
+
+    registry.take("live");
+    expect(registry.wasRecentlyAnswered("live")).toBe(true);
+
+    now = 5000;
+    registry.take("stale");
+    expect(registry.wasRecentlyAnswered("stale")).toBe(true);
+  });
+
+  test("false again once the retention window has passed - a restart happening well after a genuine answer must still be reported", () => {
+    let now = 0;
+    const registry = new ConfirmRegistry<TestEntry>(1000, { now: () => now });
+    registry.add({ id: "a", payload: "x" });
+    registry.take("a");
+    expect(registry.wasRecentlyAnswered("a")).toBe(true);
+
+    now = 61_000; // just past the 60s retention window
+    expect(registry.wasRecentlyAnswered("a")).toBe(false);
+  });
+
+  test("takeExpired sweeping an entry also counts as answering it", () => {
+    let now = 0;
+    const registry = new ConfirmRegistry<TestEntry>(1000, { now: () => now });
+    registry.add({ id: "a", payload: "x" });
+    now = 5000;
+    registry.takeExpired();
+    // Swept, not tapped - still not "answered" (nothing consumed it via a tap), so a subsequent
+    // tap on the now-vanished card should read as unknown, not as a duplicate.
+    expect(registry.wasRecentlyAnswered("a")).toBe(false);
+  });
+});
+
 describe("ConfirmRegistry.takeExpired", () => {
   // These four registries had no sweep at all: entries were dropped only by a tap, so an untapped
   // card leaked its whole replay payload for the lifetime of a daemon meant to run for weeks.

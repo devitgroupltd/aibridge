@@ -1,7 +1,7 @@
 ---
-version: 0.83.0
+version: 0.84.0
 status: solid
-last_modified_utc: 2026-08-07T10:50:00Z
+last_modified_utc: 2026-08-07T10:55:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,17 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.84.0 (2026-08-07): fixed a real operator-hit bug - tapping a fleet-confirm 'Yes, proceed'
+    button (§4.2's `/rm --all`, also `/kill --all` and `rm-topic`) after a Bridge restart wiped the
+    pending confirm did nothing at all, no message, spinner already cleared. `ConfirmRegistry.take`
+    returning `undefined` for 'never existed' and 'duplicate tap on an already-answered card' were
+    indistinguishable, so every caller stayed silent for both to avoid clobbering a real answer with
+    a bogus 'expired' edit on a race. Added `wasRecentlyAnswered` (a short-TTL 'this id was just
+    popped by a real tap' record, confirm-registry.ts) so callers can now tell the two apart: a
+    genuine duplicate stays silent, everything else - overwhelmingly a restart in practice - edits
+    the card to say so and to resend the command. Applied uniformly to all four confirm registries
+    (fleet/nl/stale/voice) via a new `notifyConfirmGone` helper in index.ts, not just the one the
+    operator happened to hit."
   - "0.83.0 (2026-08-07): §5.5's details anchor now reads as plain, self-explanatory text -
     \"Click Details to see this turn's full log.\" with a bare \"Details\" button label - instead of
     a lone clipboard emoji, per direct operator feedback that the emoji-only anchor wasn't obvious at

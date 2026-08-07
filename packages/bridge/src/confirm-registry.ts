@@ -33,6 +33,12 @@ export interface ConfirmEntry {
 
 export class ConfirmRegistry<T extends ConfirmEntry> {
   private readonly pending = new Map<string, T>();
+  // Timestamps of ids `take` has already popped, kept a little while so a caller can tell "just
+  // answered, a duplicate tap - stay silent" apart from "never in this registry at all, most likely
+  // a Bridge restart wiped it - say so" (see `wasRecentlyAnswered` below). Both cases look identical
+  // to `take` itself once the entry is gone, hence the separate map rather than a richer return value.
+  private readonly answeredAt = new Map<string, number>();
+  private static readonly ANSWERED_RETENTION_MS = 60_000;
   protected readonly ttlMs: number;
   protected readonly now: () => number;
 
@@ -50,12 +56,31 @@ export class ConfirmRegistry<T extends ConfirmEntry> {
 
   /** Pops the entry and says whether it was already past its TTL. `undefined` means the id is
    * genuinely unknown (a duplicate tap on an already-answered card, or a tap left over from before
-   * a Bridge restart) - the one case where saying nothing is right. */
+   * a Bridge restart) - callers should check `wasRecentlyAnswered` to tell those two apart before
+   * deciding whether silence is the right response. */
   take(id: string): { entry: T; expired: boolean } | undefined {
     const entry = this.pending.get(id);
     if (!entry) return undefined;
     this.pending.delete(id);
+    this.answeredAt.set(id, this.now());
     return { entry, expired: this.now() - entry.createdAt > this.ttlMs };
+  }
+
+  /** True if `id` was popped by `take` within the last minute - a duplicate tap racing its own
+   * already-in-flight answer, where editing the card again would risk clobbering the real result
+   * with a "this expired" message. False (including for an id this registry has genuinely never
+   * seen) means it's safe - and, per the Bridge's own "a stale button must say so" rule, necessary -
+   * to tell the operator their tap didn't land, since the far more common cause is a Bridge restart
+   * that wiped every pending confirmation in memory. Sweeps its own entry past the retention window
+   * so this map can't outlive the process on a long-idle daemon. */
+  wasRecentlyAnswered(id: string): boolean {
+    const at = this.answeredAt.get(id);
+    if (at === undefined) return false;
+    if (this.now() - at > ConfirmRegistry.ANSWERED_RETENTION_MS) {
+      this.answeredAt.delete(id);
+      return false;
+    }
+    return true;
   }
 
   /** An unknown *or* expired id is a no-op - kept for callers that genuinely don't distinguish the
