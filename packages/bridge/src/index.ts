@@ -3,66 +3,37 @@ import { randomUUID } from "node:crypto";
 import http from "node:http";
 import path from "node:path";
 import type * as pty from "node-pty";
-import { resolveAskCallback, renderAskAnsweredCard, renderAskCancelledCard } from "./ask-callback.ts";
-import { ABOUT_TOPICS, resolveAboutCallback } from "./about.ts";
+import { renderAskCancelledCard } from "./ask-callback.ts";
 import { buildRunArgs } from "./autostart.ts";
-import { listRepoCommands, listRepoSkills, renderCommandsListText, renderSkillsListText, resolveCommandAction } from "./commands.ts";
 import { loadConfig, STATE_DIR } from "./config.ts";
 import { initFileLogging, log } from "./logger.ts";
 import { clearDeployMarker, isDeployMarkerStale, readDeployMarker, rollbackStaleDeploy } from "./deploy.ts";
-import { parseDetailsCallback } from "./details-button.ts";
 import { DetailsAnchorStore, DETAILS_ANCHOR_RETENTION_MS } from "./details-anchor-store.ts";
-import { listAvailableVoiceModels, resolveVoiceModelCallback } from "./voice-model.ts";
-import { BrowseRegistry, buildDirKeyboard, buildFileActionKeyboard, buildHitsKeyboard, renderDirText, renderHitsText, resolveBrowseCallback } from "./browse-nav.ts";
-import { listDirectory, MAX_SEND_BYTES, prepareFileForSend, readForPreview, resolveGithubLink } from "./worktree-fs.ts";
-import { FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
-import { resolveStaleConfirmCallback, StaleConfirmRegistry } from "./stale-confirm.ts";
-import { resolveVoiceConfirmCallback, VoiceConfirmRegistry } from "./voice-confirm.ts";
+import { BrowseRegistry } from "./browse-nav.ts";
+import { FleetConfirmRegistry } from "./fleet-confirm.ts";
+import { StaleConfirmRegistry } from "./stale-confirm.ts";
+import { VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { startWhisperServer } from "./voice-transcribe.ts";
-import { NlConfirmRegistry, resolveNlConfirmCallback } from "./nl-confirm.ts";
+import { NlConfirmRegistry } from "./nl-confirm.ts";
 import { RetryStore } from "./retry-store.ts";
-import { buildContextPrefix } from "./message-context.ts";
 import { ChannelConnectCoordinator } from "./channel-connect-coordinator.ts";
 import type { RouterAction } from "./nl-router.ts";
 import { SettingsStore } from "./settings-store.ts";
 import { botCommandList } from "./fleet-commands.ts";
-import { renderDetails, renderDetailsPlainText } from "./feed-renderer.ts";
 import { monotonicNowMs } from "./monotonic-clock.ts";
 import { CostTracker } from "./cost-tracker.ts";
 import { CostStore } from "./cost-store.ts";
 import { startOtlpListener } from "./otlp-listener.ts";
-import { resolvePermCallback } from "./permission-callback.ts";
 import { sweepExpiredPermissions } from "./permission-registry.ts";
 import { loadReposRegistry, type ReposRegistry } from "./repos-registry.ts";
 import { launchSession, resolveNodeExecutable } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
 import { RateGovernor } from "./rate-governor.ts";
-import { deriveAlwaysRule, ruleAlreadyCovered } from "./rule-derivation.ts";
 import { Routing } from "./routing.ts";
-import {
-  DEFAULT_EFFORT,
-  DEFAULT_MODE,
-  EFFORTS,
-  isDefaultCategoryCancelCallback,
-  isDefaultEffortCancelCallback,
-  isDefaultModeCancelCallback,
-  isEffortCancelCallback,
-  isModeCancelCallback,
-  isModelCancelCallback,
-  buildDefaultEffortKeyboard,
-  buildDefaultModeKeyboard,
-  MODES,
-  resolveDefaultCategoryCallback,
-  resolveDefaultEffortCallback,
-  resolveDefaultModeCallback,
-  resolveEffortCallback,
-  resolveModeCallback,
-  resolveModelCallback,
-} from "./session-commands.ts";
+import { DEFAULT_EFFORT, DEFAULT_MODE, EFFORTS, MODES } from "./session-commands.ts";
 import type { Effort, Mode, SessionCommand } from "./session-commands.ts";
 import { SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
 import { looksEnglishEnough } from "./language-heuristic.ts";
-import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
 import { startPolling, TelegramClient, validateTokens } from "./telegram.ts";
 import type { InlineKeyboardMarkup } from "./telegram.ts";
 import { loadOffset, saveOffset } from "./telegram-offset.ts";
@@ -85,6 +56,7 @@ import { createCardSenders } from "./card-senders.ts";
 import { createNlDispatch } from "./nl-dispatch.ts";
 import { createCommandDispatch } from "./command-dispatch.ts";
 import type { CommandDispatch } from "./command-dispatch.ts";
+import { createCallbackQueryRouter } from "./callback-query-router.ts";
 
 // §7.2's Task Scheduler stdout/stderr gap (logger.ts's own doc comment has the full story): a
 // launch that predates `main()` itself getting to run - a bad env file, a throw during module
@@ -890,434 +862,53 @@ async function main(): Promise<void> {
     log,
   });
 
+  // callback-query-router.ts: every inline-keyboard tap's callback-query handling, one namespace
+  // rule per `callback_data` prefix - constructed last of all the per-concern modules since it's
+  // the one thing that needs nearly everything else already built.
+  const callbackQueryRouter = createCallbackQueryRouter({
+    controlBot,
+    feedGovernor,
+    routing,
+    sessionStore,
+    ptyIo,
+    pipeHandle,
+    feedWiring,
+    detailsAnchorStore,
+    confirmCards,
+    fleetConfirmRegistry,
+    staleConfirmRegistry,
+    voiceConfirmRegistry,
+    nlConfirmRegistry,
+    fleetConfirmFlow,
+    browseRegistry,
+    nlDispatch,
+    commandDispatch,
+    voiceModeCommands,
+    confirmSessionCommand,
+    isControlTopic,
+    settingsStore,
+    setAssistEnabled: (value) => {
+      assistEnabled = value;
+    },
+    setVoiceConfirmEnabled: (value) => {
+      voiceConfirmEnabled = value;
+    },
+    getDefaultSessionMode: () => defaultSessionMode,
+    getDefaultSessionEffort: () => defaultSessionEffort,
+    voiceServer,
+    voiceModelPath: config.voice.modelPath,
+    stateDir: STATE_DIR,
+    supergroupChatId: config.supergroupChatId,
+    log,
+  });
+
   const offsetPath = path.join(STATE_DIR, "telegram-offset.json");
   startPolling(controlBot, {
     initialOffset: loadOffset(offsetPath),
     onOffsetChange: (offset) => saveOffset(offsetPath, offset, (err) => log("WARN", `failed to persist Telegram offset: ${(err as Error).message}`)),
     onUpdate: (update) => {
-      const callbackQuery = update.callback_query;
-      if (callbackQuery) {
-        feedGovernor
-          .scheduleAsync("P0", () => controlBot.answerCallbackQuery(callbackQuery.id))
-          .catch((err) => log("WARN", `answerCallbackQuery failed: ${(err as Error).message}`));
-
-        const threadId = callbackQuery.message?.message_thread_id;
-        const currentRoute = threadId !== undefined ? routing.getByTopicId(threadId) : undefined;
-        const currentSlug = currentRoute?.slug;
-
-        // §6.4's per-question keyboard - checked first since "ask:" never collides with the
-        // other namespaces ("perm:", "run:", etc.).
-        const askAction = callbackQuery.data ? resolveAskCallback(callbackQuery.data) : null;
-        if (askAction) {
-          const result = pipeHandle.answerAsk(askAction.id, askAction.questionIndex, askAction.optionIndex);
-          if (!result) return; // unknown id, bad index, or already answered - a stale/duplicate tap
-          const q = result.entry.questions[askAction.questionIndex];
-          if (q) {
-            pipeHandle
-              .finalizePermissionMessage(q.messageId, renderAskAnsweredCard(result.entry.slug, q.question, q.header, result.label))
-              .catch((err) => log("WARN", `failed to finalize question message: ${(err as Error).message}`));
-          }
-          if (result.allAnswered) {
-            pipeHandle.completeAsk(askAction.id);
-            feedWiring.maybeSetState(result.entry.slug, "working");
-          }
-          return;
-        }
-
-        // §5.5's `details` button - "d:", a fresh namespace alongside "ask:"/"perm:"/etc. Nothing
-        // to resolve against a registry (the reference is self-contained: slug + turn number), so
-        // this only needs `feedStates` to check the tapped turn is still the session's current one.
-        const detailsAction = callbackQuery.data ? parseDetailsCallback(callbackQuery.data) : null;
-        if (detailsAction) {
-          const state = feedWiring.getFeedState(detailsAction.slug);
-          const stillCurrent = state && state.turnSeq === detailsAction.turnSeq;
-          const verboseDetails = sessionStore.get(detailsAction.slug)?.feedVerbose ?? false;
-          const text = stillCurrent ? renderDetails(state, verboseDetails) : "That turn has ended - its log is no longer available.";
-          // renderDetails renders the same `<code>`/escaped-entity markup the turn card itself
-          // uses (feed-renderer.ts) - needs "HTML" here or Telegram shows the literal tags.
-          const fitsInOneMessage = text.length <= 4096;
-          const anchorMsgId = detailsAnchorStore.get(detailsAction.slug, detailsAction.turnSeq);
-
-          if (anchorMsgId !== undefined) {
-            // Edit the button's own anchor message in place (full log + button removed) instead
-            // of posting a separate message - the operator's own request, so a repeated /detail
-            // tap doesn't keep piling up new messages next to the one that already has the answer.
-            // The oversized case still edits the anchor too, just to a short note - the .txt
-            // document itself still has to be its own message (Telegram can't inline a file into
-            // an edited text message).
-            const anchorText = fitsInOneMessage ? text : "📄 Details sent as a file below.";
-            feedGovernor
-              .scheduleAsync("P1", () => controlBot.editMessageText!(config.supergroupChatId, anchorMsgId, anchorText, { inline_keyboard: [] }, "HTML"))
-              .then(() => detailsAnchorStore.delete(detailsAction.slug, detailsAction.turnSeq))
-              .catch((err) => {
-                // A stale/already-deleted anchor (or any other edit failure) degrades to the
-                // pre-edit-in-place behaviour - the operator still gets the details, just as a new
-                // message instead of an edit. Drop the now-unreliable mapping either way so a
-                // future tap doesn't keep retrying the same broken edit.
-                detailsAnchorStore.delete(detailsAction.slug, detailsAction.turnSeq);
-                log("WARN", `details-anchor edit failed for "${detailsAction.slug}" turn ${detailsAction.turnSeq}, falling back to a new message: ${(err as Error).message}`);
-                if (fitsInOneMessage) confirmSessionCommand(threadId, text, "HTML");
-              });
-          } else if (fitsInOneMessage) {
-            // No anchor on record (posted before this feature shipped, or the Bridge restarted
-            // between posting it and this tap) - today's exact fallback behaviour.
-            confirmSessionCommand(threadId, text, "HTML");
-          }
-
-          if (!fitsInOneMessage) {
-            // §5.5: "Diffs always go as documents" - the same reasoning applies to a details log
-            // too long to fit in one message. Plain text, not renderDetails's HTML markup - a
-            // document viewer has no HTML renderer to make that markup invisible.
-            const plainText = stillCurrent ? renderDetailsPlainText(state, verboseDetails) : text;
-            feedGovernor
-              .scheduleAsync("P1", () =>
-                controlBot.sendDocument(config.supergroupChatId, threadId, `${detailsAction.slug}-turn${detailsAction.turnSeq}-details.txt`, plainText),
-              )
-              .catch((err) => log("WARN", `sendDocument (details) failed: ${(err as Error).message}`));
-          }
-          return;
-        }
-
-        // §6.3's approve/deny/always keyboard - checked before the /help-style command keyboard
-        // since the two callback_data namespaces ("perm:" vs "run:") never collide.
-        const permAction = callbackQuery.data ? resolvePermCallback(callbackQuery.data) : null;
-        if (permAction) {
-          // Resolve pops the entry - a stale/expired/unknown id is a silent no-op (§9 scenarios 6-7),
-          // not an error, since a race against the 30-minute sweep or a duplicate tap is expected.
-          const pending = pipeHandle.resolvePermission(permAction.requestId);
-          if (!pending) return;
-
-          const behavior = permAction.action === "deny" ? "deny" : "allow";
-          pipeHandle.sendVerdict(pending.slug, pending.requestId, behavior);
-          feedWiring.maybeSetState(pending.slug, "working");
-
-          let confirmText = `${behavior === "allow" ? "✅ Allowed" : "⛔ Denied"}: ${pending.toolName}`;
-          if (permAction.action === "always") {
-            const rule = deriveAlwaysRule(pending.toolName, pending.inputPreview);
-            const settings = readSettingsFile(STATE_DIR, pending.slug);
-            if (!rule) {
-              confirmText += " (allow-once only - command isn't safe to generalise)";
-            } else if (ruleAlreadyCovered(rule, settings)) {
-              confirmText += ` (\`${rule}\` already covered by an existing rule)`;
-            } else {
-              writeSettingsFile(STATE_DIR, pending.slug, addAlwaysRule(settings, rule));
-              confirmText += `, and added \`${rule}\` for this session`;
-            }
-          }
-          pipeHandle
-            .finalizePermissionMessage(pending.messageId, confirmText)
-            .catch((err) => log("WARN", `failed to finalize permission message: ${(err as Error).message}`));
-          return;
-        }
-
-        // `/kill --all`/`/rm --all`'s own confirm keyboard (fleet-confirm.ts) - a fresh "fc:"
-        // namespace, checked alongside "perm:" since both gate a destructive action behind a tap.
-        const fleetConfirmAction = callbackQuery.data ? resolveFleetConfirmCallback(callbackQuery.data) : null;
-        if (fleetConfirmAction) {
-          // `take`, not `resolve`: an expired card has to *say* it expired. `answerCallbackQuery`
-          // above already cleared the spinner, so returning silently here left the operator with a
-          // tap that visibly did nothing - §6.5's stated failure mode.
-          const pending = confirmCards.takeOrNotifyGone(fleetConfirmRegistry, fleetConfirmAction.id, callbackQuery.message?.message_id, (entry) =>
-            void confirmCards.markConfirmCardExpired(entry.messageId),
-          );
-          if (!pending) return;
-          if (pending.kind !== fleetConfirmAction.kind) return;
-          if (!fleetConfirmAction.confirmed) {
-            void confirmCards.finalizeFleetConfirmMessage(pending, "Cancelled - nothing was changed.");
-            return;
-          }
-          void fleetConfirmFlow.executeFleetConfirm(pending);
-          return;
-        }
-
-        // `/browse`/`/find`'s own navigation - "br:"/"bf:"/"bv:"/"bs:", four fresh namespaces
-        // (browse-nav.ts). Edits whichever message the tap came from (telegram.ts's own doc
-        // comment on why `message_id` is read straight off the callback here, unlike every other
-        // flow above), so a missing `message_id` (an old/mocked client) is a silent no-op.
-        const browseAction = callbackQuery.data ? resolveBrowseCallback(callbackQuery.data) : null;
-        if (browseAction) {
-          const browseMessageId = callbackQuery.message?.message_id;
-          if (browseMessageId === undefined) return;
-          browseRegistry.sweep();
-          const stored = browseRegistry.get(browseAction.id);
-          if (!stored) {
-            controlBot
-              .editMessageText?.(config.supergroupChatId, browseMessageId, "This browse session has expired - run /browse or /find again.", { inline_keyboard: [] })
-              .catch((err) => log("WARN", `failed to finalize expired browse message: ${(err as Error).message}`));
-            return;
-          }
-          const worktreePath = routing.get(stored.slug)?.worktreePath;
-          if (!worktreePath) return; // the session behind this id is gone
-
-          if (browseAction.kind === "dir" && stored.entry.kind === "dir") {
-            const listing = listDirectory(worktreePath, stored.entry.relPath, browseAction.page);
-            const text = listing ? renderDirText(listing) : "That folder no longer exists.";
-            const keyboard = listing ? buildDirKeyboard(browseRegistry, stored.slug, listing) : [];
-            controlBot
-              .editMessageText?.(config.supergroupChatId, browseMessageId, text, { inline_keyboard: keyboard })
-              .catch((err) => log("WARN", `editMessageText (browse dir) failed: ${(err as Error).message}`));
-            return;
-          }
-
-          if (browseAction.kind === "file_menu" && stored.entry.kind === "file") {
-            const githubUrl = resolveGithubLink(worktreePath, stored.entry.relPath);
-            controlBot
-              .editMessageText?.(config.supergroupChatId, browseMessageId, `📄 /${stored.entry.relPath}`, {
-                inline_keyboard: buildFileActionKeyboard(browseAction.id, githubUrl),
-              })
-              .catch((err) => log("WARN", `editMessageText (browse file menu) failed: ${(err as Error).message}`));
-            return;
-          }
-
-          if (browseAction.kind === "file_action" && stored.entry.kind === "file") {
-            if (browseAction.action === "view") {
-              const preview = readForPreview(worktreePath, stored.entry.relPath, stored.entry.matchLine);
-              // No parse_mode here - preview.text is arbitrary, unescaped file content, and both
-              // Telegram's Markdown and HTML modes would try to interpret stray backticks/`<`/`&`
-              // in it as real formatting (feed-escape.ts exists precisely because that's unsafe
-              // without escaping first). Plain text only.
-              const text = !preview
-                ? "That file no longer exists."
-                : preview.tooLarge
-                  ? "That file is too large to preview here - try Send file instead."
-                  : preview.binary
-                    ? "That looks like a binary file - use Send file instead."
-                    : `${preview.text}${preview.truncated ? "\n(truncated)" : ""}`;
-              const githubUrl = resolveGithubLink(worktreePath, stored.entry.relPath);
-              controlBot
-                .editMessageText?.(config.supergroupChatId, browseMessageId, text, { inline_keyboard: buildFileActionKeyboard(browseAction.id, githubUrl) })
-                .catch((err) => log("WARN", `editMessageText (browse view) failed: ${(err as Error).message}`));
-            } else {
-              const prep = prepareFileForSend(worktreePath, stored.entry.relPath);
-              if (!prep) {
-                confirmSessionCommand(threadId, "That file no longer exists.");
-              } else if (prep.tooLarge) {
-                confirmSessionCommand(threadId, `"${prep.filename}" is too large to send here (over ${Math.round(MAX_SEND_BYTES / (1024 * 1024))}MB).`);
-              } else if (controlBot.sendDocumentFile) {
-                controlBot
-                  .sendDocumentFile(config.supergroupChatId, threadId, prep.filename, prep.bytes)
-                  .catch((err) => log("WARN", `sendDocumentFile (browse send) failed: ${(err as Error).message}`));
-              }
-            }
-            return;
-          }
-
-          if (browseAction.kind === "hits" && stored.entry.kind === "hitset") {
-            controlBot
-              .editMessageText?.(config.supergroupChatId, browseMessageId, renderHitsText(stored.entry.query, stored.entry, browseAction.page), {
-                inline_keyboard: buildHitsKeyboard(browseRegistry, stored.slug, browseAction.id, stored.entry.hits, browseAction.page),
-              })
-              .catch((err) => log("WARN", `editMessageText (browse hits) failed: ${(err as Error).message}`));
-          }
-          return;
-        }
-
-        // nl-router.ts's destructive-command confirm keyboard (nl-confirm.ts) - "nc:", a fresh
-        // namespace alongside "fc:"/"vc:"/"sc:"/"d:". "Run" and "run, don't ask again" both
-        // execute the pending command through the same `executeMatchedCommand` a non-destructive
-        // NL match already uses; "don't ask again" additionally flips `assistEnabled` off first
-        // (and persists it) so every subsequent NL-matched destructive command skips this card
-        // until `/assist on` turns it back on.
-        const nlConfirmAction = callbackQuery.data ? resolveNlConfirmCallback(callbackQuery.data) : null;
-        if (nlConfirmAction) {
-          const pending = confirmCards.takeOrNotifyGone(nlConfirmRegistry, nlConfirmAction.id, callbackQuery.message?.message_id, (entry) =>
-            void confirmCards.markNlConfirmCardExpired(entry),
-          );
-          if (!pending) return;
-          if (nlConfirmAction.action === "cancel") {
-            void confirmCards.finalizeNlConfirmMessage(pending, "❌ Cancelled - nothing was changed.");
-            return;
-          }
-          if (nlConfirmAction.action === "run_and_stop_asking") {
-            assistEnabled = false;
-            settingsStore.set("assist_enabled", "false");
-          }
-          void confirmCards.finalizeNlConfirmMessage(pending, `✅ Running ${nlDispatch.describeNlCommand(pending.command)}${nlConfirmAction.action === "run_and_stop_asking" ? " (confirmation now off - /assist on to re-enable)" : ""}.`);
-          const pendingIsControl = isControlTopic(pending.threadId);
-          nlDispatch.executeMatchedCommand(pending.command, pending.threadId, pendingIsControl, pending.currentSlug);
-          return;
-        }
-
-        // §7.4's stale-inbound confirm keyboard (stale-confirm.ts) - "sc:", a fresh namespace
-        // alongside "fc:". Recomputes isControl/route/currentSlug fresh from the pending card's
-        // own threadId rather than trusting anything cached from when the card was first posted -
-        // the topic's routing could have changed (e.g. the session was `/kill`ed) in the minutes
-        // the card sat waiting for a tap, and dispatchInboundMessage already handles an
-        // unrecognised/dead currentSlug the same way a live message would.
-        const staleConfirmAction = callbackQuery.data ? resolveStaleConfirmCallback(callbackQuery.data) : null;
-        if (staleConfirmAction) {
-          const pending = confirmCards.takeOrNotifyGone(staleConfirmRegistry, staleConfirmAction.id, callbackQuery.message?.message_id, (entry) =>
-            void confirmCards.markConfirmCardExpired(entry.confirmCardMessageId),
-          );
-          if (!pending) return;
-          if (!staleConfirmAction.confirmed) {
-            void confirmCards.finalizeStaleConfirmMessage(pending, "Cancelled - not actioned.");
-            return;
-          }
-          void confirmCards.finalizeStaleConfirmMessage(pending, "✅ Confirmed - processing now.");
-          const pendingIsControl = isControlTopic(pending.threadId);
-          const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
-          void commandDispatch.dispatchInboundMessage(pending.messageId, pending.rawText, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin));
-          return;
-        }
-
-        // Voice input's own confirm keyboard (voice-confirm.ts) - "vc:", a fresh namespace
-        // alongside "sc:"/"fc:"/"d:". "Re-record"/"Type instead"/"Cancel" all discard the
-        // transcript; they differ only in which follow-up text is shown, so all three fall into
-        // the same finalize call below rather than needing separate registry/dispatch handling.
-        // "Send, don't ask again" additionally flips `voiceConfirmEnabled` off (and persists it)
-        // before sending, the typeable equivalent being `/voiceconfirm off`.
-        const voiceConfirmAction = callbackQuery.data ? resolveVoiceConfirmCallback(callbackQuery.data) : null;
-        if (voiceConfirmAction) {
-          const pending = confirmCards.takeOrNotifyGone(voiceConfirmRegistry, voiceConfirmAction.id, callbackQuery.message?.message_id, (entry) =>
-            void confirmCards.markConfirmCardExpired(entry.confirmCardMessageId),
-          );
-          if (!pending) return;
-          if (voiceConfirmAction.action === "send" || voiceConfirmAction.action === "send_and_stop_asking") {
-            if (voiceConfirmAction.action === "send_and_stop_asking") {
-              voiceConfirmEnabled = false;
-              settingsStore.set("voice_confirm_enabled", "false");
-            }
-            void confirmCards.finalizeVoiceConfirmMessage(pending, voiceConfirmAction.action === "send_and_stop_asking" ? "✅ Sent (confirmation now off - /voiceconfirm on to re-enable)." : "✅ Sent.");
-            const pendingIsControl = isControlTopic(pending.threadId);
-            const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
-            void commandDispatch.dispatchInboundMessage(pending.messageId, pending.transcript, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin));
-            return;
-          }
-          const doneText =
-            voiceConfirmAction.action === "rerecord"
-              ? "🔁 Discarded - send another voice note whenever you're ready."
-              : voiceConfirmAction.action === "type"
-                ? "✏️ Discarded - go ahead and type it."
-                : "❌ Cancelled.";
-          void confirmCards.finalizeVoiceConfirmMessage(pending, doneText);
-          return;
-        }
-
-        // `/voice`'s own model-picker keyboard (voice-model.ts) - "vm:", a fresh namespace
-        // alongside "vc:"/"d:"/"sc:"/"fc:". Re-scans the model list rather than reusing whatever
-        // was on disk when the button was posted - see applyVoiceModelSwitch's own doc comment.
-        const voiceModelName = callbackQuery.data ? resolveVoiceModelCallback(callbackQuery.data) : null;
-        if (voiceModelName && voiceServer) {
-          const voiceDir = path.dirname(config.voice.modelPath);
-          const models = listAvailableVoiceModels(voiceDir);
-          const currentName = path.basename(voiceServer.currentModelPath()).replace(/^ggml-/, "").replace(/\.bin$/, "");
-          void voiceModeCommands.applyVoiceModelSwitch(threadId, voiceModelName, voiceDir, models, currentName);
-          return;
-        }
-
-        // The trailing "✖️ Cancel" row on the /model, /mode and /effort pickers (session-commands.ts's
-        // buildLevelKeyboard) - checked ahead of the three resolve* calls below since "cancel" is
-        // deliberately never a valid level for any of them and would otherwise just look like an
-        // unrecognised tap. Edits the card to a plain "Cancelled." with the keyboard stripped,
-        // rather than leaving a stale keyboard sitting there or a whole new message.
-        if (callbackQuery.data && (isModelCancelCallback(callbackQuery.data) || isModeCancelCallback(callbackQuery.data) || isEffortCancelCallback(callbackQuery.data))) {
-          const cancelMsgId = callbackQuery.message?.message_id;
-          if (cancelMsgId !== undefined && controlBot.editMessageText) {
-            controlBot
-              .editMessageText(config.supergroupChatId, cancelMsgId, "Cancelled.", { inline_keyboard: [] })
-              .catch((err) => log("WARN", `editMessageText (cancel) failed: ${(err as Error).message}`));
-          }
-          return;
-        }
-
-        const model = callbackQuery.data ? resolveModelCallback(callbackQuery.data) : null;
-        if (model) {
-          if (currentSlug && threadId !== undefined) voiceModeCommands.applyModelSwitch(currentSlug, threadId, model);
-          return;
-        }
-
-        const mode = callbackQuery.data ? resolveModeCallback(callbackQuery.data) : null;
-        if (mode) {
-          if (currentSlug && threadId !== undefined) voiceModeCommands.applyModeSwitch(currentSlug, threadId, mode);
-          return;
-        }
-
-        const effort = callbackQuery.data ? resolveEffortCallback(callbackQuery.data) : null;
-        if (effort) {
-          if (currentSlug && threadId !== undefined) voiceModeCommands.applyEffortSwitch(currentSlug, threadId, effort);
-          return;
-        }
-
-        // `/default`'s three-namespace picker flow: "default:mode"/"default:effort" (the top-level
-        // category keyboard) edits the same message into that category's own value picker;
-        // "defmode:<value>"/"defeffort:<value>" (that picker's own buttons) applies the change and
-        // edits the message into a plain confirmation; either picker's own Cancel row edits to
-        // "Cancelled.". All three edit in place - unlike the session-scoped /model|/mode|/effort
-        // pickers above, which only ever confirm via a *new* message (`applyModelSwitch` etc.),
-        // `/default` has no `currentSlug` to hand off to and the picker itself is the whole UI, so
-        // editing it through each step reads as one drill-down instead of a new message per tap.
-        const defaultMsgId = callbackQuery.message?.message_id;
-        if (callbackQuery.data && defaultMsgId !== undefined && controlBot.editMessageText) {
-          const category = resolveDefaultCategoryCallback(callbackQuery.data);
-          if (category) {
-            const [prompt, keyboard] =
-              category === "mode"
-                ? [`Choose the default permission mode for new sessions (current: ${defaultSessionMode}):`, buildDefaultModeKeyboard(defaultSessionMode)]
-                : [`Choose the default effort level for new sessions (current: ${defaultSessionEffort}):`, buildDefaultEffortKeyboard(defaultSessionEffort)];
-            controlBot
-              .editMessageText(config.supergroupChatId, defaultMsgId, prompt, { inline_keyboard: keyboard })
-              .catch((err) => log("WARN", `editMessageText (/default category) failed: ${(err as Error).message}`));
-            return;
-          }
-          if (
-            isDefaultCategoryCancelCallback(callbackQuery.data) ||
-            isDefaultModeCancelCallback(callbackQuery.data) ||
-            isDefaultEffortCancelCallback(callbackQuery.data)
-          ) {
-            controlBot
-              .editMessageText(config.supergroupChatId, defaultMsgId, "Cancelled.", { inline_keyboard: [] })
-              .catch((err) => log("WARN", `editMessageText (/default cancel) failed: ${(err as Error).message}`));
-            return;
-          }
-          const defaultMode = resolveDefaultModeCallback(callbackQuery.data);
-          if (defaultMode) {
-            controlBot
-              .editMessageText(config.supergroupChatId, defaultMsgId, voiceModeCommands.applyDefaultMode(defaultMode), { inline_keyboard: [] })
-              .catch((err) => log("WARN", `editMessageText (/default mode) failed: ${(err as Error).message}`));
-            return;
-          }
-          const defaultEffort = resolveDefaultEffortCallback(callbackQuery.data);
-          if (defaultEffort) {
-            controlBot
-              .editMessageText(config.supergroupChatId, defaultMsgId, voiceModeCommands.applyDefaultEffort(defaultEffort), { inline_keyboard: [] })
-              .catch((err) => log("WARN", `editMessageText (/default effort) failed: ${(err as Error).message}`));
-            return;
-          }
-        }
-
-        // `/about`'s "more info" buttons ("about:") - a fresh namespace alongside "run:"/"perm:"/
-        // etc.; unlike those, there's nothing to resolve against a registry (every topic's text
-        // is static), so this just looks the id up and sends it. `/about` itself works from the
-        // control topic's own default ("General") topic, which carries no `message_thread_id` at
-        // all - unlike `resolveCommandAction`'s buttons (session-scoped only, so threadId is
-        // always defined there), threadId being undefined here is the normal case, not an error;
-        // `sendMessage` already accepts it the same way the `/about` dispatch path above does.
-        const aboutTopicId = callbackQuery.data ? resolveAboutCallback(callbackQuery.data) : null;
-        if (aboutTopicId) {
-          const topic = ABOUT_TOPICS[aboutTopicId];
-          if (!topic) return;
-          controlBot
-            .sendMessage(config.supergroupChatId, threadId, topic.details)
-            .catch((err) => log("WARN", `sendMessage (about detail) failed: ${(err as Error).message}`));
-          return;
-        }
-
-        const action = callbackQuery.data ? resolveCommandAction(callbackQuery.data) : null;
-        if (!action || threadId === undefined) return;
-        // "Commands (N)"/"Skills (N)" - answered directly, like /help/`/commands`/`/skills`
-        // themselves; this is "list them as text," not something to forward into the PTY/channel.
-        if (action.kind === "show_commands") {
-          const text = renderCommandsListText(currentRoute ? listRepoCommands(currentRoute.worktreePath) : []);
-          controlBot.sendMessage(config.supergroupChatId, threadId, text).catch((err) => log("WARN", `sendMessage (show commands) failed: ${(err as Error).message}`));
-          return;
-        }
-        if (action.kind === "show_skills") {
-          const text = renderSkillsListText(currentRoute ? listRepoSkills(currentRoute.worktreePath) : []);
-          controlBot.sendMessage(config.supergroupChatId, threadId, text).catch((err) => log("WARN", `sendMessage (show skills) failed: ${(err as Error).message}`));
-          return;
-        }
-        if (currentSlug) ptyIo.sendRaw(currentSlug, `/${action.name}`);
+      if (update.callback_query) {
+        callbackQueryRouter.routeCallbackQuery(update.callback_query);
         return;
       }
 
