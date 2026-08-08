@@ -353,19 +353,28 @@ describe("startPipeServer", () => {
   });
 
   describe("thinking placeholder", () => {
-    test("a reply edits the pending placeholder instead of sending a second message", async () => {
+    // 0.104.0: this used to assert the opposite - that a reply *edited* the placeholder in place
+    // rather than sending a second message. Editing pinned the reply's visible position to
+    // wherever "🤔 Thinking..." first landed (turn-start), which a real Bridge restart's worth of
+    // ordering fixes (0.97.0, 0.101.0) could never fix, since neither touches *where* an edited
+    // message sits - only *when* independent sends complete. The reply now always sends fresh, and
+    // the placeholder is deleted afterward instead of reused.
+    test("a reply sends fresh and deletes the pending placeholder, rather than editing it in place", async () => {
       const path = pipePath();
       const routing = new Routing();
       routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
       const sent: Array<{ text: string }> = [];
-      const edited: Array<{ messageId: number; text: string }> = [];
+      const deleted: number[] = [];
       const controlBot: SendMessageSource = {
         sendMessage: async (_chatId, _threadId, text) => {
           sent.push({ text });
           return { message_id: 99 };
         },
-        editMessageText: async (_chatId, messageId, text) => {
-          edited.push({ messageId, text });
+        editMessageText: async () => {
+          throw new Error("should not be called - the reply must send fresh, not edit the placeholder");
+        },
+        deleteMessage: async (_chatId, messageId) => {
+          deleted.push(messageId);
         },
       };
       const thinkingPlaceholder = createThinkingPlaceholder({ send: async () => 55 });
@@ -381,12 +390,12 @@ describe("startPipeServer", () => {
         encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "the answer" } satisfies ReplyMessage),
       );
 
-      await waitFor(() => edited.length >= 1);
-      expect(edited).toEqual([{ messageId: 55, text: "the answer" }]);
-      expect(sent).toEqual([]); // no second, separate message
+      await waitFor(() => sent.length >= 1 && deleted.length >= 1);
+      expect(sent).toEqual([{ text: "the answer" }]);
+      expect(deleted).toEqual([55]);
     });
 
-    test("falls back to sendMessage when no placeholder is pending for that topic", async () => {
+    test("still sends fine (no delete attempted) when no placeholder is pending for that topic", async () => {
       const path = pipePath();
       const routing = new Routing();
       routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
@@ -396,7 +405,7 @@ describe("startPipeServer", () => {
           sent.push({ text });
           return { message_id: 1 };
         },
-        editMessageText: async () => {
+        deleteMessage: async () => {
           throw new Error("should not be called - nothing pending");
         },
       };
@@ -415,6 +424,48 @@ describe("startPipeServer", () => {
 
       await waitFor(() => sent.length >= 1);
       expect(sent).toEqual([{ text: "hi" }]);
+    });
+
+    test("a deleteMessage failure is logged but never blocks or fails the reply", async () => {
+      const path = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const sent: Array<{ text: string }> = [];
+      const warnings: string[] = [];
+      const controlBot: SendMessageSource = {
+        sendMessage: async (_chatId, _threadId, text) => {
+          sent.push({ text });
+          return { message_id: 1 };
+        },
+        deleteMessage: async () => {
+          throw new Error("Telegram deleteMessage failed: Bad Request: message to delete not found");
+        },
+      };
+      const thinkingPlaceholder = createThinkingPlaceholder({ send: async () => 55 });
+      thinkingPlaceholder.start("3");
+
+      const handle = startPipeServer({
+        pipePath: path,
+        routing,
+        controlBot,
+        chatId: "-1",
+        thinkingPlaceholder,
+        log: (level, message) => {
+          if (level === "WARN") warnings.push(message);
+        },
+      });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket } = connectClient(path);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(
+        encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "hi" } satisfies ReplyMessage),
+      );
+
+      await waitFor(() => sent.length >= 1);
+      expect(sent).toEqual([{ text: "hi" }]); // the reply itself is unaffected by the delete failing
+      await waitFor(() => warnings.some((w) => w.includes("failed to delete the thinking placeholder")));
     });
   });
 

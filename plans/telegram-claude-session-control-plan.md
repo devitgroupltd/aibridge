@@ -1,7 +1,7 @@
 ---
-version: 0.103.0
+version: 0.104.0
 status: solid
-last_modified_utc: 2026-08-08T18:40:00Z
+last_modified_utc: 2026-08-08T19:02:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,28 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.104.0 (2026-08-08): closed the last piece of the reply/feed-ordering saga that 0.103.0's
+    live-testing surfaced but deliberately left as a documented trade-off rather than a blind fix -
+    operator asked for a recommendation, then approved implementing it. Root cause:
+    `pipe-server.ts`'s `handleReply` used to *edit* the turn's '🤔 Thinking...' placeholder into the
+    final reply text instead of sending a new message. `thinking-placeholder.ts` posts that
+    placeholder immediately and unthrottled at turn-start, by design, for an instant typing
+    indicator - so editing it in place permanently pinned the reply's visible position to
+    turn-start, regardless of anything sent later in the same turn (a 'Click Details' lifecycle
+    notice, a feed card): Telegram never repositions an edited message, so neither 0.97.0's nor
+    0.101.0's ordering fixes could ever touch this - both only affect *when* independent sends
+    complete, not *where* an edit's target message already sits. Fixed by always sending the reply
+    as a genuinely new P1 message (landing in true chronological order, after `onBeforeReply`'s
+    flush and anything already queued ahead of it on that lane) and deleting the placeholder
+    afterward instead of reusing it - the operator still gets the same instant feedback at
+    turn-start, and the placeholder just cleanly disappears rather than turning into the answer. A
+    failed delete (already gone, past Telegram's window, etc.) is logged and swallowed - it must
+    never take the already-sent reply down with it. 3 tests rewritten/added in
+    `pipe-server.test.ts` (send-then-delete instead of edit-in-place, the placeholder-absent
+    fallback, a delete-failure-is-swallowed case), confirmed to fail red against the pre-fix code.
+    Live-reverified end to end (scripts/telegram-automation): a fresh session's topic now reads
+    prompt -> 'Click Details' -> activity card -> reply, last, exactly the order originally
+    reported as wrong. 1201 total (was 1200), `tsc --noEmit` clean."
   - "0.103.0 (2026-08-08): live-verified the 0.97.0 reply/feed-ordering fix and the 0.100.0
     Bun-runtime-drift fix against a real Telegram client and a real Bridge restart
     (scripts/telegram-automation), per operator request. Both held: no orphan false-positive, the

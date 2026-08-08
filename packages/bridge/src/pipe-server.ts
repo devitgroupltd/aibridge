@@ -46,8 +46,9 @@ export interface PipeServerOptions {
    * tests that never exercise `send_file` don't need to supply one; a `send_file` arriving with no
    * `stateDir` configured is logged and dropped rather than defaulting to something guessed. */
   stateDir?: string;
-  /** If a "🤔 Thinking..." placeholder is pending for this topic, the reply edits it in place
-   * instead of sending a second message (see `thinking-placeholder.ts`). */
+  /** If a "🤔 Thinking..." placeholder is pending for this topic, it's deleted once the reply
+   * actually sends (0.104.0 - previously edited in place; see `handleReply`'s own doc comment for
+   * why that changed) rather than left to go stale (see `thinking-placeholder.ts`). */
   thinkingPlaceholder?: ThinkingPlaceholder;
   /** Fires after a `reply` is successfully delivered - the typing indicator's stop signal (§5's
    * feed doesn't exist yet, but "a reply landed" is already known here regardless). The reply text
@@ -270,17 +271,32 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
         return;
       }
       // Both of these are keyed by topic too, and both must use the *routed* topic rather than the
-      // claimed one. `consume` pops a placeholder by topic and the branch below edits it by
-      // `message_id` - an edit ignores the topic entirely - so a claimed-but-wrong topic would have
-      // written this session's reply into another session's "🤔 Thinking..." message, leaving that
+      // claimed one. `consume` pops a placeholder by topic, and a claimed-but-wrong topic would
+      // otherwise have written this session's reply into another session's topic, leaving that
       // session's turn permanently unfinished. `onReplySent` drives §4.4's rename-once, so the same
       // mismatch would have retitled the wrong topic and consumed its one rename.
       const routedTopic = String(topicId);
       const placeholderId = await opts.thinkingPlaceholder?.consume(routedTopic);
-      if (placeholderId !== undefined && opts.controlBot.editMessageText) {
-        await p1(() => opts.controlBot.editMessageText!(opts.chatId, placeholderId, chunks[0]!));
-      } else {
-        await p1(() => opts.controlBot.sendMessage(opts.chatId, topicId, chunks[0]!));
+      // 0.104.0: this used to *edit* the placeholder into the reply's own text instead of sending a
+      // new message - which meant the reply's visible position in the topic was permanently pinned
+      // to wherever "🤔 Thinking..." first landed (turn-start, sent immediately and unthrottled by
+      // `thinking-placeholder.ts`, by design, for an instant typing indicator), regardless of
+      // anything sent later in the same turn (a "Click Details" lifecycle notice, a feed card) -
+      // Telegram never repositions an edited message. Live-observed 2026-08-08: this made the reply
+      // look like it arrived "2nd" even after 0.97.0's/0.101.0's ordering fixes, since neither of
+      // those touches *where* an edited message sits, only *when* independent sends complete. Now
+      // the reply always sends as a genuinely new P1 message - landing in true chronological order,
+      // after `onBeforeReply`'s flush and after anything already queued ahead of it on this lane -
+      // and the placeholder is deleted afterward rather than reused, so the operator still gets the
+      // same instant "something's happening" feedback at turn-start with no stale text left behind.
+      await p1(() => opts.controlBot.sendMessage(opts.chatId, topicId, chunks[0]!));
+      if (placeholderId !== undefined && opts.controlBot.deleteMessage) {
+        // Best-effort: a delete failing (already gone, past Telegram's edit/delete window, etc.)
+        // must never take the reply down with it - the reply above has already landed either way,
+        // and a stray leftover "🤔 Thinking..." bubble is a cosmetic wart, not a lost message.
+        p1(() => opts.controlBot.deleteMessage!(opts.chatId, placeholderId)).catch((err) =>
+          log("WARN", `failed to delete the thinking placeholder for slug "${msg.slug}": ${(err as Error).message}`),
+        );
       }
       for (const chunk of chunks.slice(1)) {
         await p1(() => opts.controlBot.sendMessage(opts.chatId, topicId, chunk));
