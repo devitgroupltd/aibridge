@@ -170,6 +170,19 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
   function handleHookEvent(msg: HookEventMessage): void {
     const row = sessionStore.get(msg.slug);
 
+    // Live-observed 2026-08-08: `SessionStore.setSessionId` existed and was unit-tested, but
+    // nothing in production ever called it - `handleHookEvent` is the only place a live
+    // `session_id` from Claude Code ever reaches the Bridge, and it never persisted one. Every
+    // session, not just brand-new ones, silently lost `claude --resume` across every future Bridge
+    // restart: `resumeSession` (session-supervisor.ts) reads `row.sessionId`, found it permanently
+    // null, and killed the session with "no session id was recorded yet" instead of resuming it.
+    // `SessionStart` is the right (and only necessary) hook to key off - it fires once per live
+    // `claude` process with that process's own id, and a resumed conversation's `SessionStart`
+    // carries the same id back, so re-setting it is idempotent, not just harmless.
+    if (row && msg.hook_event_name === "SessionStart" && row.sessionId !== msg.session_id) {
+      sessionStore.setSessionId(msg.slug, msg.session_id);
+    }
+
     // §6.5's terminal-race fix (§13 check 4): if the operator answers Claude Code's own terminal
     // prompt instead of tapping the Telegram card, there is no protocol event saying so - the
     // first sign is one of these three hooks landing for the same tool the pending card is for.

@@ -1,7 +1,7 @@
 ---
-version: 0.102.0
+version: 0.103.0
 status: solid
-last_modified_utc: 2026-08-08T14:00:00Z
+last_modified_utc: 2026-08-08T18:40:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,35 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.103.0 (2026-08-08): live-verified the 0.97.0 reply/feed-ordering fix and the 0.100.0
+    Bun-runtime-drift fix against a real Telegram client and a real Bridge restart
+    (scripts/telegram-automation), per operator request. Both held: no orphan false-positive, the
+    `/new` deep-link button navigated correctly, and neither fresh session wedged. But the live
+    check surfaced two further, real gaps 0.97.0/0.100.0 didn't cover: (1) `SessionStore.setSessionId`
+    existed and was unit-tested but nothing in production ever called it - `feed-wiring.ts`'s
+    `handleHookEvent` (the only consumer of hook events) never persisted a live `session_id`
+    anywhere, so *every* session's `row.sessionId` stayed permanently null and `claude --resume`
+    (session-supervisor.ts) always found nothing to resume, killing the session on every Bridge
+    restart with 'no session id was recorded yet' instead of actually resuming it - live-reproduced
+    on two freshly created test sessions, fixed by persisting `msg.session_id` on `SessionStart`,
+    live-reverified on a third session that resumed cleanly afterward. (2) `rate-governor.ts`'s
+    `drainControl` dequeued P0/P1 tasks in strict FIFO order but fired every affordable task's own
+    `run()` without awaiting the previous one first, so two same-lane sends queued close together
+    (e.g. a turn-start 'Click Details' lifecycle notice and a `reply`, both P1) raced their own
+    network calls - delivery order depended on whichever HTTP response reached Telegram first, not
+    which was enqueued first; fixed by awaiting each task before starting the next, guarded by a
+    `draining` flag against a fresh enqueue re-entering the loop mid-await. Live-testing also
+    surfaced (documented, not fixed - a design trade-off, not a bug) that the residual 'reply looks
+    like the 2nd message' symptom in a fast single-turn session is actually caused by a third,
+    unrelated mechanism: `thinking-placeholder.ts`'s '🤔 Thinking...' message is sent immediately and
+    unthrottled at turn-start (bypassing the governor entirely, by design, for an instant typing
+    indicator), and `pipe-server.ts`'s `handleReply` *edits* that same message into the final reply
+    text rather than sending a new one - Telegram never repositions an edited message, so the reply
+    is pinned to wherever the placeholder first landed regardless of any queue-ordering fix. 8 new
+    tests (4 `feed-wiring.test.ts`, 3 `rate-governor.test.ts` covering the intra-lane race directly,
+    1 already-existing describe block gaining 3 sub-tests); both new tests confirmed to fail red
+    against the pre-fix code before the fix, not just pass green after it. 1200 total (was 1193),
+    `tsc --noEmit` clean."
   - "0.102.0 (2026-08-08): operator asked about running an aibridge session fully unattended overnight
     (no permission prompts at all). Research turned up Claude Code's `auto` permission mode, which did
     not exist when §6 was written and is not evaluated anywhere in this plan. Added a pointer in §7.6

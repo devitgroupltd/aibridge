@@ -426,6 +426,91 @@ describe("schedule()'s promise return (0.97.0 ordering barrier)", () => {
     await flushMicrotasks();
     await expect(failing).resolves.toBeUndefined(); // exhausted its retries, but schedule() never rejects
   });
+
+  // 0.101.0: `drainControl` used to dequeue P0/P1 tasks in FIFO order but fire every affordable
+  // task's own `run()` without awaiting the previous one first - so two same-lane sends queued in
+  // the same tick raced their own network calls, and delivery order (what the operator actually
+  // sees in Telegram) depended on whichever `fn()` happened to resolve first, not which was
+  // enqueued first. Live-reproduced 2026-08-08: a session's turn-start "Click Details" lifecycle
+  // notice (P1) and its own `reply` (also P1) landed in the wrong order in the topic even though
+  // the notice was scheduled first. These tests use a slow-then-fast pair to prove ordering is now
+  // enforced by *awaiting* each send, not merely by dequeue order (a fast-then-slow pair would pass
+  // even under the old, broken behaviour by coincidence).
+  describe("same-lane ordering (0.101.0 - awaited, not just dequeued, in order)", () => {
+    test("a P1 send that resolves slowly still lands before a P1 send enqueued after it, even though the second one would resolve first if fired concurrently", async () => {
+      const clock = makeClock(0);
+      const governor = new RateGovernor({ capacity: 20, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+      const order: string[] = [];
+
+      // "slow" resolves after several microtask hops (stands in for a details-button send whose
+      // HTTP round trip happens to take longer); "fast" resolves immediately (stands in for the
+      // reply that races it). Enqueued in this order - slow first, fast second - matching the live
+      // details-button-then-reply sequence.
+      governor.schedule("P1", async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+        await Promise.resolve();
+        order.push("slow");
+      });
+      governor.schedule("P1", async () => {
+        order.push("fast");
+      });
+
+      await flushMicrotasks();
+      await flushMicrotasks();
+      await flushMicrotasks();
+
+      // Enqueue order, not resolution-speed order: "fast" never even starts running until "slow"
+      // has fully settled.
+      expect(order).toEqual(["slow", "fast"]);
+    });
+
+    test("P0 still preempts a not-yet-started P1 even when a slow P1 is already enqueued first", async () => {
+      const clock = makeClock(0);
+      const governor = new RateGovernor({ capacity: 20, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+      const order: string[] = [];
+
+      governor.schedule("P1", async () => {
+        await Promise.resolve();
+        order.push("P1");
+      });
+      governor.schedule("P0", async () => {
+        order.push("P0");
+      });
+
+      await flushMicrotasks();
+      await flushMicrotasks();
+
+      // P0 always drains ahead of P1 (§5.4) - this still holds even though the P1 task was enqueued
+      // (and its token taken) first, because the P0/P1 priority check happens on every loop
+      // iteration, not just once up front.
+      expect(order).toEqual(["P0", "P1"]);
+    });
+
+    test("two concurrent drainControl triggers (enqueue during an in-flight send) do not double-run a task", async () => {
+      const clock = makeClock(0);
+      const governor = new RateGovernor({ capacity: 20, refillIntervalMs: 60_000, now: clock.now, setTimeoutFn: clock.setTimeoutFn });
+      let firstRunCount = 0;
+      let secondRunCount = 0;
+
+      governor.schedule("P1", async () => {
+        firstRunCount += 1;
+        await Promise.resolve();
+        // A second task lands while the first is still awaiting its own send - the microtask this
+        // enqueue arms must not start a second overlapping drain loop.
+        governor.schedule("P1", async () => {
+          secondRunCount += 1;
+        });
+      });
+
+      await flushMicrotasks();
+      await flushMicrotasks();
+      await flushMicrotasks();
+
+      expect(firstRunCount).toBe(1);
+      expect(secondRunCount).toBe(1);
+    });
+  });
 });
 
 describe("clampRetryAfterMs", () => {

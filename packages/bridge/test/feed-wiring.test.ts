@@ -179,6 +179,47 @@ describe("createFeedWiring", () => {
     expect(finalized[0]?.text).toContain("⛔ Denied");
   });
 
+  // 0.101.0: `SessionStore.setSessionId` existed and was unit-tested in isolation, but nothing in
+  // production ever called it - `handleHookEvent` is the only place a live `session_id` from
+  // Claude Code ever reaches the Bridge. Live-observed 2026-08-08: every session's `row.sessionId`
+  // stayed permanently null, so `claude --resume <id>` (session-supervisor.ts) always found nothing
+  // to resume, killing the session on every Bridge restart with "no session id was recorded yet"
+  // instead of actually resuming it.
+  test("handleHookEvent persists session_id from a SessionStart hook", () => {
+    const { feedWiring, sessionStore } = setup();
+    sessionStore.insert(row({ sessionId: null }));
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "SessionStart", session_id: "claude-sess-abc" }));
+
+    expect(sessionStore.get("fix-bug")?.sessionId).toBe("claude-sess-abc");
+  });
+
+  test("handleHookEvent re-recording the same session_id on a resumed SessionStart is a harmless no-op", () => {
+    const { feedWiring, sessionStore } = setup();
+    sessionStore.insert(row({ sessionId: "claude-sess-abc" }));
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "SessionStart", session_id: "claude-sess-abc" }));
+
+    expect(sessionStore.get("fix-bug")?.sessionId).toBe("claude-sess-abc");
+  });
+
+  test("handleHookEvent does not persist session_id for an unknown slug", () => {
+    const { feedWiring, sessionStore } = setup();
+    // No insert() - "fix-bug" is not a tracked session.
+
+    expect(() => feedWiring.handleHookEvent(hookMsg({ hook_event_name: "SessionStart", session_id: "claude-sess-abc" }))).not.toThrow();
+    expect(sessionStore.get("fix-bug")).toBeUndefined();
+  });
+
+  test("handleHookEvent ignores session_id on hook events other than SessionStart", () => {
+    const { feedWiring, sessionStore } = setup();
+    sessionStore.insert(row({ sessionId: "sess-1" }));
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit", session_id: "some-other-id" }));
+
+    expect(sessionStore.get("fix-bug")?.sessionId).toBe("sess-1");
+  });
+
   test("handleHookEvent does nothing extra when no pending permission matches", () => {
     const { feedWiring, sessionStore, verdicts, finalized } = setup();
     sessionStore.insert(row());

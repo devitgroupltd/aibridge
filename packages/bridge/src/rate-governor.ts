@@ -138,6 +138,9 @@ export class RateGovernor {
   private readonly now: () => number;
   private p2DroppedCount = 0;
   private drainRetryTimerArmed = false;
+  /** Guards `drainControl` against running twice concurrently (0.101.0) - see that method's own
+   * doc comment for what running twice used to cost. */
+  private draining = false;
   /** Rolling window of recent P2 outcomes, pruned to the last 60s on every read/write - backs
    * `p2PressureExceeded()` (§5.4 point 4: "if P2 drops exceed 50% over a 60s window"). */
   private readonly p2Outcomes: Array<{ atMs: number; dropped: boolean }> = [];
@@ -290,21 +293,47 @@ export class RateGovernor {
     );
   }
 
-  private drainControl(): void {
-    for (;;) {
-      const task = this.p0Queue[0] ?? this.p1Queue[0];
-      if (!task) return;
-      if (!this.controlBucket.tryTake()) {
-        // The bucket is empty (or paused) but work is still queued - nothing else is guaranteed to
-        // come along and re-drain it, so own the retry. Without this, a burst that exhausts the
-        // 20/min budget leaves the overflow parked until the operator happens to trigger another
-        // send: buttons keep spinning on the phone even though tokens refilled seconds later.
-        this.armDrainRetry();
-        return;
+  /** Drained one task at a time, awaiting each one's actual Telegram send before starting the
+   * next - not just dequeuing in FIFO order and firing every affordable task's HTTP call at once.
+   *
+   * 0.101.0: it used to be the latter (`void this.runControlTask(task)` inside this same loop,
+   * never awaited), which kept strict *dequeue* order but not strict *delivery* order - two P1
+   * sends dequeued back-to-back (e.g. a turn-start "Click Details" lifecycle notice, then a
+   * `reply`) each fired their own `fetch` and raced each other over the network, so whichever HTTP
+   * response actually reached Telegram first decided the messages' visible order, not which was
+   * dequeued first. Live-reproduced 2026-08-08: a reply sent within the same tick as a lifecycle
+   * notice landed ahead of it in the topic even though the notice was enqueued (and dequeued)
+   * first - the same "reply appears out of order" symptom 0.97.0 already fixed for the P2-vs-P1
+   * boundary, just one lane over. Awaiting each send before starting the next is the same "await
+   * every send before issuing the next" discipline `scheduleP2Async`'s own doc comment already
+   * cites - now applied within a lane, not just across the P1/P2 boundary.
+   *
+   * `draining` guards against two overlapping loops (one already awaiting a send, a second started
+   * by a fresh `enqueueControl` or `armDrainRetry` wake landing mid-await) - re-entering would
+   * reintroduce the exact concurrent-send race this method exists to remove. A task enqueued while
+   * a loop is already running doesn't need a second loop anyway: this `for` re-reads the queue
+   * fronts every iteration, so the running loop picks it up itself. */
+  private async drainControl(): Promise<void> {
+    if (this.draining) return;
+    this.draining = true;
+    try {
+      for (;;) {
+        const task = this.p0Queue[0] ?? this.p1Queue[0];
+        if (!task) return;
+        if (!this.controlBucket.tryTake()) {
+          // The bucket is empty (or paused) but work is still queued - nothing else is guaranteed to
+          // come along and re-drain it, so own the retry. Without this, a burst that exhausts the
+          // 20/min budget leaves the overflow parked until the operator happens to trigger another
+          // send: buttons keep spinning on the phone even though tokens refilled seconds later.
+          this.armDrainRetry();
+          return;
+        }
+        if (this.p0Queue[0] === task) this.p0Queue.shift();
+        else this.p1Queue.shift();
+        await this.runControlTask(task);
       }
-      if (this.p0Queue[0] === task) this.p0Queue.shift();
-      else this.p1Queue.shift();
-      void this.runControlTask(task);
+    } finally {
+      this.draining = false;
     }
   }
 
