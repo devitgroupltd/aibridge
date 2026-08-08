@@ -4,11 +4,10 @@ import http from "node:http";
 import path from "node:path";
 import type * as pty from "node-pty";
 import { resolveAskCallback, renderAskAnsweredCard, renderAskCancelledCard } from "./ask-callback.ts";
-import { ABOUT_TOPICS, buildAboutKeyboard, isAboutCommand, renderAbout, resolveAboutCallback } from "./about.ts";
+import { ABOUT_TOPICS, isAboutCommand, resolveAboutCallback } from "./about.ts";
 import { buildRunArgs } from "./autostart.ts";
 import {
   buildCmdShimText,
-  buildCommandKeyboard,
   buildSkillShimText,
   isBuiltinPassthroughCommand,
   listRepoCommands,
@@ -37,8 +36,7 @@ import {
   renderHitsText,
   resolveBrowseCallback,
 } from "./browse-nav.ts";
-import { listDirectory, MAX_SEND_BYTES, prepareFileForSend, readForPreview, resolveGithubLink, searchWorktree } from "./worktree-fs.ts";
-import { buildDiffReview } from "./diff-review.ts";
+import { listDirectory, MAX_SEND_BYTES, prepareFileForSend, readForPreview, resolveGithubLink } from "./worktree-fs.ts";
 import { FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import { resolveStaleConfirmCallback, StaleConfirmRegistry } from "./stale-confirm.ts";
 import { resolveVoiceConfirmCallback, VoiceConfirmRegistry } from "./voice-confirm.ts";
@@ -57,7 +55,6 @@ import {
   parseCommandsQuery,
   parseFleetCommand,
   parseSkillsQuery,
-  renderHelp,
   stripBotMention,
 } from "./fleet-commands.ts";
 import { renderDetails, renderDetailsPlainText } from "./feed-renderer.ts";
@@ -121,6 +118,7 @@ import { createDeployLifecycleCommands, createProcessRunner } from "./deploy-lif
 import { createVoiceModeCommands } from "./voice-mode-commands.ts";
 import { createConfirmSessionCommand, createFleetConfirmFlow, createStopIndicatorsForTopic } from "./fleet-confirm-flow.ts";
 import type { FleetConfirmFlow } from "./fleet-confirm-flow.ts";
+import { createCardSenders } from "./card-senders.ts";
 
 // §7.2's Task Scheduler stdout/stderr gap (logger.ts's own doc comment has the full story): a
 // launch that predates `main()` itself getting to run - a bad env file, a throw during module
@@ -392,6 +390,18 @@ async function main(): Promise<void> {
   // above, entries here are non-consuming (a folder's Prev/Next can be tapped repeatedly) and never
   // store a messageId - a tap edits whichever message it came from, read straight off the callback.
   const browseRegistry = new BrowseRegistry();
+
+  // card-senders.ts: /about, /help, /commands, /skills, /browse, /find, /diff - thin wrappers
+  // around already-tested renderers, each reached by both an exact-syntax command and its
+  // NL-matched equivalent (nl-router.ts).
+  const cardSenders = createCardSenders({
+    controlBot,
+    confirmSessionCommand,
+    browseRegistry,
+    supergroupChatId: config.supergroupChatId,
+    log,
+  });
+
   const voiceServer = config.voice.enabled ? startWhisperServer(config.voice, log) : null;
 
   // Two independent, cheap "Claude is working on this" signals, kept side by side rather than
@@ -855,106 +865,6 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  /** `/about`'s exact-syntax and NL-matched (`kind: "about"`, nl-router.ts) paths both call this -
-   * extracted so there's one place to keep in sync. */
-  function sendAboutCard(threadId: number | undefined): void {
-    controlBot
-      .sendMessage(config.supergroupChatId, threadId, renderAbout(), { inline_keyboard: buildAboutKeyboard() })
-      .catch((err) => log("WARN", `sendMessage (/about) failed: ${(err as Error).message}`));
-  }
-
-  /** `/help`'s exact-syntax and NL-matched (`kind: "help"`, nl-router.ts) paths both call this. */
-  function sendHelpCard(threadId: number | undefined, route: ReturnType<typeof routing.getByTopicId>): void {
-    const repoCommands = route ? listRepoCommands(route.worktreePath) : [];
-    const repoSkills = route ? listRepoSkills(route.worktreePath) : [];
-    controlBot
-      .sendMessage(config.supergroupChatId, threadId, renderHelp(), { inline_keyboard: buildCommandKeyboard(repoCommands, repoSkills) })
-      .catch((err) => log("WARN", `sendMessage (command list) failed: ${(err as Error).message}`));
-  }
-
-  /** `/commands [<term>]`'s exact-syntax and NL-matched (`kind: "commands"`, nl-router.ts) paths
-   * both call this - session-scoped only (no worktree to read commands from without a `route`). */
-  function sendCommandsListCard(threadId: number | undefined, route: ReturnType<typeof routing.getByTopicId>, term: string): void {
-    const text = route
-      ? renderCommandsListText(listRepoCommands(route.worktreePath), term)
-      : "Repo commands are session-scoped - send /commands inside a session's own topic.";
-    controlBot.sendMessage(config.supergroupChatId, threadId, text).catch((err) => log("WARN", `sendMessage (/commands) failed: ${(err as Error).message}`));
-  }
-
-  /** `/skills [<term>]`'s exact-syntax and NL-matched (`kind: "skills"`, nl-router.ts) paths both
-   * call this - same session-scoping as `sendCommandsListCard`. */
-  function sendSkillsListCard(threadId: number | undefined, route: ReturnType<typeof routing.getByTopicId>, term: string): void {
-    const text = route
-      ? renderSkillsListText(listRepoSkills(route.worktreePath), term)
-      : "Repo skills are session-scoped - send /skills inside a session's own topic.";
-    controlBot.sendMessage(config.supergroupChatId, threadId, text).catch((err) => log("WARN", `sendMessage (/skills) failed: ${(err as Error).message}`));
-  }
-
-  /** `/browse [<path>]` - session-scoped only, same as `sendCommandsListCard`. An invalid/escaping
-   * `path` argument (worktree-fs.ts's `resolveWorktreeRelPath` rejects it) is reported, not silently
-   * clamped to the root. */
-  function sendBrowseCard(threadId: number | undefined, route: ReturnType<typeof routing.getByTopicId>, requestedPath: string): void {
-    if (!route) {
-      confirmSessionCommand(threadId, "File browsing is session-scoped - send /browse inside a session's own topic.");
-      return;
-    }
-    const listing = listDirectory(route.worktreePath, requestedPath);
-    if (!listing) {
-      confirmSessionCommand(threadId, `Can't browse "${requestedPath || "/"}" - it doesn't exist, or is outside this session's worktree.`);
-      return;
-    }
-    controlBot
-      .sendMessage(config.supergroupChatId, threadId, renderDirText(listing), { inline_keyboard: buildDirKeyboard(browseRegistry, route.slug, listing) })
-      .catch((err) => log("WARN", `sendMessage (/browse) failed: ${(err as Error).message}`));
-  }
-
-  /** `/find <query>` - session-scoped only. The hit set is a snapshot taken now, stored once in
-   * `browseRegistry` (kind "hitset") and paged from that snapshot rather than re-searched per page -
-   * see browse-nav.ts's own doc comment on `buildHitsKeyboard` for why. */
-  function sendFindCard(threadId: number | undefined, route: ReturnType<typeof routing.getByTopicId>, query: string): void {
-    if (!route) {
-      confirmSessionCommand(threadId, "File search is session-scoped - send /find inside a session's own topic.");
-      return;
-    }
-    const result = searchWorktree(route.worktreePath, query);
-    const hitsetId = browseRegistry.add(route.slug, { kind: "hitset", query, ...result });
-    controlBot
-      .sendMessage(config.supergroupChatId, threadId, renderHitsText(query, result, 0), {
-        inline_keyboard: buildHitsKeyboard(browseRegistry, route.slug, hitsetId, result.hits, 0),
-      })
-      .catch((err) => log("WARN", `sendMessage (/find) failed: ${(err as Error).message}`));
-  }
-
-  /** `/diff` - session-scoped only. Pushes the session's pending (uncommitted) changes to a
-   * throwaway GitHub branch and replies with a compare-view link (diff-review.ts), or a scrubbed
-   * `.diff` document when there's no GitHub remote or the push itself fails - see that module's own
-   * doc comment for the full design. */
-  function sendDiffCard(threadId: number | undefined, route: ReturnType<typeof routing.getByTopicId>): void {
-    if (!route) {
-      confirmSessionCommand(threadId, "Diff review is session-scoped - send /diff inside a session's own topic.");
-      return;
-    }
-    const review = buildDiffReview(route.worktreePath, route.slug);
-    const untrackedNote = review.untrackedFiles.length > 0 ? ` ${review.untrackedFiles.length} new file(s) not shown - /browse to view: ${review.untrackedFiles.join(", ")}` : "";
-    if (review.kind === "empty") {
-      confirmSessionCommand(threadId, review.untrackedFiles.length > 0 ? `No tracked changes.${untrackedNote}` : "No pending changes.");
-      return;
-    }
-    if (review.kind === "link" && review.url) {
-      controlBot
-        .sendMessage(config.supergroupChatId, threadId, `${review.filesChanged} file(s) changed.${untrackedNote}`, {
-          inline_keyboard: [[{ text: "Open diff on GitHub", url: review.url }]],
-        })
-        .catch((err) => log("WARN", `sendMessage (/diff) failed: ${(err as Error).message}`));
-      return;
-    }
-    if (review.kind === "document" && review.diffText !== undefined && controlBot.sendDocumentFile) {
-      controlBot
-        .sendDocumentFile(config.supergroupChatId, threadId, `${route.slug}.diff`, new TextEncoder().encode(review.diffText), `${review.filesChanged} file(s) changed.${untrackedNote}`)
-        .catch((err) => log("WARN", `sendDocumentFile (/diff) failed: ${(err as Error).message}`));
-    }
-  }
-
   /** Short human-readable label for an NL-matched command's confirm card and its finalize message
    * - not exhaustive-per-field (e.g. `/new`'s prompt text isn't echoed back), just enough for the
    * operator to recognise what they're about to approve. */
@@ -991,19 +901,19 @@ async function main(): Promise<void> {
     currentSlug: string | undefined,
   ): void {
     if (command.kind === "help") {
-      sendHelpCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined);
+      cardSenders.sendHelpCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined);
       return;
     }
     if (command.kind === "about") {
-      sendAboutCard(threadId);
+      cardSenders.sendAboutCard(threadId);
       return;
     }
     if (command.kind === "commands") {
-      sendCommandsListCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.term);
+      cardSenders.sendCommandsListCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.term);
       return;
     }
     if (command.kind === "skills") {
-      sendSkillsListCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.term);
+      cardSenders.sendSkillsListCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.term);
       return;
     }
     if (command.kind === "builtin") {
@@ -1011,15 +921,15 @@ async function main(): Promise<void> {
       return;
     }
     if (command.kind === "browse") {
-      sendBrowseCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.path);
+      cardSenders.sendBrowseCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.path);
       return;
     }
     if (command.kind === "find") {
-      sendFindCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.query);
+      cardSenders.sendFindCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.query);
       return;
     }
     if (command.kind === "diff") {
-      sendDiffCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined);
+      cardSenders.sendDiffCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined);
       return;
     }
     if (command.kind === "model" || command.kind === "mode" || command.kind === "effort") {
@@ -1274,7 +1184,7 @@ async function main(): Promise<void> {
     // the on-ramp `/help` deliberately isn't; works from either the control topic or a session's
     // own topic, same as /help.
     if (isAboutCommand(text)) {
-      sendAboutCard(threadId);
+      cardSenders.sendAboutCard(threadId);
       return;
     }
 
@@ -1282,7 +1192,7 @@ async function main(): Promise<void> {
     // session topic it's plausible real content meant for Claude (e.g. "?" as a shorthand
     // question), so only the unambiguous slash forms are recognised there.
     if (isHelpCommand(text, isControl)) {
-      sendHelpCard(threadId, route);
+      cardSenders.sendHelpCard(threadId, route);
       return;
     }
 
@@ -1306,12 +1216,12 @@ async function main(): Promise<void> {
         ptyIo.sendChannelText(route.slug, route.topicId, buildCmdShimText(asInvocation.name, asInvocation.args), String(messageId), from);
         return;
       }
-      sendCommandsListCard(threadId, route, commandsQuery.term);
+      cardSenders.sendCommandsListCard(threadId, route, commandsQuery.term);
       return;
     }
     const skillsQuery = parseSkillsQuery(text);
     if (skillsQuery) {
-      sendSkillsListCard(threadId, route, skillsQuery.term);
+      cardSenders.sendSkillsListCard(threadId, route, skillsQuery.term);
       return;
     }
 
@@ -1321,16 +1231,16 @@ async function main(): Promise<void> {
     // own doc comment for why it carries its own independent path-containment logic.
     const browseCmd = parseBrowseCommand(text);
     if (browseCmd) {
-      sendBrowseCard(threadId, route, browseCmd.path);
+      cardSenders.sendBrowseCard(threadId, route, browseCmd.path);
       return;
     }
     const findCmd = parseFindCommand(text);
     if (findCmd) {
-      sendFindCard(threadId, route, findCmd.query);
+      cardSenders.sendFindCard(threadId, route, findCmd.query);
       return;
     }
     if (parseDiffCommand(text)) {
-      sendDiffCard(threadId, route);
+      cardSenders.sendDiffCard(threadId, route);
       return;
     }
 
