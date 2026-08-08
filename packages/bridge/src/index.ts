@@ -1800,6 +1800,29 @@ async function main(): Promise<void> {
     await finalizeFleetConfirmMessage(pending, rows.length === 0 ? "Nothing left to act on." : `${verb} ${rows.length} session${rows.length === 1 ? "" : "s"}: ${rows.map((r) => r.slug).join(", ")}${note}`);
   }
 
+  /** `/kill --all --force`/`/rm --all --force` (operator-requested 2026-08-08): the same teardown
+   * `executeFleetConfirm` runs after a button tap, just triggered on the same message instead of
+   * behind a posted Yes/No card - the operator has already decided and doesn't want to round-trip a
+   * tap. Posts the same summary text a tapped card would have finalized to, just as a plain reply
+   * since there's no card here to finalize. */
+  async function executeFleetActionDirect(kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[]): Promise<void> {
+    if (targets.length === 0) {
+      confirmSessionCommand(topicId, kind === "kill" ? "No live sessions to kill." : "No sessions to remove.");
+      return;
+    }
+    let allTopicsDeleted = true;
+    for (const row of targets) {
+      if (kind === "kill") {
+        await killSessionRow(row);
+      } else if (!(await removeSessionRow(row))) {
+        allTopicsDeleted = false;
+      }
+    }
+    const verb = kind === "kill" ? "Killed" : "Removed";
+    const note = kind === "rm" && !allTopicsDeleted ? ORPHAN_TOPIC_NOTE : "";
+    confirmSessionCommand(topicId, `${verb} ${targets.length} session${targets.length === 1 ? "" : "s"}: ${targets.map((r) => r.slug).join(", ")}${note}`);
+  }
+
   async function handleKillCommand(cmd: Extract<FleetCommand, { kind: "kill" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
     if (cmd.all) {
       // Excludes config.selfCheck.slug the same way runStartupReconciliation already does (index.ts's
@@ -1808,6 +1831,10 @@ async function main(): Promise<void> {
       // operator-created session with its own discoverable Telegram topic, so a blanket "kill
       // everything" must not sweep it in.
       const targets = sessionStore.all().filter((r) => r.state !== "dead" && r.slug !== config.selfCheck.slug);
+      if (cmd.force) {
+        await executeFleetActionDirect("kill", topicId, targets);
+        return;
+      }
       await postFleetConfirm("kill", topicId, targets, `Kill ${targets.length} live session${targets.length === 1 ? "" : "s"}?`);
       return;
     }
@@ -1879,6 +1906,10 @@ async function main(): Promise<void> {
       // deleteForumTopic against a hardcoded SELF_CHECK_TOPIC_ID that was never actually created via
       // createForumTopic in the first place.
       const targets = sessionStore.all().filter((r) => r.slug !== config.selfCheck.slug);
+      if (cmd.force) {
+        await executeFleetActionDirect("rm", topicId, targets);
+        return;
+      }
       await postFleetConfirm("rm", topicId, targets, `Remove ALL ${targets.length} session${targets.length === 1 ? "" : "s"} - worktrees and topics deleted, live ones killed first?`);
       return;
     }

@@ -24,8 +24,8 @@ export type RmBulkFilter = { mode: "dead" } | { mode: "prefix"; prefix: string }
 export type FleetCommand =
   | { kind: "new"; repo: string; prompt: string; model?: Model; sourceText?: string }
   | { kind: "ls" }
-  | { kind: "kill"; slug?: string; all?: boolean }
-  | { kind: "rm"; slug?: string; bulk?: RmBulkFilter }
+  | { kind: "kill"; slug?: string; all?: boolean; force?: boolean }
+  | { kind: "rm"; slug?: string; bulk?: RmBulkFilter; force?: boolean }
   | { kind: "attach"; slug?: string }
   | { kind: "pause"; slug?: string }
   | { kind: "usage"; slug?: string }
@@ -56,7 +56,7 @@ const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
  * phone keyboard is its own small tax) is recognised the same way everywhere, rather than only for
  * whichever command happened to get a bug report first.
  */
-const KNOWN_FLAG_WORDS = ["all", "dead", "prefix", "base", "model", ...MODELS] as const;
+const KNOWN_FLAG_WORDS = ["all", "dead", "prefix", "base", "model", "force", ...MODELS] as const;
 
 /** Matches a *single* leading hyphen immediately before one of `KNOWN_FLAG_WORDS`, but not a second
  * hyphen of an already-double-dash flag (the `(?<!-)` lookbehind) and not a longer word that merely
@@ -77,9 +77,19 @@ const SINGLE_DASH_FLAG_RE = new RegExp(`(?<!-)-(${KNOWN_FLAG_WORDS.join("|")})(?
  * same idea as the dash-character fix above - a keyboard that dropped one hyphen shouldn't produce
  * a different, unhelpful error (or worse, get parsed as a slug named "-all") instead of the command
  * that was obviously meant.
+ *
+ * `-f` is a second, separate alias straight to `--force` (operator-requested 2026-08-08, alongside
+ * `-force`/`--force` - see `parseKill`/`parseRm`'s force handling below) rather than going through
+ * `KNOWN_FLAG_WORDS`: that mechanism replaces a matched word with itself (`-all` -> `--all`), which
+ * would turn `-f` into the non-existent `--f`, not `--force`. Kept as its own trailing replace so
+ * it never fires on the `-f` inside an already-double-dashed `--force` (the `(?<!-)` lookbehind
+ * rejects a hyphen with another hyphen right before it).
  */
 export function normalizeDashFlags(text: string): string {
-  return text.replace(/[‒–—]/g, "--").replace(SINGLE_DASH_FLAG_RE, "--$1");
+  return text
+    .replace(/[‒–—]/g, "--")
+    .replace(SINGLE_DASH_FLAG_RE, "--$1")
+    .replace(/(?<!-)-f(?![a-zA-Z])/g, "--force");
 }
 
 /** `/new [--opus|--haiku|--fable|--sonnet] <repo> <prompt...>` - the flag, if present, must come
@@ -160,21 +170,41 @@ function parseVerbose(rest: string): FleetCommand | null {
 }
 
 /** `/kill --all` requests fleet-confirm-gated (`index.ts`, fleet-confirm.ts) termination of every
- * live session. Anything else falls through to the ordinary single-slug form. */
+ * live session. Anything else falls through to the ordinary single-slug form.
+ *
+ * `--force` (operator-requested 2026-08-08, alongside its `-force`/`-f` aliases normalised above)
+ * skips that Yes/No card and has `index.ts` tear everything down on the same message instead - the
+ * escape hatch for an operator who's already decided and doesn't want to round-trip a button tap.
+ * Deliberately narrow: it's only recognised alongside `--all`, the one form that shows a card at
+ * all - a bare `/kill <slug>` already executes immediately with no confirmation to skip (§4.2), so
+ * `force` on that path would be a no-op flag with nothing to explain what it did. */
 function parseKill(rest: string): FleetCommand {
-  const trimmed = rest.trim();
-  if (trimmed === "--all") return { kind: "kill", all: true };
+  const tokens = rest.trim().split(/\s+/).filter((t) => t.length > 0);
+  const force = tokens.includes("--force");
+  const withoutForce = tokens.filter((t) => t !== "--force");
+  if (withoutForce.length === 1 && withoutForce[0] === "--all") {
+    return force ? { kind: "kill", all: true, force: true } : { kind: "kill", all: true };
+  }
+  const trimmed = withoutForce.join(" ");
   return { kind: "kill", slug: trimmed.length > 0 ? trimmed : undefined };
 }
 
 /** `/rm --dead` removes every `dead`-state row; `/rm --prefix <text>` removes every `dead`-state
  * row whose slug starts with `<text>` (still `dead`-only, for the same reason `--dead` is - see
  * `RmBulkFilter`'s own note); `/rm --all` requests fleet-confirm-gated removal of every session
- * regardless of state. Anything else falls through to the ordinary single-slug form. */
+ * regardless of state. Anything else falls through to the ordinary single-slug form.
+ *
+ * `--force` is `parseKill`'s same escape hatch, scoped the same way: only meaningful alongside
+ * `--all`, since that's the only `/rm` form that posts a confirm card - `--dead`/`--prefix` already
+ * execute immediately (never touch a live session, so there was never anything to confirm), and a
+ * bare `/rm <slug>` does too. A stray `--force` on any of those is harmlessly stripped rather than
+ * rejected, same tolerance the dash-normalisation above already extends to typos. */
 function parseRm(rest: string): FleetCommand {
-  const trimmed = rest.trim();
+  const tokens = rest.trim().split(/\s+/).filter((t) => t.length > 0);
+  const force = tokens.includes("--force");
+  const trimmed = tokens.filter((t) => t !== "--force").join(" ");
   if (trimmed === "--dead") return { kind: "rm", bulk: { mode: "dead" } };
-  if (trimmed === "--all") return { kind: "rm", bulk: { mode: "all" } };
+  if (trimmed === "--all") return force ? { kind: "rm", bulk: { mode: "all" }, force: true } : { kind: "rm", bulk: { mode: "all" } };
   const prefixMatch = trimmed.match(/^--prefix\s+(\S+)$/);
   if (prefixMatch?.[1]) return { kind: "rm", bulk: { mode: "prefix", prefix: prefixMatch[1] } };
   return { kind: "rm", slug: trimmed.length > 0 ? trimmed : undefined };
@@ -627,8 +657,9 @@ export function renderHelp(): string {
     "  /about - what this bot can do, with examples (start here if you're new)",
     "  /new [--model] <repo> <prompt> - start a new session",
     "  /ls - list sessions, with what's running/waiting on each",
-    "  /kill [<slug>|--all] - stop a session (or all, confirm-gated)",
-    "  /rm [<slug>|--dead|--prefix <text>|--all] - remove a dead session row",
+    "  /kill [<slug>|--all [--force]] - stop a session (or all, confirm-gated unless --force)",
+    "  /rm [<slug>|--dead|--prefix <text>|--all [--force]] - remove a dead session row (--all is",
+    "    confirm-gated unless --force)",
     "  /rm (bare, inside a topic with no tracked session) - offers to delete that orphaned Telegram topic itself, confirm-gated",
     "  /attach [<slug>] - show a session's PTY tail",
     "  /pause [<slug>] - pause a session",
@@ -704,8 +735,8 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "about", description: "What this bot can do, with examples" },
     { command: "new", description: "Start a new session: /new [--model] <repo> <prompt>" },
     { command: "ls", description: "List sessions, with what's running/waiting on each" },
-    { command: "kill", description: "Stop a session: /kill [<slug>|--all]" },
-    { command: "rm", description: "Remove a dead session row: /rm [<slug>|--dead|--prefix <text>|--all]" },
+    { command: "kill", description: "Stop a session: /kill [<slug>|--all [--force]]" },
+    { command: "rm", description: "Remove a dead session row: /rm [<slug>|--dead|--prefix <text>|--all [--force]]" },
     { command: "attach", description: "Show a session's PTY tail" },
     { command: "pause", description: "Pause a session" },
     { command: "usage", description: "Token/cost usage" },

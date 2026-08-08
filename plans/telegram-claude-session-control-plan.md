@@ -1,7 +1,7 @@
 ---
-version: 0.100.1
+version: 0.101.0
 status: solid
-last_modified_utc: 2026-08-08T06:10:00Z
+last_modified_utc: 2026-08-08T06:30:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,27 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.101.0 (2026-08-08): operator asked for a way to skip `/kill --all`/`/rm --all`'s Yes/No
+    confirm card entirely - typing `/rm --all --force` (or its `-force`/`-f` aliases, normalized
+    the same way `-all` already is) instead of tapping a button. This is the reverse of 0.29.0's
+    own explicit-direction call to scope confirmation to buttons only, 'rather than a typed
+    `--confirm` flag' - superseded by a later explicit direction from the same operator, not a
+    reconsideration on aibridge's part. Deliberately narrow: `--force` is only meaningful next to
+    `--all`, the one form of each command that posts a card at all - a bare `/kill <slug>`/
+    `/rm <slug>` already executes immediately (§4.2), so `--force` there would be a no-op flag
+    with nothing to explain what it did, and `/rm --dead`/`--prefix` likewise never touch a live
+    session and never confirm. `fleet-commands.ts`'s `parseKill`/`parseRm` gained a `force` field,
+    tokenizing rest-of-line instead of matching it as one literal string (needed once `--force`
+    could appear before or after `--all`); `index.ts` gained `executeFleetActionDirect`, the same
+    per-row teardown loop `executeFleetConfirm` runs after a tap, just posting its summary as a
+    plain reply since there's no card to finalize. 4 new tests
+    (`fleet-commands.test.ts`) covering both flag orders, the `-force`/`-f` aliases, and `--force`
+    being harmlessly stripped on forms that never confirm; 970 total, `tsc --noEmit` clean.
+    Live-verified against the real bot after a restart: spawned a throwaway `say-hello-and-then-stop`
+    haiku session via `/new`, `/kill --all --force` killed it with no confirm card posted (straight
+    to \"Killed 1 session: say-hello-and-then-stop\"), then `/rm --all --force` removed both it and an
+    unrelated pre-existing `dead` row the same way, leaving the excluded self-check `test-session`
+    untouched throughout - `bridge-dev.log` shows no `postFleetConfirm`/warning lines either time."
   - "0.100.1 (2026-08-08): follow-up to 0.100.0 below, prompted by being asked directly whether it
     was covered by tests. `buildCreateArgs` (pure logic) already was; the two `index.ts` wiring
     changes stay untestable in isolation (the same accepted closures-inside-main() gap prior fixes
@@ -3356,8 +3377,8 @@ permission relay and feed renderer are all already scoped to a single Bridge pro
 | `/new [--opus\|--haiku] <repo> <prompt>` | Create worktree, create topic, launch session, send prompt as first message. Sonnet unless overridden |
 | `/ls` | List live sessions: slug, state, worktree, branch, age, last activity, model, session cost and tokens (§5.7). A `working` or `awaiting_input` row gets an extra detail line - the current tool/activity and elapsed turn time for `working` (from `feed-state.ts`'s activity log), or what it's specifically waiting on for `awaiting_input` (the pending permission's tool+preview, the pending question's text, or a generic "reply" if neither registry has an entry) - built as a read-only join over the same sources the session's own turn card already reads, not a new tracked state. Added 2026-08-05 |
 | `/budget` | Rolling 5-hour spend across the fleet, per-session breakdown, and the cap (§10.5) |
-| `/kill <slug>` | SIGTERM the session, close the topic, leave the worktree in place |
-| `/rm <slug>` | As `/kill`, plus remove the worktree and delete the topic |
+| `/kill <slug>` | SIGTERM the session, close the topic, leave the worktree in place. `/kill --all` is confirm-gated (§4.2's fleet-confirm card) unless `--force`/`-force`/`-f` is also given (added 2026-08-08), which skips the card and acts immediately |
+| `/rm <slug>` | As `/kill`, plus remove the worktree and delete the topic. `/rm --all` is confirm-gated the same way and takes the same `--force` escape hatch; `/rm --dead`/`/rm --prefix <text>` never confirm in the first place (dead rows only), so `--force` there is a harmless no-op |
 | `/attach <slug>` | Post the tail of the session's PTY ring buffer, plus the `claude --resume <session_id>` command for local pickup (§2.3) |
 | `/cmd <name> [args]` | Run a repo slash command by proxy. See below: this is a shim, not a passthrough |
 | `/model <sonnet\|opus\|haiku\|fable>` | Switch the current session's model live, mid-conversation. Session-scoped only, same convention as a bare `/kill` (§4.2.1) |

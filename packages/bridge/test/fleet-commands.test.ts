@@ -227,6 +227,26 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/rm --all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
   });
 
+  test("/kill --all --force skips the confirm flow", () => {
+    expect(parseFleetCommand("/kill --all --force")).toEqual({ kind: "kill", all: true, force: true });
+    expect(parseFleetCommand("/kill --force --all")).toEqual({ kind: "kill", all: true, force: true });
+  });
+
+  test("/rm --all --force skips the confirm flow", () => {
+    expect(parseFleetCommand("/rm --all --force")).toEqual({ kind: "rm", bulk: { mode: "all" }, force: true });
+  });
+
+  test("-force and -f are recognised as --force aliases", () => {
+    expect(parseFleetCommand("/kill --all -force")).toEqual({ kind: "kill", all: true, force: true });
+    expect(parseFleetCommand("/kill --all -f")).toEqual({ kind: "kill", all: true, force: true });
+    expect(parseFleetCommand("/rm --all -f")).toEqual({ kind: "rm", bulk: { mode: "all" }, force: true });
+  });
+
+  test("--force with no --all is a no-op flag on the single-slug/bulk forms, stripped rather than rejected", () => {
+    expect(parseFleetCommand("/kill fix-bug --force")).toEqual({ kind: "kill", slug: "fix-bug" });
+    expect(parseFleetCommand("/rm --dead --force")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
+  });
+
   test("a mobile keyboard's autocorrected dash (en/em/figure) in place of -- is normalized before parsing", () => {
     expect(parseFleetCommand("/kill –all")).toEqual({ kind: "kill", all: true });
     expect(parseFleetCommand("/rm —all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
