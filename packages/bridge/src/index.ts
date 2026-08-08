@@ -4,58 +4,28 @@ import http from "node:http";
 import path from "node:path";
 import type * as pty from "node-pty";
 import { resolveAskCallback, renderAskAnsweredCard, renderAskCancelledCard } from "./ask-callback.ts";
-import { ABOUT_TOPICS, isAboutCommand, resolveAboutCallback } from "./about.ts";
+import { ABOUT_TOPICS, resolveAboutCallback } from "./about.ts";
 import { buildRunArgs } from "./autostart.ts";
-import {
-  buildCmdShimText,
-  buildSkillShimText,
-  isBuiltinPassthroughCommand,
-  listRepoCommands,
-  listRepoSkills,
-  parseCmdInvocation,
-  parseSkillInvocation,
-  renderCommandsListText,
-  renderSkillsListText,
-  resolveCommandAction,
-} from "./commands.ts";
+import { listRepoCommands, listRepoSkills, renderCommandsListText, renderSkillsListText, resolveCommandAction } from "./commands.ts";
 import { loadConfig, STATE_DIR } from "./config.ts";
 import { initFileLogging, log } from "./logger.ts";
 import { clearDeployMarker, isDeployMarkerStale, readDeployMarker, rollbackStaleDeploy } from "./deploy.ts";
 import { parseDetailsCallback } from "./details-button.ts";
 import { DetailsAnchorStore, DETAILS_ANCHOR_RETENTION_MS } from "./details-anchor-store.ts";
 import { listAvailableVoiceModels, resolveVoiceModelCallback } from "./voice-model.ts";
-import {
-  BrowseRegistry,
-  buildDirKeyboard,
-  buildFileActionKeyboard,
-  buildHitsKeyboard,
-  parseBrowseCommand,
-  parseDiffCommand,
-  parseFindCommand,
-  renderDirText,
-  renderHitsText,
-  resolveBrowseCallback,
-} from "./browse-nav.ts";
+import { BrowseRegistry, buildDirKeyboard, buildFileActionKeyboard, buildHitsKeyboard, renderDirText, renderHitsText, resolveBrowseCallback } from "./browse-nav.ts";
 import { listDirectory, MAX_SEND_BYTES, prepareFileForSend, readForPreview, resolveGithubLink } from "./worktree-fs.ts";
 import { FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import { resolveStaleConfirmCallback, StaleConfirmRegistry } from "./stale-confirm.ts";
 import { resolveVoiceConfirmCallback, VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { startWhisperServer } from "./voice-transcribe.ts";
 import { NlConfirmRegistry, resolveNlConfirmCallback } from "./nl-confirm.ts";
-import { isRetryPhrase, retryTopicKey, RetryStore } from "./retry-store.ts";
+import { RetryStore } from "./retry-store.ts";
 import { buildContextPrefix } from "./message-context.ts";
 import { ChannelConnectCoordinator } from "./channel-connect-coordinator.ts";
 import type { RouterAction } from "./nl-router.ts";
 import { SettingsStore } from "./settings-store.ts";
-import type { FleetCommand } from "./fleet-commands.ts";
-import {
-  botCommandList,
-  isHelpCommand,
-  parseCommandsQuery,
-  parseFleetCommand,
-  parseSkillsQuery,
-  stripBotMention,
-} from "./fleet-commands.ts";
+import { botCommandList } from "./fleet-commands.ts";
 import { renderDetails, renderDetailsPlainText } from "./feed-renderer.ts";
 import { monotonicNowMs } from "./monotonic-clock.ts";
 import { CostTracker } from "./cost-tracker.ts";
@@ -70,11 +40,6 @@ import { RateGovernor } from "./rate-governor.ts";
 import { deriveAlwaysRule, ruleAlreadyCovered } from "./rule-derivation.ts";
 import { Routing } from "./routing.ts";
 import {
-  buildDefaultEffortKeyboard,
-  buildDefaultModeKeyboard,
-  buildEffortKeyboard,
-  buildModeKeyboard,
-  buildModelKeyboard,
   DEFAULT_EFFORT,
   DEFAULT_MODE,
   EFFORTS,
@@ -84,10 +49,9 @@ import {
   isEffortCancelCallback,
   isModeCancelCallback,
   isModelCancelCallback,
-  isSessionCommandAttempt,
-  MODELS,
+  buildDefaultEffortKeyboard,
+  buildDefaultModeKeyboard,
   MODES,
-  parseSessionCommand,
   resolveDefaultCategoryCallback,
   resolveDefaultEffortCallback,
   resolveDefaultModeCallback,
@@ -95,7 +59,7 @@ import {
   resolveModeCallback,
   resolveModelCallback,
 } from "./session-commands.ts";
-import type { Effort, Mode, Model, SessionCommand } from "./session-commands.ts";
+import type { Effort, Mode, SessionCommand } from "./session-commands.ts";
 import { SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
 import { looksEnglishEnough } from "./language-heuristic.ts";
 import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
@@ -119,6 +83,8 @@ import { createConfirmSessionCommand, createFleetConfirmFlow, createStopIndicato
 import type { FleetConfirmFlow } from "./fleet-confirm-flow.ts";
 import { createCardSenders } from "./card-senders.ts";
 import { createNlDispatch } from "./nl-dispatch.ts";
+import { createCommandDispatch } from "./command-dispatch.ts";
+import type { CommandDispatch } from "./command-dispatch.ts";
 
 // §7.2's Task Scheduler stdout/stderr gap (logger.ts's own doc comment has the full story): a
 // launch that predates `main()` itself getting to run - a bad env file, a throw during module
@@ -365,10 +331,18 @@ async function main(): Promise<void> {
     log,
   });
 
+  // command-dispatch.ts's `dispatchFleetCommand`/`dispatchInboundMessage` are real two-way
+  // dependencies with both `nlDispatch` (below) and `inboundMedia` (right below) - `commandDispatch`
+  // itself isn't constructed until after `sessionLifecycle`/`fleetReporting`/`fleetConfirmFlow`/
+  // `deployLifecycle`/`voiceModeCommands`/`cardSenders`/`feedWiring`/`nlDispatch` all exist. Declared
+  // as a `let` here, before anything that needs to close over it, and assigned once with the real
+  // factory result further down - same "forward reference resolved before it's ever called, never
+  // before it's assigned" pattern as `fleetConfirmFlow` (fleet-confirm-flow.ts, item 11).
+  let commandDispatch: CommandDispatch;
+
   // inbound-media.ts: voice/attachment handling plus the onUpdate plain-message routing entry
-  // point - `dispatchInboundMessage` (declared further down, function-hoisted so the forward
-  // reference here is safe) and `voiceConfirmEnabled` (read live via a getter, not a snapshot,
-  // since `/voiceconfirm` flips it at runtime) are both injected.
+  // point - `dispatchInboundMessage` and `voiceConfirmEnabled` (read live via a getter, not a
+  // snapshot, since `/voiceconfirm` flips it at runtime) are both injected.
   const inboundMedia = createInboundMedia({
     controlBot,
     feedGovernor,
@@ -377,7 +351,8 @@ async function main(): Promise<void> {
     staleConfirmRegistry,
     voiceConfirmRegistry,
     confirmSessionCommand,
-    dispatchInboundMessage,
+    dispatchInboundMessage: (messageId, rawText, threadId, isControl, route, currentSlug, from, contextPrefix) =>
+      commandDispatch.dispatchInboundMessage(messageId, rawText, threadId, isControl, route, currentSlug, from, contextPrefix),
     isControlTopic,
     voiceConfirmEnabled: () => voiceConfirmEnabled,
     voice: config.voice,
@@ -692,9 +667,9 @@ async function main(): Promise<void> {
 
   // nl-dispatch.ts: NL-router matching, the destructive-command confirm gate, and executing a
   // matched command through the exact same handlers a typed command uses.
-  // `dispatchFleetCommand` (command-dispatch.ts, not yet extracted) is a hoisted function
-  // declaration further down this same scope - safe to reference here, same forward-reference
-  // treatment as `dispatchInboundMessage` in inbound-media.ts (item 6).
+  // `commandDispatch` (declared as a `let` above, alongside `inboundMedia`'s own forward reference
+  // to it) isn't assigned until further down - `dispatchFleetCommand` below is a closure over it,
+  // same reasoning as `inboundMedia`'s own `dispatchInboundMessage` option.
   const nlDispatch = createNlDispatch({
     controlBot,
     routing,
@@ -706,7 +681,7 @@ async function main(): Promise<void> {
     applyModeSwitch: voiceModeCommands.applyModeSwitch,
     applyEffortSwitch: voiceModeCommands.applyEffortSwitch,
     nlConfirmRegistry,
-    dispatchFleetCommand,
+    dispatchFleetCommand: (fleetCmd, threadId, isControl, currentSlug) => commandDispatch.dispatchFleetCommand(fleetCmd, threadId, isControl, currentSlug),
     nlRouterConfig: config.nlRouter,
     getNlRouterBackend: () => nlRouterBackend,
     getAssistEnabled: () => assistEnabled,
@@ -889,366 +864,31 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  /**
-   * The exact-syntax `/command` switch, extracted so both a typed `/command` (`parseFleetCommand`,
-   * below) and an NL-matched command (nl-router.ts, wired further down) execute through the exact
-   * same code path - no separate copy to keep in sync. `isControl` mirrors the same two inline
-   * checks (`/new`, `/budget`) `dispatchInboundMessage` always ran; an NL match can never produce
-   * either kind outside the control topic anyway (`nl-router.ts`'s `allowedKinds`), but the check
-   * stays here too as defense in depth rather than trusting that filtering happened upstream.
-   */
-  function dispatchFleetCommand(fleetCmd: FleetCommand, threadId: number | undefined, isControl: boolean, currentSlug: string | undefined): void {
-    if (fleetCmd.kind === "new") {
-      if (!isControl) {
-        confirmSessionCommand(threadId, "/new only works from the control topic.");
-        return;
-      }
-      void sessionLifecycle.handleNewCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "ls") {
-      sessionLifecycle.handleLsCommand(threadId);
-      return;
-    }
-    if (fleetCmd.kind === "budget") {
-      if (!isControl) {
-        confirmSessionCommand(threadId, "/budget only works from the control topic.");
-        return;
-      }
-      fleetReporting.handleBudgetCommand(threadId);
-      return;
-    }
-    if (fleetCmd.kind === "kill") {
-      void sessionLifecycle.handleKillCommand(fleetCmd, threadId, currentSlug);
-      return;
-    }
-    if (fleetCmd.kind === "rm") {
-      void sessionLifecycle.handleRmCommand(fleetCmd, threadId, currentSlug);
-      return;
-    }
-    if (fleetCmd.kind === "attach") {
-      sessionLifecycle.handleAttachCommand(fleetCmd, threadId, currentSlug);
-      return;
-    }
-    if (fleetCmd.kind === "usage") {
-      void fleetConfirmFlow.handleUsageCommand(fleetCmd, threadId, currentSlug);
-      return;
-    }
-    if (fleetCmd.kind === "restart") {
-      void deployLifecycle.handleRestartCommand(threadId);
-      return;
-    }
-    if (fleetCmd.kind === "deploy") {
-      void deployLifecycle.handleDeployCommand(threadId, fleetCmd.slug);
-      return;
-    }
-    if (fleetCmd.kind === "detail") {
-      sessionLifecycle.handleDetailCommand(fleetCmd, threadId, currentSlug);
-      return;
-    }
-    if (fleetCmd.kind === "verbose") {
-      sessionLifecycle.handleVerboseCommand(fleetCmd, threadId, currentSlug);
-      return;
-    }
-    if (fleetCmd.kind === "settings") {
-      fleetReporting.handleSettingsCommand(threadId);
-      return;
-    }
-    if (fleetCmd.kind === "autostart") {
-      void deployLifecycle.handleAutostartCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "repos") {
-      fleetReporting.handleReposCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "voice") {
-      voiceModeCommands.handleVoiceModelCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "assist") {
-      voiceModeCommands.handleAssistCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "router") {
-      voiceModeCommands.handleRouterBackendCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "voiceconfirm") {
-      voiceModeCommands.handleVoiceConfirmCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "default") {
-      if (!isControl) {
-        confirmSessionCommand(threadId, "/default only works from the control topic.");
-        return;
-      }
-      voiceModeCommands.handleDefaultCommand(fleetCmd, threadId);
-      return;
-    }
-    sessionLifecycle.handlePauseCommand(fleetCmd, threadId, currentSlug);
-  }
-
-  /**
-   * The full plain-text/command dispatch that used to sit inline inside `onUpdate` - extracted
-   * (§7.4) so a stale backlog message can be replayed from `staleConfirmRegistry`'s "yes" tap
-   * through the exact same path a live message takes, rather than duplicating or approximating
-   * that logic at the confirm-tap call site. Pure code motion off the live path below: no branch
-   * here changed behaviour, only how the four already-computed values it depends on
-   * (`isControl`/`route`/`currentSlug`/`from`) arrive - as parameters instead of closed-over
-   * `const`s - plus `text` now derives from `rawText` internally instead of being handed in
-   * pre-stripped, so a replay strips a `@botusername` mention the same way a live message would.
-   *
-   * Async since 2026-08-06 (nl-router.ts): the final two fallthrough branches (no session /
-   * forward-to-session) now try the NL router first - a real network/process call - before
-   * falling back to today's immediate behaviour. Every existing caller already calls this
-   * fire-and-forget (`void dispatchInboundMessage(...)` or a bare call inside a non-awaited
-   * context), so returning a `Promise<void>` instead of `void` changes nothing at any call site.
-   */
-  async function dispatchInboundMessage(
-    messageId: number,
-    rawText: string,
-    threadId: number | undefined,
-    isControl: boolean,
-    route: ReturnType<typeof routing.getByTopicId>,
-    currentSlug: string | undefined,
-    from: string,
-    // §5.x (message-context.ts): built once by the caller from the *original* Telegram message's
-    // `forward_origin`/`reply_to_message` (never re-derived from `rawText`, which by this point may
-    // already be a synthesized announcement/transcript with no such fields of its own). Applied only
-    // at the one "this reaches the session" send below - never mixed into `text`/`rawText` itself,
-    // which every `/command` parse in this function still needs byte-identical to what was typed.
-    contextPrefix = "",
-  ): Promise<void> {
-    // Strip a Telegram-inserted "@botusername" before any command parsing below - see
-    // stripBotMention's doc comment for why this has to happen exactly once, here.
-    const text = stripBotMention(rawText.trim());
-
-    // Any message landing in a session's own topic (chat, command, whatever) pushes the feed
-    // card's already-fixed position further up the topic - see feedInterjected's own doc comment
-    // above for why the *next* card flush needs to know this happened.
-    if (route && !isControl) feedWiring.markInterjected(route.slug);
-
-    const fleetCmd = parseFleetCommand(text);
-    if (fleetCmd) {
-      dispatchFleetCommand(fleetCmd, threadId, isControl, currentSlug);
-      return;
-    }
-
-    // `/retry` (retry-store.ts, §4.2, added 2026-08-07): only intercepted when `retryStore` actually
-    // holds something for this topic - so a plain "retry"/"try again" meant for Claude, in a topic
-    // with nothing pending, still falls through to the session untouched instead of being swallowed
-    // on the strength of the phrase alone.
-    if (isRetryPhrase(text)) {
-      const pendingRetry = retryStore.resolve(retryTopicKey(threadId));
-      if (!pendingRetry) {
-        confirmSessionCommand(threadId, "Nothing to retry - no expired confirmation is waiting here.");
-        return;
-      }
-      void nlDispatch.postNlConfirm(pendingRetry.command, pendingRetry.threadId, pendingRetry.currentSlug);
-      return;
-    }
-
-    // `/about`: the friendly capability overview (about.ts) - checked ahead of /help since it's
-    // the on-ramp `/help` deliberately isn't; works from either the control topic or a session's
-    // own topic, same as /help.
-    if (isAboutCommand(text)) {
-      cardSenders.sendAboutCard(threadId);
-      return;
-    }
-
-    // "?" bare (no slash) is only treated as a help request from the control topic - inside a
-    // session topic it's plausible real content meant for Claude (e.g. "?" as a shorthand
-    // question), so only the unambiguous slash forms are recognised there.
-    if (isHelpCommand(text, isControl)) {
-      cardSenders.sendHelpCard(threadId, route);
-      return;
-    }
-
-    // `/commands [<term>]`/`/skills [<term>]` - the per-project, item-count-scoped lists (see
-    // commands.ts's doc comments on `buildCommandKeyboard` for why these replaced per-item
-    // buttons: seowrite, confirmed live 2026-08-04, has 43 repo commands and 66 skills, and a
-    // flat button-per-item keyboard can't scale to that). Session-scoped only - control topic
-    // has no worktree to read commands/skills from.
-    const commandsQuery = parseCommandsQuery(text);
-    if (commandsQuery) {
-      // `/commands <name> [args]` is documented in three places (commands.ts, about.ts, and its own
-      // unit test) as a synonym for `/cmd <name> [args]`, but this list-filter branch matched first
-      // and greedily, so the invocation form was unreachable: `/commands review/pre-push --staged`
-      // answered `No repo commands matched "review/pre-push --staged"` instead of running it. Only a
-      // *real* command name takes the invocation path; anything else is still a list filter, so
-      // `/commands review` keeps working as a search. (The unit test passed throughout because it
-      // exercised the parser in isolation - reachability is a dispatch-order property, not a parser
-      // one.)
-      const asInvocation = commandsQuery.term ? parseCmdInvocation(`/cmd ${commandsQuery.term}`) : null;
-      if (route && asInvocation && listRepoCommands(route.worktreePath).includes(asInvocation.name)) {
-        ptyIo.sendChannelText(route.slug, route.topicId, buildCmdShimText(asInvocation.name, asInvocation.args), String(messageId), from);
-        return;
-      }
-      cardSenders.sendCommandsListCard(threadId, route, commandsQuery.term);
-      return;
-    }
-    const skillsQuery = parseSkillsQuery(text);
-    if (skillsQuery) {
-      cardSenders.sendSkillsListCard(threadId, route, skillsQuery.term);
-      return;
-    }
-
-    // `/browse [<path>]`/`/find <query>` - the Telegram file browser/search (browse-nav.ts,
-    // worktree-fs.ts). Session-scoped only, same reasoning as /commands/skills above: there's no
-    // worktree to browse without a route. Bridge-native, not a Claude tool call - see worktree-fs.ts's
-    // own doc comment for why it carries its own independent path-containment logic.
-    const browseCmd = parseBrowseCommand(text);
-    if (browseCmd) {
-      cardSenders.sendBrowseCard(threadId, route, browseCmd.path);
-      return;
-    }
-    const findCmd = parseFindCommand(text);
-    if (findCmd) {
-      cardSenders.sendFindCard(threadId, route, findCmd.query);
-      return;
-    }
-    if (parseDiffCommand(text)) {
-      cardSenders.sendDiffCard(threadId, route);
-      return;
-    }
-
-    // A bare /model, /mode or /effort (no argument to act on) surfaces a button per option
-    // instead of falling through to the ordinary inbound-message path, where it would just
-    // arrive as plain chat text and get answered conversationally rather than switching
-    // anything (confirmed live for /effort). Each shows the session's current value (✓-marked
-    // button, named in the prompt text) when one is known, and a trailing Cancel button - without
-    // that, the only way to back out was to ignore the card and hope, or send an unrelated message
-    // that just sits below it.
-    const currentModel = currentSlug ? sessionStore.get(currentSlug)?.model : undefined;
-    const bareCommandKeyboards: Record<string, { prompt: string; keyboard: () => ReturnType<typeof buildEffortKeyboard> }> = {
-      "/model": {
-        prompt: currentModel ? `Choose a model (current: ${currentModel}):` : "Choose a model:",
-        keyboard: () => buildModelKeyboard((MODELS as readonly string[]).includes(currentModel ?? "") ? (currentModel as Model) : undefined),
-      },
-      "/mode": {
-        prompt: currentSlug ? `Choose a permission mode (current: ${routing.getMode(currentSlug)}):` : "Choose a permission mode:",
-        keyboard: () => buildModeKeyboard(currentSlug ? routing.getMode(currentSlug) : undefined),
-      },
-      "/effort": {
-        prompt: currentSlug ? `Choose an effort level (current: ${routing.getEffort(currentSlug)}):` : "Choose an effort level:",
-        keyboard: () => buildEffortKeyboard(currentSlug ? routing.getEffort(currentSlug) : undefined),
-      },
-    };
-    const bareCommand = bareCommandKeyboards[text];
-    if (bareCommand) {
-      controlBot
-        .sendMessage(config.supergroupChatId, threadId, bareCommand.prompt, {
-          inline_keyboard: bareCommand.keyboard(),
-        })
-        .catch((err) => log("WARN", `sendMessage (${text} list) failed: ${(err as Error).message}`));
-      return;
-    }
-
-    // §4.2.1/§4.2.2: neither /model nor /mode fires a hook or a reply call, so the Bridge
-    // confirms them itself rather than waiting for an ack that will never arrive. Both are
-    // session-scoped only (§4.2.2) - sent from the control topic they're rejected outright.
-    const attempt = parseSessionCommand(text);
-    if (attempt) {
-      if (!currentSlug || threadId === undefined) {
-        confirmSessionCommand(threadId, "/model, /mode and /effort are session-scoped - send them inside that session's own topic.");
-        return;
-      }
-      if (attempt.kind === "model") {
-        voiceModeCommands.applyModelSwitch(currentSlug, threadId, attempt.model);
-      } else if (attempt.kind === "effort") {
-        voiceModeCommands.applyEffortSwitch(currentSlug, threadId, attempt.effort);
-      } else {
-        voiceModeCommands.applyModeSwitch(currentSlug, threadId, attempt.mode);
-      }
-      return;
-    }
-    if (isSessionCommandAttempt(text)) {
-      confirmSessionCommand(
-        threadId,
-        `Unrecognised /model, /mode or /effort argument. Models: ${MODELS.join(", ")}. Modes: ${MODES.join(", ")}. Effort: ${EFFORTS.join(", ")}.`,
-      );
-      return;
-    }
-
-    const builtinName = text.startsWith("/") ? text.slice(1) : "";
-    if (isBuiltinPassthroughCommand(builtinName)) {
-      if (currentSlug) ptyIo.sendRaw(currentSlug, text);
-      return;
-    }
-
-    // §4.3's "a message to a `dead` row's topic is acknowledged, not silently dropped", for the case
-    // the check further down cannot reach: reconciliation only re-routes non-`dead` rows, so after any
-    // restart a killed session's topic has a row but no route, and `currentSlug` is undefined here.
-    // Answering from the row keeps the contract holding across a restart instead of only before one.
-    if (!currentSlug && !isControl && threadId !== undefined) {
-      const deadRow = sessionStore.getByTopicId(threadId);
-      if (deadRow?.state === "dead") {
-        confirmSessionCommand(threadId, "This session has ended.");
-        return;
-      }
-    }
-
-    if (!currentSlug || threadId === undefined) {
-      // Natural-language routing (nl-router.ts) - only reached once every exact-syntax check
-      // above has already rejected this text. `hasSession: false` narrows the offered commands to
-      // the control-topic-only subset (`/new`/`/budget`); on no match, today's exact behaviour.
-      await nlDispatch.routeOrFallback(text, { isControl, hasSession: false, repoNames: reposRegistry?.names() }, threadId, isControl, undefined, () => {
-        if (isControl) confirmSessionCommand(threadId, "Unrecognised control-topic command. Try /new, /ls or /help.");
-      });
-      return;
-    }
-
-    // §4.3: a message to a topic whose row is `dead` is acknowledged, not queued or silently
-    // dropped - the one case the state table doesn't cover on its own.
-    if (sessionStore.get(currentSlug)?.state === "dead") {
-      confirmSessionCommand(threadId, "This session has ended.");
-      return;
-    }
-
-    // Manual typing equivalent of the old per-item buttons (removed 2026-08-04 - see
-    // commands.ts's `buildCommandKeyboard` doc comment): `/cmd <name>`/`/commands <name>`
-    // invokes a repo command by name, `/<name>` invokes a repo skill by name if - and only if -
-    // `<name>` matches a real skill; anything else falls through untouched rather than treating
-    // every leading "/" as an error, since ordinary chat text can start with "/" too.
-    if (route) {
-      const cmdInvoke = parseCmdInvocation(text);
-      if (cmdInvoke) {
-        if (listRepoCommands(route.worktreePath).includes(cmdInvoke.name)) {
-          ptyIo.sendChannelText(currentSlug, threadId, buildCmdShimText(cmdInvoke.name, cmdInvoke.args), String(messageId), from);
-        } else {
-          confirmSessionCommand(threadId, `No repo command named "${cmdInvoke.name}" in this project. Try /commands to list them.`);
-        }
-        return;
-      }
-      // A bare `/<name>` is checked against both skills and repo commands (in that order) -
-      // `/cmd`/`/commands` stays available as an explicit disambiguator for the rare case a
-      // skill and a command share a name, but for everything else typing `/deep-check` should
-      // just work without the operator needing to know which category it's in.
-      const skillInvoke = parseSkillInvocation(text);
-      if (skillInvoke) {
-        if (listRepoSkills(route.worktreePath).includes(skillInvoke.name)) {
-          ptyIo.sendChannelText(currentSlug, threadId, buildSkillShimText(skillInvoke.name, skillInvoke.args), String(messageId), from);
-          return;
-        }
-        if (listRepoCommands(route.worktreePath).includes(skillInvoke.name)) {
-          ptyIo.sendChannelText(currentSlug, threadId, buildCmdShimText(skillInvoke.name, skillInvoke.args), String(messageId), from);
-          return;
-        }
-      }
-    }
-
-    // Natural-language routing again - this time with a real session to either act on
-    // (`hasSession: true`, so `/model`/`/mode`/`/effort` are also offered) or forward to on no
-    // match, exactly as §10.1.2's note below always did.
-    await nlDispatch.routeOrFallback(text, { isControl, hasSession: true, repoNames: reposRegistry?.names() }, threadId, isControl, currentSlug, () => {
-      // §10.1.2: notifications/claude/channel is confirmed broken upstream (getClientCapabilities()
-      // never negotiates the capability), so inbound delivery writes the same <channel> tag
-      // Claude Code would have rendered itself directly to the session's PTY, exactly as an
-      // operator typing it and pressing Enter would.
-      ptyIo.sendChannelText(currentSlug, threadId, contextPrefix + rawText, String(messageId), from);
-    });
-  }
+  // command-dispatch.ts: the exact-syntax `/command` switch (also reached by an NL-matched command
+  // via `nlDispatch`'s `dispatchFleetCommand` callback below) and the full plain-text/command
+  // dispatch gauntlet for every inbound message. Constructed after `nlDispatch` since
+  // `dispatchInboundMessage` calls `nlDispatch.postNlConfirm`/`routeOrFallback` on its own
+  // fallthrough paths - the reverse of the forward reference `nlDispatch` itself took to
+  // `dispatchFleetCommand` while this module didn't exist yet.
+  commandDispatch = createCommandDispatch({
+    controlBot,
+    routing,
+    ptyIo,
+    sessionStore,
+    confirmSessionCommand,
+    sessionLifecycle,
+    fleetReporting,
+    fleetConfirmFlow,
+    deployLifecycle,
+    voiceModeCommands,
+    cardSenders,
+    feedWiring,
+    retryStore,
+    nlDispatch,
+    getReposRegistry: () => reposRegistry,
+    supergroupChatId: config.supergroupChatId,
+    log,
+  });
 
   const offsetPath = path.join(STATE_DIR, "telegram-offset.json");
   startPolling(controlBot, {
@@ -1517,7 +1157,7 @@ async function main(): Promise<void> {
           void confirmCards.finalizeStaleConfirmMessage(pending, "✅ Confirmed - processing now.");
           const pendingIsControl = isControlTopic(pending.threadId);
           const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
-          void dispatchInboundMessage(pending.messageId, pending.rawText, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin));
+          void commandDispatch.dispatchInboundMessage(pending.messageId, pending.rawText, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin));
           return;
         }
 
@@ -1541,7 +1181,7 @@ async function main(): Promise<void> {
             void confirmCards.finalizeVoiceConfirmMessage(pending, voiceConfirmAction.action === "send_and_stop_asking" ? "✅ Sent (confirmation now off - /voiceconfirm on to re-enable)." : "✅ Sent.");
             const pendingIsControl = isControlTopic(pending.threadId);
             const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
-            void dispatchInboundMessage(pending.messageId, pending.transcript, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin));
+            void commandDispatch.dispatchInboundMessage(pending.messageId, pending.transcript, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin));
             return;
           }
           const doneText =
