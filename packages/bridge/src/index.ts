@@ -39,8 +39,7 @@ import {
 } from "./browse-nav.ts";
 import { listDirectory, MAX_SEND_BYTES, prepareFileForSend, readForPreview, resolveGithubLink, searchWorktree } from "./worktree-fs.ts";
 import { buildDiffReview } from "./diff-review.ts";
-import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
-import type { PendingFleetConfirm } from "./fleet-confirm.ts";
+import { FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import { resolveStaleConfirmCallback, StaleConfirmRegistry } from "./stale-confirm.ts";
 import { resolveVoiceConfirmCallback, VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { startWhisperServer } from "./voice-transcribe.ts";
@@ -69,7 +68,7 @@ import { startOtlpListener } from "./otlp-listener.ts";
 import { resolvePermCallback } from "./permission-callback.ts";
 import { sweepExpiredPermissions } from "./permission-registry.ts";
 import { loadReposRegistry, type ReposRegistry } from "./repos-registry.ts";
-import { launchSession, resolveNodeExecutable, stripAnsi } from "./session-launcher.ts";
+import { launchSession, resolveNodeExecutable } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
 import { RateGovernor } from "./rate-governor.ts";
 import { deriveAlwaysRule, ruleAlreadyCovered } from "./rule-derivation.ts";
@@ -101,7 +100,6 @@ import {
   resolveModelCallback,
 } from "./session-commands.ts";
 import type { Effort, Mode, Model, SessionCommand } from "./session-commands.ts";
-import { formatUsagePanel } from "./usage-panel.ts";
 import { SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
 import { looksEnglishEnough } from "./language-heuristic.ts";
 import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
@@ -121,6 +119,8 @@ import { createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE } from "./session-lif
 import { createFleetReportingCommands } from "./fleet-reporting-commands.ts";
 import { createDeployLifecycleCommands, createProcessRunner } from "./deploy-lifecycle-commands.ts";
 import { createVoiceModeCommands } from "./voice-mode-commands.ts";
+import { createConfirmSessionCommand, createFleetConfirmFlow, createStopIndicatorsForTopic } from "./fleet-confirm-flow.ts";
+import type { FleetConfirmFlow } from "./fleet-confirm-flow.ts";
 
 // §7.2's Task Scheduler stdout/stderr gap (logger.ts's own doc comment has the full story): a
 // launch that predates `main()` itself getting to run - a bad env file, a throw during module
@@ -286,6 +286,13 @@ async function main(): Promise<void> {
   // 14-18 are unit-tested against rate-governor.ts/feed-coalescer.ts directly) and every P1 fleet
   // notice - used directly here and passed into quota-alarms.ts/feed-wiring.ts below.
   const feedGovernor = new RateGovernor({ log });
+
+  // fleet-confirm-flow.ts: `confirmSessionCommand` is the P1-lane-wrapped send primitive nearly
+  // every other module in this split is built on (session-supervisor.ts, feed-wiring.ts,
+  // confirm-cards.ts, and every fleet-command module extracted so far) - constructed this early,
+  // right after its one dependency (`feedGovernor`) exists, rather than alongside the rest of
+  // fleet-confirm-flow.ts's own exports (which need `sessionLifecycle`, not yet constructed here).
+  const confirmSessionCommand = createConfirmSessionCommand({ feedGovernor, controlBot, supergroupChatId: config.supergroupChatId, log });
 
   // quota-alarms.ts: §10.5's usage-limit/burn-rate guardrails. `feedGovernor` is passed as a shared
   // reference (composition root owns it, used pervasively for other P1 sends elsewhere in this
@@ -474,44 +481,6 @@ async function main(): Promise<void> {
     echoSettleMs,
   });
 
-  /** Writes `/usage` into `slug`'s own PTY (a local TUI overlay - never reaches the model, so it
-   * can't pollute the conversation) and resolves once Claude Code's async "scanning local sessions"
-   * refresh has settled (the "d to day · w to week" hint is the last thing that overlay renders -
-   * confirmed live 2026-08-04, see `usage-panel.ts`). Falls back to whatever's been captured so far
-   * on timeout rather than discarding it - the first frame alone already has real numbers, same
-   * "best-effort" convention `/attach`'s ring buffer already uses. Always closes the overlay with
-   * Esc before resolving, so the session isn't left showing it over the normal prompt. */
-  function requestUsagePanel(slug: string, timeoutMs = 10_000): Promise<string> {
-    return new Promise((resolve) => {
-      const write = routing.getPtyWrite(slug);
-      if (!write) {
-        resolve(`No live PTY for "${slug}" to query.`);
-        return;
-      }
-      if (usageWaiters.has(slug)) {
-        resolve(`A /usage capture for "${slug}" is already in flight - the reply to that one is on its way.`);
-        return;
-      }
-      const finish = (state: { buffer: string }) => {
-        clearTimeout(timeout);
-        usageWaiters.delete(slug);
-        write("\x1b");
-        resolve(formatUsagePanel(stripAnsi(state.buffer)));
-      };
-      const timeout = setTimeout(() => {
-        const state = usageWaiters.get(slug);
-        if (state) finish(state);
-      }, timeoutMs);
-      usageWaiters.set(slug, {
-        buffer: "",
-        check() {
-          if (/d to day/i.test(stripAnsi(this.buffer))) finish(this);
-        },
-      });
-      write("/usage\r");
-    });
-  }
-
   // feed-wiring.ts: the hook-event -> feed-card rendering pipeline, the details-button anchor, and
   // the hook-driven half of the state table. Constructed *before* `pipeHandle` (needs
   // `feedWiring.handleHookEvent` as its `onHookEvent`), so the three `resolveByToolMatch`/
@@ -614,11 +583,29 @@ async function main(): Promise<void> {
     log,
   });
 
+  // fleet-confirm-flow.ts: no dependency on sessionLifecycle, so constructed directly here rather
+  // than needing the forward-reference treatment postFleetConfirm/executeFleetActionDirect below
+  // need (see fleetConfirmFlow's own construction, further down, for why those two do).
+  const stopIndicatorsForTopic = createStopIndicatorsForTopic({
+    typingIndicator,
+    thinkingPlaceholder,
+    controlBot,
+    feedGovernor,
+    supergroupChatId: config.supergroupChatId,
+    log,
+  });
+
+  // fleet-confirm-flow.ts's `createFleetConfirmFlow` genuinely needs `sessionLifecycle` (for
+  // killSessionRow/removeSessionRow/resolveTargetSlug), but `sessionLifecycle` itself takes
+  // `postFleetConfirm`/`executeFleetActionDirect` as injected callbacks - a real two-way
+  // dependency. Broken the same way a hoisted function declaration would have broken it pre-split:
+  // `sessionLifecycle` is constructed first, with `postFleetConfirm`/`executeFleetActionDirect`
+  // wrapped in closures over `fleetConfirmFlow` below, which isn't assigned until right after -
+  // safe, since neither closure is ever called until well after both consts exist.
+  let fleetConfirmFlow: FleetConfirmFlow;
+
   // session-lifecycle-commands.ts: /new, /ls, /kill, /rm, /attach, /pause, /detail, /verbose, plus
-  // the shared resolveTargetSlug/resolveSessionOrBail helpers. `stopIndicatorsForTopic`/
-  // `postFleetConfirm`/`executeFleetActionDirect` (fleet-confirm-flow.ts, not yet extracted) are
-  // injected callbacks, same forward-reference treatment as `dispatchInboundMessage` in
-  // inbound-media.ts - all three are hoisted function declarations further down this same scope.
+  // the shared resolveTargetSlug/resolveSessionOrBail helpers.
   const sessionLifecycle = createSessionLifecycleCommands({
     sessionStore,
     routing,
@@ -632,8 +619,8 @@ async function main(): Promise<void> {
     fleetConfirmRegistry,
     confirmSessionCommand,
     stopIndicatorsForTopic,
-    postFleetConfirm,
-    executeFleetActionDirect,
+    postFleetConfirm: (kind, topicId, targets, promptText) => fleetConfirmFlow.postFleetConfirm(kind, topicId, targets, promptText),
+    executeFleetActionDirect: (kind, topicId, targets) => fleetConfirmFlow.executeFleetActionDirect(kind, topicId, targets),
     writeModeKeystrokes: voiceModeCommands.writeModeKeystrokes,
     waitForChannelConnected,
     isControlTopic,
@@ -644,6 +631,20 @@ async function main(): Promise<void> {
     selfCheckSlug: config.selfCheck.slug,
     fleetWorktreesRoot,
     otlpPort,
+    log,
+  });
+
+  fleetConfirmFlow = createFleetConfirmFlow({
+    controlBot,
+    routing,
+    sessionStore,
+    confirmCards,
+    fleetConfirmRegistry,
+    sessionLifecycle,
+    confirmSessionCommand,
+    usageWaiters,
+    orphanTopicNote: ORPHAN_TOPIC_NOTE,
+    supergroupChatId: config.supergroupChatId,
     log,
   });
 
@@ -806,120 +807,6 @@ async function main(): Promise<void> {
   // restart-settle.ts: everything reconciliation just resumed is only milliseconds old from here -
   // `respawnSelfAndExit` waits out RESTART_SETTLE_MS from this point rather than firing immediately.
   bootReadyAt = Date.now();
-
-  // §5.4's P1 lane: every fleet-command echo and session lifecycle notice this Bridge posts on
-  // its own initiative funnels through here, so wiring it through the governor once covers all of
-  // them - never delayed behind P2 feed traffic, itself never allowed to delay a P0 permission
-  // prompt or question.
-  function confirmSessionCommand(topicId: number | undefined, text: string, parseMode?: "HTML", keyboard?: InlineKeyboardMarkup): void {
-    feedGovernor
-      .scheduleAsync("P1", () => controlBot.sendMessage(config.supergroupChatId, topicId, text, keyboard, parseMode))
-      .catch((err: unknown) => log("WARN", `failed to send command confirmation: ${(err as Error).message}`));
-  }
-
-  /** §4.2's `/kill`/`/rm`: no `reply` will ever land for this topic again, so the two "Claude is
-   * working" signals (§5) need an explicit stop rather than their normal reply-triggered one - left
-   * running, the typing indicator nags Telegram for up to its 30-minute backstop and the "🤔
-   * Thinking..." placeholder sits there forever, both outliving the session they described. */
-  function stopIndicatorsForTopic(topicId: number): void {
-    const topicIdStr = String(topicId);
-    typingIndicator.stop(topicIdStr);
-    thinkingPlaceholder.consume(topicIdStr).then((messageId) => {
-      if (messageId === undefined || !controlBot.editMessageText) return;
-      return feedGovernor.scheduleAsync("P1", () => controlBot.editMessageText!(config.supergroupChatId, messageId, "Session ended."));
-    }).catch((err: unknown) => log("WARN", `failed to clear thinking placeholder for topic ${topicId}: ${(err as Error).message}`));
-  }
-
-  /** Posts the Yes/No confirm card for `/kill --all`/`/rm --all` and registers it in
-   * `fleetConfirmRegistry` - shared since the two commands differ only in wording and which
-   * teardown function eventually runs. Returns without posting if there's nothing to act on. */
-  async function postFleetConfirm(kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[], promptText: string): Promise<void> {
-    if (targets.length === 0) {
-      confirmSessionCommand(topicId, kind === "kill" ? "No live sessions to kill." : "No sessions to remove.");
-      return;
-    }
-    const id = randomUUID().slice(0, 8);
-    const slugs = targets.map((r) => r.slug);
-    try {
-      const sent = await controlBot.sendMessage(config.supergroupChatId, topicId, `${promptText}\n${slugs.join(", ")}`, {
-        inline_keyboard: buildFleetConfirmKeyboard(kind, id),
-      });
-      fleetConfirmRegistry.add({ id, kind, slugs, topicId, messageId: sent.message_id });
-    } catch (err) {
-      log("WARN", `failed to post /${kind} --all confirmation: ${(err as Error).message}`);
-    }
-  }
-
-  /** Runs after a `/kill --all`/`/rm --all` confirm tap - re-looks-up rows by slug rather than
-   * trusting a snapshot from when the confirm card was posted, since a session can die or get
-   * removed independently in the minutes between posting and the tap. */
-  async function executeFleetConfirm(pending: PendingFleetConfirm): Promise<void> {
-    // §4.5.2's `rm-topic` variant has no session row at all - it acts on `pending.topicId`
-    // directly, which is the only reason it was postable in the first place (no DB lookup).
-    if (pending.kind === "rm-topic") {
-      if (pending.topicId === undefined) {
-        await confirmCards.finalizeFleetConfirmMessage(pending, "Nothing left to act on.");
-        return;
-      }
-      try {
-        await controlBot.deleteForumTopic(config.supergroupChatId, pending.topicId);
-        await confirmCards.finalizeFleetConfirmMessage(pending, "Topic deleted.");
-      } catch (err) {
-        log("WARN", `deleteForumTopic failed for orphan topic ${pending.topicId}: ${(err as Error).message}`);
-        await confirmCards.finalizeFleetConfirmMessage(pending, "Telegram would not delete this topic - it may need to be removed by hand (topic menu -> Delete Topic).");
-      }
-      return;
-    }
-
-    const rows = pending.slugs.map((s) => sessionStore.get(s)).filter((r): r is SessionRow => r !== undefined);
-    let allTopicsDeleted = true;
-    for (const row of rows) {
-      if (pending.kind === "kill") {
-        await sessionLifecycle.killSessionRow(row);
-      } else if (!(await sessionLifecycle.removeSessionRow(row))) {
-        allTopicsDeleted = false;
-      }
-    }
-    const verb = pending.kind === "kill" ? "Killed" : "Removed";
-    const note = pending.kind === "rm" && !allTopicsDeleted ? ORPHAN_TOPIC_NOTE : "";
-    await confirmCards.finalizeFleetConfirmMessage(pending, rows.length === 0 ? "Nothing left to act on." : `${verb} ${rows.length} session${rows.length === 1 ? "" : "s"}: ${rows.map((r) => r.slug).join(", ")}${note}`);
-  }
-
-  /** `/kill --all --force`/`/rm --all --force` (operator-requested 2026-08-08): the same teardown
-   * `executeFleetConfirm` runs after a button tap, just triggered on the same message instead of
-   * behind a posted Yes/No card - the operator has already decided and doesn't want to round-trip a
-   * tap. Posts the same summary text a tapped card would have finalized to, just as a plain reply
-   * since there's no card here to finalize. */
-  async function executeFleetActionDirect(kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[]): Promise<void> {
-    if (targets.length === 0) {
-      confirmSessionCommand(topicId, kind === "kill" ? "No live sessions to kill." : "No sessions to remove.");
-      return;
-    }
-    let allTopicsDeleted = true;
-    for (const row of targets) {
-      if (kind === "kill") {
-        await sessionLifecycle.killSessionRow(row);
-      } else if (!(await sessionLifecycle.removeSessionRow(row))) {
-        allTopicsDeleted = false;
-      }
-    }
-    const verb = kind === "kill" ? "Killed" : "Removed";
-    const note = kind === "rm" && !allTopicsDeleted ? ORPHAN_TOPIC_NOTE : "";
-    confirmSessionCommand(topicId, `${verb} ${targets.length} session${targets.length === 1 ? "" : "s"}: ${targets.map((r) => r.slug).join(", ")}${note}`);
-  }
-
-  /** `/usage` (§4.2, added 2026-08-04): asks `slug`'s own session to open Claude Code's own `/usage`
-   * overlay (account-level Anthropic usage, distinct from anything Bridge tracks itself) and relays
-   * the parsed Session/Weekly/Weekly-Fable percentages back into Telegram. */
-  async function handleUsageCommand(cmd: Extract<FleetCommand, { kind: "usage" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
-    const resolved = sessionLifecycle.resolveTargetSlug(cmd.slug, currentSlug);
-    if ("error" in resolved) {
-      confirmSessionCommand(topicId, resolved.error);
-      return;
-    }
-    const summary = await requestUsagePanel(resolved.slug);
-    confirmSessionCommand(topicId, summary);
-  }
 
   /**
    * The only correct way for this process to replace itself. A raw detached spawn is killed
@@ -1265,7 +1152,7 @@ async function main(): Promise<void> {
       return;
     }
     if (fleetCmd.kind === "usage") {
-      void handleUsageCommand(fleetCmd, threadId, currentSlug);
+      void fleetConfirmFlow.handleUsageCommand(fleetCmd, threadId, currentSlug);
       return;
     }
     if (fleetCmd.kind === "restart") {
@@ -1720,7 +1607,7 @@ async function main(): Promise<void> {
             void confirmCards.finalizeFleetConfirmMessage(pending, "Cancelled - nothing was changed.");
             return;
           }
-          void executeFleetConfirm(pending);
+          void fleetConfirmFlow.executeFleetConfirm(pending);
           return;
         }
 

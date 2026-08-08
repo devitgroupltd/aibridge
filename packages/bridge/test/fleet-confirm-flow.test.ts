@@ -1,0 +1,339 @@
+import { describe, expect, test } from "bun:test";
+import { createConfirmSessionCommand, createFleetConfirmFlow, createStopIndicatorsForTopic } from "../src/fleet-confirm-flow.ts";
+import { FleetConfirmRegistry } from "../src/fleet-confirm.ts";
+import type { PendingFleetConfirm } from "../src/fleet-confirm.ts";
+import { RateGovernor } from "../src/rate-governor.ts";
+import { Routing } from "../src/routing.ts";
+import { SessionStore, type SessionRow } from "../src/session-store.ts";
+
+function row(overrides: Partial<SessionRow> = {}): SessionRow {
+  return {
+    slug: "fix-bug",
+    topicId: 5,
+    sessionId: "sess-1",
+    worktreePath: "c:\\does\\not\\exist\\fix-bug",
+    branch: "claude/fix-bug-1",
+    repoPath: "c:\\does\\not\\exist\\repo",
+    model: "sonnet",
+    ptyPid: 1234,
+    state: "working",
+    turnCardMsg: null,
+    paused: false,
+    renamed: false,
+    feedDetail: "compact",
+    feedVerbose: false,
+    createdUtc: "2026-08-08T00:00:00.000Z",
+    lastEventUtc: "2026-08-08T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function fakeControlBot() {
+  const sent: Array<{ topicId: number | undefined; text: string; keyboard?: unknown }> = [];
+  const edited: Array<{ messageId: number; text: string }> = [];
+  const deletedTopics: number[] = [];
+  let failDelete = false;
+  return {
+    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string, replyMarkup?: unknown) => {
+      sent.push({ topicId, text, keyboard: replyMarkup });
+      return { message_id: sent.length };
+    },
+    editMessageText: async (_chatId: unknown, messageId: number, text: string) => {
+      edited.push({ messageId, text });
+    },
+    deleteForumTopic: async (_chatId: unknown, messageThreadId: number) => {
+      if (failDelete) throw new Error("Telegram rejected the delete");
+      deletedTopics.push(messageThreadId);
+    },
+    createForumTopic: async () => ({ message_thread_id: 999 }),
+    editForumTopic: async () => {},
+    closeForumTopic: async () => {},
+    sent,
+    edited,
+    deletedTopics,
+    failDeleteNextTime() {
+      failDelete = true;
+    },
+  };
+}
+
+describe("createConfirmSessionCommand", () => {
+  test("schedules the send through the P1 lane and delivers text/keyboard/parseMode", async () => {
+    const controlBot = fakeControlBot();
+    const feedGovernor = new RateGovernor({ log: () => {} });
+    const confirmSessionCommand = createConfirmSessionCommand({ feedGovernor, controlBot, supergroupChatId: "-100", log: () => {} });
+
+    confirmSessionCommand(5, "hello", "HTML", { inline_keyboard: [] });
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(controlBot.sent).toEqual([{ topicId: 5, text: "hello", keyboard: { inline_keyboard: [] } }]);
+  });
+
+  test("a failed send is logged, not thrown", async () => {
+    // §5.4's P1 lane retries a failure up to 3 times with real backoff - fake the timer so this
+    // test doesn't have to wait out 1s/2s/4s of real delay before the rejection finally surfaces.
+    const feedGovernor = new RateGovernor({ log: () => {}, setTimeoutFn: (fn) => setImmediate(fn), clearTimeoutFn: () => {} });
+    const warnings: string[] = [];
+    const failingBot = { sendMessage: async () => Promise.reject(new Error("network down")) };
+    const confirmSessionCommand = createConfirmSessionCommand({ feedGovernor, controlBot: failingBot, supergroupChatId: "-100", log: (level, msg) => warnings.push(`${level}: ${msg}`) });
+
+    confirmSessionCommand(undefined, "hello");
+    // 3 retries, each hopping through a setImmediate - wait out enough real macrotask turns.
+    for (let i = 0; i < 6; i++) await new Promise((resolve) => setImmediate(resolve));
+
+    expect(warnings.some((w) => w.includes("failed to send command confirmation"))).toBe(true);
+  });
+});
+
+describe("createStopIndicatorsForTopic", () => {
+  function fakeTypingIndicator() {
+    const stopped: string[] = [];
+    return { start: () => {}, stop: (key: string) => stopped.push(key), stopped };
+  }
+  function fakeThinkingPlaceholder(messageId: number | undefined) {
+    return { start: () => {}, consume: async () => messageId };
+  }
+
+  test("stops the typing indicator for the topic", () => {
+    const typingIndicator = fakeTypingIndicator();
+    const thinkingPlaceholder = fakeThinkingPlaceholder(undefined);
+    const controlBot = fakeControlBot();
+    const feedGovernor = new RateGovernor({ log: () => {} });
+    const stopIndicatorsForTopic = createStopIndicatorsForTopic({ typingIndicator, thinkingPlaceholder, controlBot, feedGovernor, supergroupChatId: "-100", log: () => {} });
+
+    stopIndicatorsForTopic(5);
+
+    expect(typingIndicator.stopped).toEqual(["5"]);
+  });
+
+  test("edits the thinking placeholder to 'Session ended.' when one was pending", async () => {
+    const typingIndicator = fakeTypingIndicator();
+    const thinkingPlaceholder = fakeThinkingPlaceholder(42);
+    const controlBot = fakeControlBot();
+    const feedGovernor = new RateGovernor({ log: () => {} });
+    const stopIndicatorsForTopic = createStopIndicatorsForTopic({ typingIndicator, thinkingPlaceholder, controlBot, feedGovernor, supergroupChatId: "-100", log: () => {} });
+
+    stopIndicatorsForTopic(5);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(controlBot.edited).toEqual([{ messageId: 42, text: "Session ended." }]);
+  });
+
+  test("does nothing when there was no pending placeholder", async () => {
+    const typingIndicator = fakeTypingIndicator();
+    const thinkingPlaceholder = fakeThinkingPlaceholder(undefined);
+    const controlBot = fakeControlBot();
+    const feedGovernor = new RateGovernor({ log: () => {} });
+    const stopIndicatorsForTopic = createStopIndicatorsForTopic({ typingIndicator, thinkingPlaceholder, controlBot, feedGovernor, supergroupChatId: "-100", log: () => {} });
+
+    stopIndicatorsForTopic(5);
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(controlBot.edited).toEqual([]);
+  });
+});
+
+function setup(overrides: { killSessionRow?: (row: SessionRow) => Promise<void>; removeSessionRow?: (row: SessionRow) => Promise<boolean>; resolveTargetSlug?: (explicit: string | undefined, currentSlug: string | undefined) => { slug: string } | { error: string } } = {}) {
+  const controlBot = fakeControlBot();
+  const routing = new Routing();
+  const sessionStore = new SessionStore(":memory:");
+  const fleetConfirmRegistry = new FleetConfirmRegistry();
+  const finalizeCalls: Array<{ pending: PendingFleetConfirm; text: string }> = [];
+  const confirmed: Array<{ topicId: number | undefined; text: string }> = [];
+  const killed: string[] = [];
+  const removed: string[] = [];
+  const usageWaiters = new Map<string, { buffer: string; check: () => void }>();
+  const confirmCards = {
+    finalizeFleetConfirmMessage: async (pending: PendingFleetConfirm, text: string) => {
+      finalizeCalls.push({ pending, text });
+    },
+  };
+  const sessionLifecycle = {
+    killSessionRow: overrides.killSessionRow ?? (async (r: SessionRow) => {
+      killed.push(r.slug);
+    }),
+    removeSessionRow: overrides.removeSessionRow ?? (async (r: SessionRow) => {
+      removed.push(r.slug);
+      return true;
+    }),
+    resolveTargetSlug: overrides.resolveTargetSlug ?? ((explicit: string | undefined, currentSlug: string | undefined) => {
+      const slug = explicit ?? currentSlug;
+      return slug ? { slug } : { error: "No session specified and this isn't a session topic." };
+    }),
+  };
+  const fleetConfirmFlow = createFleetConfirmFlow({
+    controlBot,
+    routing,
+    sessionStore,
+    confirmCards: confirmCards as never,
+    fleetConfirmRegistry,
+    sessionLifecycle,
+    confirmSessionCommand: (topicId, text) => {
+      confirmed.push({ topicId, text });
+    },
+    usageWaiters,
+    orphanTopicNote: " (note: some topics couldn't be deleted)",
+    supergroupChatId: "-100",
+    log: () => {},
+  });
+  return { fleetConfirmFlow, controlBot, routing, sessionStore, fleetConfirmRegistry, finalizeCalls, confirmed, killed, removed };
+}
+
+describe("createFleetConfirmFlow", () => {
+  describe("postFleetConfirm", () => {
+    test("with no targets, reports there's nothing to do and posts no card", async () => {
+      const { fleetConfirmFlow, controlBot, confirmed } = setup();
+
+      await fleetConfirmFlow.postFleetConfirm("kill", 1, [], "Kill 0 sessions?");
+
+      expect(confirmed[0]?.text).toBe("No live sessions to kill.");
+      expect(controlBot.sent).toEqual([]);
+    });
+
+    test("posts the Yes/No card and registers it in the registry", async () => {
+      const { fleetConfirmFlow, controlBot, fleetConfirmRegistry } = setup();
+
+      await fleetConfirmFlow.postFleetConfirm("rm", 1, [row()], "Remove 1 session?");
+
+      expect(controlBot.sent[0]?.text).toContain("fix-bug");
+      expect(controlBot.sent[0]?.keyboard).toBeDefined();
+      const button = (controlBot.sent[0]?.keyboard as { inline_keyboard: Array<Array<{ callback_data?: string }>> }).inline_keyboard[0]?.[0];
+      const id = button?.callback_data?.split(":")[2];
+      expect(id).toBeDefined();
+      expect(fleetConfirmRegistry.take(id!)?.entry.slugs).toEqual(["fix-bug"]);
+    });
+  });
+
+  describe("executeFleetConfirm", () => {
+    test("rm-topic with no topicId finalizes as nothing left to act on", async () => {
+      const { fleetConfirmFlow, finalizeCalls } = setup();
+      const pending: PendingFleetConfirm = { id: "abc", kind: "rm-topic", slugs: [], topicId: undefined, messageId: 1, createdAt: Date.now() };
+
+      await fleetConfirmFlow.executeFleetConfirm(pending);
+
+      expect(finalizeCalls[0]?.text).toBe("Nothing left to act on.");
+    });
+
+    test("rm-topic deletes the forum topic and finalizes", async () => {
+      const { fleetConfirmFlow, controlBot, finalizeCalls } = setup();
+      const pending: PendingFleetConfirm = { id: "abc", kind: "rm-topic", slugs: [], topicId: 7, messageId: 1, createdAt: Date.now() };
+
+      await fleetConfirmFlow.executeFleetConfirm(pending);
+
+      expect(controlBot.deletedTopics).toEqual([7]);
+      expect(finalizeCalls[0]?.text).toBe("Topic deleted.");
+    });
+
+    test("rm-topic reports when Telegram refuses the delete", async () => {
+      const { fleetConfirmFlow, controlBot, finalizeCalls } = setup();
+      controlBot.failDeleteNextTime();
+      const pending: PendingFleetConfirm = { id: "abc", kind: "rm-topic", slugs: [], topicId: 7, messageId: 1, createdAt: Date.now() };
+
+      await fleetConfirmFlow.executeFleetConfirm(pending);
+
+      expect(finalizeCalls[0]?.text).toContain("would not delete this topic");
+    });
+
+    test("kill tears down each row via sessionLifecycle.killSessionRow and finalizes a summary", async () => {
+      const { fleetConfirmFlow, sessionStore, killed, finalizeCalls } = setup();
+      sessionStore.insert(row({ slug: "a", sessionId: "s-a", topicId: 10 }));
+      sessionStore.insert(row({ slug: "b", sessionId: "s-b", topicId: 11 }));
+      const pending: PendingFleetConfirm = { id: "abc", kind: "kill", slugs: ["a", "b"], topicId: 1, messageId: 1, createdAt: Date.now() };
+
+      await fleetConfirmFlow.executeFleetConfirm(pending);
+
+      expect(killed).toEqual(["a", "b"]);
+      expect(finalizeCalls[0]?.text).toContain("Killed 2 sessions: a, b");
+    });
+
+    test("rm appends the orphan-topic note when a topic couldn't be deleted", async () => {
+      const { fleetConfirmFlow, sessionStore, finalizeCalls } = setup({ removeSessionRow: async () => false });
+      sessionStore.insert(row({ slug: "a", sessionId: "s-a" }));
+      const pending: PendingFleetConfirm = { id: "abc", kind: "rm", slugs: ["a"], topicId: 1, messageId: 1, createdAt: Date.now() };
+
+      await fleetConfirmFlow.executeFleetConfirm(pending);
+
+      expect(finalizeCalls[0]?.text).toContain("Removed 1 session: a");
+      expect(finalizeCalls[0]?.text).toContain("couldn't be deleted");
+    });
+
+    test("no rows left to act on (all slugs vanished) finalizes 'nothing left'", async () => {
+      const { fleetConfirmFlow, finalizeCalls } = setup();
+      const pending: PendingFleetConfirm = { id: "abc", kind: "kill", slugs: ["ghost"], topicId: 1, messageId: 1, createdAt: Date.now() };
+
+      await fleetConfirmFlow.executeFleetConfirm(pending);
+
+      expect(finalizeCalls[0]?.text).toBe("Nothing left to act on.");
+    });
+  });
+
+  describe("executeFleetActionDirect", () => {
+    test("with no targets, reports there's nothing to do", async () => {
+      const { fleetConfirmFlow, confirmed } = setup();
+
+      await fleetConfirmFlow.executeFleetActionDirect("rm", 1, []);
+
+      expect(confirmed[0]?.text).toBe("No sessions to remove.");
+    });
+
+    test("tears down each target directly and confirms a summary, no card involved", async () => {
+      const { fleetConfirmFlow, killed, confirmed, controlBot } = setup();
+
+      await fleetConfirmFlow.executeFleetActionDirect("kill", 1, [row({ slug: "a" }), row({ slug: "b" })]);
+
+      expect(killed).toEqual(["a", "b"]);
+      expect(confirmed[0]?.text).toBe("Killed 2 sessions: a, b");
+      expect(controlBot.sent).toEqual([]); // confirmSessionCommand, not a posted card
+    });
+  });
+
+  describe("requestUsagePanel / handleUsageCommand", () => {
+    test("with no live PTY for the slug, resolves with a clear message", async () => {
+      const { fleetConfirmFlow } = setup();
+
+      const result = await fleetConfirmFlow.requestUsagePanel("fix-bug", 50);
+
+      expect(result).toContain('No live PTY for "fix-bug"');
+    });
+
+    test("a concurrent capture for the same slug is refused, not queued", async () => {
+      const { fleetConfirmFlow, routing } = setup();
+      routing.setPtyWrite("fix-bug", () => {});
+
+      const first = fleetConfirmFlow.requestUsagePanel("fix-bug", 50);
+      const second = await fleetConfirmFlow.requestUsagePanel("fix-bug", 50);
+
+      expect(second).toContain("already in flight");
+      await first;
+    });
+
+    test("falls back to whatever was captured by the timeout", async () => {
+      const { fleetConfirmFlow, routing } = setup();
+      routing.setPtyWrite("fix-bug", () => {});
+
+      const result = await fleetConfirmFlow.requestUsagePanel("fix-bug", 20);
+
+      expect(typeof result).toBe("string");
+    });
+
+    test("handleUsageCommand reports resolveTargetSlug's error without querying a panel", async () => {
+      const { fleetConfirmFlow, confirmed } = setup({ resolveTargetSlug: () => ({ error: "No session specified." }) });
+
+      await fleetConfirmFlow.handleUsageCommand({ kind: "usage", slug: undefined }, 1, undefined);
+
+      expect(confirmed[0]?.text).toBe("No session specified.");
+    });
+
+    test("handleUsageCommand resolves the slug then confirms the panel summary", async () => {
+      const { fleetConfirmFlow, confirmed } = setup({ resolveTargetSlug: () => ({ slug: "fix-bug" }) });
+
+      await fleetConfirmFlow.handleUsageCommand({ kind: "usage", slug: undefined }, 1, "fix-bug");
+
+      expect(confirmed[0]?.text).toContain('No live PTY for "fix-bug"');
+    });
+  });
+});
