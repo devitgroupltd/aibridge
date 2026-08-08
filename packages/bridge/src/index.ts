@@ -3,8 +3,7 @@ import { randomUUID } from "node:crypto";
 import http from "node:http";
 import path from "node:path";
 import type * as pty from "node-pty";
-import type { ChannelMetaFields, HookEventMessage } from "@aibridge/protocol";
-import { renderChannelTag } from "@aibridge/protocol";
+import type { HookEventMessage } from "@aibridge/protocol";
 import { resolveAskCallback, renderAskAnsweredCard, renderAskCancelledCard } from "./ask-callback.ts";
 import { ABOUT_TOPICS, buildAboutKeyboard, isAboutCommand, renderAbout, resolveAboutCallback } from "./about.ts";
 import { buildCreateArgs, buildDeleteArgs, buildFixTaskSettingsScript, buildQueryArgs, buildRunArgs, parseQueryOutput, renderAutostartStatus, TASK_NAME } from "./autostart.ts";
@@ -75,7 +74,6 @@ import { isRetryPhrase, retryTopicKey, RetryStore } from "./retry-store.ts";
 import { buildContextPrefix } from "./message-context.ts";
 import type { MessageOrigin } from "./message-context.ts";
 import { ChannelConnectCoordinator } from "./channel-connect-coordinator.ts";
-import { recoverWedgedPty } from "./wedged-recovery.ts";
 import { routeText } from "./nl-router.ts";
 import type { RouterAction } from "./nl-router.ts";
 import { SettingsStore } from "./settings-store.ts";
@@ -165,6 +163,7 @@ import { createTypingIndicator } from "./typing-indicator.ts";
 import { restartSettleDelayMs } from "./restart-settle.ts";
 import { removeWorktree } from "./worktree.ts";
 import { createSessionSupervisor } from "./session-supervisor.ts";
+import { createPtyIo, DEFAULT_ECHO_SETTLE_MS, DEFAULT_SUBMIT_CONFIRM_WINDOW_MS } from "./pty-io.ts";
 
 // §7.2's Task Scheduler stdout/stderr gap (logger.ts's own doc comment has the full story): a
 // launch that predates `main()` itself getting to run - a bad env file, a throw during module
@@ -348,12 +347,13 @@ async function main(): Promise<void> {
   const BURN_RATE_ALARM_COOLDOWN_MS = 60 * 60 * 1000;
   let lastBurnAlarmMs = 0;
 
-  // `sendChannelText`'s lost-Enter detector (found 2026-08-04) - real activity (spinner frames etc.)
-  // redraws well within a couple of seconds, confirmed live, so this is generous rather than tight.
-  const SUBMIT_CONFIRM_WINDOW_MS = Number(process.env.AIBRIDGE_SUBMIT_CONFIRM_WINDOW_MS ?? 2500);
+  // pty-io.ts's lost-Enter detector (found 2026-08-04) - real activity (spinner frames etc.) redraws
+  // well within a couple of seconds, confirmed live, so this is generous rather than tight. Read
+  // here (composition root owns env/config loading) and passed through as options below.
+  const submitConfirmWindowMs = Number(process.env.AIBRIDGE_SUBMIT_CONFIRM_WINDOW_MS ?? DEFAULT_SUBMIT_CONFIRM_WINDOW_MS);
   // How long the write's own echo takes to land, confirmed live to be well under 500ms - the
-  // baseline for the check above is taken after this, not at the moment of the write itself.
-  const ECHO_SETTLE_MS = Number(process.env.AIBRIDGE_ECHO_SETTLE_MS ?? 500);
+  // baseline for the lost-Enter check is taken after this, not at the moment of the write itself.
+  const echoSettleMs = Number(process.env.AIBRIDGE_ECHO_SETTLE_MS ?? DEFAULT_ECHO_SETTLE_MS);
 
   function maybeFireBurnRateAlarm(nowMs: number): void {
     if (nowMs - lastBurnAlarmMs < BURN_RATE_ALARM_COOLDOWN_MS) return;
@@ -688,6 +688,20 @@ async function main(): Promise<void> {
     usageWaiters,
   });
 
+  // pty-io.ts: PTY write primitives, the lost-Enter detector, and its wedged-session auto-recovery.
+  // Depends on sessionSupervisor's liveness accessors (constructed just above) rather than owning
+  // any PTY-tracking state itself.
+  const ptyIo = createPtyIo({
+    routing,
+    typingIndicator,
+    thinkingPlaceholder,
+    lastActivityAt: sessionSupervisor.lastActivityAt,
+    ptyLookup: { get: (slug) => sessionSupervisor.getPtyProcess(slug) },
+    log,
+    submitConfirmWindowMs,
+    echoSettleMs,
+  });
+
   /** Writes `/usage` into `slug`'s own PTY (a local TUI overlay - never reaches the model, so it
    * can't pollute the conversation) and resolves once Claude Code's async "scanning local sessions"
    * refresh has settled (the "d to day · w to week" hint is the last thing that overlay renders -
@@ -905,122 +919,6 @@ async function main(): Promise<void> {
   // `respawnSelfAndExit` waits out RESTART_SETTLE_MS from this point rather than firing immediately.
   bootReadyAt = Date.now();
 
-  let seq = 0;
-
-  // Raw keystroke passthrough: /model, /mode, /compact and /clear are all CLI-native, with no
-  // backing markdown file for the /cmd shim (§4.2) to reach - they're written straight to the PTY,
-  // bypassing the <channel> tag entirely, exactly as an operator typing them at the desk would.
-  // Same two-write submit pattern as the tag path (see sendChannelText): confirmed live that a
-  // single write carrying text plus a trailing \r leaves it sitting unsubmitted.
-  function sendRaw(slug: string, text: string): void {
-    const write = routing.getPtyWrite(slug);
-    if (!write) {
-      log("WARN", `no live session for slug "${slug}" - command dropped`);
-      return;
-    }
-    write(text);
-    write("\r");
-  }
-
-  // /effort, unlike /model, opens a "Change effort level? 1. Yes, switch  2. No, go back"
-  // confirmation dialog with "Yes" pre-selected - live-verified 2026-08-03. A second Enter selects
-  // it, but sending both \r's in the same tick arrives before the dialog has rendered and is
-  // dropped, leaving the dialog open and the level unchanged (also confirmed live) - same class of
-  // PTY-timing hazard as the known single-write text+\r issue, one layer removed. A short delay
-  // before the confirming \r fixes it.
-  function sendEffortCommand(slug: string, effort: string): void {
-    const write = routing.getPtyWrite(slug);
-    if (!write) {
-      log("WARN", `no live session for slug "${slug}" - command dropped`);
-      return;
-    }
-    write(`/effort ${effort}`);
-    write("\r");
-    setTimeout(() => write("\r"), 200);
-  }
-
-  /**
-   * Retries the trailing `\r` once if the PTY produces no output at all within the window - found
-   * live 2026-08-04 (see the 0.27.0 changelog entry): the content+`\r` writes can land with the
-   * Enter never actually submitting, silently wedging the session with no further output ever and
-   * no error anywhere. `session.ready`/`waitForChannelConnected` close the *startup* race but not
-   * this one. A genuinely working turn produces PTY output (spinner frames etc.) well within this
-   * window - confirmed live, real activity redraws every few hundred ms - so "nothing at all" for
-   * the full window is a reliable "the Enter didn't land" signal, not a false positive on a slow
-   * turn. Resends only the `\r`, never the content, so a `\r` that *did* land doesn't get the
-   * prompt injected twice. If the retry also produces nothing, gives up loudly instead of leaving
-   * the "Thinking..." placeholder lying forever with no explanation.
-   */
-  function confirmSubmitted(slug: string, topicId: number, write: (text: string) => void, attempt = 1): void {
-    // The write's own echo (the typed text reappearing) is itself real, non-empty PTY output - so
-    // the baseline has to be taken *after* that echo has landed, not at the moment of the write,
-    // or the echo alone always looks like "it worked" regardless of whether Claude ever submitted
-    // it. `ECHO_SETTLE_MS` is comfortably longer than the echo has ever taken to land live.
-    setTimeout(() => {
-      const baseline = sessionSupervisor.lastActivityAt(slug) ?? 0;
-      setTimeout(() => {
-        const lastActivity = sessionSupervisor.lastActivityAt(slug) ?? 0;
-        if (lastActivity > baseline) return; // real activity happened after the echo settled
-        if (attempt >= 2) {
-          log("ERROR", `session "${slug}" produced no output after ${attempt} attempts to submit an inbound message - likely wedged`);
-          autoRecoverWedgedSession(slug);
-          return;
-        }
-        log("WARN", `session "${slug}" produced no output ${SUBMIT_CONFIRM_WINDOW_MS}ms after an inbound message - retrying the Enter`);
-        write("\r");
-        confirmSubmitted(slug, topicId, write, attempt + 1);
-      }, SUBMIT_CONFIRM_WINDOW_MS);
-    }, ECHO_SETTLE_MS);
-  }
-
-  /**
-   * Self-heals the wedged-PTY failure mode `confirmSubmitted` detects, found live 2026-08-07
-   * ("check-what-is-left-to"): `pty-write-guard.ts` already stops a dead node-pty write-socket from
-   * crashing the daemon, but left alone that left the session a permanent zombie - its `claude`
-   * process can stay alive and burning CPU while the Bridge's own link into it is dead, with no
-   * output ever again and no recovery short of the operator noticing a silent topic and typing
-   * `/kill` + `/new` by hand - which also throws the conversation away (a fresh slug/topic/worktree,
-   * not a continuation).
-   *
-   * Deliberately does *not* reuse `/kill`'s `killSessionRow` (that marks the row "dead" and closes
-   * the topic - a dead end, not a recovery) or duplicate any resume logic of its own. Instead it
-   * terminates just the wedged PTY via `recoverWedgedPty` (wedged-recovery.ts) *without* first
-   * clearing `ptyProcessBySlug` - the one thing `/kill`/`/rm` deliberately do first (see
-   * `handleUnexpectedExit`'s own doc comment) specifically to mark a kill as "deliberate, don't
-   * resume". Leaving the map entry in place makes this indistinguishable from a real crash to
-   * `handleUnexpectedExit`, which already does exactly "restore/fix and continue" right: same
-   * slug, same topic, same worktree, `claude --resume <session_id>` on a fresh PTY, with its own
-   * backoff/give-up safety net (`MAX_CONSECUTIVE_RESUME_ATTEMPTS`) already in place for the rarer
-   * case where the underlying process is now so broken even a resume immediately re-exits.
-   */
-  function autoRecoverWedgedSession(slug: string): void {
-    const recovered = recoverWedgedPty({ get: (s) => sessionSupervisor.getPtyProcess(s) }, slug);
-    if (!recovered) return; // already gone - a manual /kill/rm, or a real crash, raced this same detection
-    log(
-      "WARN",
-      `session "${slug}"'s PTY write-socket is dead but its process is still alive - killing it so the existing crash-resume path (§12 Phase 5) can relaunch it via claude --resume instead of leaving a zombie`,
-    );
-    // handleUnexpectedExit (wired in wireSession's onExit) takes over from here - it posts its own
-    // "attempting to resume" notice, so no separate confirmSessionCommand here would just double up.
-  }
-
-  // A normal inbound turn: wrapped in the <channel> tag Claude Code would have rendered itself,
-  // for text Claude should read and act on rather than a literal TUI keystroke.
-  function sendChannelText(slug: string, topicId: number, content: string, msgId: string, from: string): void {
-    const write = routing.getPtyWrite(slug);
-    if (!write) {
-      log("WARN", `no live session for slug "${slug}" - inbound message dropped`);
-      return;
-    }
-    seq += 1;
-    const meta: ChannelMetaFields = { topic_id: String(topicId), msg_id: msgId, from, seq };
-    write(renderChannelTag(content, meta));
-    write("\r");
-    typingIndicator.start(meta.topic_id);
-    thinkingPlaceholder.start(meta.topic_id);
-    confirmSubmitted(slug, topicId, write);
-  }
-
   // §5.4's P1 lane: every fleet-command echo and session lifecycle notice this Bridge posts on
   // its own initiative funnels through here, so wiring it through the governor once covers all of
   // them - never delayed behind P2 feed traffic, itself never allowed to delay a P0 permission
@@ -1034,7 +932,7 @@ async function main(): Promise<void> {
   // Shared by the typed `/model foo` / `/mode bar` / `/effort baz` path and the button-tap path
   // (bare /model, /mode or /effort followed by a keyboard selection) - same switch, two triggers.
   function applyModelSwitch(slug: string, topicId: number, model: string): void {
-    sendRaw(slug, `/model ${model}`);
+    ptyIo.sendRaw(slug, `/model ${model}`);
     sessionStore.setModel(slug, model);
     confirmSessionCommand(topicId, `Switched ${slug} to ${model}`);
   }
@@ -1046,7 +944,7 @@ async function main(): Promise<void> {
   function writeModeKeystrokes(slug: string, mode: Mode): void {
     const current = routing.getMode(slug);
     const keystrokes = buildModeKeystrokes(current, mode);
-    // Already at the target mode: no keystroke to send, and sendRaw("") would still submit a
+    // Already at the target mode: no keystroke to send, and ptyIo.sendRaw("") would still submit a
     // spurious blank Enter at the prompt.
     if (keystrokes.length > 0) {
       routing.getPtyWrite(slug)?.(keystrokes);
@@ -1060,7 +958,7 @@ async function main(): Promise<void> {
   }
 
   function applyEffortSwitch(slug: string, topicId: number, effort: Effort): void {
-    sendEffortCommand(slug, effort);
+    ptyIo.sendEffortCommand(slug, effort);
     routing.setEffort(slug, effort);
     confirmSessionCommand(topicId, `Switched ${slug} to ${effort} effort`);
   }
@@ -1188,8 +1086,8 @@ async function main(): Promise<void> {
     // default already assumes "manual" until the first real switch, so a same-value keystroke send
     // isn't even a true no-op, just zero `buildModeKeystrokes` steps.
     if (defaultSessionMode !== DEFAULT_MODE) writeModeKeystrokes(slug, defaultSessionMode);
-    if (defaultSessionEffort !== DEFAULT_EFFORT) sendEffortCommand(slug, defaultSessionEffort);
-    sendChannelText(slug, topic.message_thread_id, newSessionContent(cmd), "new-1", "telegram");
+    if (defaultSessionEffort !== DEFAULT_EFFORT) ptyIo.sendEffortCommand(slug, defaultSessionEffort);
+    ptyIo.sendChannelText(slug, topic.message_thread_id, newSessionContent(cmd), "new-1", "telegram");
   }
 
   function handleLsCommand(topicId: number | undefined): void {
@@ -2415,7 +2313,7 @@ async function main(): Promise<void> {
       return;
     }
     if (command.kind === "builtin") {
-      if (currentSlug) sendRaw(currentSlug, `/${command.name}`);
+      if (currentSlug) ptyIo.sendRaw(currentSlug, `/${command.name}`);
       return;
     }
     if (command.kind === "browse") {
@@ -2715,7 +2613,7 @@ async function main(): Promise<void> {
       // one.)
       const asInvocation = commandsQuery.term ? parseCmdInvocation(`/cmd ${commandsQuery.term}`) : null;
       if (route && asInvocation && listRepoCommands(route.worktreePath).includes(asInvocation.name)) {
-        sendChannelText(route.slug, route.topicId, buildCmdShimText(asInvocation.name, asInvocation.args), String(messageId), from);
+        ptyIo.sendChannelText(route.slug, route.topicId, buildCmdShimText(asInvocation.name, asInvocation.args), String(messageId), from);
         return;
       }
       sendCommandsListCard(threadId, route, commandsQuery.term);
@@ -2806,7 +2704,7 @@ async function main(): Promise<void> {
 
     const builtinName = text.startsWith("/") ? text.slice(1) : "";
     if (isBuiltinPassthroughCommand(builtinName)) {
-      if (currentSlug) sendRaw(currentSlug, text);
+      if (currentSlug) ptyIo.sendRaw(currentSlug, text);
       return;
     }
 
@@ -2848,7 +2746,7 @@ async function main(): Promise<void> {
       const cmdInvoke = parseCmdInvocation(text);
       if (cmdInvoke) {
         if (listRepoCommands(route.worktreePath).includes(cmdInvoke.name)) {
-          sendChannelText(currentSlug, threadId, buildCmdShimText(cmdInvoke.name, cmdInvoke.args), String(messageId), from);
+          ptyIo.sendChannelText(currentSlug, threadId, buildCmdShimText(cmdInvoke.name, cmdInvoke.args), String(messageId), from);
         } else {
           confirmSessionCommand(threadId, `No repo command named "${cmdInvoke.name}" in this project. Try /commands to list them.`);
         }
@@ -2861,11 +2759,11 @@ async function main(): Promise<void> {
       const skillInvoke = parseSkillInvocation(text);
       if (skillInvoke) {
         if (listRepoSkills(route.worktreePath).includes(skillInvoke.name)) {
-          sendChannelText(currentSlug, threadId, buildSkillShimText(skillInvoke.name, skillInvoke.args), String(messageId), from);
+          ptyIo.sendChannelText(currentSlug, threadId, buildSkillShimText(skillInvoke.name, skillInvoke.args), String(messageId), from);
           return;
         }
         if (listRepoCommands(route.worktreePath).includes(skillInvoke.name)) {
-          sendChannelText(currentSlug, threadId, buildCmdShimText(skillInvoke.name, skillInvoke.args), String(messageId), from);
+          ptyIo.sendChannelText(currentSlug, threadId, buildCmdShimText(skillInvoke.name, skillInvoke.args), String(messageId), from);
           return;
         }
       }
@@ -2879,7 +2777,7 @@ async function main(): Promise<void> {
       // never negotiates the capability), so inbound delivery writes the same <channel> tag
       // Claude Code would have rendered itself directly to the session's PTY, exactly as an
       // operator typing it and pressing Enter would.
-      sendChannelText(currentSlug, threadId, contextPrefix + rawText, String(messageId), from);
+      ptyIo.sendChannelText(currentSlug, threadId, contextPrefix + rawText, String(messageId), from);
     });
   }
 
@@ -3334,7 +3232,7 @@ async function main(): Promise<void> {
           controlBot.sendMessage(config.supergroupChatId, threadId, text).catch((err) => log("WARN", `sendMessage (show skills) failed: ${(err as Error).message}`));
           return;
         }
-        if (currentSlug) sendRaw(currentSlug, `/${action.name}`);
+        if (currentSlug) ptyIo.sendRaw(currentSlug, `/${action.name}`);
         return;
       }
 
