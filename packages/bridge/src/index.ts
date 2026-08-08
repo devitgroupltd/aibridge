@@ -62,12 +62,9 @@ import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCal
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
 import { formatStaleAge, hasAttachment, isStaleInbound } from "./stale-inbound.ts";
 import { buildStaleConfirmKeyboard, resolveStaleConfirmCallback, StaleConfirmRegistry } from "./stale-confirm.ts";
-import type { PendingStaleConfirm } from "./stale-confirm.ts";
 import { buildVoiceConfirmKeyboard, resolveVoiceConfirmCallback, VoiceConfirmRegistry } from "./voice-confirm.ts";
-import type { PendingVoiceConfirm } from "./voice-confirm.ts";
 import { startWhisperServer, transcribeVoiceNote } from "./voice-transcribe.ts";
 import { buildNlConfirmKeyboard, NlConfirmRegistry, resolveNlConfirmCallback } from "./nl-confirm.ts";
-import type { PendingNlConfirm } from "./nl-confirm.ts";
 import { isRetryPhrase, retryTopicKey, RetryStore } from "./retry-store.ts";
 import { buildContextPrefix } from "./message-context.ts";
 import type { MessageOrigin } from "./message-context.ts";
@@ -150,7 +147,7 @@ import { SessionStore, type SessionRow, type SessionState } from "./session-stor
 import { looksEnglishEnough } from "./language-heuristic.ts";
 import { slugFromPrompt, uniqueSlug } from "./slug.ts";
 import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
-import { buildTopicDeepLink, isPermanentEditFailure, startPolling, TelegramClient, validateTokens } from "./telegram.ts";
+import { buildTopicDeepLink, startPolling, TelegramClient, validateTokens } from "./telegram.ts";
 import type { InlineKeyboardMarkup } from "./telegram.ts";
 import { loadOffset, saveOffset } from "./telegram-offset.ts";
 import { createThinkingPlaceholder } from "./thinking-placeholder.ts";
@@ -161,6 +158,7 @@ import { createSessionSupervisor } from "./session-supervisor.ts";
 import { createPtyIo, DEFAULT_ECHO_SETTLE_MS, DEFAULT_SUBMIT_CONFIRM_WINDOW_MS } from "./pty-io.ts";
 import { createFeedWiring } from "./feed-wiring.ts";
 import { createQuotaAlarms, DEFAULT_BURN_RATE_THRESHOLD_USD } from "./quota-alarms.ts";
+import { createConfirmCards } from "./confirm-cards.ts";
 
 // §7.2's Task Scheduler stdout/stderr gap (logger.ts's own doc comment has the full story): a
 // launch that predates `main()` itself getting to run - a bad env file, a throw during module
@@ -381,6 +379,18 @@ async function main(): Promise<void> {
   // nl-confirm entry actually expires (the sweep below, and the tap-loses-the-race path further
   // down) - never on a cancel/run, which already has its own explicit outcome.
   const retryStore = new RetryStore();
+
+  // confirm-cards.ts: the four confirm-card protocols' (fleet/stale/voice/nl) shared finalize/
+  // expire/take-or-notify-gone logic - `feedGovernor` passed as a shared reference, same convention
+  // as quota-alarms.ts/feed-wiring.ts above.
+  const confirmCards = createConfirmCards({
+    controlBot,
+    feedGovernor,
+    supergroupChatId: config.supergroupChatId,
+    retryStore,
+    log,
+  });
+
   // `/browse`/`/find`'s own id-per-row registry (browse-nav.ts) - unlike the confirm registries
   // above, entries here are non-consuming (a folder's Prev/Next can be tapped repeatedly) and never
   // store a messageId - a tap edits whichever message it came from, read straight off the callback.
@@ -601,10 +611,10 @@ async function main(): Promise<void> {
     // operator-confirm cards too: past their TTL, strip the keyboard and say so. Doubles as the
     // sweep these four never had - entries used to be dropped only by a tap, so an untapped card
     // (and its whole replay payload) leaked for the lifetime of the daemon.
-    for (const entry of nlConfirmRegistry.takeExpired()) void markNlConfirmCardExpired(entry);
-    for (const entry of fleetConfirmRegistry.takeExpired()) void markConfirmCardExpired(entry.messageId);
-    for (const entry of staleConfirmRegistry.takeExpired()) void markConfirmCardExpired(entry.confirmCardMessageId);
-    for (const entry of voiceConfirmRegistry.takeExpired()) void markConfirmCardExpired(entry.confirmCardMessageId);
+    for (const entry of nlConfirmRegistry.takeExpired()) void confirmCards.markNlConfirmCardExpired(entry);
+    for (const entry of fleetConfirmRegistry.takeExpired()) void confirmCards.markConfirmCardExpired(entry.messageId);
+    for (const entry of staleConfirmRegistry.takeExpired()) void confirmCards.markConfirmCardExpired(entry.confirmCardMessageId);
+    for (const entry of voiceConfirmRegistry.takeExpired()) void confirmCards.markConfirmCardExpired(entry.confirmCardMessageId);
 
     // §6.4: past the 3540s ceiling, cancel rather than let the hook's own 3600s timeout expire
     // silently - the operator sees an explicit "cancelled" card and Claude sees a `deny` it can
@@ -1014,67 +1024,6 @@ async function main(): Promise<void> {
     }
   }
 
-  /** The one "this card is settled" edit: replace its text, strip its keyboard. Every confirm card
-   * (fleet, NL, stale, voice) finalizes identically - four copies of this differing only in which
-   * field held the message id was pure duplication. */
-  async function finalizeCard(messageId: number, text: string): Promise<void> {
-    if (!controlBot.editMessageText) return;
-    try {
-      // Through the control governor's P1 lane, not a direct call. §5.4 counts every method against
-      // the token, and the expiry sweep below can produce a *burst*: one stale-confirm card per
-      // backlog message after an overnight sleep means ~200 of these come due in the same tick. Fired
-      // directly they would all 429 - invisibly to the governor, whose bucket would still believe the
-      // budget was free when the next P0 permission card went out.
-      await feedGovernor.scheduleAsync("P1", async () => {
-        try {
-          await controlBot.editMessageText!(config.supergroupChatId, messageId, text, { inline_keyboard: [] });
-        } catch (err) {
-          // Swallowed *inside* the lane deliberately: P1 retries three times with backoff, and a
-          // message that can never be edited again (the operator deleted it, or it aged out of
-          // Telegram's 48h edit window) would spend four control-bucket tokens per card. A sweep burst
-          // of 200 expired cards would then burn ~40 minutes of the 20/min budget on failures that
-          // cannot succeed, delaying real replies. Transient errors still get their retries.
-          if (!isPermanentEditFailure(err)) throw err;
-          log("WARN", `confirm card ${messageId} is no longer editable - leaving it as-is`);
-        }
-      });
-    } catch (err) {
-      log("WARN", `failed to finalize a confirm card: ${(err as Error).message}`);
-    }
-  }
-
-  /** What the sweep (and a tap that lost the race to it) leaves behind, so an expired card reads as
-   * expired instead of as a button that does nothing. */
-  function markConfirmCardExpired(messageId: number): Promise<void> {
-    return finalizeCard(messageId, "⌛ This confirmation expired - send it again if you still want it.");
-  }
-
-  /** Same "past its TTL" outcome as `markConfirmCardExpired`, but for nl-confirm specifically:
-   * stashes the command into `retryStore` first (see that file's doc comment) and says so on the
-   * card, so `/retry` - or a spoken "retry"/"try again" - re-arms it instead of the operator having
-   * to retype/re-say the original request. */
-  function markNlConfirmCardExpired(entry: PendingNlConfirm): Promise<void> {
-    retryStore.add({ id: retryTopicKey(entry.threadId), command: entry.command, threadId: entry.threadId, currentSlug: entry.currentSlug });
-    return finalizeCard(entry.messageId, "⌛ This confirmation expired - /retry to re-arm it, or send it again if you still want it.");
-  }
-
-  /** What a tap on an id `registry.take()` no longer has leaves behind. Two causes look identical
-   * to `take` once the entry is gone - a duplicate tap racing its own already-in-flight answer, or
-   * a tap left over from before a Bridge restart wiped every in-memory confirmation - and only the
-   * second should edit the card, since re-editing the first would clobber the real result with a
-   * misleading "no longer valid" a moment after it was correctly answered. `wasRecentlyAnswered`
-   * tells the two apart. Restart is the far more common case in practice (§4.5.1: the operator
-   * restarts, then taps a button that was already on screen), and leaving it silent - Telegram's
-   * spinner already cleared - was the exact §6.5 failure mode this project works to avoid elsewhere. */
-  function notifyConfirmGone(registry: { wasRecentlyAnswered(id: string): boolean }, id: string, messageId: number | undefined): void {
-    if (registry.wasRecentlyAnswered(id) || messageId === undefined) return;
-    void finalizeCard(messageId, "⌛ This confirmation is no longer valid - most likely the Bridge restarted since it was posted. Resend the command to try again.");
-  }
-
-  async function finalizeFleetConfirmMessage(pending: PendingFleetConfirm, text: string): Promise<void> {
-    await finalizeCard(pending.messageId, text);
-  }
-
   /** §7.4's stale-inbound path: posts the "received while offline, still want this?" card instead
    * of dispatching a backlog message directly, and registers the replay payload. Mirrors
    * `postFleetConfirm`'s shape exactly. */
@@ -1095,10 +1044,6 @@ async function main(): Promise<void> {
    * worktree and announcing it to a live session as if it had just arrived. */
   function notifyStaleAttachment(threadId: number | undefined, ageLabel: string): void {
     confirmSessionCommand(threadId, `⏳ An attachment arrived while offline (${ageLabel}) - not delivered. Re-send it if you still want it.`);
-  }
-
-  async function finalizeStaleConfirmMessage(pending: PendingStaleConfirm, text: string): Promise<void> {
-    await finalizeCard(pending.confirmCardMessageId, text);
   }
 
   /** Voice-input's own confirm-card path (voice-confirm.ts): downloads the voice note, transcribes
@@ -1223,14 +1168,6 @@ async function main(): Promise<void> {
     }
   }
 
-  /** Keeps the transcript visible under the final status line rather than replacing it outright -
-   * once the card's buttons are gone, the transcript text was the only record of what a "Sent"/
-   * "Discarded" tap actually applied to; losing it made the finalized message unreadable on its
-   * own (live-reported: a "✅ Sent." card with no way to see what was sent). */
-  async function finalizeVoiceConfirmMessage(pending: PendingVoiceConfirm, statusLine: string): Promise<void> {
-    await finalizeCard(pending.confirmCardMessageId, `🎤 ${pending.transcript}\n\n${statusLine}`);
-  }
-
   /** Runs after a `/kill --all`/`/rm --all` confirm tap - re-looks-up rows by slug rather than
    * trusting a snapshot from when the confirm card was posted, since a session can die or get
    * removed independently in the minutes between posting and the tap. */
@@ -1239,15 +1176,15 @@ async function main(): Promise<void> {
     // directly, which is the only reason it was postable in the first place (no DB lookup).
     if (pending.kind === "rm-topic") {
       if (pending.topicId === undefined) {
-        await finalizeFleetConfirmMessage(pending, "Nothing left to act on.");
+        await confirmCards.finalizeFleetConfirmMessage(pending, "Nothing left to act on.");
         return;
       }
       try {
         await controlBot.deleteForumTopic(config.supergroupChatId, pending.topicId);
-        await finalizeFleetConfirmMessage(pending, "Topic deleted.");
+        await confirmCards.finalizeFleetConfirmMessage(pending, "Topic deleted.");
       } catch (err) {
         log("WARN", `deleteForumTopic failed for orphan topic ${pending.topicId}: ${(err as Error).message}`);
-        await finalizeFleetConfirmMessage(pending, "Telegram would not delete this topic - it may need to be removed by hand (topic menu -> Delete Topic).");
+        await confirmCards.finalizeFleetConfirmMessage(pending, "Telegram would not delete this topic - it may need to be removed by hand (topic menu -> Delete Topic).");
       }
       return;
     }
@@ -1263,7 +1200,7 @@ async function main(): Promise<void> {
     }
     const verb = pending.kind === "kill" ? "Killed" : "Removed";
     const note = pending.kind === "rm" && !allTopicsDeleted ? ORPHAN_TOPIC_NOTE : "";
-    await finalizeFleetConfirmMessage(pending, rows.length === 0 ? "Nothing left to act on." : `${verb} ${rows.length} session${rows.length === 1 ? "" : "s"}: ${rows.map((r) => r.slug).join(", ")}${note}`);
+    await confirmCards.finalizeFleetConfirmMessage(pending, rows.length === 0 ? "Nothing left to act on." : `${verb} ${rows.length} session${rows.length === 1 ? "" : "s"}: ${rows.map((r) => r.slug).join(", ")}${note}`);
   }
 
   /** `/kill --all --force`/`/rm --all --force` (operator-requested 2026-08-08): the same teardown
@@ -2140,10 +2077,6 @@ async function main(): Promise<void> {
     }
   }
 
-  async function finalizeNlConfirmMessage(pending: PendingNlConfirm, text: string): Promise<void> {
-    await finalizeCard(pending.messageId, text);
-  }
-
   /**
    * The one entry point for both of `dispatchInboundMessage`'s fallthrough branches (no session /
    * forward-to-session) - tries the NL router, and only calls `onNoMatch` (today's existing
@@ -2696,19 +2629,13 @@ async function main(): Promise<void> {
           // `take`, not `resolve`: an expired card has to *say* it expired. `answerCallbackQuery`
           // above already cleared the spinner, so returning silently here left the operator with a
           // tap that visibly did nothing - §6.5's stated failure mode.
-          const fleetTaken = fleetConfirmRegistry.take(fleetConfirmAction.id);
-          if (!fleetTaken) {
-            notifyConfirmGone(fleetConfirmRegistry, fleetConfirmAction.id, callbackQuery.message?.message_id);
-            return;
-          }
-          if (fleetTaken.expired) {
-            void markConfirmCardExpired(fleetTaken.entry.messageId);
-            return;
-          }
-          const pending = fleetTaken.entry;
+          const pending = confirmCards.takeOrNotifyGone(fleetConfirmRegistry, fleetConfirmAction.id, callbackQuery.message?.message_id, (entry) =>
+            void confirmCards.markConfirmCardExpired(entry.messageId),
+          );
+          if (!pending) return;
           if (pending.kind !== fleetConfirmAction.kind) return;
           if (!fleetConfirmAction.confirmed) {
-            void finalizeFleetConfirmMessage(pending, "Cancelled - nothing was changed.");
+            void confirmCards.finalizeFleetConfirmMessage(pending, "Cancelled - nothing was changed.");
             return;
           }
           void executeFleetConfirm(pending);
@@ -2805,25 +2732,19 @@ async function main(): Promise<void> {
         // until `/assist on` turns it back on.
         const nlConfirmAction = callbackQuery.data ? resolveNlConfirmCallback(callbackQuery.data) : null;
         if (nlConfirmAction) {
-          const nlTaken = nlConfirmRegistry.take(nlConfirmAction.id);
-          if (!nlTaken) {
-            notifyConfirmGone(nlConfirmRegistry, nlConfirmAction.id, callbackQuery.message?.message_id);
-            return;
-          }
-          if (nlTaken.expired) {
-            void markNlConfirmCardExpired(nlTaken.entry);
-            return;
-          }
-          const pending = nlTaken.entry;
+          const pending = confirmCards.takeOrNotifyGone(nlConfirmRegistry, nlConfirmAction.id, callbackQuery.message?.message_id, (entry) =>
+            void confirmCards.markNlConfirmCardExpired(entry),
+          );
+          if (!pending) return;
           if (nlConfirmAction.action === "cancel") {
-            void finalizeNlConfirmMessage(pending, "❌ Cancelled - nothing was changed.");
+            void confirmCards.finalizeNlConfirmMessage(pending, "❌ Cancelled - nothing was changed.");
             return;
           }
           if (nlConfirmAction.action === "run_and_stop_asking") {
             assistEnabled = false;
             settingsStore.set("assist_enabled", "false");
           }
-          void finalizeNlConfirmMessage(pending, `✅ Running ${describeNlCommand(pending.command)}${nlConfirmAction.action === "run_and_stop_asking" ? " (confirmation now off - /assist on to re-enable)" : ""}.`);
+          void confirmCards.finalizeNlConfirmMessage(pending, `✅ Running ${describeNlCommand(pending.command)}${nlConfirmAction.action === "run_and_stop_asking" ? " (confirmation now off - /assist on to re-enable)" : ""}.`);
           const pendingIsControl = isControlTopic(pending.threadId);
           executeMatchedCommand(pending.command, pending.threadId, pendingIsControl, pending.currentSlug);
           return;
@@ -2837,21 +2758,15 @@ async function main(): Promise<void> {
         // unrecognised/dead currentSlug the same way a live message would.
         const staleConfirmAction = callbackQuery.data ? resolveStaleConfirmCallback(callbackQuery.data) : null;
         if (staleConfirmAction) {
-          const staleTaken = staleConfirmRegistry.take(staleConfirmAction.id);
-          if (!staleTaken) {
-            notifyConfirmGone(staleConfirmRegistry, staleConfirmAction.id, callbackQuery.message?.message_id);
-            return;
-          }
-          if (staleTaken.expired) {
-            void markConfirmCardExpired(staleTaken.entry.confirmCardMessageId);
-            return;
-          }
-          const pending = staleTaken.entry;
+          const pending = confirmCards.takeOrNotifyGone(staleConfirmRegistry, staleConfirmAction.id, callbackQuery.message?.message_id, (entry) =>
+            void confirmCards.markConfirmCardExpired(entry.confirmCardMessageId),
+          );
+          if (!pending) return;
           if (!staleConfirmAction.confirmed) {
-            void finalizeStaleConfirmMessage(pending, "Cancelled - not actioned.");
+            void confirmCards.finalizeStaleConfirmMessage(pending, "Cancelled - not actioned.");
             return;
           }
-          void finalizeStaleConfirmMessage(pending, "✅ Confirmed - processing now.");
+          void confirmCards.finalizeStaleConfirmMessage(pending, "✅ Confirmed - processing now.");
           const pendingIsControl = isControlTopic(pending.threadId);
           const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
           void dispatchInboundMessage(pending.messageId, pending.rawText, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin));
@@ -2866,22 +2781,16 @@ async function main(): Promise<void> {
         // before sending, the typeable equivalent being `/voiceconfirm off`.
         const voiceConfirmAction = callbackQuery.data ? resolveVoiceConfirmCallback(callbackQuery.data) : null;
         if (voiceConfirmAction) {
-          const voiceTaken = voiceConfirmRegistry.take(voiceConfirmAction.id);
-          if (!voiceTaken) {
-            notifyConfirmGone(voiceConfirmRegistry, voiceConfirmAction.id, callbackQuery.message?.message_id);
-            return;
-          }
-          if (voiceTaken.expired) {
-            void markConfirmCardExpired(voiceTaken.entry.confirmCardMessageId);
-            return;
-          }
-          const pending = voiceTaken.entry;
+          const pending = confirmCards.takeOrNotifyGone(voiceConfirmRegistry, voiceConfirmAction.id, callbackQuery.message?.message_id, (entry) =>
+            void confirmCards.markConfirmCardExpired(entry.confirmCardMessageId),
+          );
+          if (!pending) return;
           if (voiceConfirmAction.action === "send" || voiceConfirmAction.action === "send_and_stop_asking") {
             if (voiceConfirmAction.action === "send_and_stop_asking") {
               voiceConfirmEnabled = false;
               settingsStore.set("voice_confirm_enabled", "false");
             }
-            void finalizeVoiceConfirmMessage(pending, voiceConfirmAction.action === "send_and_stop_asking" ? "✅ Sent (confirmation now off - /voiceconfirm on to re-enable)." : "✅ Sent.");
+            void confirmCards.finalizeVoiceConfirmMessage(pending, voiceConfirmAction.action === "send_and_stop_asking" ? "✅ Sent (confirmation now off - /voiceconfirm on to re-enable)." : "✅ Sent.");
             const pendingIsControl = isControlTopic(pending.threadId);
             const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
             void dispatchInboundMessage(pending.messageId, pending.transcript, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin));
@@ -2893,7 +2802,7 @@ async function main(): Promise<void> {
               : voiceConfirmAction.action === "type"
                 ? "✏️ Discarded - go ahead and type it."
                 : "❌ Cancelled.";
-          void finalizeVoiceConfirmMessage(pending, doneText);
+          void confirmCards.finalizeVoiceConfirmMessage(pending, doneText);
           return;
         }
 
