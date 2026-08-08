@@ -1,7 +1,7 @@
 ---
-version: 0.101.0
+version: 0.102.0
 status: solid
-last_modified_utc: 2026-08-08T06:30:00Z
+last_modified_utc: 2026-08-08T14:00:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,15 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.102.0 (2026-08-08): operator asked about running an aibridge session fully unattended overnight
+    (no permission prompts at all). Research turned up Claude Code's `auto` permission mode, which did
+    not exist when §6 was written and is not evaluated anywhere in this plan. Added a pointer in §7.6
+    naming it as a Phase 6b evaluation candidate - not adopted now, since it needs a real headless
+    probe against a running session (the §6.1.1 standard) and there is no walking skeleton to probe it
+    against yet (Phase 1 not started). No other section changed; `bypassPermissions` and `dontAsk` were
+    also considered and rejected for aibridge specifically - the former needs container/VM isolation
+    this Windows-native host doesn't have (§6.7), the latter auto-denies `AskUserQuestion` before it can
+    reach the §6.4 hook, breaking the Telegram question flow."
   - "0.101.0 (2026-08-08): operator asked for a way to skip `/kill --all`/`/rm --all`'s Yes/No
     confirm card entirely - typing `/rm --all --force` (or its `-force`/`-f` aliases, normalized
     the same way `-all` already is) instead of tapping a button. This is the reverse of 0.29.0's
@@ -2750,6 +2759,20 @@ so that Phase 6 is a checklist rather than a fresh investigation.
 metric (§10.3) showing the allowlist has had to grow broad enough to be uncomfortable; or registering a
 repo less well-understood than SeoWrite (the pilot project), where the blast radius of a given
 allowlist entry has not been assessed the way §10.4.1 assesses SeoWrite's.
+
+**Candidate to evaluate here, not before:** Claude Code's `auto` permission mode (a fifth mode alongside
+the four §6.1 already accounts for) - a server-side classifier that reviews actions in place of most
+permission prompts, with its own hardcoded deny-list (force-push, prod deploys/destroys, secret
+exfiltration, disabling CI, `curl|bash`, and more) independent of the session's settings.json. It did
+not exist when §6 was written and is not evaluated anywhere in this plan. It might shrink the
+hand-maintained §6.2 `ask`/`allow` lists, since its built-in denials overlap the category those lists
+exist to catch - but it raises the same "verified, not inferred" question §6.1.1 already had to answer
+once for the guard-hook precedence: does a classifier denial reach the Telegram feed the way a §6.3
+permission escalation does, or does it fail silently mid-session? Does it fight the `AskUserQuestion`
+hook (§6.4)? Untested. Requires Sonnet/Opus 4.6+ (met by the models in use as of 2026-08-08) and needs a
+real headless probe against a running session before any of this plan's other sections cite it as fact
+- there is no walking skeleton to probe it against yet (Phase 1), which is why this is a pointer for
+Phase 6b's design pass, not a decision made now.
 
 **What the migration costs**, in dependency order:
 
