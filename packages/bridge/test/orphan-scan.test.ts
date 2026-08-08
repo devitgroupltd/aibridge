@@ -58,4 +58,23 @@ describe("findOrphanProcesses (§9 scenario 24, §4.5's reconciliation table)", 
     const processes = [{ pid: 1234, commandLine: '"claude.exe" --channels plugin:aibridge-telegram@devitgroup-plugins --model sonnet' }];
     expect(findOrphanProcesses(processes, [row()])).toEqual([]);
   });
+
+  // 0.99.0: this was the self-check ("test-session") row's actual live bug, root-caused
+  // 2026-08-08. Its row's ptyPid was never kept in sync with its own relaunch (unlike a fleet
+  // session's `resumeSession`, which calls `setPtyPid` every time), so it stayed stuck at 0 - and
+  // matching is by *exact pid*, so a legitimate session with a stale ptyPid flags its own perfectly
+  // healthy process as an orphan indistinguishable from a real leak. This function's own matching
+  // logic was never wrong; the bug was upstream (index.ts never calling `setPtyPid` on that path) -
+  // these two cases document the mechanism, i.e. what the fix actually depends on.
+  test("a row whose ptyPid was never kept in sync with its own relaunch still self-flags as an orphan", () => {
+    const processes = [{ pid: 6304, commandLine: '"claude.exe" --channels plugin:aibridge-telegram@devitgroup-plugins --model sonnet' }];
+    expect(findOrphanProcesses(processes, [row({ slug: "test-session", ptyPid: 0 })])).toEqual([
+      { pid: 6304, commandLine: '"claude.exe" --channels plugin:aibridge-telegram@devitgroup-plugins --model sonnet' },
+    ]);
+  });
+
+  test("once ptyPid is kept in sync with the relaunch (the actual fix), the same session is no longer flagged", () => {
+    const processes = [{ pid: 6304, commandLine: '"claude.exe" --channels plugin:aibridge-telegram@devitgroup-plugins --model sonnet' }];
+    expect(findOrphanProcesses(processes, [row({ slug: "test-session", ptyPid: 6304 })])).toEqual([]);
+  });
 });

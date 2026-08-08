@@ -1,7 +1,7 @@
 ---
-version: 0.98.0
+version: 0.100.1
 status: solid
-last_modified_utc: 2026-08-08T05:40:00Z
+last_modified_utc: 2026-08-08T06:10:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,64 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.100.1 (2026-08-08): follow-up to 0.100.0 below, prompted by being asked directly whether it
+    was covered by tests. `buildCreateArgs` (pure logic) already was; the two `index.ts` wiring
+    changes stay untestable in isolation (the same accepted closures-inside-main() gap prior fixes
+    have hit); but `resolveNodeExecutable` had silently introduced a third, verbatim-duplicated,
+    zero-test copy of 'parse `where.exe`'s multi-line output, take the first non-blank line' -
+    exactly the silent-wrong shape §9 exists to catch (e.g. a shim earlier on PATH than the real
+    binary would misresolve which binary the Bridge respawns itself as, with no test anywhere
+    that would notice). Extracted into `firstNonEmptyLine`, shared by all three resolvers. 7 new
+    tests (`session-launcher.test.ts`): single match, CRLF trailing newline, multiple matches
+    (first wins, matching real PATH-search order), a leading blank line skipped rather than
+    mistaken for the answer, whitespace-only output producing no match rather than a blank-string
+    one, empty output, and untrimmed surrounding whitespace. 966 total (up from 959), `tsc --noEmit`
+    clean."
+  - "0.100.0 (2026-08-08): operator reported *every* new session wedging immediately after spawn
+    (PTY write-socket dead within ~1s, auto-resumed via §12 Phase 5's crash-resume, and the resume
+    routinely failing outright with 'Claude reported no matching session' since the original
+    process died before Claude Code ever persisted a single real exchange for it to resume). Traced
+    to the actual root cause, not the resume-failure symptom (that detection - `RESUME_FAILURE_PATTERN`
+    et al - was already working exactly as designed): `Get-CimInstance` confirmed the live Bridge
+    process was `bun.exe run .../index.ts`, not `node --experimental-strip-types` - the documented
+    runtime this codebase has stated explicitly, repeatedly, since 0.21.0 (which root-caused and
+    reproduced, outside this codebase, that a node-pty ConPTY write against a perfectly healthy
+    child throws an unhandled 'Socket is closed' asynchronously on the next tick specifically when
+    the *Bridge itself* runs under Bun - `pty-write-guard.ts` only stops that from crashing the
+    whole daemon, it doesn't stop the session from wedging). Two drift points had put the Bridge on
+    Bun: `autostart.ts`'s Task Scheduler registration hardcoded `<bunExePath> run <entryScriptPath>`
+    for its own `/TR`, and `respawnSelfAndExit`'s raw-spawn fallback (`/restart`, `/deploy`'s
+    self-repo restart, the stale-deploy rollback) did `spawn(process.execPath,
+    process.argv.slice(1), ...)` - blindly re-launching with whatever binary happened to start the
+    *current* process, so once the Bridge was ever started under Bun even once (that Task Scheduler
+    entry, or a manual `bun run`), every subsequent self-respawn perpetuated the same lineage
+    forever, permanently, across restarts. Fixed both to always resolve and launch the documented
+    runtime explicitly regardless of how the current process itself started: new
+    `resolveNodeExecutable` (session-launcher.ts, mirroring the existing `resolveBunExecutable` -
+    which is for a *different*, legitimate use, the channel server's own MCP registration, §2.4,
+    correctly untouched), wired into both `autostart.ts`'s `/TR` string and
+    `respawnSelfAndExit`'s fallback spawn. Updated `buildCreateArgs`'s existing test for the new
+    `node --experimental-strip-types` invocation shape; `resolveNodeExecutable` itself stays
+    untested like its `resolveBunExecutable`/`resolveClaudeExecutable` siblings (a thin `where`
+    shell-out wrapper, same pre-existing gap). 959 total, `tsc --noEmit` clean. **Operational note,
+    not covered by the code fix alone**: the already-running Bun-launched Bridge instance needs one
+    `/restart` after this deploys to actually pick up the corrected self-respawn path - the fix
+    prevents recurrence going forward, it doesn't retroactively fix a process already running."
+  - "0.99.0 (2026-08-08): operator asked why `/restart` reported \"Found 1 orphaned claude
+    process(es)... pid(s) 6304\" every time. Root-caused live: 6304 was the Bridge's own self-check
+    (\"test-session\") session, relaunched fresh by that very restart - `Get-CimInstance` confirmed
+    its command line was the self-check's own settings path. Not a leak: the self-check session's
+    row only ever calls `sessionStore.insert` once, on the Bridge's first-ever boot, with `ptyPid: 0`
+    - every later relaunch (including this one) spawns a fresh process but never updates that row's
+    ptyPid, unlike a fleet session's `resumeSession`, which already calls `setPtyPid` on every
+    relaunch. `reportOrphanProcesses` matches live processes against rows by *exact pid*, so a
+    permanently-0 ptyPid meant the self-check session's own perfectly healthy relaunch could never
+    match its own row, misreporting itself as an orphan on every single restart going forward, not
+    just this one. Fixed with the one missing call: `sessionStore.setPtyPid(config.selfCheck.slug,
+    session.ptyProcess.pid ?? 0)` right after the self-check `wireSession`, mirroring the fleet path.
+    2 new tests in `orphan-scan.test.ts` (the exact self-check shape - stale ptyPid still self-flags;
+    kept in sync, it doesn't) and 1 in `session-store.test.ts` (`setPtyPid` itself, previously
+    untested despite being load-bearing here). 959 total (up from 956), `tsc --noEmit` clean."
   - "0.98.0 (2026-08-08): operator asked whether `/new`'s \"Created ... in a new topic.\" confirmation
     could jump straight to the new topic instead of making the operator find it by hand in the topic
     list. Confirmed against Telegram's own deep-link docs (core.telegram.org/api/links): a

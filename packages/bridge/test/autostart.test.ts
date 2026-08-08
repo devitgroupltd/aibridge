@@ -11,8 +11,13 @@ import {
 } from "../src/autostart.ts";
 
 describe("buildCreateArgs / buildQueryArgs / buildDeleteArgs", () => {
-  test("buildCreateArgs registers a logon-trigger task at limited (non-admin) privilege", () => {
-    const args = buildCreateArgs("C:\\bun.exe", "C:\\aibridge\\index.ts");
+  // 0.100.0: this was `<bunExePath> run <entryScriptPath>` until root-caused live 2026-08-08 -
+  // Bun is the confirmed trigger for node-pty's unhandled "Socket is closed" ConPTY write crash
+  // (0.21.0), so a logon-triggered Bridge registered this way wedged nearly every session it ever
+  // spawned. Must always be the documented runtime instead (packages/bridge/package.json's own
+  // `start` script), never Bun.
+  test("buildCreateArgs registers a logon-trigger task at limited (non-admin) privilege, running node --experimental-strip-types", () => {
+    const args = buildCreateArgs("C:\\node.exe", "C:\\aibridge\\index.ts");
     expect(args).toEqual([
       "/Create",
       "/TN",
@@ -20,7 +25,7 @@ describe("buildCreateArgs / buildQueryArgs / buildDeleteArgs", () => {
       "/SC",
       "ONLOGON",
       "/TR",
-      '"C:\\bun.exe" run "C:\\aibridge\\index.ts"',
+      '"C:\\node.exe" --experimental-strip-types "C:\\aibridge\\index.ts"',
       "/RL",
       "LIMITED",
       "/F",

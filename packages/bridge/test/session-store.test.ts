@@ -120,6 +120,18 @@ describe("SessionStore", () => {
     expect(store.get("fix-bug")).toMatchObject({ model: "opus", sessionId: "sess-123", turnCardMsg: 42, paused: true });
   });
 
+  // 0.99.0: the self-check session's own row never called this on relaunch (unlike every fleet
+  // session's `resumeSession`), so its ptyPid stayed stuck at its one-time insert value forever -
+  // and `findOrphanProcesses` matches live processes against rows by exact pid, so a stale ptyPid
+  // meant the self-check session's own freshly-launched process flagged itself as an "orphan" on
+  // every restart (live-observed 2026-08-08, right after an operator-issued `/restart`).
+  test("setPtyPid updates only that field, leaving the rest of the row untouched", () => {
+    const store = new SessionStore(":memory:");
+    store.insert(row({ ptyPid: 0 }));
+    store.setPtyPid("fix-bug", 6304);
+    expect(store.get("fix-bug")).toEqual(row({ ptyPid: 6304 }));
+  });
+
   test("remove deletes the row entirely", () => {
     const store = new SessionStore(":memory:");
     store.insert(row());

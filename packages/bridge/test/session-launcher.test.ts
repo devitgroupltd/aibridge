@@ -1,6 +1,41 @@
 import { describe, expect, test } from "bun:test";
 import type * as pty from "node-pty";
-import { buildClaudeSpawnArgs, stripAnsi, waitForStartupPrompt } from "../src/session-launcher.ts";
+import { buildClaudeSpawnArgs, firstNonEmptyLine, stripAnsi, waitForStartupPrompt } from "../src/session-launcher.ts";
+
+// 0.100.0: the resolveNodeExecutable/resolveBunExecutable/resolveClaudeExecutable trio all parse
+// `where.exe`'s output through this exact logic - pulled out and tested on its own, since the exec
+// call itself stays untestable I/O but this parsing is pure, decidable, and the one place a wrong
+// pick (e.g. a shim ahead of the real binary on PATH) would silently misresolve which binary the
+// Bridge respawns itself as.
+describe("firstNonEmptyLine (where.exe output parsing)", () => {
+  test("a single match, no trailing newline", () => {
+    expect(firstNonEmptyLine("C:\\nvm4w\\nodejs\\node.exe")).toBe("C:\\nvm4w\\nodejs\\node.exe");
+  });
+
+  test("a single match with where.exe's usual CRLF trailing newline", () => {
+    expect(firstNonEmptyLine("C:\\nvm4w\\nodejs\\node.exe\r\n")).toBe("C:\\nvm4w\\nodejs\\node.exe");
+  });
+
+  test("multiple matches (a shim earlier on PATH than the real binary) - takes the first, PATH order", () => {
+    expect(firstNonEmptyLine("C:\\Users\\me\\shims\\node.exe\r\nC:\\nvm4w\\nodejs\\node.exe\r\n")).toBe("C:\\Users\\me\\shims\\node.exe");
+  });
+
+  test("a blank line ahead of a real match is skipped, not treated as the answer", () => {
+    expect(firstNonEmptyLine("\r\nC:\\nvm4w\\nodejs\\node.exe\r\n")).toBe("C:\\nvm4w\\nodejs\\node.exe");
+  });
+
+  test("whitespace-only output is no match, not a blank-string match", () => {
+    expect(firstNonEmptyLine("   \r\n\t\r\n")).toBeUndefined();
+  });
+
+  test("empty output is no match", () => {
+    expect(firstNonEmptyLine("")).toBeUndefined();
+  });
+
+  test("a line is trimmed of its own leading/trailing whitespace", () => {
+    expect(firstNonEmptyLine("   C:\\nvm4w\\nodejs\\node.exe   \r\n")).toBe("C:\\nvm4w\\nodejs\\node.exe");
+  });
+});
 
 /** A minimal stand-in for `pty.IPty` - `waitForStartupPrompt` only ever calls `.onData`. */
 class FakePty {

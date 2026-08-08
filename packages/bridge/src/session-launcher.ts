@@ -12,6 +12,22 @@ import { generateSettings, writeSettingsFile } from "./settings.ts";
 import { ensureWorktree } from "./worktree.ts";
 
 /**
+ * `where.exe` prints one match per line (CRLF), and - live-observed - a blank trailing line, or
+ * more than one match when a shim/stub sits earlier on PATH than the real binary; §9's silent-wrong
+ * bar means the "which line is the actual answer" logic is worth pulling out and testing on its
+ * own rather than trusting three independent inline copies to keep agreeing. Takes the *first*
+ * non-blank line deliberately - PATH order is the same precedence an interactive shell would use,
+ * so this matches "the one `where` would run" rather than an arbitrary pick among duplicates.
+ * `undefined` for empty/whitespace-only output (no match), never a blank string.
+ */
+export function firstNonEmptyLine(output: string): string | undefined {
+  return output
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find((line) => line.length > 0);
+}
+
+/**
  * node-pty's Windows ConPTY agent calls its native `startProcess` directly with `file` before
  * `cwd`/`env`/args are ever applied (those only arrive later, via a separate `connect()` call) -
  * so whatever PATH-search behaviour that native call does is not the same as an interactive
@@ -24,10 +40,7 @@ let cachedClaudeExePath: string | undefined;
 function resolveClaudeExecutable(): string {
   if (cachedClaudeExePath) return cachedClaudeExePath;
   const output = execFileSync("where", ["claude.exe"], { encoding: "utf8" });
-  const first = output
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line.length > 0);
+  const first = firstNonEmptyLine(output);
   if (!first) {
     throw new Error("claude.exe not found on PATH - is Claude Code installed and logged in for this account? (§7.5)");
   }
@@ -49,14 +62,38 @@ let cachedBunExePath: string | undefined;
 export function resolveBunExecutable(): string {
   if (cachedBunExePath) return cachedBunExePath;
   const output = execFileSync("where", ["bun.exe"], { encoding: "utf8" });
-  const first = output
-    .split(/\r?\n/)
-    .map((line) => line.trim())
-    .find((line) => line.length > 0);
+  const first = firstNonEmptyLine(output);
   if (!first) {
     throw new Error("bun.exe not found on PATH - is Bun installed for this account? (§9)");
   }
   cachedBunExePath = first;
+  return first;
+}
+
+/**
+ * The Bridge process's own runtime - `node --experimental-strip-types`, never Bun (0.21.0
+ * root-caused this precisely: a node-pty ConPTY write that succeeds against a perfectly healthy
+ * child still throws an unhandled "Socket is closed" asynchronously on the next tick when the
+ * *Bridge itself* runs under Bun, wedging almost every session within ~1s of spawn - reproduced
+ * with a minimal repro outside this codebase). `resolveBunExecutable` above is for a completely
+ * different, legitimate use: the *channel server*'s own MCP registration inside a session, which is
+ * correctly meant to run under Bun (§2.4). Every self-respawn site and the Task Scheduler
+ * registration (autostart.ts) must resolve this one instead - live-observed 2026-08-08, both
+ * `/autostart install`'s own Task Scheduler `/TR` string and `respawnSelfAndExit`'s raw-spawn
+ * fallback (which blindly reused `process.execPath`/`process.argv`, perpetuating whatever binary
+ * happened to launch the current process) had drifted onto Bun, and every new session on that
+ * fleet was wedging and auto-resuming as a direct result.
+ */
+let cachedNodeExePath: string | undefined;
+
+export function resolveNodeExecutable(): string {
+  if (cachedNodeExePath) return cachedNodeExePath;
+  const output = execFileSync("where", ["node.exe"], { encoding: "utf8" });
+  const first = firstNonEmptyLine(output);
+  if (!first) {
+    throw new Error("node.exe not found on PATH - is Node.js installed for this account?");
+  }
+  cachedNodeExePath = first;
   return first;
 }
 

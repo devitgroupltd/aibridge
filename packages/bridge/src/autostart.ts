@@ -9,9 +9,15 @@ import { escapeForFeed } from "./feed-escape.ts";
  */
 export const TASK_NAME = "aibridge";
 
-/** `schtasks /Create` args for a logon-trigger task running `<bunExePath> run <entryScriptPath>`. */
-export function buildCreateArgs(bunExePath: string, entryScriptPath: string): string[] {
-  return ["/Create", "/TN", TASK_NAME, "/SC", "ONLOGON", "/TR", `"${bunExePath}" run "${entryScriptPath}"`, "/RL", "LIMITED", "/F"];
+/** `schtasks /Create` args for a logon-trigger task running
+ * `<nodeExePath> --experimental-strip-types <entryScriptPath>` - the Bridge's own documented
+ * runtime (packages/bridge/package.json's `start` script), never Bun. Was `<bunExePath> run
+ * <entryScriptPath>` until 0.100.0: Bun is the confirmed, reproduced trigger for node-pty's
+ * unhandled "Socket is closed" ConPTY write crash (0.21.0), so a logon-triggered Bridge launched
+ * this way wedged nearly every session it ever spawned - see `resolveNodeExecutable`'s own doc
+ * comment (session-launcher.ts) for the full chain. */
+export function buildCreateArgs(nodeExePath: string, entryScriptPath: string): string[] {
+  return ["/Create", "/TN", TASK_NAME, "/SC", "ONLOGON", "/TR", `"${nodeExePath}" --experimental-strip-types "${entryScriptPath}"`, "/RL", "LIMITED", "/F"];
 }
 
 export function buildQueryArgs(): string[] {

@@ -121,7 +121,7 @@ import {
   resolveRepoNameFuzzy,
   type ReposRegistry,
 } from "./repos-registry.ts";
-import { launchSession, resolveBunExecutable, stripAnsi } from "./session-launcher.ts";
+import { launchSession, resolveNodeExecutable, stripAnsi } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
 import { RateGovernor } from "./rate-governor.ts";
 import { deriveAlwaysRule, ruleAlreadyCovered } from "./rule-derivation.ts";
@@ -841,6 +841,14 @@ async function main(): Promise<void> {
     });
 
     wireSession(config.selfCheck.slug, session.ptyProcess, config.selfCheck.topicId);
+    // Without this, the self-check row's ptyPid stays whatever it was set to on the row's one-time
+    // insert above (0, since that always predates the first-ever launch) forever after - unlike
+    // every fleet session, which gets this same call on each `resumeSession` relaunch (§4.5).
+    // `reportOrphanProcesses` right below then matches live processes against rows by exact pid, so
+    // a permanently-0 ptyPid means the self-check session's own freshly-launched process can never
+    // match its own row - flagging its perfectly legitimate self-relaunch as an "orphan" on every
+    // single restart (live-observed 2026-08-08, right after an operator-issued `/restart`).
+    sessionStore.setPtyPid(config.selfCheck.slug, session.ptyProcess.pid ?? 0);
 
     // Stage 7 manual-verification-only affordance: this process's own stdin isn't a real TTY
     // when the Bridge itself is launched non-interactively, so mirrorPtyToConsole's stdin pipe
@@ -2076,7 +2084,18 @@ async function main(): Promise<void> {
     }
     const ranViaTask = !(await runSchtasks(buildRunArgs())).failed;
     if (!ranViaTask) {
-      spawn(process.execPath, process.argv.slice(1), { detached: true, stdio: "ignore" }).unref();
+      // Deliberately never `spawn(process.execPath, process.argv.slice(1), ...)` here (0.100.0):
+      // that blindly re-launches with whatever binary happened to start *this* process, so a
+      // Bridge that was ever started via `bun run` even once - manually, or via the autostart
+      // Task Scheduler entry's own past mis-registration - kept perpetuating that lineage forever,
+      // across every `/restart` and `/deploy`. Bun is the confirmed, reproduced trigger for
+      // node-pty's unhandled "Socket is closed" ConPTY write crash (0.21.0), which wedges nearly
+      // every session within ~1s of spawn - live-observed 2026-08-08, see
+      // `resolveNodeExecutable`'s own doc comment (session-launcher.ts) for the full chain. Always
+      // resolving and re-launching the documented runtime explicitly, regardless of how this
+      // process itself was started, is what actually breaks that cycle rather than perpetuating it.
+      const entryScript = path.join(import.meta.dirname, "index.ts");
+      spawn(resolveNodeExecutable(), ["--experimental-strip-types", entryScript], { detached: true, stdio: "ignore" }).unref();
     }
     process.exit(0);
   }
@@ -2266,7 +2285,7 @@ async function main(): Promise<void> {
       }
       if (cmd.action === "install") {
         const entryScript = path.join(import.meta.dirname, "index.ts");
-        const result = await runSchtasks(buildCreateArgs(resolveBunExecutable(), entryScript));
+        const result = await runSchtasks(buildCreateArgs(resolveNodeExecutable(), entryScript));
         if (result.failed) throw new Error(result.stderr.trim() || "schtasks /Create failed");
         // schtasks /Create leaves two defaults that would bite later (§7.2 point 2's 3-day execution
         // limit, and a "Multiple Instances" policy that silently breaks /restart's buildRunArgs path -
