@@ -69,29 +69,17 @@ import {
   parseCommandsQuery,
   parseFleetCommand,
   parseSkillsQuery,
-  renderBudget,
   renderHelp,
-  renderReposList,
-  renderSettings,
   stripBotMention,
 } from "./fleet-commands.ts";
 import { renderDetails, renderDetailsPlainText } from "./feed-renderer.ts";
 import { monotonicNowMs } from "./monotonic-clock.ts";
-import { CostTracker, FIVE_HOURS_MS, ONE_WEEK_MS } from "./cost-tracker.ts";
+import { CostTracker } from "./cost-tracker.ts";
 import { CostStore } from "./cost-store.ts";
-import { currentUnits, WEIGHTED_CAP } from "./concurrency-cap.ts";
 import { startOtlpListener } from "./otlp-listener.ts";
 import { resolvePermCallback } from "./permission-callback.ts";
 import { sweepExpiredPermissions } from "./permission-registry.ts";
-import {
-  addRepoEntry,
-  cloneRepo,
-  inferDefaultRepoPath,
-  isGitUrl,
-  loadReposRegistry,
-  removeRepoEntry,
-  type ReposRegistry,
-} from "./repos-registry.ts";
+import { loadReposRegistry, type ReposRegistry } from "./repos-registry.ts";
 import { launchSession, resolveNodeExecutable, stripAnsi } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
 import { RateGovernor } from "./rate-governor.ts";
@@ -143,6 +131,7 @@ import { createQuotaAlarms, DEFAULT_BURN_RATE_THRESHOLD_USD } from "./quota-alar
 import { createConfirmCards } from "./confirm-cards.ts";
 import { createInboundMedia } from "./inbound-media.ts";
 import { createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE } from "./session-lifecycle-commands.ts";
+import { createFleetReportingCommands } from "./fleet-reporting-commands.ts";
 
 // §7.2's Task Scheduler stdout/stderr gap (logger.ts's own doc comment has the full story): a
 // launch that predates `main()` itself getting to run - a bad env file, a throw during module
@@ -629,6 +618,21 @@ async function main(): Promise<void> {
     log,
   });
 
+  const fleetReporting = createFleetReportingCommands({
+    controlBot,
+    sessionStore,
+    costTracker,
+    confirmSessionCommand,
+    isControlTopic,
+    getReposRegistry: () => reposRegistry,
+    setReposRegistry: (registry) => {
+      reposRegistry = registry;
+    },
+    reposTomlPath,
+    supergroupChatId: config.supergroupChatId,
+    log,
+  });
+
   // §6.5: strip the keyboard, mark "expired", and deny (see sweepExpiredPermissions) on any
   // pending permission request past its TTL - a stale button left live would look tappable but
   // silently do nothing.
@@ -802,22 +806,6 @@ async function main(): Promise<void> {
   }
 
   // ---- §4.2's fleet commands (Phase 5) ----
-
-  /** §10.5 point 2's `/budget`: fleet-wide rolling 5h/7d spend plus a per-session 5h breakdown -
-   * control-topic only, same as `/ls` (no single session to scope this to). */
-  function handleBudgetCommand(topicId: number | undefined): void {
-    const nowMs = Date.now();
-    costTracker.prune(nowMs);
-    const fleetFiveHour = costTracker.fleetSpendSince(FIVE_HOURS_MS, nowMs);
-    const fleetWeekly = costTracker.fleetSpendSince(ONE_WEEK_MS, nowMs);
-    const perSessionFiveHour = new Map<string, number>();
-    for (const row of sessionStore.all()) {
-      if (row.sessionId) perSessionFiveHour.set(row.slug, costTracker.spendSince(row.sessionId, FIVE_HOURS_MS, nowMs));
-    }
-    controlBot
-      .sendMessage(config.supergroupChatId, topicId, renderBudget(fleetFiveHour, fleetWeekly, perSessionFiveHour))
-      .catch((err) => log("WARN", `sendMessage (/budget) failed: ${(err as Error).message}`));
-  }
 
   /** `/voice [<model>]` - control-topic-only (voice-model.ts), same reasoning as `/budget`/`/ls`:
    * there is exactly one whisper-server for the whole Bridge, not one per session, so there is
@@ -1112,79 +1100,6 @@ async function main(): Promise<void> {
     }
     log("INFO", "/deploy: self-repo, respawning and exiting");
     await respawnSelfAndExit();
-  }
-
-  /** `/settings`: control-topic only, same reasoning as `/budget` - repos.toml and the weighted
-   * concurrency budget are fleet-wide, not scoped to any one session's topic. */
-  function handleSettingsCommand(topicId: number | undefined): void {
-    if (!isControlTopic(topicId)) {
-      confirmSessionCommand(topicId, "/settings only works from the control topic.");
-      return;
-    }
-    controlBot
-      .sendMessage(
-        config.supergroupChatId,
-        topicId,
-        renderSettings(reposRegistry?.all() ?? [], { current: currentUnits(sessionStore.all()), cap: WEIGHTED_CAP }),
-      )
-      .catch((err) => log("WARN", `sendMessage (/settings) failed: ${(err as Error).message}`));
-  }
-
-  /** `/repos [list|add <name> [path|git-url] [--base <b>] [--model <m>]|rm <name>]`: §7.5's
-   * registry, now mutable from Telegram (`repos-registry.ts` owns the file I/O and validation)
-   * instead of only by hand-editing repos.toml. Control-topic only, same reasoning as
-   * `/settings`/`/budget` - the registry is fleet-wide, not scoped to any one session's topic.
-   * `add`/`rm` reload `reposRegistry` in place so the very next `/new` sees the change without a
-   * Bridge restart.
-   *
-   * `add`'s path argument is resolved here, ahead of `addRepoEntry`'s own local-path checks: a git
-   * URL (`isGitUrl`) is cloned first (`cloneRepo`) into an inferred destination, and an omitted path
-   * is inferred outright (`inferDefaultRepoPath`) - both only when every already-registered repo
-   * shares one parent folder, per the operator's own §7.5 ask; otherwise this asks for an explicit
-   * path rather than guessing. */
-  function handleReposCommand(cmd: Extract<FleetCommand, { kind: "repos" }>, topicId: number | undefined): void {
-    if (!isControlTopic(topicId)) {
-      confirmSessionCommand(topicId, "/repos only works from the control topic.");
-      return;
-    }
-    if (cmd.action === "list") {
-      controlBot
-        .sendMessage(config.supergroupChatId, topicId, renderReposList(reposRegistry?.all() ?? []))
-        .catch((err) => log("WARN", `sendMessage (/repos) failed: ${(err as Error).message}`));
-      return;
-    }
-    try {
-      if (cmd.action === "add") {
-        const existing = reposRegistry?.all() ?? [];
-        const givenUrl = cmd.path && isGitUrl(cmd.path) ? cmd.path : undefined;
-        let repoPath = givenUrl ? undefined : cmd.path;
-        if (!repoPath) {
-          repoPath = inferDefaultRepoPath(existing, cmd.name) ?? undefined;
-          if (!repoPath) {
-            confirmSessionCommand(
-              topicId,
-              `/repos add ${cmd.name}: no path given and none could be inferred (need at least one repo already registered, all sharing one parent folder) - specify a path or git URL explicitly.`,
-            );
-            return;
-          }
-        }
-        if (givenUrl) {
-          cloneRepo(givenUrl, repoPath, cmd.base);
-        }
-        addRepoEntry(reposTomlPath, { name: cmd.name, path: repoPath, base: cmd.base, model: cmd.model });
-        reposRegistry = loadReposRegistry(reposTomlPath);
-        confirmSessionCommand(
-          topicId,
-          `${givenUrl ? `Cloned ${givenUrl} -> ${repoPath} and r` : "R"}egistered "${cmd.name}" -> ${repoPath} (§7.5). /new ${cmd.name} <prompt> now works.`,
-        );
-        return;
-      }
-      removeRepoEntry(reposTomlPath, cmd.name);
-      reposRegistry = loadReposRegistry(reposTomlPath);
-      confirmSessionCommand(topicId, `Unregistered "${cmd.name}" - any existing worktree/session for it is untouched.`);
-    } catch (err) {
-      confirmSessionCommand(topicId, `/repos ${cmd.action} failed: ${(err as Error).message}`);
-    }
   }
 
   /** Wraps `schtasks.exe` (built into Windows, no extra dependency) - `/Query` against an
@@ -1675,7 +1590,7 @@ async function main(): Promise<void> {
         confirmSessionCommand(threadId, "/budget only works from the control topic.");
         return;
       }
-      handleBudgetCommand(threadId);
+      fleetReporting.handleBudgetCommand(threadId);
       return;
     }
     if (fleetCmd.kind === "kill") {
@@ -1711,7 +1626,7 @@ async function main(): Promise<void> {
       return;
     }
     if (fleetCmd.kind === "settings") {
-      handleSettingsCommand(threadId);
+      fleetReporting.handleSettingsCommand(threadId);
       return;
     }
     if (fleetCmd.kind === "autostart") {
@@ -1719,7 +1634,7 @@ async function main(): Promise<void> {
       return;
     }
     if (fleetCmd.kind === "repos") {
-      handleReposCommand(fleetCmd, threadId);
+      fleetReporting.handleReposCommand(fleetCmd, threadId);
       return;
     }
     if (fleetCmd.kind === "voice") {
