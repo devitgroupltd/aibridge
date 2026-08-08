@@ -161,7 +161,8 @@ import { isValidTransition, SessionStore, type SessionRow, type SessionState } f
 import { looksEnglishEnough } from "./language-heuristic.ts";
 import { slugFromPrompt, uniqueSlug } from "./slug.ts";
 import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
-import { isPermanentEditFailure, startPolling, TelegramClient, validateTokens } from "./telegram.ts";
+import { buildTopicDeepLink, isPermanentEditFailure, startPolling, TelegramClient, validateTokens } from "./telegram.ts";
+import type { InlineKeyboardMarkup } from "./telegram.ts";
 import { loadOffset, saveOffset } from "./telegram-offset.ts";
 import { createThinkingPlaceholder } from "./thinking-placeholder.ts";
 import { createTypingIndicator } from "./typing-indicator.ts";
@@ -1094,9 +1095,9 @@ async function main(): Promise<void> {
   // its own initiative funnels through here, so wiring it through the governor once covers all of
   // them - never delayed behind P2 feed traffic, itself never allowed to delay a P0 permission
   // prompt or question.
-  function confirmSessionCommand(topicId: number | undefined, text: string, parseMode?: "HTML"): void {
+  function confirmSessionCommand(topicId: number | undefined, text: string, parseMode?: "HTML", keyboard?: InlineKeyboardMarkup): void {
     feedGovernor
-      .scheduleAsync("P1", () => controlBot.sendMessage(config.supergroupChatId, topicId, text, undefined, parseMode))
+      .scheduleAsync("P1", () => controlBot.sendMessage(config.supergroupChatId, topicId, text, keyboard, parseMode))
       .catch((err: unknown) => log("WARN", `failed to send command confirmation: ${(err as Error).message}`));
   }
 
@@ -1375,7 +1376,12 @@ async function main(): Promise<void> {
       lastEventUtc: nowIso(),
     });
 
-    confirmSessionCommand(controlTopicId, `Created "${slug}" (${model}) in a new topic.`);
+    // Deep-links straight into the new topic (buildTopicDeepLink's own doc comment) rather than
+    // making the operator find it by hand in the topic list - a `url` button, so no round trip
+    // through the Bridge and no callback-registry entry to track or ever expire.
+    confirmSessionCommand(controlTopicId, `Created "${slug}" (${model}) in a new topic.`, undefined, {
+      inline_keyboard: [[{ text: `↪️ Open "${slug}"`, url: buildTopicDeepLink(config.supergroupChatId, topic.message_thread_id) }]],
+    });
 
     // Two independent gates, both real events rather than guessed delays: the dev-channels dialog
     // must be confirmed (`session.ready` - otherwise the write lands on the still-open dialog and

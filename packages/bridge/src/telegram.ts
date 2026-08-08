@@ -89,6 +89,24 @@ export interface InlineKeyboardMarkup {
   inline_keyboard: InlineKeyboardButton[][];
 }
 
+/** Deep link straight into a specific forum topic - `t.me/c/<chat id, minus the "-100" Bot API
+ * prefix>/<message_thread_id>`, confirmed against Telegram's own deep-link docs
+ * (core.telegram.org/api/links). `message_thread_id` is the id of the topic's own creation service
+ * message; resolving a message link that points at a `messageActionTopicCreate` message opens the
+ * topic itself rather than that message, which is what makes this work with nothing beyond the id
+ * `createForumTopic` already hands back. A `url`-type `InlineKeyboardButton` (unlike every
+ * `callback_data` one elsewhere in this codebase) needs no round trip through the Bridge at all -
+ * Telegram's own client resolves it locally, the same way browse-nav.ts's GitHub link button does.
+ *
+ * `chatId` is expected in Bot API form (`-100xxxxxxxxxx`) - anything not matching that shape is
+ * returned as-is rather than mangled, so a malformed/unexpected config value produces an
+ * obviously-broken link (easy to notice) instead of a silently wrong one. */
+export function buildTopicDeepLink(chatId: string | number, topicId: number): string {
+  const raw = String(chatId);
+  const stripped = raw.startsWith("-100") ? raw.slice(4) : raw;
+  return `https://t.me/c/${stripped}/${topicId}`;
+}
+
 export interface UpdatesSource {
   getUpdates(offset: number, timeoutSec: number): Promise<TelegramUpdate[]>;
 }

@@ -2,7 +2,7 @@ import { createServer } from "node:net";
 import { describe, expect, test } from "bun:test";
 import { StubTelegramServer } from "@aibridge/stub-telegram";
 import { RateLimitedError } from "../src/rate-governor.ts";
-import { fetchWithTimeout, startPolling, TelegramClient, validateTokens } from "../src/telegram.ts";
+import { buildTopicDeepLink, fetchWithTimeout, startPolling, TelegramClient, validateTokens } from "../src/telegram.ts";
 import type { GetMeSource, TelegramUpdate, UpdatesSource } from "../src/telegram.ts";
 
 function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -16,6 +16,24 @@ function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
     tick();
   });
 }
+
+describe("buildTopicDeepLink", () => {
+  // The `/new`-confirmation "open this session" button's whole mechanism: a t.me/c/ link straight
+  // into a forum topic, confirmed against Telegram's own deep-link docs (core.telegram.org/api/links).
+  test("strips the Bot API's -100 supergroup prefix and appends the topic id", () => {
+    expect(buildTopicDeepLink("-1004470540564", 37)).toBe("https://t.me/c/4470540564/37");
+  });
+
+  test("accepts a numeric chat id the same way", () => {
+    expect(buildTopicDeepLink(-1004470540564, 37)).toBe("https://t.me/c/4470540564/37");
+  });
+
+  // A malformed/unexpected config value should produce an obviously-broken link (easy for the
+  // operator to notice: a "-" mid-URL) rather than a silently wrong one that just doesn't work.
+  test("leaves a chat id that doesn't start with -100 unmangled, rather than guessing", () => {
+    expect(buildTopicDeepLink("-4470540564", 37)).toBe("https://t.me/c/-4470540564/37");
+  });
+});
 
 describe("fetchWithTimeout", () => {
   // Found live 2026-08-06: every Telegram call used a bare `fetch` with no client-side timeout,

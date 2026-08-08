@@ -1,7 +1,7 @@
 ---
-version: 0.97.0
+version: 0.98.0
 status: solid
-last_modified_utc: 2026-08-07T22:30:00Z
+last_modified_utc: 2026-08-08T05:40:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,22 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.98.0 (2026-08-08): operator asked whether `/new`'s \"Created ... in a new topic.\" confirmation
+    could jump straight to the new topic instead of making the operator find it by hand in the topic
+    list. Confirmed against Telegram's own deep-link docs (core.telegram.org/api/links): a
+    `t.me/c/<chat id, minus the Bot API's \"-100\" prefix>/<message_thread_id>` link opens a private
+    supergroup's forum topic directly - resolving a message link that points at the
+    `messageActionTopicCreate` service message opens the topic itself rather than that message, and
+    `message_thread_id` (already returned by `createForumTopic`, already threaded through this call
+    site) *is* that message's id, so nothing new needs computing. New `buildTopicDeepLink` in
+    telegram.ts; `confirmSessionCommand` gained an optional trailing `keyboard` param (forwarded
+    straight to `sendMessage`'s existing `replyMarkup`); `handleNewCommand`'s confirmation now carries
+    a `url`-type inline button (\"↪️ Open \\\"<slug>\\\"\") - `url` buttons resolve client-side, so
+    unlike every `callback_data` button elsewhere in this codebase this needs no round trip through
+    the Bridge and no registry entry that could ever go stale or need expiring. 3 new tests
+    (`telegram.test.ts`): the \"-100\"-stripping happy path, a numeric chat id accepted the same way,
+    and a chat id that doesn't match the expected prefix left unmangled (an obviously-broken link is
+    easier to notice than a silently wrong one). 956 total (up from 953), `tsc --noEmit` clean."
   - "0.97.0 (2026-08-07): operator asked to actually close the reply-vs-feed-card ordering gap
     0.91.0 only narrowed, rather than accept it as a permanent workaround. Web/GitHub research
     confirmed there is no server-side ordering guarantee across independent Telegram `sendMessage`
