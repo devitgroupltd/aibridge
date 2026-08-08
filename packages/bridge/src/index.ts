@@ -3,7 +3,6 @@ import { randomUUID } from "node:crypto";
 import http from "node:http";
 import path from "node:path";
 import type * as pty from "node-pty";
-import type { HookEventMessage } from "@aibridge/protocol";
 import { resolveAskCallback, renderAskAnsweredCard, renderAskCancelledCard } from "./ask-callback.ts";
 import { ABOUT_TOPICS, buildAboutKeyboard, isAboutCommand, renderAbout, resolveAboutCallback } from "./about.ts";
 import { buildCreateArgs, buildDeleteArgs, buildFixTaskSettingsScript, buildQueryArgs, buildRunArgs, parseQueryOutput, renderAutostartStatus, TASK_NAME } from "./autostart.ts";
@@ -34,7 +33,7 @@ import {
   truncateForTelegram,
   writeDeployMarker,
 } from "./deploy.ts";
-import { buildDetailsKeyboard, parseDetailsCallback } from "./details-button.ts";
+import { parseDetailsCallback } from "./details-button.ts";
 import { DetailsAnchorStore, DETAILS_ANCHOR_RETENTION_MS } from "./details-anchor-store.ts";
 import {
   attachmentKindLabel,
@@ -59,7 +58,6 @@ import {
 } from "./browse-nav.ts";
 import { listDirectory, MAX_SEND_BYTES, prepareFileForSend, readForPreview, resolveGithubLink, searchWorktree } from "./worktree-fs.ts";
 import { buildDiffReview, cleanupDiffRefs } from "./diff-review.ts";
-import { FeedCoalescer } from "./feed-coalescer.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
 import { formatStaleAge, hasAttachment, isStaleInbound } from "./stale-inbound.ts";
@@ -95,10 +93,8 @@ import {
   renderSettings,
   stripBotMention,
 } from "./fleet-commands.ts";
-import { renderCard, renderDetails, renderDetailsPlainText } from "./feed-renderer.ts";
-import { applyEvent, createFeedState, promptsInLastHour, shouldSplitCard, splitCard } from "./feed-state.ts";
+import { renderDetails, renderDetailsPlainText } from "./feed-renderer.ts";
 import { monotonicNowMs } from "./monotonic-clock.ts";
-import { normalizeHookEvent } from "./hook-events.ts";
 import { CostTracker, FIVE_HOURS_MS, ONE_WEEK_MS } from "./cost-tracker.ts";
 import { CostStore } from "./cost-store.ts";
 import { checkConcurrencyCap, currentUnits, WEIGHTED_CAP } from "./concurrency-cap.ts";
@@ -149,7 +145,6 @@ import {
   resolveModelCallback,
 } from "./session-commands.ts";
 import type { DefaultCategory, Effort, Mode, Model, SessionCommand } from "./session-commands.ts";
-import { stateForHookEvent } from "./session-state-transitions.ts";
 import { formatUsagePanel } from "./usage-panel.ts";
 import { isValidTransition, SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
 import { looksEnglishEnough } from "./language-heuristic.ts";
@@ -164,6 +159,7 @@ import { restartSettleDelayMs } from "./restart-settle.ts";
 import { removeWorktree } from "./worktree.ts";
 import { createSessionSupervisor } from "./session-supervisor.ts";
 import { createPtyIo, DEFAULT_ECHO_SETTLE_MS, DEFAULT_SUBMIT_CONFIRM_WINDOW_MS } from "./pty-io.ts";
+import { createFeedWiring } from "./feed-wiring.ts";
 
 // §7.2's Task Scheduler stdout/stderr gap (logger.ts's own doc comment has the full story): a
 // launch that predates `main()` itself getting to run - a bad env file, a throw during module
@@ -425,13 +421,6 @@ async function main(): Promise<void> {
   const browseRegistry = new BrowseRegistry();
   const voiceServer = config.voice.enabled ? startWhisperServer(config.voice, log) : null;
 
-  function maybeSetState(slug: string, target: SessionState): void {
-    const row = sessionStore.get(slug);
-    if (row && row.state !== target && isValidTransition(row.state, target)) {
-      sessionStore.setState(slug, target, nowIso());
-    }
-  }
-
   // Two independent, cheap "Claude is working on this" signals, kept side by side rather than
   // choosing one: `sendChatAction` renders correctly on mobile clients but Telegram Desktop has a
   // known bug (tdesktop#30452) that only shows it in the topics overview, not inside the open
@@ -460,188 +449,10 @@ async function main(): Promise<void> {
     log: (level, message) => log(level, message),
   });
 
-  // §5.1-§5.4: one turn-card state per session, one shared governor across both the feed bot's
-  // droppable P2 lane (§9 scenarios 14-18 are unit-tested against rate-governor.ts/
-  // feed-coalescer.ts directly) and a per-session-count-scaled coalescer that skips a render when
-  // the text hasn't actually changed. Reply/permission-card/answerCallbackQuery sends on the
-  // control bot are deliberately left as direct calls for this pass - see Phase 3's own note.
-  const feedStates = new Map<string, ReturnType<typeof createFeedState>>();
-  const feedMessageIds = new Map<string, number>();
-  // A message landing in a session's own topic after the card's last edit leaves the still-live
-  // card visually "stuck" above it - Telegram never repositions an edited message, the same fact
-  // behind the turn/split boundaries above, just triggered by the *operator* instead of a hook
-  // event (live-observed complaint, 2026-08-07). Marked in dispatchInboundMessage, consumed (and
-  // cleared) by the next flush below - no need to force an immediate one, since there's nothing new
-  // to show until the next hook event anyway.
-  const feedInterjected = new Set<string>();
+  // §5.1-§5.4: one shared governor across both the feed bot's droppable P2 lane (§9 scenarios
+  // 14-18 are unit-tested against rate-governor.ts/feed-coalescer.ts directly) and every P1 fleet
+  // notice - used directly here and passed into feed-wiring.ts below.
   const feedGovernor = new RateGovernor({ log });
-  const feedCoalescer = new FeedCoalescer({
-    activeSessionCount: () => routing.all().length,
-    quietMode: () => feedGovernor.p2PressureExceeded(),
-    // Returns `feedGovernor.schedule`'s own promise (0.97.0) rather than firing it and returning
-    // nothing - `reset()` propagates this back out to `onBeforeReply`, so awaiting a reply's
-    // ordering barrier actually awaits this call's underlying Telegram send, not just its scheduling.
-    onFlush: (slug, text) => {
-      return feedGovernor.schedule("P2", async () => {
-        // §4.2's /pause: replies and prompts still flow, only the feed card stops updating.
-        if (sessionStore.get(slug)?.paused) return;
-        const route = routing.get(slug);
-        if (!route) return;
-        if (feedInterjected.delete(slug)) feedMessageIds.delete(slug);
-        const existingMessageId = feedMessageIds.get(slug);
-        if (existingMessageId !== undefined && feedBot.editMessageText) {
-          try {
-            await feedBot.editMessageText(config.supergroupChatId, existingMessageId, text, undefined, "HTML");
-          } catch (err) {
-            // A per-message permanent failure has to invalidate the cached id, or the feed for this
-            // session is dead for the rest of the process's life: the P2 lane swallows rejections,
-            // so every later flush edited the same unusable message, silently, forever. Dropping
-            // the id makes the next flush post a fresh card instead. (Reachable by deleting the
-            // card by hand, and by Telegram's 48h edit window on a long-lived session.)
-            if (isPermanentEditFailure(err)) {
-              feedMessageIds.delete(slug);
-              log("WARN", `feed card for "${slug}" is no longer editable (${(err as Error).message}) - a fresh card will be posted`);
-              return;
-            }
-            throw err;
-          }
-        } else {
-          const sent = await feedBot.sendMessage(config.supergroupChatId, route.topicId, text, undefined, "HTML");
-          feedMessageIds.set(slug, sent.message_id);
-        }
-      });
-    },
-  });
-
-  // §10.4.1: this project's own choice of threshold, not a number the plan specifies - a
-  // conservative "worth a look" signal for whether the allowlist has grown too broad on a host
-  // with no sandbox, surfaced as a log line now and left for a Phase 5 fleet command to expose.
-  const PROMPTS_PER_HOUR_WARN_THRESHOLD = 20;
-
-  // §5.4 point 4's quiet-mode notice: posted once on the rising edge only ("posts ... once", not
-  // on every tick while pressure persists), and reset once pressure clears so a later, separate
-  // storm notifies again rather than staying silent forever after the first one.
-  let quietModeNotified = false;
-
-  /** §5.5: one small anchor message per turn carrying the `details` button - see
-   * `details-button.ts` for why this can't just live on the turn card itself. P1 lane (a
-   * lifecycle notice, not a permission/question card), and skipped for a `/pause`d session for
-   * the same reason `feedCoalescer`'s own flush is (§4.2: "replies and prompts still flow, only
-   * the feed card stops updating" - this is feed-adjacent, not a reply or a prompt).
-   *
-   * The anchor is edited in place (not left un-edited) once its button is actually tapped - see
-   * the "d:" callback branch below - so its own message_id is persisted here (`detailsAnchorStore`,
-   * survives a restart on the operator's own request) the moment it's known. */
-  function postDetailsButton(slug: string, turnSeq: number): void {
-    if (sessionStore.get(slug)?.paused) return;
-    const route = routing.get(slug);
-    if (!route) return;
-    feedGovernor
-      .scheduleAsync("P1", () =>
-        controlBot.sendMessage(config.supergroupChatId, route.topicId, "Click Details to see this turn's full log.", {
-          inline_keyboard: buildDetailsKeyboard(slug, turnSeq),
-        }),
-      )
-      .then((sent) => detailsAnchorStore.set(slug, turnSeq, sent.message_id, Date.now()))
-      .catch((err) => log("WARN", `failed to post details button for "${slug}": ${(err as Error).message}`));
-  }
-
-  function handleHookEvent(msg: HookEventMessage): void {
-    // §4.5's resume path needs a real session_id to hand to `claude --resume` - every hook event
-    // carries one (§5.1), so this is the only place it's ever known, and it's cheap to keep fresh
-    // in case a session's own id ever changes mid-run (e.g. after its own internal --resume).
-    // Missing live 2026-08-03 until now: `sessionId` sat `null` forever, so the very first restart
-    // recovery attempt had nothing to resume with.
-    const row = sessionStore.get(msg.slug);
-    if (row && row.sessionId !== msg.session_id) {
-      sessionStore.setSessionId(msg.slug, msg.session_id);
-    }
-    // A hook firing is the only proof a (re)launched session actually got far enough to run - so
-    // it, not a successful spawn, is what clears the consecutive-immediate-exit counter. Goes
-    // through session-supervisor.ts's accessor rather than a raw Map - that module owns this state.
-    sessionSupervisor.clearResumeAttempts(msg.slug);
-
-    // §6.5's terminal-race fix (§13 check 4): if the operator answers Claude Code's own terminal
-    // prompt instead of tapping the Telegram card, there is no protocol event saying so - the
-    // first sign is one of these three hooks landing for the same tool the pending card is for.
-    // `PermissionDenied` on its own is ambiguous (fired by the sandbox's own deny rules too, with
-    // nothing pending to match), so it's folded into the same lookup rather than special-cased.
-    if (msg.hook_event_name === "PostToolUse" || msg.hook_event_name === "PostToolUseFailure" || msg.hook_event_name === "PermissionDenied") {
-      const toolName = typeof msg.payload.tool_name === "string" ? msg.payload.tool_name : undefined;
-      // The tool *input* is what makes this a match rather than a guess - see `resolveByToolMatch`
-      // and `toolInputMatches` on what pairing by tool name alone did, and on why the comparison has
-      // to parse the preview rather than substring-search it.
-      const resolved = toolName ? pipeHandle.permissionRegistry.resolveByToolMatch(msg.slug, toolName, msg.payload.tool_input) : undefined;
-      if (resolved) {
-        // The card is only half of it: the channel server's permission call is still blocked, and
-        // nothing else will unblock it now that the entry is out of the registry (the expiry sweep
-        // can no longer see it). Send the verdict the operator's own terminal answer implies.
-        pipeHandle.sendVerdict(resolved.slug, resolved.requestId, msg.hook_event_name === "PermissionDenied" ? "deny" : "allow");
-        const behaviorLabel = msg.hook_event_name === "PermissionDenied" ? "⛔ Denied" : "✅ Allowed";
-        pipeHandle
-          .finalizePermissionMessage(resolved.messageId, `${behaviorLabel}: ${resolved.toolName} (answered at terminal)`)
-          .catch((err) => log("WARN", `failed to finalize permission message resolved at the terminal for "${msg.slug}": ${(err as Error).message}`));
-      }
-    }
-
-    // §4.3's state table, the hook-driven half (the permission/ask half is wired via
-    // onAwaitingInput/maybeSetState below) - a stale/duplicate event is a silent no-op, not an error.
-    const targetState = stateForHookEvent(msg.hook_event_name, typeof msg.payload.reason === "string" ? msg.payload.reason : undefined);
-    if (targetState) maybeSetState(msg.slug, targetState);
-
-    const event = normalizeHookEvent(msg.hook_event_name, msg.payload);
-    if (!event) return;
-
-    // §10.5 point 3's second quota-stop signal - a `StopFailure` hook whose own error text names a
-    // rate limit/usage limit, independent of whether the OTLP `api_error` event (unverified shape,
-    // see otlp-listener.ts) ever arrives for the same failure.
-    if (event.kind === "turn_end" && !event.success && /rate.?limit|usage limit|quota/i.test(event.error)) {
-      markQuotaStopped(msg.slug);
-    }
-
-    const nowMs = Date.now();
-    const previous = feedStates.get(msg.slug) ?? createFeedState(msg.slug);
-    let next = applyEvent(previous, event, nowMs);
-    feedStates.set(msg.slug, next);
-    const feedSettings = row ? { detail: row.feedDetail, verbose: row.feedVerbose } : undefined;
-
-    if (event.kind === "turn_start") {
-      // §5.3/§5.4 are explicit that the card is *one message per turn*, edited in place - so a new
-      // turn must start a new message. Without this the id set on the session's very first flush
-      // was reused forever: turn 2 overwrote turn 1's record of what happened, and by turn 6 the
-      // "live" card was buried above dozens of newer messages, since Telegram never repositions an
-      // edited message. (`postDetailsButton` below already posts a fresh anchor per turn - the two
-      // were out of step.)
-      // Order matters, and getting it backwards undoes the whole fix. `reset` flushes any render that
-      // was still armed when the turn ended, and that flush runs *synchronously* (the P2 lane invokes
-      // its callback inline, and the callback reads `feedMessageIds` before its first await). So the
-      // outgoing turn's last frame has to be able to still find its own card id - clear the id first
-      // and that final frame gets posted as a brand-new message, leaving turn N frozen at an earlier
-      // frame and turn N+1 editing turn N's final content. Flush into the old card, *then* forget it.
-      feedCoalescer.reset(msg.slug);
-      feedMessageIds.delete(msg.slug);
-      const promptCount = promptsInLastHour(next, nowMs);
-      if (promptCount > PROMPTS_PER_HOUR_WARN_THRESHOLD) {
-        log("WARN", `session "${msg.slug}" started ${promptCount} turns in the last hour - check whether its allowlist has grown too broad (§10.4.1)`);
-      }
-      postDetailsButton(msg.slug, next.turnSeq);
-    } else if (shouldSplitCard(next)) {
-      // A very long turn (many tool calls) otherwise edits the same message forever, which loses
-      // any sense of *when* things happened relative to anything else in the topic (live-observed
-      // complaint, 2026-08-07) - same underlying Telegram fact as the turn boundary above (edits
-      // never reposition), just crossed mid-turn instead of between turns. Same flush-then-clear
-      // order and the same reason: render (and let this notify carry) the boundary-crossing line
-      // into the card about to be frozen *before* moving `cardLineOffset` past it, or that line
-      // never appears in either card.
-      feedCoalescer.notify(msg.slug, renderCard(next, nowMs, feedSettings));
-      feedCoalescer.reset(msg.slug);
-      feedMessageIds.delete(msg.slug);
-      next = splitCard(next);
-      feedStates.set(msg.slug, next);
-    }
-
-    feedCoalescer.notify(msg.slug, renderCard(next, nowMs, feedSettings));
-  }
 
   // The deterministic half of `/new`'s first-write race (§4.5's dev-channels dialog is the other
   // half, handled in `session-launcher.ts`): a slug can have at most one pending waiter at a time,
@@ -740,6 +551,30 @@ async function main(): Promise<void> {
     });
   }
 
+  // feed-wiring.ts: the hook-event -> feed-card rendering pipeline, the details-button anchor, and
+  // the hook-driven half of the state table. Constructed *before* `pipeHandle` (needs
+  // `feedWiring.handleHookEvent` as its `onHookEvent`), so the three `resolveByToolMatch`/
+  // `sendVerdict`/`finalizePermissionMessage` closures below reference `pipeHandle` ahead of its
+  // own declaration - safe, since none of them run until a real hook event arrives, well after
+  // `pipeHandle` is assigned (same deferred-closure pattern `confirmSessionCommand` already uses
+  // above). `markQuotaStopped` is a hoisted function declaration (module 4, quota-alarms.ts,
+  // hasn't been extracted yet) - passed by reference for the same reason.
+  const feedWiring = createFeedWiring({
+    sessionStore,
+    routing,
+    detailsAnchorStore,
+    feedGovernor,
+    controlBot,
+    feedBot,
+    supergroupChatId: config.supergroupChatId,
+    confirmSessionCommand,
+    markQuotaStopped,
+    resolveByToolMatch: (slug, toolName, toolInput) => pipeHandle.permissionRegistry.resolveByToolMatch(slug, toolName, toolInput),
+    sendVerdict: (slug, requestId, behavior) => pipeHandle.sendVerdict(slug, requestId, behavior),
+    finalizePermissionMessage: (messageId, text) => pipeHandle.finalizePermissionMessage(messageId, text),
+    log,
+  });
+
   // §10.1.2: inbound delivery no longer goes through the channel server (see the onUpdate
   // handler below), but the pipe server still owns outbound reply relay and stays the
   // transport for Phase 2+ (permission_request/verdict/event), so it's still started
@@ -758,7 +593,7 @@ async function main(): Promise<void> {
     // for this slug to flush right before the reply's own send - and since 0.97.0, `reset`'s return
     // (via `onFlush` below, now itself promise-returning) is a promise `pipe-server.ts` actually
     // awaits (bounded by its own timeout), not just a fire-and-forget head start.
-    onBeforeReply: (slug) => feedCoalescer.reset(slug),
+    onBeforeReply: (slug) => feedWiring.resetCoalescer(slug),
     onReplySent: (topicId, text) => {
       typingIndicator.stop(topicId);
       // §4.4's rename-once: the first real reply upgrades the topic off its provisional
@@ -777,8 +612,8 @@ async function main(): Promise<void> {
         }
       }
     },
-    onHookEvent: handleHookEvent,
-    onAwaitingInput: (slug) => maybeSetState(slug, "awaiting_input"),
+    onHookEvent: feedWiring.handleHookEvent,
+    onAwaitingInput: (slug) => feedWiring.maybeSetState(slug, "awaiting_input"),
     onChannelConnected: (slug) => {
       channelConnectCoordinator.onConnected(slug);
     },
@@ -828,13 +663,7 @@ async function main(): Promise<void> {
     // feed bot's bucket is genuinely saturated, not just one unlucky edit - tell the operator once
     // rather than let cards silently go stale with no explanation. feed-coalescer.ts already reads
     // this same signal to double its own interval; this is only the notice half.
-    const quiet = feedGovernor.p2PressureExceeded();
-    if (quiet && !quietModeNotified) {
-      quietModeNotified = true;
-      confirmSessionCommand(undefined, `⚠️ feed throttled, ${routing.all().length} sessions active`);
-    } else if (!quiet && quietModeNotified) {
-      quietModeNotified = false;
-    }
+    feedWiring.checkQuietMode();
   }, 60_000);
 
   if (process.env.AIBRIDGE_SKIP_LAUNCH !== "1") {
@@ -1097,7 +926,7 @@ async function main(): Promise<void> {
     for (const row of rows) {
       if (row.sessionId) costBySlug.set(row.slug, costTracker.lifetimeSpend(row.sessionId));
     }
-    const detailBySlug = buildLsDetail(rows, nowMs, monotonicNowMs(), feedStates, pipeHandle.permissionRegistry.all(), pipeHandle.askRegistry.all());
+    const detailBySlug = buildLsDetail(rows, nowMs, monotonicNowMs(), feedWiring.allFeedStates(), pipeHandle.permissionRegistry.all(), pipeHandle.askRegistry.all());
     controlBot
       .sendMessage(config.supergroupChatId, topicId, renderLsTable(rows, nowMs, costBySlug, detailBySlug), undefined, "HTML")
       .catch((err) => log("WARN", `sendMessage (/ls) failed: ${(err as Error).message}`));
@@ -1560,8 +1389,7 @@ async function main(): Promise<void> {
 
     sessionStore.remove(slug);
     routing.remove(slug);
-    feedStates.delete(slug);
-    feedMessageIds.delete(slug);
+    feedWiring.forgetSession(slug);
     return topicDeleted;
   }
 
@@ -2558,7 +2386,7 @@ async function main(): Promise<void> {
     // Any message landing in a session's own topic (chat, command, whatever) pushes the feed
     // card's already-fixed position further up the topic - see feedInterjected's own doc comment
     // above for why the *next* card flush needs to know this happened.
-    if (route && !isControl) feedInterjected.add(route.slug);
+    if (route && !isControl) feedWiring.markInterjected(route.slug);
 
     const fleetCmd = parseFleetCommand(text);
     if (fleetCmd) {
@@ -2810,7 +2638,7 @@ async function main(): Promise<void> {
           }
           if (result.allAnswered) {
             pipeHandle.completeAsk(askAction.id);
-            maybeSetState(result.entry.slug, "working");
+            feedWiring.maybeSetState(result.entry.slug, "working");
           }
           return;
         }
@@ -2820,7 +2648,7 @@ async function main(): Promise<void> {
         // this only needs `feedStates` to check the tapped turn is still the session's current one.
         const detailsAction = callbackQuery.data ? parseDetailsCallback(callbackQuery.data) : null;
         if (detailsAction) {
-          const state = feedStates.get(detailsAction.slug);
+          const state = feedWiring.getFeedState(detailsAction.slug);
           const stillCurrent = state && state.turnSeq === detailsAction.turnSeq;
           const verboseDetails = sessionStore.get(detailsAction.slug)?.feedVerbose ?? false;
           const text = stillCurrent ? renderDetails(state, verboseDetails) : "That turn has ended - its log is no longer available.";
@@ -2880,7 +2708,7 @@ async function main(): Promise<void> {
 
           const behavior = permAction.action === "deny" ? "deny" : "allow";
           pipeHandle.sendVerdict(pending.slug, pending.requestId, behavior);
-          maybeSetState(pending.slug, "working");
+          feedWiring.maybeSetState(pending.slug, "working");
 
           let confirmText = `${behavior === "allow" ? "✅ Allowed" : "⛔ Denied"}: ${pending.toolName}`;
           if (permAction.action === "always") {

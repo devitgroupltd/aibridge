@@ -1,0 +1,279 @@
+import { describe, expect, test } from "bun:test";
+import { createFeedWiring } from "../src/feed-wiring.ts";
+import { DetailsAnchorStore } from "../src/details-anchor-store.ts";
+import { RateGovernor } from "../src/rate-governor.ts";
+import { Routing } from "../src/routing.ts";
+import { SessionStore, type SessionRow } from "../src/session-store.ts";
+import type { HookEventMessage } from "@aibridge/protocol";
+import type { PendingPermissionRequest } from "../src/permission-registry.ts";
+
+function row(overrides: Partial<SessionRow> = {}): SessionRow {
+  return {
+    slug: "fix-bug",
+    topicId: 2,
+    sessionId: "sess-1",
+    worktreePath: "c:\\data\\worktrees\\fix-bug",
+    branch: "claude/fix-bug-1",
+    repoPath: "c:\\data\\projects\\seowrite",
+    model: "sonnet",
+    ptyPid: 1234,
+    state: "starting",
+    turnCardMsg: null,
+    paused: false,
+    renamed: false,
+    feedDetail: "compact",
+    feedVerbose: false,
+    createdUtc: "2026-08-03T00:00:00.000Z",
+    lastEventUtc: "2026-08-03T00:00:00.000Z",
+    ...overrides,
+  };
+}
+
+function hookMsg(overrides: Partial<HookEventMessage> = {}): HookEventMessage {
+  return {
+    v: 1,
+    slug: "fix-bug",
+    type: "event",
+    hook_event_name: "UserPromptSubmit",
+    session_id: "sess-1",
+    payload: {},
+    ...overrides,
+  };
+}
+
+function fakeSendMessageSource() {
+  const sent: Array<{ chatId: unknown; topicId: number | undefined; text: string }> = [];
+  const edits: Array<{ messageId: number; text: string }> = [];
+  return {
+    sendMessage: async (chatId: unknown, topicId: number | undefined, text: string) => {
+      sent.push({ chatId, topicId, text });
+      return { message_id: sent.length };
+    },
+    editMessageText: async (_chatId: unknown, messageId: number, text: string) => {
+      edits.push({ messageId, text });
+    },
+    sent,
+    edits,
+  };
+}
+
+function setup(overrides: Partial<Parameters<typeof createFeedWiring>[0]> = {}) {
+  const sessionStore = new SessionStore(":memory:");
+  const routing = new Routing();
+  const detailsAnchorStore = new DetailsAnchorStore(":memory:");
+  const feedGovernor = new RateGovernor({ log: () => {} });
+  const controlBot = fakeSendMessageSource();
+  const feedBot = fakeSendMessageSource();
+  const confirmCalls: Array<{ topicId: number | undefined; text: string }> = [];
+  const quotaStoppedSlugs: string[] = [];
+  const verdicts: Array<{ slug: string; requestId: string; behavior: string }> = [];
+  const finalized: Array<{ messageId: number; text: string }> = [];
+  let permissionToResolve: PendingPermissionRequest | undefined;
+
+  const feedWiring = createFeedWiring({
+    sessionStore,
+    routing,
+    detailsAnchorStore,
+    feedGovernor,
+    controlBot,
+    feedBot,
+    supergroupChatId: "-100",
+    confirmSessionCommand: (topicId, text) => confirmCalls.push({ topicId, text }),
+    markQuotaStopped: (slug) => quotaStoppedSlugs.push(slug),
+    resolveByToolMatch: () => permissionToResolve,
+    sendVerdict: (slug, requestId, behavior) => {
+      verdicts.push({ slug, requestId, behavior });
+      return true;
+    },
+    finalizePermissionMessage: async (messageId, text) => {
+      finalized.push({ messageId, text });
+    },
+    ...overrides,
+  });
+
+  return {
+    feedWiring,
+    sessionStore,
+    routing,
+    controlBot,
+    feedBot,
+    confirmCalls,
+    quotaStoppedSlugs,
+    verdicts,
+    finalized,
+    setPermissionToResolve: (p: PendingPermissionRequest | undefined) => {
+      permissionToResolve = p;
+    },
+  };
+}
+
+describe("createFeedWiring", () => {
+  test("maybeSetState applies a valid transition and is a no-op for an invalid one", () => {
+    const { feedWiring, sessionStore } = setup();
+    sessionStore.insert(row({ state: "idle" }));
+
+    feedWiring.maybeSetState("fix-bug", "working");
+    expect(sessionStore.get("fix-bug")?.state).toBe("working");
+
+    // idle -> awaiting_input is not a valid transition (isValidTransition's own table) - working
+    // is already current, so this checks the *unreachable* transition is rejected, not a same-state
+    // no-op.
+    feedWiring.maybeSetState("fix-bug", "starting");
+    expect(sessionStore.get("fix-bug")?.state).toBe("working");
+  });
+
+  test("maybeSetState is a no-op for an unknown slug", () => {
+    const { feedWiring, sessionStore } = setup();
+    feedWiring.maybeSetState("no-such-slug", "working");
+    expect(sessionStore.get("no-such-slug")).toBeUndefined();
+  });
+
+  test("handleHookEvent resolves a pending permission via the terminal-race fix when a matching PostToolUse arrives", () => {
+    const { feedWiring, sessionStore, verdicts, finalized, setPermissionToResolve } = setup();
+    sessionStore.insert(row());
+    setPermissionToResolve({
+      requestId: "req-1",
+      slug: "fix-bug",
+      toolName: "Bash",
+      description: "run a command",
+      inputPreview: "npm test",
+      topicId: 2,
+      messageId: 55,
+      createdAt: Date.now(),
+    });
+
+    feedWiring.handleHookEvent(
+      hookMsg({
+        hook_event_name: "PostToolUse",
+        payload: { tool_use_id: "tu-1", tool_name: "Bash", tool_input: {} },
+      }),
+    );
+
+    expect(verdicts).toEqual([{ slug: "fix-bug", requestId: "req-1", behavior: "allow" }]);
+    expect(finalized.length).toBe(1);
+    expect(finalized[0]?.text).toContain("✅ Allowed");
+  });
+
+  test("handleHookEvent sends a deny verdict for PermissionDenied", () => {
+    const { feedWiring, sessionStore, verdicts, finalized, setPermissionToResolve } = setup();
+    sessionStore.insert(row());
+    setPermissionToResolve({
+      requestId: "req-1",
+      slug: "fix-bug",
+      toolName: "Bash",
+      description: "run a command",
+      inputPreview: "npm test",
+      topicId: 2,
+      messageId: 55,
+      createdAt: Date.now(),
+    });
+
+    feedWiring.handleHookEvent(
+      hookMsg({
+        hook_event_name: "PermissionDenied",
+        payload: { tool_name: "Bash" },
+      }),
+    );
+
+    expect(verdicts).toEqual([{ slug: "fix-bug", requestId: "req-1", behavior: "deny" }]);
+    expect(finalized[0]?.text).toContain("⛔ Denied");
+  });
+
+  test("handleHookEvent does nothing extra when no pending permission matches", () => {
+    const { feedWiring, sessionStore, verdicts, finalized } = setup();
+    sessionStore.insert(row());
+
+    feedWiring.handleHookEvent(
+      hookMsg({
+        hook_event_name: "PostToolUse",
+        payload: { tool_use_id: "tu-1", tool_name: "Bash" },
+      }),
+    );
+
+    expect(verdicts).toEqual([]);
+    expect(finalized).toEqual([]);
+  });
+
+  test("handleHookEvent calls markQuotaStopped on a StopFailure whose error names a rate/usage limit", () => {
+    const { feedWiring, sessionStore, quotaStoppedSlugs } = setup();
+    sessionStore.insert(row());
+
+    feedWiring.handleHookEvent(
+      hookMsg({
+        hook_event_name: "StopFailure",
+        payload: { error: "rate limit exceeded, try again later" },
+      }),
+    );
+
+    expect(quotaStoppedSlugs).toEqual(["fix-bug"]);
+  });
+
+  test("handleHookEvent does not call markQuotaStopped for an unrelated StopFailure", () => {
+    const { feedWiring, sessionStore, quotaStoppedSlugs } = setup();
+    sessionStore.insert(row());
+
+    feedWiring.handleHookEvent(
+      hookMsg({
+        hook_event_name: "StopFailure",
+        payload: { error: "network timeout" },
+      }),
+    );
+
+    expect(quotaStoppedSlugs).toEqual([]);
+  });
+
+  test("handleHookEvent's turn_start posts a details button and starts a fresh feed-state entry", async () => {
+    const { feedWiring, sessionStore, routing, controlBot } = setup();
+    sessionStore.insert(row());
+    routing.add({ slug: "fix-bug", topicId: 2, worktreePath: "c:\\data\\worktrees\\fix-bug" });
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit" }));
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(controlBot.sent.length).toBe(1);
+    expect(controlBot.sent[0]?.text).toContain("Details");
+    expect(feedWiring.getFeedState("fix-bug")).toBeDefined();
+  });
+
+  test("markInterjected/getFeedState/allFeedStates/forgetSession round-trip", () => {
+    const { feedWiring, sessionStore } = setup();
+    sessionStore.insert(row());
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit" }));
+
+    expect(feedWiring.getFeedState("fix-bug")).toBeDefined();
+    expect(feedWiring.allFeedStates().get("fix-bug")).toBe(feedWiring.getFeedState("fix-bug"));
+
+    feedWiring.markInterjected("fix-bug"); // no observable state here beyond not throwing - the
+    // effect is consumed internally by the next coalescer flush, already covered by feed-coalescer.test.ts
+
+    feedWiring.forgetSession("fix-bug");
+    expect(feedWiring.getFeedState("fix-bug")).toBeUndefined();
+  });
+
+  test("checkQuietMode posts once on the rising edge and resets on the falling edge, per feedGovernor.p2PressureExceeded()", () => {
+    let quiet = false;
+    const fakeGovernor = {
+      p2PressureExceeded: () => quiet,
+      schedule: () => Promise.resolve(),
+      scheduleAsync: () => Promise.resolve({ message_id: 1 }),
+    } as unknown as RateGovernor;
+    const { feedWiring, confirmCalls } = setup({ feedGovernor: fakeGovernor });
+
+    feedWiring.checkQuietMode();
+    expect(confirmCalls.length).toBe(0);
+
+    quiet = true;
+    feedWiring.checkQuietMode();
+    feedWiring.checkQuietMode(); // still quiet - must not notify a second time
+    expect(confirmCalls.length).toBe(1);
+
+    quiet = false;
+    feedWiring.checkQuietMode(); // clears the flag, no new notice
+    expect(confirmCalls.length).toBe(1);
+
+    quiet = true;
+    feedWiring.checkQuietMode(); // a later, separate storm notifies again
+    expect(confirmCalls.length).toBe(2);
+  });
+});
