@@ -24,7 +24,7 @@ import { initFileLogging, log } from "./logger.ts";
 import { clearDeployMarker, isDeployMarkerStale, readDeployMarker, rollbackStaleDeploy } from "./deploy.ts";
 import { parseDetailsCallback } from "./details-button.ts";
 import { DetailsAnchorStore, DETAILS_ANCHOR_RETENTION_MS } from "./details-anchor-store.ts";
-import { buildVoiceModelKeyboard, listAvailableVoiceModels, resolveVoiceModelCallback } from "./voice-model.ts";
+import { listAvailableVoiceModels, resolveVoiceModelCallback } from "./voice-model.ts";
 import {
   BrowseRegistry,
   buildDirKeyboard,
@@ -75,12 +75,10 @@ import { RateGovernor } from "./rate-governor.ts";
 import { deriveAlwaysRule, ruleAlreadyCovered } from "./rule-derivation.ts";
 import { Routing } from "./routing.ts";
 import {
-  buildDefaultCategoryKeyboard,
   buildDefaultEffortKeyboard,
   buildDefaultModeKeyboard,
   buildEffortKeyboard,
   buildModeKeyboard,
-  buildModeKeystrokes,
   buildModelKeyboard,
   DEFAULT_EFFORT,
   DEFAULT_MODE,
@@ -102,7 +100,7 @@ import {
   resolveModeCallback,
   resolveModelCallback,
 } from "./session-commands.ts";
-import type { DefaultCategory, Effort, Mode, Model, SessionCommand } from "./session-commands.ts";
+import type { Effort, Mode, Model, SessionCommand } from "./session-commands.ts";
 import { formatUsagePanel } from "./usage-panel.ts";
 import { SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
 import { looksEnglishEnough } from "./language-heuristic.ts";
@@ -122,6 +120,7 @@ import { createInboundMedia } from "./inbound-media.ts";
 import { createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE } from "./session-lifecycle-commands.ts";
 import { createFleetReportingCommands } from "./fleet-reporting-commands.ts";
 import { createDeployLifecycleCommands, createProcessRunner } from "./deploy-lifecycle-commands.ts";
+import { createVoiceModeCommands } from "./voice-mode-commands.ts";
 
 // §7.2's Task Scheduler stdout/stderr gap (logger.ts's own doc comment has the full story): a
 // launch that predates `main()` itself getting to run - a bad env file, a throw during module
@@ -581,12 +580,45 @@ async function main(): Promise<void> {
     log,
   });
 
+  const voiceModeCommands = createVoiceModeCommands({
+    ptyIo,
+    routing,
+    sessionStore,
+    settingsStore,
+    controlBot,
+    confirmSessionCommand,
+    voiceServer,
+    voiceModelPath: config.voice.modelPath,
+    getAssistEnabled: () => assistEnabled,
+    setAssistEnabled: (value) => {
+      assistEnabled = value;
+    },
+    getVoiceConfirmEnabled: () => voiceConfirmEnabled,
+    setVoiceConfirmEnabled: (value) => {
+      voiceConfirmEnabled = value;
+    },
+    getDefaultSessionMode: () => defaultSessionMode,
+    setDefaultSessionMode: (mode) => {
+      defaultSessionMode = mode;
+    },
+    getDefaultSessionEffort: () => defaultSessionEffort,
+    setDefaultSessionEffort: (effort) => {
+      defaultSessionEffort = effort;
+    },
+    getNlRouterBackend: () => nlRouterBackend,
+    setNlRouterBackend: (backend) => {
+      nlRouterBackend = backend;
+    },
+    nlRouterApiKeyConfigured: Boolean(config.nlRouter.apiKey),
+    supergroupChatId: config.supergroupChatId,
+    log,
+  });
+
   // session-lifecycle-commands.ts: /new, /ls, /kill, /rm, /attach, /pause, /detail, /verbose, plus
   // the shared resolveTargetSlug/resolveSessionOrBail helpers. `stopIndicatorsForTopic`/
-  // `postFleetConfirm`/`executeFleetActionDirect` (fleet-confirm-flow.ts, not yet extracted) and
-  // `writeModeKeystrokes` (voice-mode-commands.ts, not yet extracted) are injected callbacks, same
-  // forward-reference treatment as `dispatchInboundMessage` in inbound-media.ts - all four are
-  // hoisted function declarations further down this same scope.
+  // `postFleetConfirm`/`executeFleetActionDirect` (fleet-confirm-flow.ts, not yet extracted) are
+  // injected callbacks, same forward-reference treatment as `dispatchInboundMessage` in
+  // inbound-media.ts - all three are hoisted function declarations further down this same scope.
   const sessionLifecycle = createSessionLifecycleCommands({
     sessionStore,
     routing,
@@ -602,7 +634,7 @@ async function main(): Promise<void> {
     stopIndicatorsForTopic,
     postFleetConfirm,
     executeFleetActionDirect,
-    writeModeKeystrokes,
+    writeModeKeystrokes: voiceModeCommands.writeModeKeystrokes,
     waitForChannelConnected,
     isControlTopic,
     getReposRegistry: () => reposRegistry,
@@ -785,89 +817,6 @@ async function main(): Promise<void> {
       .catch((err: unknown) => log("WARN", `failed to send command confirmation: ${(err as Error).message}`));
   }
 
-  // Shared by the typed `/model foo` / `/mode bar` / `/effort baz` path and the button-tap path
-  // (bare /model, /mode or /effort followed by a keyboard selection) - same switch, two triggers.
-  function applyModelSwitch(slug: string, topicId: number, model: string): void {
-    ptyIo.sendRaw(slug, `/model ${model}`);
-    sessionStore.setModel(slug, model);
-    confirmSessionCommand(topicId, `Switched ${slug} to ${model}`);
-  }
-
-  // Shared by applyModeSwitch (an operator-visible switch, with its own confirmation) and
-  // handleNewCommand's `/defaultmode` application (silent - the new topic already gets its own
-  // "Created ..." confirmation, and a second "Switched ... mode" message right after would just be
-  // noise for something the operator already configured, not something they just asked for here).
-  function writeModeKeystrokes(slug: string, mode: Mode): void {
-    const current = routing.getMode(slug);
-    const keystrokes = buildModeKeystrokes(current, mode);
-    // Already at the target mode: no keystroke to send, and ptyIo.sendRaw("") would still submit a
-    // spurious blank Enter at the prompt.
-    if (keystrokes.length > 0) {
-      routing.getPtyWrite(slug)?.(keystrokes);
-    }
-    routing.setMode(slug, mode);
-  }
-
-  function applyModeSwitch(slug: string, topicId: number, mode: Mode): void {
-    writeModeKeystrokes(slug, mode);
-    confirmSessionCommand(topicId, `Switched ${slug} to ${mode} mode`);
-  }
-
-  function applyEffortSwitch(slug: string, topicId: number, effort: Effort): void {
-    ptyIo.sendEffortCommand(slug, effort);
-    routing.setEffort(slug, effort);
-    confirmSessionCommand(topicId, `Switched ${slug} to ${effort} effort`);
-  }
-
-  // ---- §4.2's fleet commands (Phase 5) ----
-
-  /** `/voice [<model>]` - control-topic-only (voice-model.ts), same reasoning as `/budget`/`/ls`:
-   * there is exactly one whisper-server for the whole Bridge, not one per session, so there is
-   * nothing to scope this to besides the fleet itself. Bare `/voice` lists what's on disk with a
-   * button per model (current one checkmarked); `/voice <model>` or a button tap switches live via
-   * `/load` - live-verified 2026-08-05, no process restart needed. */
-  function handleVoiceModelCommand(cmd: Extract<FleetCommand, { kind: "voice" }>, topicId: number | undefined): void {
-    if (!voiceServer) {
-      confirmSessionCommand(topicId, "Voice input isn't enabled on this Bridge (VOICE_ENABLED=false).");
-      return;
-    }
-    const voiceDir = path.dirname(config.voice.modelPath);
-    const models = listAvailableVoiceModels(voiceDir);
-    const currentName = path.basename(voiceServer.currentModelPath()).replace(/^ggml-/, "").replace(/\.bin$/, "");
-    if (!cmd.model) {
-      if (models.length === 0) {
-        confirmSessionCommand(topicId, `No Whisper models found under ${voiceDir} - run scripts/setup-windows.ps1's voice step.`);
-        return;
-      }
-      controlBot
-        .sendMessage(config.supergroupChatId, topicId, `Current model: ${currentName}\nChoose a model:`, { inline_keyboard: buildVoiceModelKeyboard(models, currentName) })
-        .catch((err) => log("WARN", `sendMessage (/voice) failed: ${(err as Error).message}`));
-      return;
-    }
-    void applyVoiceModelSwitch(topicId, cmd.model, voiceDir, models, currentName);
-  }
-
-  /** Re-validates `name` against a freshly re-scanned model list rather than trusting the caller
-   * (a typed `/voice <name>` argument is untrusted text; a button tap is re-checked too, since the
-   * list on disk could have changed between the button being posted and tapped). */
-  async function applyVoiceModelSwitch(topicId: number | undefined, name: string, voiceDir: string, models: readonly string[], currentName: string): Promise<void> {
-    if (!voiceServer) return;
-    if (name === currentName) {
-      confirmSessionCommand(topicId, `🎤 Already using "${name}".`);
-      return;
-    }
-    if (!models.includes(name)) {
-      confirmSessionCommand(topicId, `Unknown model "${name}" - available: ${models.length > 0 ? models.join(", ") : "(none found)"}`);
-      return;
-    }
-    try {
-      await voiceServer.switchModel(path.join(voiceDir, `ggml-${name}.bin`));
-      confirmSessionCommand(topicId, `🎤 Switched to "${name}".`);
-    } catch (err) {
-      confirmSessionCommand(topicId, `Failed to switch to "${name}": ${(err as Error).message}`);
-    }
-  }
-
   /** §4.2's `/kill`/`/rm`: no `reply` will ever land for this topic again, so the two "Claude is
    * working" signals (§5) need an explicit stop rather than their normal reply-triggered one - left
    * running, the typing indicator nags Telegram for up to its 30-minute backstop and the "🤔
@@ -1017,150 +966,6 @@ async function main(): Promise<void> {
       spawn(resolveNodeExecutable(), ["--experimental-strip-types", entryScript], { detached: true, stdio: "ignore" }).unref();
     }
     process.exit(0);
-  }
-
-  /** `/assist [on|off]` - whether an NL-matched destructive command shows a confirm card first
-   * (nl-confirm.ts). `assistEnabled` is the in-memory copy every confirm-gate check reads;
-   * `settingsStore` is only touched on an actual change, matching `feed_detail`/`feed_verbose`'s
-   * own "in-memory for reads, persisted on write" shape (session-store.ts). */
-  function handleAssistCommand(cmd: Extract<FleetCommand, { kind: "assist" }>, topicId: number | undefined): void {
-    if (cmd.action === "status") {
-      confirmSessionCommand(topicId, `Natural-language destructive-command confirmation is ${assistEnabled ? "on" : "off"}.`);
-      return;
-    }
-    assistEnabled = cmd.action === "on";
-    settingsStore.set("assist_enabled", assistEnabled ? "true" : "false");
-    confirmSessionCommand(
-      topicId,
-      assistEnabled
-        ? "Natural-language destructive-command confirmation is now on - kill/rm/restart/deploy/repos-rm matched from plain text or voice will ask first."
-        : "Natural-language destructive-command confirmation is now off - kill/rm/restart/deploy/repos-rm matched from plain text or voice will run immediately.",
-    );
-  }
-
-  /** `/voiceconfirm [on|off]` - whether a transcribed voice note shows a Send/Re-record/Type-
-   * instead card first (voice-confirm.ts) or is auto-sent straight through. Same in-memory-for-
-   * reads, persisted-on-write shape as `handleAssistCommand`. */
-  function handleVoiceConfirmCommand(cmd: Extract<FleetCommand, { kind: "voiceconfirm" }>, topicId: number | undefined): void {
-    if (cmd.action === "status") {
-      confirmSessionCommand(topicId, `Voice-note send confirmation is ${voiceConfirmEnabled ? "on" : "off"}.`);
-      return;
-    }
-    voiceConfirmEnabled = cmd.action === "on";
-    settingsStore.set("voice_confirm_enabled", voiceConfirmEnabled ? "true" : "false");
-    confirmSessionCommand(
-      topicId,
-      voiceConfirmEnabled
-        ? "Voice-note send confirmation is now on - a transcribed voice note shows a Send/Re-record/Type-instead card before it's dispatched."
-        : "Voice-note send confirmation is now off - a transcribed voice note is sent straight through, with the transcript still shown so you can see what was sent - /voiceconfirm on to review before sending again.",
-    );
-  }
-
-  /** Text shown by both bare `/default` and the "Cancel"-free result of applying a mode change -
-   * kept as one function so the two spots that need "what are the defaults right now" (the status
-   * card and the mode-change confirmation) can't drift apart. */
-  function renderDefaultModeConfirmation(mode: Mode): string {
-    return mode === "auto"
-      ? "New sessions will now start in auto mode - no permission prompts at all for any tool call, including git commit/push, until this is changed back. /default mode manual to revert."
-      : `New sessions will now start in ${mode} mode.`;
-  }
-
-  /** `/default` (bare or `status`): both current values, plus a tappable Mode/Effort keyboard to
-   * drill into either one (`session-commands.ts`'s `buildDefaultCategoryKeyboard`) - one command to
-   * remember instead of two separately-named ones (operator feedback, 2026-08-07). Sent directly via
-   * `controlBot`, not `confirmSessionCommand`, so the keyboard actually attaches - same reasoning as
-   * the bare `/model`/`/mode`/`/effort` keyboards further down. */
-  function sendDefaultStatusCard(topicId: number | undefined): void {
-    controlBot
-      .sendMessage(
-        config.supergroupChatId,
-        topicId,
-        `New sessions currently start in ${defaultSessionMode} mode at ${defaultSessionEffort} effort. Tap one to change it:`,
-        { inline_keyboard: buildDefaultCategoryKeyboard(defaultSessionMode, defaultSessionEffort) },
-      )
-      .catch((err) => log("WARN", `sendMessage (/default status) failed: ${(err as Error).message}`));
-  }
-
-  /** `/default mode` / `/default effort` with no value (typed, or reached by tapping a category
-   * button from `sendDefaultStatusCard`'s keyboard): shows that category's own value picker, current
-   * value marked, under the `defmode:`/`defeffort:` namespace (`session-commands.ts` - deliberately
-   * not `mode:`/`effort:`, which resolve against `currentSlug` and would silently no-op here). */
-  function sendDefaultCategoryPicker(topicId: number | undefined, category: DefaultCategory): void {
-    const [prompt, keyboard] =
-      category === "mode"
-        ? [`Choose the default permission mode for new sessions (current: ${defaultSessionMode}):`, buildDefaultModeKeyboard(defaultSessionMode)]
-        : [`Choose the default effort level for new sessions (current: ${defaultSessionEffort}):`, buildDefaultEffortKeyboard(defaultSessionEffort)];
-    controlBot
-      .sendMessage(config.supergroupChatId, topicId, prompt, { inline_keyboard: keyboard })
-      .catch((err) => log("WARN", `sendMessage (/default ${category}) failed: ${(err as Error).message}`));
-  }
-
-  /** `/default mode <value>` / `/default effort <value>` (typed, or via the value pickers' own
-   * callback taps in the `onUpdate` handler below) - the actual set-and-persist, shared by both
-   * entry points so a typed command and a tapped button can't drift into different behavior.
-   *
-   * `mode`'s `auto` gets its own explicit warning in the confirmation text - it's the one
-   * `nl-router.ts`'s `isDestructive` already treats as security-sensitive when reached via natural
-   * language inside a live session, and setting it here has a wider blast radius than that
-   * single-session case: every session launched from this point on starts with no permission
-   * prompts at all, not just the one the operator is looking at right now, until this is explicitly
-   * changed back. `effort` has no such warning - it's a cost/latency choice, not a safety one. */
-  function applyDefaultMode(mode: Mode): string {
-    defaultSessionMode = mode;
-    settingsStore.set("default_session_mode", mode);
-    return renderDefaultModeConfirmation(mode);
-  }
-
-  function applyDefaultEffort(effort: Effort): string {
-    defaultSessionEffort = effort;
-    settingsStore.set("default_session_effort", effort);
-    return `New sessions will now start at ${effort} effort.`;
-  }
-
-  function handleDefaultCommand(cmd: Extract<FleetCommand, { kind: "default" }>, topicId: number | undefined): void {
-    if (cmd.category === "status") {
-      sendDefaultStatusCard(topicId);
-      return;
-    }
-    if (cmd.category === "mode") {
-      if (cmd.value === undefined) {
-        sendDefaultCategoryPicker(topicId, "mode");
-        return;
-      }
-      confirmSessionCommand(topicId, applyDefaultMode(cmd.value));
-      return;
-    }
-    if (cmd.value === undefined) {
-      sendDefaultCategoryPicker(topicId, "effort");
-      return;
-    }
-    confirmSessionCommand(topicId, applyDefaultEffort(cmd.value));
-  }
-
-  /** `/router [api|cli]` - live switch for the NL-router backend, no restart needed either
-   * direction. Switching to "api" is refused (not silently downgraded to "cli") when no key is
-   * configured - the operator asked for the fast/paid path specifically, so a silent no-op would
-   * be more confusing than telling them what's missing. */
-  function handleRouterBackendCommand(cmd: Extract<FleetCommand, { kind: "router" }>, topicId: number | undefined): void {
-    if (cmd.action === "status") {
-      confirmSessionCommand(
-        topicId,
-        `Natural-language routing backend: ${nlRouterBackend}${nlRouterBackend === "cli" ? " (your Claude Code subscription)" : " (funded ANTHROPIC_API_KEY)"}.`,
-      );
-      return;
-    }
-    if (cmd.action === "api" && !config.nlRouter.apiKey) {
-      confirmSessionCommand(topicId, "No ANTHROPIC_API_KEY configured in .env - add one first, then /router api.");
-      return;
-    }
-    nlRouterBackend = cmd.action;
-    settingsStore.set("nl_router_backend", nlRouterBackend);
-    confirmSessionCommand(
-      topicId,
-      nlRouterBackend === "api"
-        ? "Natural-language routing now uses the API backend - faster, but each unmatched message has a small real cost."
-        : "Natural-language routing now uses your Claude Code subscription (cli backend) - no extra cost, but slower per message.",
-    );
   }
 
   /** `/about`'s exact-syntax and NL-matched (`kind: "about"`, nl-router.ts) paths both call this -
@@ -1332,9 +1137,9 @@ async function main(): Promise<void> {
     }
     if (command.kind === "model" || command.kind === "mode" || command.kind === "effort") {
       if (!currentSlug || threadId === undefined) return;
-      if (command.kind === "model") applyModelSwitch(currentSlug, threadId, command.model);
-      else if (command.kind === "effort") applyEffortSwitch(currentSlug, threadId, command.effort);
-      else applyModeSwitch(currentSlug, threadId, command.mode);
+      if (command.kind === "model") voiceModeCommands.applyModelSwitch(currentSlug, threadId, command.model);
+      else if (command.kind === "effort") voiceModeCommands.applyEffortSwitch(currentSlug, threadId, command.effort);
+      else voiceModeCommands.applyModeSwitch(currentSlug, threadId, command.mode);
       return;
     }
     dispatchFleetCommand(command, threadId, isControl, currentSlug);
@@ -1492,19 +1297,19 @@ async function main(): Promise<void> {
       return;
     }
     if (fleetCmd.kind === "voice") {
-      handleVoiceModelCommand(fleetCmd, threadId);
+      voiceModeCommands.handleVoiceModelCommand(fleetCmd, threadId);
       return;
     }
     if (fleetCmd.kind === "assist") {
-      handleAssistCommand(fleetCmd, threadId);
+      voiceModeCommands.handleAssistCommand(fleetCmd, threadId);
       return;
     }
     if (fleetCmd.kind === "router") {
-      handleRouterBackendCommand(fleetCmd, threadId);
+      voiceModeCommands.handleRouterBackendCommand(fleetCmd, threadId);
       return;
     }
     if (fleetCmd.kind === "voiceconfirm") {
-      handleVoiceConfirmCommand(fleetCmd, threadId);
+      voiceModeCommands.handleVoiceConfirmCommand(fleetCmd, threadId);
       return;
     }
     if (fleetCmd.kind === "default") {
@@ -1512,7 +1317,7 @@ async function main(): Promise<void> {
         confirmSessionCommand(threadId, "/default only works from the control topic.");
         return;
       }
-      handleDefaultCommand(fleetCmd, threadId);
+      voiceModeCommands.handleDefaultCommand(fleetCmd, threadId);
       return;
     }
     sessionLifecycle.handlePauseCommand(fleetCmd, threadId, currentSlug);
@@ -1684,11 +1489,11 @@ async function main(): Promise<void> {
         return;
       }
       if (attempt.kind === "model") {
-        applyModelSwitch(currentSlug, threadId, attempt.model);
+        voiceModeCommands.applyModelSwitch(currentSlug, threadId, attempt.model);
       } else if (attempt.kind === "effort") {
-        applyEffortSwitch(currentSlug, threadId, attempt.effort);
+        voiceModeCommands.applyEffortSwitch(currentSlug, threadId, attempt.effort);
       } else {
-        applyModeSwitch(currentSlug, threadId, attempt.mode);
+        voiceModeCommands.applyModeSwitch(currentSlug, threadId, attempt.mode);
       }
       return;
     }
@@ -2091,7 +1896,7 @@ async function main(): Promise<void> {
           const voiceDir = path.dirname(config.voice.modelPath);
           const models = listAvailableVoiceModels(voiceDir);
           const currentName = path.basename(voiceServer.currentModelPath()).replace(/^ggml-/, "").replace(/\.bin$/, "");
-          void applyVoiceModelSwitch(threadId, voiceModelName, voiceDir, models, currentName);
+          void voiceModeCommands.applyVoiceModelSwitch(threadId, voiceModelName, voiceDir, models, currentName);
           return;
         }
 
@@ -2112,19 +1917,19 @@ async function main(): Promise<void> {
 
         const model = callbackQuery.data ? resolveModelCallback(callbackQuery.data) : null;
         if (model) {
-          if (currentSlug && threadId !== undefined) applyModelSwitch(currentSlug, threadId, model);
+          if (currentSlug && threadId !== undefined) voiceModeCommands.applyModelSwitch(currentSlug, threadId, model);
           return;
         }
 
         const mode = callbackQuery.data ? resolveModeCallback(callbackQuery.data) : null;
         if (mode) {
-          if (currentSlug && threadId !== undefined) applyModeSwitch(currentSlug, threadId, mode);
+          if (currentSlug && threadId !== undefined) voiceModeCommands.applyModeSwitch(currentSlug, threadId, mode);
           return;
         }
 
         const effort = callbackQuery.data ? resolveEffortCallback(callbackQuery.data) : null;
         if (effort) {
-          if (currentSlug && threadId !== undefined) applyEffortSwitch(currentSlug, threadId, effort);
+          if (currentSlug && threadId !== undefined) voiceModeCommands.applyEffortSwitch(currentSlug, threadId, effort);
           return;
         }
 
@@ -2162,14 +1967,14 @@ async function main(): Promise<void> {
           const defaultMode = resolveDefaultModeCallback(callbackQuery.data);
           if (defaultMode) {
             controlBot
-              .editMessageText(config.supergroupChatId, defaultMsgId, applyDefaultMode(defaultMode), { inline_keyboard: [] })
+              .editMessageText(config.supergroupChatId, defaultMsgId, voiceModeCommands.applyDefaultMode(defaultMode), { inline_keyboard: [] })
               .catch((err) => log("WARN", `editMessageText (/default mode) failed: ${(err as Error).message}`));
             return;
           }
           const defaultEffort = resolveDefaultEffortCallback(callbackQuery.data);
           if (defaultEffort) {
             controlBot
-              .editMessageText(config.supergroupChatId, defaultMsgId, applyDefaultEffort(defaultEffort), { inline_keyboard: [] })
+              .editMessageText(config.supergroupChatId, defaultMsgId, voiceModeCommands.applyDefaultEffort(defaultEffort), { inline_keyboard: [] })
               .catch((err) => log("WARN", `editMessageText (/default effort) failed: ${(err as Error).message}`));
             return;
           }
