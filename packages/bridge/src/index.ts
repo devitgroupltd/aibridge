@@ -146,7 +146,7 @@ import {
 } from "./session-commands.ts";
 import type { DefaultCategory, Effort, Mode, Model, SessionCommand } from "./session-commands.ts";
 import { formatUsagePanel } from "./usage-panel.ts";
-import { isValidTransition, SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
+import { SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
 import { looksEnglishEnough } from "./language-heuristic.ts";
 import { slugFromPrompt, uniqueSlug } from "./slug.ts";
 import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
@@ -160,6 +160,7 @@ import { removeWorktree } from "./worktree.ts";
 import { createSessionSupervisor } from "./session-supervisor.ts";
 import { createPtyIo, DEFAULT_ECHO_SETTLE_MS, DEFAULT_SUBMIT_CONFIRM_WINDOW_MS } from "./pty-io.ts";
 import { createFeedWiring } from "./feed-wiring.ts";
+import { createQuotaAlarms, DEFAULT_BURN_RATE_THRESHOLD_USD } from "./quota-alarms.ts";
 
 // §7.2's Task Scheduler stdout/stderr gap (logger.ts's own doc comment has the full story): a
 // launch that predates `main()` itself getting to run - a bad env file, a throw during module
@@ -314,34 +315,23 @@ async function main(): Promise<void> {
   const costStore = new CostStore(dbPath);
   const costTracker = new CostTracker(costStore);
 
-  function slugForSessionId(sessionId: string): string | undefined {
-    return sessionStore.getBySessionId(sessionId)?.slug;
-  }
+  // §5.1-§5.4: one shared governor across both the feed bot's droppable P2 lane (§9 scenarios
+  // 14-18 are unit-tested against rate-governor.ts/feed-coalescer.ts directly) and every P1 fleet
+  // notice - used directly here and passed into quota-alarms.ts/feed-wiring.ts below.
+  const feedGovernor = new RateGovernor({ log });
 
-  /** §10.5 point 3: marks a session `quota_stopped` and posts a one-time notice, from either signal
-   * - the OTLP `api_error` log event or a `StopFailure` hook carrying a rate-limit error (wired
-   * below in `handleHookEvent`). Idempotent: a session already `quota_stopped` (or `dead`) is left
-   * alone rather than re-posting on every subsequent error in the same stopped window. */
-  function markQuotaStopped(slug: string): void {
-    const row = sessionStore.get(slug);
-    if (!row || row.state === "quota_stopped" || row.state === "dead") return;
-    if (!isValidTransition(row.state, "quota_stopped")) return;
-    sessionStore.setState(slug, "quota_stopped", nowIso());
-    feedGovernor
-      .scheduleAsync("P1", () =>
-        controlBot.sendMessage(config.supergroupChatId, row.topicId, `⚠️ "${slug}" stopped on a usage limit (§10.5) - this looks frozen but isn't wedged; it should resume once the window resets.`),
-      )
-      .catch((err) => log("WARN", `failed to post quota-stop notice for "${slug}": ${(err as Error).message}`));
-  }
-
-  // §10.5 point 2's burn-rate alarm - this project's own choice of threshold, not a number the plan
-  // specifies (same convention as §10.4.1's prompts-per-hour warning), overridable for a laptop that
-  // wants a tighter or looser guardrail. `lastBurnAlarmMs` cooldown keeps a session that's genuinely
-  // burning through quota from posting on every single API call once it crosses the line - "an alarm
-  // that fires constantly is an alarm nobody reads" (§10.5).
-  const BURN_RATE_THRESHOLD_USD = Number(process.env.AIBRIDGE_BURN_RATE_THRESHOLD_USD ?? 10);
-  const BURN_RATE_ALARM_COOLDOWN_MS = 60 * 60 * 1000;
-  let lastBurnAlarmMs = 0;
+  // quota-alarms.ts: §10.5's usage-limit/burn-rate guardrails. `feedGovernor` is passed as a shared
+  // reference (composition root owns it, used pervasively for other P1 sends elsewhere in this
+  // file), same convention as feed-wiring.ts's own construction.
+  const quotaAlarms = createQuotaAlarms({
+    sessionStore,
+    costTracker,
+    feedGovernor,
+    controlBot,
+    supergroupChatId: config.supergroupChatId,
+    burnRateThresholdUsd: Number(process.env.AIBRIDGE_BURN_RATE_THRESHOLD_USD ?? DEFAULT_BURN_RATE_THRESHOLD_USD),
+    log,
+  });
 
   // pty-io.ts's lost-Enter detector (found 2026-08-04) - real activity (spinner frames etc.) redraws
   // well within a couple of seconds, confirmed live, so this is generous rather than tight. Read
@@ -351,40 +341,16 @@ async function main(): Promise<void> {
   // baseline for the lost-Enter check is taken after this, not at the moment of the write itself.
   const echoSettleMs = Number(process.env.AIBRIDGE_ECHO_SETTLE_MS ?? DEFAULT_ECHO_SETTLE_MS);
 
-  function maybeFireBurnRateAlarm(nowMs: number): void {
-    if (nowMs - lastBurnAlarmMs < BURN_RATE_ALARM_COOLDOWN_MS) return;
-    const fleetFiveHour = costTracker.fleetSpendSince(FIVE_HOURS_MS, nowMs);
-    if (fleetFiveHour < BURN_RATE_THRESHOLD_USD) return;
-    lastBurnAlarmMs = nowMs;
-    const breakdown = sessionStore
-      .all()
-      .filter((r) => r.sessionId)
-      .map((r) => ({ slug: r.slug, spend: costTracker.spendSince(r.sessionId as string, FIVE_HOURS_MS, nowMs) }))
-      .filter((r) => r.spend > 0)
-      .sort((a, b) => b.spend - a.spend)
-      .map((r) => `  ${r.slug}: $${r.spend.toFixed(2)}`)
-      .join("\n");
-    feedGovernor
-      .scheduleAsync("P1", () =>
-        controlBot.sendMessage(
-          config.supergroupChatId,
-          undefined,
-          `⚠️ Burn-rate alarm: fleet has spent $${fleetFiveHour.toFixed(2)} in the last 5h (threshold $${BURN_RATE_THRESHOLD_USD.toFixed(2)}).\n${breakdown}`,
-        ),
-      )
-      .catch((err) => log("WARN", `failed to post burn-rate alarm: ${(err as Error).message}`));
-  }
-
   startOtlpListener({
     port: otlpPort,
     log,
     onApiRequest: (event) => {
       costTracker.record(event.sessionId, event.atMs, event.costUsd);
-      maybeFireBurnRateAlarm(event.atMs);
+      quotaAlarms.maybeFireBurnRateAlarm(event.atMs);
     },
     onApiError: (event) => {
-      const slug = slugForSessionId(event.sessionId);
-      if (slug) markQuotaStopped(slug);
+      const slug = quotaAlarms.slugForSessionId(event.sessionId);
+      if (slug) quotaAlarms.markQuotaStopped(slug);
     },
   });
 
@@ -448,11 +414,6 @@ async function main(): Promise<void> {
     },
     log: (level, message) => log(level, message),
   });
-
-  // §5.1-§5.4: one shared governor across both the feed bot's droppable P2 lane (§9 scenarios
-  // 14-18 are unit-tested against rate-governor.ts/feed-coalescer.ts directly) and every P1 fleet
-  // notice - used directly here and passed into feed-wiring.ts below.
-  const feedGovernor = new RateGovernor({ log });
 
   // The deterministic half of `/new`'s first-write race (§4.5's dev-channels dialog is the other
   // half, handled in `session-launcher.ts`): a slug can have at most one pending waiter at a time,
@@ -557,8 +518,7 @@ async function main(): Promise<void> {
   // `sendVerdict`/`finalizePermissionMessage` closures below reference `pipeHandle` ahead of its
   // own declaration - safe, since none of them run until a real hook event arrives, well after
   // `pipeHandle` is assigned (same deferred-closure pattern `confirmSessionCommand` already uses
-  // above). `markQuotaStopped` is a hoisted function declaration (module 4, quota-alarms.ts,
-  // hasn't been extracted yet) - passed by reference for the same reason.
+  // above).
   const feedWiring = createFeedWiring({
     sessionStore,
     routing,
@@ -568,7 +528,7 @@ async function main(): Promise<void> {
     feedBot,
     supergroupChatId: config.supergroupChatId,
     confirmSessionCommand,
-    markQuotaStopped,
+    markQuotaStopped: quotaAlarms.markQuotaStopped,
     resolveByToolMatch: (slug, toolName, toolInput) => pipeHandle.permissionRegistry.resolveByToolMatch(slug, toolName, toolInput),
     sendVerdict: (slug, requestId, behavior) => pipeHandle.sendVerdict(slug, requestId, behavior),
     finalizePermissionMessage: (messageId, text) => pipeHandle.finalizePermissionMessage(messageId, text),
