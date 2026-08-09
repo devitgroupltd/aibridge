@@ -8,7 +8,7 @@
  * actually open them.
  */
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { promises as fsPromises } from "node:fs";
 import path from "node:path";
 
 export type AttachmentKind = "image" | "document" | "video" | "audio" | "video note";
@@ -65,12 +65,17 @@ export function buildInboxFilename(name: string): string {
 
 /** Lands a downloaded attachment inside the session's own inbox - deliberately outside the git
  * worktree (`$STATE/sessions/<slug>/inbox/`, never the worktree path) so nothing accidentally
- * gets committed. Returns the absolute path Claude should be told about. */
-export function writeAttachmentToInbox(stateDir: string, slug: string, name: string, bytes: Uint8Array): string {
+ * gets committed. Returns the absolute path Claude should be told about.
+ *
+ * §9, found live 2026-08-09: this used to write synchronously - up to `TELEGRAM_MAX_DOWNLOAD_BYTES`
+ * (20MB) blocking the whole single-threaded Bridge (every other session's `getUpdates`/permission
+ * card/reply) for the duration of the write. `fs/promises` here instead; the one caller
+ * (`inbound-media.ts`'s `handleAttachmentMessage`) already awaits everything around it. */
+export async function writeAttachmentToInbox(stateDir: string, slug: string, name: string, bytes: Uint8Array): Promise<string> {
   const dir = path.join(stateDir, "sessions", slug, "inbox");
-  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  await fsPromises.mkdir(dir, { recursive: true });
   const fullPath = path.join(dir, buildInboxFilename(name));
-  writeFileSync(fullPath, bytes);
+  await fsPromises.writeFile(fullPath, bytes);
   return fullPath;
 }
 

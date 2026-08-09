@@ -9,6 +9,7 @@ import {
 } from "./commands.ts";
 import { isAboutCommand } from "./about.ts";
 import { parseBrowseCommand, parseDiffCommand, parseFindCommand } from "./browse-nav.ts";
+import { fireAndForget } from "./fire-and-forget.ts";
 import { isRetryPhrase, retryTopicKey, type RetryStore } from "./retry-store.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import { isHelpCommand, parseCommandsQuery, parseFleetCommand, parseSkillsQuery, stripBotMention } from "./fleet-commands.ts";
@@ -159,7 +160,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
         confirmSessionCommand(threadId, "/new only works from the control topic.");
         return;
       }
-      void sessionLifecycle.handleNewCommand(fleetCmd, threadId);
+      fireAndForget(sessionLifecycle.handleNewCommand(fleetCmd, threadId), log, "command-dispatch handleNewCommand");
       return;
     }
     if (fleetCmd.kind === "ls") {
@@ -175,11 +176,11 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
       return;
     }
     if (fleetCmd.kind === "kill") {
-      void sessionLifecycle.handleKillCommand(fleetCmd, threadId, currentSlug);
+      fireAndForget(sessionLifecycle.handleKillCommand(fleetCmd, threadId, currentSlug), log, "command-dispatch handleKillCommand");
       return;
     }
     if (fleetCmd.kind === "rm") {
-      void sessionLifecycle.handleRmCommand(fleetCmd, threadId, currentSlug);
+      fireAndForget(sessionLifecycle.handleRmCommand(fleetCmd, threadId, currentSlug), log, "command-dispatch handleRmCommand");
       return;
     }
     if (fleetCmd.kind === "attach") {
@@ -187,15 +188,15 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
       return;
     }
     if (fleetCmd.kind === "usage") {
-      void fleetConfirmFlow.handleUsageCommand(fleetCmd, threadId, currentSlug);
+      fireAndForget(fleetConfirmFlow.handleUsageCommand(fleetCmd, threadId, currentSlug), log, "command-dispatch handleUsageCommand");
       return;
     }
     if (fleetCmd.kind === "restart") {
-      void deployLifecycle.handleRestartCommand(threadId);
+      fireAndForget(deployLifecycle.handleRestartCommand(threadId), log, "command-dispatch handleRestartCommand");
       return;
     }
     if (fleetCmd.kind === "deploy") {
-      void deployLifecycle.handleDeployCommand(threadId, fleetCmd.slug);
+      fireAndForget(deployLifecycle.handleDeployCommand(threadId, fleetCmd.slug), log, "command-dispatch handleDeployCommand");
       return;
     }
     if (fleetCmd.kind === "detail") {
@@ -211,7 +212,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
       return;
     }
     if (fleetCmd.kind === "autostart") {
-      void deployLifecycle.handleAutostartCommand(fleetCmd, threadId);
+      fireAndForget(deployLifecycle.handleAutostartCommand(fleetCmd, threadId), log, "command-dispatch handleAutostartCommand");
       return;
     }
     if (fleetCmd.kind === "repos") {
@@ -454,7 +455,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
         confirmSessionCommand(threadId, "Nothing to retry - no expired confirmation is waiting here.");
         return;
       }
-      void nlDispatch.postNlConfirm(pendingRetry.command, pendingRetry.threadId, pendingRetry.currentSlug);
+      fireAndForget(nlDispatch.postNlConfirm(pendingRetry.command, pendingRetry.threadId, pendingRetry.currentSlug), log, "command-dispatch postNlConfirm(retry)");
       return;
     }
 

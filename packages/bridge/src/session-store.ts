@@ -135,8 +135,24 @@ export function isValidTransition(from: SessionState, to: SessionState): boolean
   return ALLOWED_TRANSITIONS[from].includes(to);
 }
 
+/** One entry per column added after the table's initial `CREATE TABLE IF NOT EXISTS` shape - see
+ * `SessionStore.migrate`'s own doc comment. Order doesn't matter (each is independently guarded),
+ * but is kept in the order the columns were actually added. */
+const COLUMN_MIGRATIONS: readonly { column: string; ddl: string }[] = [
+  { column: "renamed", ddl: "ALTER TABLE sessions ADD COLUMN renamed INTEGER NOT NULL DEFAULT 0;" },
+  { column: "feed_detail", ddl: "ALTER TABLE sessions ADD COLUMN feed_detail TEXT NOT NULL DEFAULT 'compact';" },
+  { column: "feed_verbose", ddl: "ALTER TABLE sessions ADD COLUMN feed_verbose INTEGER NOT NULL DEFAULT 0;" },
+];
+
 export class SessionStore {
   private readonly db: SqliteHandleLike;
+  /** Caches each distinct SQL string's prepared statement rather than re-preparing (re-parsing) it
+   * on every call - §9, found live 2026-08-09: every accessor/mutator below called
+   * `this.db.prepare(sql)` fresh on every single invocation, needlessly re-parsing identical SQL on
+   * every session read/write across a daemon meant to run for weeks. The set of distinct queries
+   * this class issues is small and fixed (one per method below), so this cache can only ever hold a
+   * handful of entries - never unbounded. */
+  private readonly preparedCache = new Map<string, SqliteStatementLike>();
 
   constructor(dbPath: string) {
     const Database = loadDatabaseCtor();
@@ -170,29 +186,33 @@ export class SessionStore {
    * before a column was added (confirmed live 2026-08-03: `renamed` landing after this table had
    * already been created by an earlier Bridge run) keeps its old schema forever and throws "table
    * sessions has no column named X" on the next insert. `ALTER TABLE ... ADD COLUMN` is the SQLite
-   * way to catch it up, guarded by `PRAGMA table_info` so it only runs once per missing column.
+   * way to catch it up, guarded by `PRAGMA table_info` so it only runs once per missing column -
+   * driven by `COLUMN_MIGRATIONS` (§9, found live 2026-08-09: this used to be one hand-written
+   * `if (!columns.has(...)) exec(...)` block per column, so a new column cost a new copy-pasted
+   * if-block here rather than one new table entry).
    */
   private migrate(): void {
     const columns = new Set((this.db.prepare("PRAGMA table_info(sessions)").all() as unknown as { name: string }[]).map((c) => c.name));
-    if (!columns.has("renamed")) {
-      this.db.exec("ALTER TABLE sessions ADD COLUMN renamed INTEGER NOT NULL DEFAULT 0;");
-    }
-    if (!columns.has("feed_detail")) {
-      this.db.exec("ALTER TABLE sessions ADD COLUMN feed_detail TEXT NOT NULL DEFAULT 'compact';");
-    }
-    if (!columns.has("feed_verbose")) {
-      this.db.exec("ALTER TABLE sessions ADD COLUMN feed_verbose INTEGER NOT NULL DEFAULT 0;");
+    for (const { column, ddl } of COLUMN_MIGRATIONS) {
+      if (!columns.has(column)) this.db.exec(ddl);
     }
   }
 
+  private prepare(sql: string): SqliteStatementLike {
+    let stmt = this.preparedCache.get(sql);
+    if (!stmt) {
+      stmt = this.db.prepare(sql);
+      this.preparedCache.set(sql, stmt);
+    }
+    return stmt;
+  }
+
   insert(row: SessionRow): void {
-    this.db
-      .prepare(
-        `INSERT INTO sessions
-         (slug, topic_id, session_id, worktree_path, branch, repo_path, model, pty_pid, state, turn_card_msg, paused, renamed, feed_detail, feed_verbose, created_utc, last_event_utc)
-         VALUES ($slug, $topic_id, $session_id, $worktree_path, $branch, $repo_path, $model, $pty_pid, $state, $turn_card_msg, $paused, $renamed, $feed_detail, $feed_verbose, $created_utc, $last_event_utc)`,
-      )
-      .run({
+    this.prepare(
+      `INSERT INTO sessions
+       (slug, topic_id, session_id, worktree_path, branch, repo_path, model, pty_pid, state, turn_card_msg, paused, renamed, feed_detail, feed_verbose, created_utc, last_event_utc)
+       VALUES ($slug, $topic_id, $session_id, $worktree_path, $branch, $repo_path, $model, $pty_pid, $state, $turn_card_msg, $paused, $renamed, $feed_detail, $feed_verbose, $created_utc, $last_event_utc)`,
+    ).run({
         $slug: row.slug,
         $topic_id: row.topicId,
         $session_id: row.sessionId,
@@ -213,12 +233,12 @@ export class SessionStore {
   }
 
   get(slug: string): SessionRow | undefined {
-    const row = this.db.prepare("SELECT * FROM sessions WHERE slug = $slug").get({ $slug: slug }) as unknown as SessionRowSql | undefined;
+    const row = this.prepare("SELECT * FROM sessions WHERE slug = $slug").get({ $slug: slug }) as unknown as SessionRowSql | undefined;
     return row ? fromSql(row) : undefined;
   }
 
   getByTopicId(topicId: number): SessionRow | undefined {
-    const row = this.db.prepare("SELECT * FROM sessions WHERE topic_id = $topic_id").get({ $topic_id: topicId }) as unknown as SessionRowSql | undefined;
+    const row = this.prepare("SELECT * FROM sessions WHERE topic_id = $topic_id").get({ $topic_id: topicId }) as unknown as SessionRowSql | undefined;
     return row ? fromSql(row) : undefined;
   }
 
@@ -226,17 +246,21 @@ export class SessionStore {
    * (unset until the first hook fires), so a lookup before that point is a legitimate miss, not an
    * error. */
   getBySessionId(sessionId: string): SessionRow | undefined {
-    const row = this.db.prepare("SELECT * FROM sessions WHERE session_id = $session_id").get({ $session_id: sessionId }) as unknown as SessionRowSql | undefined;
+    const row = this.prepare("SELECT * FROM sessions WHERE session_id = $session_id").get({ $session_id: sessionId }) as unknown as SessionRowSql | undefined;
     return row ? fromSql(row) : undefined;
   }
 
   all(): SessionRow[] {
-    const rows = this.db.prepare("SELECT * FROM sessions ORDER BY created_utc ASC").all() as unknown as SessionRowSql[];
+    const rows = this.prepare("SELECT * FROM sessions ORDER BY created_utc ASC").all() as unknown as SessionRowSql[];
     return rows.map(fromSql);
   }
 
+  /** §9, found live 2026-08-09: this used to go through the full `all()` - every column of every
+   * row, plus `fromSql`'s field-by-field mapping - just to throw all of it away except the slugs.
+   * A dedicated single-column query does exactly what's needed. */
   slugs(): Set<string> {
-    return new Set(this.all().map((r) => r.slug));
+    const rows = this.prepare("SELECT slug FROM sessions").all() as unknown as { slug: string }[];
+    return new Set(rows.map((r) => r.slug));
   }
 
   /** Throws on a transition not present in §4.3's table - callers should check
@@ -248,45 +272,43 @@ export class SessionStore {
     if (!isValidTransition(current.state, state)) {
       throw new Error(`invalid session state transition for "${slug}": ${current.state} -> ${state}`);
     }
-    this.db
-      .prepare("UPDATE sessions SET state = $state, last_event_utc = $now WHERE slug = $slug")
-      .run({ $state: state, $now: nowIso, $slug: slug });
+    this.prepare("UPDATE sessions SET state = $state, last_event_utc = $now WHERE slug = $slug").run({ $state: state, $now: nowIso, $slug: slug });
   }
 
   setModel(slug: string, model: string): void {
-    this.db.prepare("UPDATE sessions SET model = $model WHERE slug = $slug").run({ $model: model, $slug: slug });
+    this.prepare("UPDATE sessions SET model = $model WHERE slug = $slug").run({ $model: model, $slug: slug });
   }
 
   setSessionId(slug: string, sessionId: string): void {
-    this.db.prepare("UPDATE sessions SET session_id = $session_id WHERE slug = $slug").run({ $session_id: sessionId, $slug: slug });
+    this.prepare("UPDATE sessions SET session_id = $session_id WHERE slug = $slug").run({ $session_id: sessionId, $slug: slug });
   }
 
   setTurnCardMsg(slug: string, messageId: number | null): void {
-    this.db.prepare("UPDATE sessions SET turn_card_msg = $msg WHERE slug = $slug").run({ $msg: messageId, $slug: slug });
+    this.prepare("UPDATE sessions SET turn_card_msg = $msg WHERE slug = $slug").run({ $msg: messageId, $slug: slug });
   }
 
   setPaused(slug: string, paused: boolean): void {
-    this.db.prepare("UPDATE sessions SET paused = $paused WHERE slug = $slug").run({ $paused: paused ? 1 : 0, $slug: slug });
+    this.prepare("UPDATE sessions SET paused = $paused WHERE slug = $slug").run({ $paused: paused ? 1 : 0, $slug: slug });
   }
 
   setRenamed(slug: string): void {
-    this.db.prepare("UPDATE sessions SET renamed = 1 WHERE slug = $slug").run({ $slug: slug });
+    this.prepare("UPDATE sessions SET renamed = 1 WHERE slug = $slug").run({ $slug: slug });
   }
 
   setFeedDetail(slug: string, level: FeedDetailLevel): void {
-    this.db.prepare("UPDATE sessions SET feed_detail = $level WHERE slug = $slug").run({ $level: level, $slug: slug });
+    this.prepare("UPDATE sessions SET feed_detail = $level WHERE slug = $slug").run({ $level: level, $slug: slug });
   }
 
   setFeedVerbose(slug: string, verbose: boolean): void {
-    this.db.prepare("UPDATE sessions SET feed_verbose = $verbose WHERE slug = $slug").run({ $verbose: verbose ? 1 : 0, $slug: slug });
+    this.prepare("UPDATE sessions SET feed_verbose = $verbose WHERE slug = $slug").run({ $verbose: verbose ? 1 : 0, $slug: slug });
   }
 
   setPtyPid(slug: string, ptyPid: number): void {
-    this.db.prepare("UPDATE sessions SET pty_pid = $pty_pid WHERE slug = $slug").run({ $pty_pid: ptyPid, $slug: slug });
+    this.prepare("UPDATE sessions SET pty_pid = $pty_pid WHERE slug = $slug").run({ $pty_pid: ptyPid, $slug: slug });
   }
 
   remove(slug: string): void {
-    this.db.prepare("DELETE FROM sessions WHERE slug = $slug").run({ $slug: slug });
+    this.prepare("DELETE FROM sessions WHERE slug = $slug").run({ $slug: slug });
   }
 
   close(): void {

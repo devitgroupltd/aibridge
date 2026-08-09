@@ -71,8 +71,10 @@ export class ConfirmRegistry<T extends ConfirmEntry> {
    * with a "this expired" message. False (including for an id this registry has genuinely never
    * seen) means it's safe - and, per the Bridge's own "a stale button must say so" rule, necessary -
    * to tell the operator their tap didn't land, since the far more common cause is a Bridge restart
-   * that wiped every pending confirmation in memory. Sweeps its own entry past the retention window
-   * so this map can't outlive the process on a long-idle daemon. */
+   * that wiped every pending confirmation in memory. Opportunistically sweeps this one entry if it's
+   * past the retention window - `takeExpired()` (below) is what actually guarantees the map can't
+   * outlive the process, since an id whose card is *never* tapped a second time (the common case)
+   * would otherwise never pass through here at all. */
   wasRecentlyAnswered(id: string): boolean {
     const at = this.answeredAt.get(id);
     if (at === undefined) return false;
@@ -90,9 +92,23 @@ export class ConfirmRegistry<T extends ConfirmEntry> {
     return taken && !taken.expired ? taken.entry : undefined;
   }
 
+  /** §9, found live 2026-08-09: `answeredAt` was only ever pruned lazily, one id at a time, from
+   * inside `wasRecentlyAnswered` - a card tapped once and never tapped again (the overwhelming
+   * common case; a second tap on an already-answered card is the rare one this map exists for at
+   * all) left its entry in `answeredAt` forever, growing without bound across the lifetime of a
+   * daemon meant to run for weeks. `takeExpired()` already runs on `index.ts`'s own 60s sweep for
+   * every confirm registry, so it's the natural place to also prune every `answeredAt` entry past
+   * its own retention window, rather than requiring some future caller to remember a second sweep. */
+  private sweepAnsweredAt(now: number): void {
+    for (const [id, at] of this.answeredAt) {
+      if (now - at > ConfirmRegistry.ANSWERED_RETENTION_MS) this.answeredAt.delete(id);
+    }
+  }
+
   /** Removes and returns everything past its TTL, so the caller can mark each card expired. */
   takeExpired(): T[] {
     const now = this.now();
+    this.sweepAnsweredAt(now);
     const out: T[] = [];
     for (const [id, entry] of this.pending) {
       if (now - entry.createdAt > this.ttlMs) {
@@ -105,5 +121,13 @@ export class ConfirmRegistry<T extends ConfirmEntry> {
 
   get size(): number {
     return this.pending.size;
+  }
+
+  /** Test-only visibility into `answeredAt`'s own size - the leak `sweepAnsweredAt` fixes is
+   * otherwise unobservable from outside this class (every public method that reads `answeredAt`
+   * already prunes lazily, one id at a time, which was never the actual problem: the untapped-card
+   * case that never calls `wasRecentlyAnswered` at all). */
+  get answeredSize(): number {
+    return this.answeredAt.size;
   }
 }

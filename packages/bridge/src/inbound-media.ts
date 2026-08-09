@@ -1,5 +1,6 @@
 import type { AttachmentKind } from "./attachment-inbox.ts";
 import { attachmentKindLabel, buildAttachmentAnnouncement, guessAttachmentFilename, TELEGRAM_MAX_DOWNLOAD_BYTES, writeAttachmentToInbox } from "./attachment-inbox.ts";
+import { fireAndForget } from "./fire-and-forget.ts";
 import { isKnownCommandText } from "./fleet-commands.ts";
 import { buildContextPrefix, type MessageOrigin } from "./message-context.ts";
 import { randomUUID } from "node:crypto";
@@ -187,7 +188,11 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
       }
       const autoIsControl = isControlTopic(threadId);
       const autoRoute = threadId !== undefined ? routing.getByTopicId(threadId) : undefined;
-      void dispatchInboundMessage(messageId, text, threadId, autoIsControl, autoRoute, autoRoute?.slug, from, buildContextPrefix(origin));
+      fireAndForget(
+        dispatchInboundMessage(messageId, text, threadId, autoIsControl, autoRoute, autoRoute?.slug, from, buildContextPrefix(origin)),
+        log,
+        "inbound-media dispatchInboundMessage(auto-sent voice)",
+      );
     } catch (err) {
       log("WARN", `voice transcription failed: ${(err as Error).message}`);
       const failText = "Couldn't transcribe that voice note - try again, or just type it.";
@@ -232,9 +237,13 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
       const { file_path } = await controlBot.getFile(fileId);
       const bytes = await controlBot.downloadFile(file_path);
       const suggestedName = guessAttachmentFilename(kind, fileName, mimeType);
-      const absPath = writeAttachmentToInbox(stateDir, route.slug, suggestedName, bytes);
+      const absPath = await writeAttachmentToInbox(stateDir, route.slug, suggestedName, bytes);
       const announcement = buildAttachmentAnnouncement(kind, absPath, caption);
-      void dispatchInboundMessage(messageId, announcement, threadId, isControl, route, route.slug, from, buildContextPrefix(origin));
+      fireAndForget(
+        dispatchInboundMessage(messageId, announcement, threadId, isControl, route, route.slug, from, buildContextPrefix(origin)),
+        log,
+        `inbound-media dispatchInboundMessage(${kind} attachment)`,
+      );
     } catch (err) {
       log("WARN", `attachment download failed: ${(err as Error).message}`);
       confirmSessionCommand(threadId, `Couldn't download that ${kind} - try sending it again.`);
@@ -283,7 +292,11 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     const hasActionableContent = message.text !== undefined || hasAttachment(message);
     if (hasActionableContent && !message.voice && isStaleInbound(message.date, nowMs)) {
       if (message.text !== undefined) {
-        void postStaleConfirm(threadId, message.message_id, message.text, from, formatStaleAge(message.date, nowMs), message);
+        fireAndForget(
+          postStaleConfirm(threadId, message.message_id, message.text, from, formatStaleAge(message.date, nowMs), message),
+          log,
+          "inbound-media postStaleConfirm",
+        );
       } else {
         // An attachment gets a plain notice rather than a replayable confirm card: replaying one
         // would mean holding its `file_id` and re-running the download later, and a re-send from
@@ -300,7 +313,7 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     // own TTL) is what matters, not staleness of when the note was recorded, because nothing
     // reaches the session until the operator taps Send on a transcript they can read.
     if (message.voice) {
-      void handleVoiceMessage(message.voice, threadId, message.message_id, from, message.date, message);
+      fireAndForget(handleVoiceMessage(message.voice, threadId, message.message_id, from, message.date, message), log, "inbound-media handleVoiceMessage");
       return;
     }
 
@@ -311,27 +324,47 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     // with `voice`/`text` above - order here doesn't matter beyond that.
     if (message.photo && message.photo.length > 0) {
       const largest = message.photo[message.photo.length - 1]!;
-      void handleAttachmentMessage("image", largest.file_id, largest.file_size, undefined, undefined, threadId, route, isControl, message.message_id, message.caption, from, message);
+      fireAndForget(
+        handleAttachmentMessage("image", largest.file_id, largest.file_size, undefined, undefined, threadId, route, isControl, message.message_id, message.caption, from, message),
+        log,
+        "inbound-media handleAttachmentMessage(image)",
+      );
       return;
     }
     if (message.document) {
       const doc = message.document;
-      void handleAttachmentMessage("document", doc.file_id, doc.file_size, doc.file_name, doc.mime_type, threadId, route, isControl, message.message_id, message.caption, from, message);
+      fireAndForget(
+        handleAttachmentMessage("document", doc.file_id, doc.file_size, doc.file_name, doc.mime_type, threadId, route, isControl, message.message_id, message.caption, from, message),
+        log,
+        "inbound-media handleAttachmentMessage(document)",
+      );
       return;
     }
     if (message.video) {
       const video = message.video;
-      void handleAttachmentMessage("video", video.file_id, video.file_size, video.file_name, video.mime_type, threadId, route, isControl, message.message_id, message.caption, from, message);
+      fireAndForget(
+        handleAttachmentMessage("video", video.file_id, video.file_size, video.file_name, video.mime_type, threadId, route, isControl, message.message_id, message.caption, from, message),
+        log,
+        "inbound-media handleAttachmentMessage(video)",
+      );
       return;
     }
     if (message.audio) {
       const audio = message.audio;
-      void handleAttachmentMessage("audio", audio.file_id, audio.file_size, audio.file_name, audio.mime_type, threadId, route, isControl, message.message_id, message.caption, from, message);
+      fireAndForget(
+        handleAttachmentMessage("audio", audio.file_id, audio.file_size, audio.file_name, audio.mime_type, threadId, route, isControl, message.message_id, message.caption, from, message),
+        log,
+        "inbound-media handleAttachmentMessage(audio)",
+      );
       return;
     }
     if (message.video_note) {
       const note = message.video_note;
-      void handleAttachmentMessage("video note", note.file_id, note.file_size, undefined, undefined, threadId, route, isControl, message.message_id, message.caption, from, message);
+      fireAndForget(
+        handleAttachmentMessage("video note", note.file_id, note.file_size, undefined, undefined, threadId, route, isControl, message.message_id, message.caption, from, message),
+        log,
+        "inbound-media handleAttachmentMessage(video note)",
+      );
       return;
     }
 
@@ -339,7 +372,11 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
 
     // §7.4's gate already ran above, before any content branch - nothing below ever sees a stale
     // message.
-    void dispatchInboundMessage(message.message_id, message.text, threadId, isControl, route, currentSlug, from, buildContextPrefix(message));
+    fireAndForget(
+      dispatchInboundMessage(message.message_id, message.text, threadId, isControl, route, currentSlug, from, buildContextPrefix(message)),
+      log,
+      "inbound-media dispatchInboundMessage",
+    );
   }
 
   return {

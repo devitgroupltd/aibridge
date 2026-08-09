@@ -312,6 +312,34 @@ export class TelegramClient implements UpdatesSource {
     return `${this.baseUrl}/bot${this.token}/${method}`;
   }
 
+  /**
+   * §9, found live 2026-08-09: every JSON-body method below (`sendMessage`, `editMessageText`,
+   * `deleteMessage`, `answerCallbackQuery`, `sendChatAction`, `getUpdates`, `getFile`,
+   * `setMyCommands`, and all four forum-topic methods) was a byte-identical `fetchWithTimeout(...,
+   * { method: "POST", headers: json, body: JSON.stringify(params) }, timeoutMs)` +
+   * `parseTelegramResponse(res, method)`, differing only in the method name, the params, and
+   * (rarely) the timeout - 14 places a future header/timeout-default change could be missed in
+   * some but not all of them. `getMe` is the one deliberate exception: it's a bare GET with no
+   * body (that's what Telegram actually receives from it today), not a POST with an empty JSON
+   * body, so it stays outside this helper rather than silently changing what goes over the wire.
+   */
+  private async callJson<T>(method: string, params: Record<string, unknown>, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<T> {
+    const res = await fetchWithTimeout(
+      this.url(method),
+      { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(params) },
+      timeoutMs,
+    );
+    return parseTelegramResponse<T>(res, method);
+  }
+
+  /** Same dedup, for the three multipart (`FormData`) methods (`sendDocument`, `sendPhotoFile`,
+   * `sendDocumentFile`) - each built its own `fetchWithTimeout(..., { method: "POST", body: form
+   * }, FILE_TIMEOUT_MS)` + `parseTelegramResponse` pair, identical past the endpoint name. */
+  private async callMultipart<T>(method: string, form: FormData, timeoutMs = FILE_TIMEOUT_MS): Promise<T> {
+    const res = await fetchWithTimeout(this.url(method), { method: "POST", body: form }, timeoutMs);
+    return parseTelegramResponse<T>(res, method);
+  }
+
   async getMe(): Promise<{ id: number; username: string }> {
     const res = await fetchWithTimeout(this.url("getMe"), {}, DEFAULT_TIMEOUT_MS);
     return parseTelegramResponse(res, "getMe");
@@ -320,16 +348,7 @@ export class TelegramClient implements UpdatesSource {
   async getUpdates(offset: number, timeoutSec: number): Promise<TelegramUpdate[]> {
     // The client-side budget must comfortably outlast Telegram's own server-side long-poll
     // (`timeoutSec`) - 10s of slack for the round trip itself, not a race against it.
-    const res = await fetchWithTimeout(
-      this.url("getUpdates"),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ offset, timeout: timeoutSec }),
-      },
-      (timeoutSec + 10) * 1000,
-    );
-    return parseTelegramResponse(res, "getUpdates");
+    return this.callJson("getUpdates", { offset, timeout: timeoutSec }, (timeoutSec + 10) * 1000);
   }
 
   async sendMessage(
@@ -339,53 +358,22 @@ export class TelegramClient implements UpdatesSource {
     replyMarkup?: InlineKeyboardMarkup,
     parseMode?: "HTML",
   ): Promise<{ message_id: number }> {
-    const res = await fetchWithTimeout(
-      this.url("sendMessage"),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_thread_id: messageThreadId,
-          text,
-          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-          ...(parseMode ? { parse_mode: parseMode } : {}),
-        }),
-      },
-      DEFAULT_TIMEOUT_MS,
-    );
-    return parseTelegramResponse(res, "sendMessage");
+    return this.callJson("sendMessage", {
+      chat_id: chatId,
+      message_thread_id: messageThreadId,
+      text,
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      ...(parseMode ? { parse_mode: parseMode } : {}),
+    });
   }
 
   /** Must be called for every `callback_query` update, or the tapped button spins forever on mobile. */
   async answerCallbackQuery(callbackQueryId: string, text?: string): Promise<void> {
-    const res = await fetchWithTimeout(
-      this.url("answerCallbackQuery"),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ callback_query_id: callbackQueryId, ...(text ? { text } : {}) }),
-      },
-      DEFAULT_TIMEOUT_MS,
-    );
-    await parseTelegramResponse(res, "answerCallbackQuery");
+    await this.callJson("answerCallbackQuery", { callback_query_id: callbackQueryId, ...(text ? { text } : {}) });
   }
 
-  async sendChatAction(
-    chatId: string | number,
-    messageThreadId: number | undefined,
-    action: string,
-  ): Promise<void> {
-    const res = await fetchWithTimeout(
-      this.url("sendChatAction"),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId, action }),
-      },
-      DEFAULT_TIMEOUT_MS,
-    );
-    await parseTelegramResponse(res, "sendChatAction");
+  async sendChatAction(chatId: string | number, messageThreadId: number | undefined, action: string): Promise<void> {
+    await this.callJson("sendChatAction", { chat_id: chatId, message_thread_id: messageThreadId, action });
   }
 
   async editMessageText(
@@ -395,54 +383,30 @@ export class TelegramClient implements UpdatesSource {
     replyMarkup?: InlineKeyboardMarkup,
     parseMode?: "HTML",
   ): Promise<void> {
-    const res = await fetchWithTimeout(
-      this.url("editMessageText"),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({
-          chat_id: chatId,
-          message_id: messageId,
-          text,
-          ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
-          ...(parseMode ? { parse_mode: parseMode } : {}),
-        }),
-      },
-      DEFAULT_TIMEOUT_MS,
-    );
-    await parseTelegramResponse(res, "editMessageText");
+    await this.callJson("editMessageText", {
+      chat_id: chatId,
+      message_id: messageId,
+      text,
+      ...(replyMarkup ? { reply_markup: replyMarkup } : {}),
+      ...(parseMode ? { parse_mode: parseMode } : {}),
+    });
   }
 
   async deleteMessage(chatId: string | number, messageId: number): Promise<void> {
-    const res = await fetchWithTimeout(
-      this.url("deleteMessage"),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, message_id: messageId }),
-      },
-      DEFAULT_TIMEOUT_MS,
-    );
-    await parseTelegramResponse(res, "deleteMessage");
+    await this.callJson("deleteMessage", { chat_id: chatId, message_id: messageId });
   }
 
   /** §5.5: a `details` payload over Telegram's 4096-character message limit goes as a document
    * instead ("Diffs always go as documents; a diff rendered into a chat bubble on a phone is
    * unreadable and burns budget" - the same reasoning applies to an oversized activity log).
-   * Multipart, unlike every other method here, since `sendDocument` takes a file rather than a
+   * Multipart, unlike every JSON-body method above, since `sendDocument` takes a file rather than a
    * JSON body - plain `FormData`/`Blob` from the global `fetch` implementation, no extra dependency. */
-  async sendDocument(
-    chatId: string | number,
-    messageThreadId: number | undefined,
-    filename: string,
-    content: string,
-  ): Promise<{ message_id: number }> {
+  async sendDocument(chatId: string | number, messageThreadId: number | undefined, filename: string, content: string): Promise<{ message_id: number }> {
     const form = new FormData();
     form.append("chat_id", String(chatId));
     if (messageThreadId !== undefined) form.append("message_thread_id", String(messageThreadId));
     form.append("document", new Blob([content], { type: "text/plain" }), filename);
-    const res = await fetchWithTimeout(this.url("sendDocument"), { method: "POST", body: form }, FILE_TIMEOUT_MS);
-    return parseTelegramResponse(res, "sendDocument");
+    return this.callMultipart("sendDocument", form);
   }
 
   /** §5.8: an outbound screenshot/image, rendered inline in the topic - same multipart shape as
@@ -459,8 +423,7 @@ export class TelegramClient implements UpdatesSource {
     if (messageThreadId !== undefined) form.append("message_thread_id", String(messageThreadId));
     if (caption) form.append("caption", caption);
     form.append("photo", new Blob([bytes]), filename);
-    const res = await fetchWithTimeout(this.url("sendPhoto"), { method: "POST", body: form }, FILE_TIMEOUT_MS);
-    return parseTelegramResponse(res, "sendPhoto");
+    return this.callMultipart("sendPhoto", form);
   }
 
   /** §5.8: an outbound non-image file (or an image in a format Telegram's `sendPhoto` won't take) -
@@ -477,22 +440,12 @@ export class TelegramClient implements UpdatesSource {
     if (messageThreadId !== undefined) form.append("message_thread_id", String(messageThreadId));
     if (caption) form.append("caption", caption);
     form.append("document", new Blob([bytes]), filename);
-    const res = await fetchWithTimeout(this.url("sendDocument"), { method: "POST", body: form }, FILE_TIMEOUT_MS);
-    return parseTelegramResponse(res, "sendDocument");
+    return this.callMultipart("sendDocument", form);
   }
 
   /** Resolves a `file_id` (e.g. a voice note's) to a `file_path` for use with `downloadFile`. */
   async getFile(fileId: string): Promise<{ file_path: string }> {
-    const res = await fetchWithTimeout(
-      this.url("getFile"),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ file_id: fileId }),
-      },
-      DEFAULT_TIMEOUT_MS,
-    );
-    return parseTelegramResponse(res, "getFile");
+    return this.callJson("getFile", { file_id: fileId });
   }
 
   /** Downloads the raw bytes from Telegram's file CDN - a plain GET against `/file/bot<token>/...`,
@@ -507,68 +460,23 @@ export class TelegramClient implements UpdatesSource {
   }
 
   async setMyCommands(chatId: string | number, commands: readonly BotCommand[]): Promise<void> {
-    const res = await fetchWithTimeout(
-      this.url("setMyCommands"),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ commands, scope: { type: "chat", chat_id: chatId } }),
-      },
-      DEFAULT_TIMEOUT_MS,
-    );
-    await parseTelegramResponse(res, "setMyCommands");
+    await this.callJson("setMyCommands", { commands, scope: { type: "chat", chat_id: chatId } });
   }
 
   async createForumTopic(chatId: string | number, name: string): Promise<{ message_thread_id: number }> {
-    const res = await fetchWithTimeout(
-      this.url("createForumTopic"),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, name }),
-      },
-      DEFAULT_TIMEOUT_MS,
-    );
-    return parseTelegramResponse(res, "createForumTopic");
+    return this.callJson("createForumTopic", { chat_id: chatId, name });
   }
 
   async editForumTopic(chatId: string | number, messageThreadId: number, name: string): Promise<void> {
-    const res = await fetchWithTimeout(
-      this.url("editForumTopic"),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId, name }),
-      },
-      DEFAULT_TIMEOUT_MS,
-    );
-    await parseTelegramResponse(res, "editForumTopic");
+    await this.callJson("editForumTopic", { chat_id: chatId, message_thread_id: messageThreadId, name });
   }
 
   async closeForumTopic(chatId: string | number, messageThreadId: number): Promise<void> {
-    const res = await fetchWithTimeout(
-      this.url("closeForumTopic"),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId }),
-      },
-      DEFAULT_TIMEOUT_MS,
-    );
-    await parseTelegramResponse(res, "closeForumTopic");
+    await this.callJson("closeForumTopic", { chat_id: chatId, message_thread_id: messageThreadId });
   }
 
   async deleteForumTopic(chatId: string | number, messageThreadId: number): Promise<void> {
-    const res = await fetchWithTimeout(
-      this.url("deleteForumTopic"),
-      {
-        method: "POST",
-        headers: { "content-type": "application/json" },
-        body: JSON.stringify({ chat_id: chatId, message_thread_id: messageThreadId }),
-      },
-      DEFAULT_TIMEOUT_MS,
-    );
-    await parseTelegramResponse(res, "deleteForumTopic");
+    await this.callJson("deleteForumTopic", { chat_id: chatId, message_thread_id: messageThreadId });
   }
 }
 
@@ -589,8 +497,15 @@ export async function validateTokens(control: GetMeSource, feed: GetMeSource): P
 export interface PollLoopOptions {
   /** Telegram long-poll timeout in seconds. */
   timeoutSec?: number;
-  /** Delay before retrying after a failed getUpdates call. */
+  /** Delay before the *first* retry after a failed `getUpdates` call - each consecutive failure
+   * doubles it (capped at `maxRetryDelayMs`), resetting back to this floor the next time
+   * `getUpdates` succeeds. §9, found live 2026-08-09: this used to be a flat delay regardless of how
+   * many consecutive failures had already happened, so a sustained Telegram outage polled forever at
+   * a fixed ~1/s - harmless in isolation, but needlessly hammering an endpoint that's already down. */
   retryDelayMs?: number;
+  /** Ceiling for the exponential backoff above - a sustained outage settles here rather than the
+   * delay growing without bound. Default 30s. */
+  maxRetryDelayMs?: number;
   /** Resume from a persisted offset instead of 0 (§4.5.1/§9). Telegram only forgets an update once
    * a *later* `getUpdates` call passes a higher offset - the offset bump on receipt only takes
    * effect on the *next* call, so a process that dies (crash or `/restart`) right after handling an
@@ -607,7 +522,17 @@ export interface PollLoopOptions {
    * closed even if a caller does pass `initialOffset`. */
   onOffsetChange?: (offset: number) => void;
   onUpdate: (update: TelegramUpdate) => void;
+  /** `getUpdates` itself failed (network, timeout, a non-2xx response) - distinct from
+   * `onUpdateError` below, which is a single update's own handling blowing up. */
   onError?: (err: unknown) => void;
+  /** §9, found live 2026-08-09: a synchronous throw from `onUpdate` used to abort the rest of that
+   * batch's updates (the surrounding `for` loop's remaining iterations never ran) and was reported
+   * through `onError` as if `getUpdates` itself had failed - the wrong cause, and Telegram's own
+   * offset-forgetting rule (see `initialOffset`'s doc comment) means the *other* updates already
+   * offset-bumped ahead of the failing one would never be replayed either. Each update's own handling
+   * is now wrapped individually: one bad update is reported here and skipped, every other update in
+   * the same batch still gets a chance to run. */
+  onUpdateError?: (update: TelegramUpdate, err: unknown) => void;
 }
 
 /** Starts the single `getUpdates` long-poll loop (§2, §12 Phase 1). Returns a stop function. */
@@ -615,20 +540,28 @@ export function startPolling(source: UpdatesSource, opts: PollLoopOptions): () =
   let stopped = false;
   let offset = opts.initialOffset ?? 0;
   const timeoutSec = opts.timeoutSec ?? 25;
-  const retryDelayMs = opts.retryDelayMs ?? 1000;
+  const baseRetryDelayMs = opts.retryDelayMs ?? 1000;
+  const maxRetryDelayMs = opts.maxRetryDelayMs ?? 30_000;
+  let retryDelayMs = baseRetryDelayMs;
 
   const loop = async () => {
     while (!stopped) {
       try {
         const updates = await source.getUpdates(offset, timeoutSec);
+        retryDelayMs = baseRetryDelayMs; // a successful call resets the backoff
         for (const update of updates) {
           offset = update.update_id + 1;
           opts.onOffsetChange?.(offset);
-          opts.onUpdate(update);
+          try {
+            opts.onUpdate(update);
+          } catch (err) {
+            opts.onUpdateError?.(update, err);
+          }
         }
       } catch (err) {
         opts.onError?.(err);
         await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
+        retryDelayMs = Math.min(retryDelayMs * 2, maxRetryDelayMs);
       }
     }
   };

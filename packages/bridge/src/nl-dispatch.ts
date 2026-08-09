@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { fireAndForget } from "./fire-and-forget.ts";
 import { buildNlConfirmKeyboard, NlConfirmRegistry } from "./nl-confirm.ts";
 import { routeText as realRouteText } from "./nl-router.ts";
 import type { RouterAction } from "./nl-router.ts";
@@ -219,7 +220,7 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     // `handleNewCommand` recover the operator's own words via `newSessionContent`.
     if (result.command.kind === "new") result.command = { ...result.command, sourceText: text };
     if (result.destructive && getAssistEnabled()) {
-      void postNlConfirm(result.command, threadId, currentSlug);
+      fireAndForget(postNlConfirm(result.command, threadId, currentSlug), log, "nl-dispatch postNlConfirm");
       return;
     }
     executeMatchedCommand(result.command, threadId, isControl, currentSlug);

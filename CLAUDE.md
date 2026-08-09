@@ -2,17 +2,22 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: design complete, no code written yet
+## Status: implemented through Phase 5, hardening ongoing
 
-This repo currently contains only `README.md` and the full design document,
-[`plans/telegram-claude-session-control-plan.md`](plans/telegram-claude-session-control-plan.md). That
-plan is the source of truth for every architectural decision below — read it (particularly the
-Overview, §2 Architecture, §7.5, §9, and §12 Phases) before implementing anything. This file summarizes
-it; it does not replace it. When the plan and this file disagree, the plan wins and this file is stale.
+The full design document,
+[`plans/telegram-claude-session-control-plan.md`](plans/telegram-claude-session-control-plan.md), is
+still the source of truth for every architectural decision below — read it (particularly the
+Overview, §2 Architecture, §7.5, §9, and §12 Phases) before touching related code. This file
+summarizes it; it does not replace it. When the plan and this file disagree, the plan wins and this
+file is stale.
 
-Current position in the roadmap (§12): prerequisites P-1/P-2/P-4/P-5 and the interactive protocol
-sitting (Phase 1.0) are done. Phase 1 ("walking skeleton" — Bridge with a single `getUpdates` loop, a
-minimal channel server, one hardcoded topic) has not been started.
+Current position in the roadmap (§12): Phases 1-5 are implemented (`packages/bridge`,
+`packages/channel-server`, `packages/hook-client`, `packages/protocol`, `packages/stub-telegram`) —
+the `getUpdates` loop, the pipe protocol, fleet commands, the session supervisor with crash-resume,
+deploy/voice/NL-router support, and the Telegram-automation live-verification rig are all real and
+covered by `bun test` (see `Commands` below). Phase 6 (WSL2 migration) has not been started. See
+[`plans/codebase-hardening-plan.md`](plans/codebase-hardening-plan.md) for the current
+cleanup/hardening backlog against this implementation.
 
 ## What this project is
 
@@ -24,13 +29,14 @@ a `repos.toml` lookup, never something baked into aibridge itself.
 
 ## Commands
 
-No build, lint, or test tooling exists yet because no source code exists yet. Once implementation
-starts, per §9 (the only place aibridge's own conventions are specified rather than deferred):
+Per §9 (the only place aibridge's own conventions are specified rather than deferred):
 
 - Runtime/tooling: **Bun** (TypeScript). The hook client is compiled to a single-file binary via
   `bun build --compile` (startup latency is load-bearing there, §2.2); the Bridge and channel server
   run from source under `bun`.
-- Test framework: `bun test`. Type gate: `tsc --noEmit`. Both are meant to run in CI per package.
+- `bun test` — the full suite (all packages, ~1250+ tests). Test framework: `bun test`.
+- `bun run typecheck` — `tsc --noEmit` across every package's own `tsconfig.json`. Type gate: both
+  this and `bun test` are meant to run in CI per package.
 - Testing convention: unit-test any helper whose failure mode is **silent-wrong** (produces a
   plausible-looking but incorrect result) rather than a loud crash, plus every exit-code or protocol
   contract another component branches on. §9 lists 41 concrete scenarios this covers (protocol

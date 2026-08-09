@@ -91,11 +91,33 @@ describe("log file rotation", () => {
 
     writeFileSync(logPath, "a".repeat(10 * 1024 * 1024 + 1));
     log("INFO", "first rotation");
+    // Simulates a second boot inheriting an already-oversized file from the run before it - the
+    // realistic way `bridge.log` grows without going through this module's own `log()` calls.
+    // `rotateIfNeeded`'s size tracking is seeded once per boot (from a real stat, right here) and
+    // kept incrementally after that - it does not, and should not, notice a file rewritten by
+    // something outside this process without a fresh `initFileLogging` call telling it to re-check.
+    initFileLogging(stateDir);
     writeFileSync(logPath, "b".repeat(10 * 1024 * 1024 + 1));
     log("INFO", "second rotation");
 
     const rotatedContents = readFileSync(rotatedPath, "utf8");
     expect(rotatedContents).toContain("b");
     expect(rotatedContents).not.toContain("a");
+  });
+
+  test("an external write to the log file mid-boot is not detected until the next initFileLogging call - the accepted tradeoff for not re-statting on every line (§9, found live 2026-08-09)", () => {
+    stateDir = mkdtempSync(path.join(os.tmpdir(), "aibridge-logger-track-"));
+    initFileLogging(stateDir);
+    const logPath = path.join(stateDir, "bridge.log");
+    const rotatedPath = `${logPath}.1`;
+
+    log("INFO", "small line establishes tracking for this boot");
+    // Nothing outside this module writes to bridge.log in production - this simulates the one thing
+    // the byte-tracking approach cannot see without a real stat, to make the accepted limit explicit
+    // and locked in by a test rather than an untested assumption.
+    writeFileSync(logPath, "z".repeat(10 * 1024 * 1024 + 1));
+    log("INFO", "tracked total is still tiny, so this does not trigger rotation");
+
+    expect(existsSync(rotatedPath)).toBe(false);
   });
 });

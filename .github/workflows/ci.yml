@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-and-typecheck:
+    # aibridge's own runtime target is Windows (native Windows for Phases 1-5, CLAUDE.md), and
+    # node-pty/ConPTY behavior is Windows-specific, but the unit suite itself (bun test + tsc
+    # --noEmit) has no Windows-only dependency - runs on a hosted Windows runner anyway so a CI
+    # failure reflects the same platform the Bridge actually ships on.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Test
+        run: bun test
+
+      - name: Typecheck
+        run: bash scripts/typecheck.sh

@@ -1,5 +1,6 @@
 import path from "node:path";
 import type * as pty from "node-pty";
+import { fireAndForget } from "./fire-and-forget.ts";
 import { findOrphanProcesses } from "./orphan-scan.ts";
 import { listClaudeProcesses } from "./process-scan.ts";
 import { reconcile } from "./reconciliation.ts";
@@ -213,7 +214,7 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
     });
     ptyProcessBySlug.set(slug, ptyProcess);
     ptyProcess.onExit(({ exitCode }) => {
-      void handleUnexpectedExit(slug, ptyProcess, topicId, exitCode);
+      fireAndForget(handleUnexpectedExit(slug, ptyProcess, topicId, exitCode), log, `session-supervisor handleUnexpectedExit(${slug})`);
     });
   }
 
@@ -257,21 +258,52 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
     await resumeSession(row);
   }
 
+  /** Marks `slug` dead if (and only if) its row still exists and isn't already dead - every
+   * "give up, mark it dead" branch in `resumeSession` goes through this rather than a raw
+   * `sessionStore.setState(slug, "dead", ...)`, because that throws `unknown slug` (§9's own
+   * exhaustive-transition-table discipline, session-store.ts) if the row was removed by a `/rm`
+   * that raced this same async function - and an uncaught throw here propagates out through the
+   * bare `void handleUnexpectedExit(...)` at this module's `onExit` handler into the global
+   * `unhandledRejection -> process.exit(1)` (index.ts), taking down every other session in the
+   * fleet over one operator command that has nothing to do with them (found live 2026-08-09). */
+  function markDeadIfPresent(slug: string): void {
+    const current = sessionStore.get(slug);
+    if (current && current.state !== "dead") sessionStore.setState(slug, "dead", now());
+  }
+
   /**
    * Shared by both restart-recovery paths - a Bridge restart (`runStartupReconciliation`) and a
    * live crash (`handleUnexpectedExit`) - since both need exactly the same thing: relaunch via
    * `claude --resume <session_id>` on a fresh PTY, rewire it, and tell the topic what happened.
    * §4.5's "row exists, `state = awaiting_input`" case is handled first since the pending prompt
    * is gone either way and needs its own notice, distinct from the resume notice.
+   *
+   * Re-reads the row from the store as its very first step rather than trusting `row` (the
+   * caller's own snapshot) for anything beyond `topicId`/`worktreePath` (fields that don't change
+   * once a session exists). `handleUnexpectedExit`'s snapshot in particular can be up to
+   * `RESUME_BACKOFF_MS`'s longest entry (60s) stale by the time this runs - long enough for an
+   * operator's `/rm` (removes the row) or `/kill` (marks it `dead`) to land during the wait. Found
+   * live 2026-08-09: without this re-read, a `/rm` during the backoff wait crashed the whole
+   * Bridge (see `markDeadIfPresent`'s own doc comment), and a `/kill` during the wait still let the
+   * stale snapshot's resume fire, resurrecting a session the operator had just deliberately ended.
    */
   async function resumeSession(row: SessionRow): Promise<void> {
     const { slug, topicId } = row;
-    if (row.state === "awaiting_input") {
+    const current = sessionStore.get(slug);
+    if (!current) {
+      log("INFO", `resumeSession("${slug}") skipped - its row no longer exists (removed, most likely by /rm, during the resume wait)`);
+      return;
+    }
+    if (current.state === "dead") {
+      log("INFO", `resumeSession("${slug}") skipped - it was already marked dead (most likely by /kill) during the resume wait`);
+      return;
+    }
+    if (current.state === "awaiting_input") {
       sessionStore.setState(slug, "working", now());
       confirmSessionCommand(topicId, "The pending question was lost - please re-ask.");
     }
-    if (!row.sessionId) {
-      sessionStore.setState(slug, "dead", now());
+    if (!current.sessionId) {
+      markDeadIfPresent(slug);
       confirmSessionCommand(topicId, `Session "${slug}" could not be resumed (no session id was recorded yet). Worktree preserved at ${row.worktreePath}.`);
       return;
     }
@@ -279,10 +311,10 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
       const session = launchSession({
         slug,
         topicId,
-        repoPath: row.repoPath,
-        worktreesRoot: path.dirname(row.worktreePath),
-        model: row.model,
-        resumeSessionId: row.sessionId,
+        repoPath: current.repoPath,
+        worktreesRoot: path.dirname(current.worktreePath),
+        model: current.model,
+        resumeSessionId: current.sessionId,
         otlpPort,
         log,
       });
@@ -294,7 +326,7 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
       // `!isControl && !route` guard, with no error and no log line. Confirmed live 2026-08-04:
       // a resumed session answered /ls (control topic, doesn't need routing) but never replied to
       // anything sent in its own topic - not the command being wrong, the route being missing.
-      routing.add({ slug, topicId, worktreePath: row.worktreePath });
+      routing.add({ slug, topicId, worktreePath: current.worktreePath });
       // `claude --resume` failing (`RESUME_FAILURE_PATTERN`) doesn't throw or exit the process - it
       // silently falls through to a brand-new conversation in the same PTY - so this must be checked
       // rather than assumed: found live 2026-08-07, a session whose crash-before-first-transcript-
@@ -303,7 +335,7 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
       // was never resent into the fresh conversation underneath.
       const { resumeFailed } = await session.ready;
       if (resumeFailed) {
-        log("WARN", `session "${slug}"'s claude --resume ${row.sessionId} failed (no matching conversation) - it started a fresh conversation instead`);
+        log("WARN", `session "${slug}"'s claude --resume ${current.sessionId} failed (no matching conversation) - it started a fresh conversation instead`);
         // That fresh conversation has no relation to what was actually asked for, and `dead` is
         // `session-store.ts`'s own terminal state (no path back from it) - the row is very likely
         // already `dead` by now anyway, from the `SessionEnd` hook that fires for the abandoned
@@ -311,13 +343,13 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
         // than leaving Claude Code's own fresh-start running, is what makes §4.3's "This session
         // has ended" reply true instead of a lie: an untracked live PTY behind a `dead` row would
         // otherwise burn a Claude Code seat and a worktree forever with no way for the operator to
-        // reach or reclaim it. Same kill-then-delete ordering `killAndUntrack` uses, so the async
+        // reach or reclaim it. Same delete-then-kill ordering `killAndUntrack` uses, so the async
         // `onExit` this fires sees the map entry already gone and treats it as a deliberate kill,
         // not a crash to auto-resume.
-        session.ptyProcess.kill();
         ptyProcessBySlug.delete(slug);
+        session.ptyProcess.kill();
         routing.clearPtyWrite(slug);
-        if (sessionStore.get(slug)?.state !== "dead") sessionStore.setState(slug, "dead", now());
+        markDeadIfPresent(slug);
         confirmSessionCommand(
           topicId,
           `⚠️ Session "${slug}" couldn't resume its prior conversation (Claude reported no matching session) - this session has ended. Worktree preserved at ${row.worktreePath}; /new to start a fresh one.`,
@@ -326,7 +358,7 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
         confirmSessionCommand(topicId, `Session "${slug}" resumed.`);
       }
     } catch (err) {
-      sessionStore.setState(slug, "dead", now());
+      markDeadIfPresent(slug);
       confirmSessionCommand(topicId, `Failed to resume "${slug}": ${(err as Error).message}. Worktree preserved at ${row.worktreePath}.`);
     }
   }
@@ -336,12 +368,30 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
   }
 
   function killAndUntrack(slug: string): void {
-    ptyProcessBySlug.get(slug)?.kill();
-    ptyProcessBySlug.delete(slug);
+    // Delete-then-kill, not kill-then-delete (0.10x.0 fix): `handleUnexpectedExit`'s own doc comment
+    // states the invariant it depends on as "`/kill`/`/rm` both delete the map entry before calling
+    // `.kill()`" - the map entry being gone by the time the async `onExit` handler runs is what tells
+    // a deliberate kill apart from a real crash there. The old order only worked by accident, because
+    // node-pty's `onExit` fires asynchronously; a synchronous emitter (or an awaited step ever landing
+    // between these two lines) would misclassify a deliberate `/kill`/`/rm` as a crash and auto-resume
+    // a session the operator just killed.
+    const proc = ptyProcessBySlug.get(slug);
+    untrack(slug);
+    proc?.kill();
   }
 
   function untrack(slug: string): void {
     ptyProcessBySlug.delete(slug);
+    // §9, found live 2026-08-09: neither of these was ever cleared on teardown before - a `/kill`
+    // or `/rm` left both pinned for a slug that no longer has a live session, growing without bound
+    // across the many `/new`+`/rm` cycles a daemon meant to run for weeks will see. A stale
+    // `resumeAttempts` entry in particular isn't only a leak: `slug.ts` derives a slug from the
+    // prompt's own first words, so a later `/new` reusing the exact same slug is entirely possible
+    // - without this, that unrelated fresh session would inherit a resume-attempt count that was
+    // never its own, and could give up on auto-resuming its very first real crash instead of
+    // getting the full `RESUME_BACKOFF_MS` ladder.
+    resumeAttempts.delete(slug);
+    lastPtyActivityBySlug.delete(slug);
   }
 
   function clearResumeAttempts(slug: string): void {

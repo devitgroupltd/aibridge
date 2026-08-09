@@ -131,6 +131,69 @@ describe("startPipeServer", () => {
     expect(calls[0]).toEqual({ chatId: "-1004470540564", threadId: 3, text: "hi from claude" });
   });
 
+  test("two multi-chunk replies for the same slug never interleave their chunks, even when the first is slow (§9, found live 2026-08-09)", async () => {
+    const path = pipePath();
+    const routing = new Routing();
+    routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+    const calls: string[] = [];
+    let sendCount = 0;
+    let resolveFirst: (() => void) | undefined;
+    const firstSendBlocked = new Promise<void>((resolve) => {
+      resolveFirst = resolve;
+    });
+    const controlBot: SendMessageSource = {
+      sendMessage: async (_chatId, _threadId, text) => {
+        sendCount += 1;
+        // Only the very first send (reply A's first chunk) blocks - simulates a slow Telegram round
+        // trip on the send that started first. Without per-slug serialization, reply B's own chunks
+        // (dispatched right after, on a separate connection-less call) would race ahead of it and
+        // land before A's first chunk ever completes.
+        if (sendCount === 1) await firstSendBlocked;
+        calls.push(text);
+        return { message_id: sendCount };
+      },
+    };
+
+    const handle = startPipeServer({ pipePath: path, routing, controlBot, chatId: "-1004470540564" });
+    servers.push(handle.server);
+    await waitFor(() => handle.server.listening);
+
+    const { socket } = connectClient(path);
+    await waitFor(() => socket.readyState === "open");
+
+    // Two lines, each comfortably under Telegram's chunk limit on its own but combined over it -
+    // `splitForTelegram` keeps line boundaries where it can, so this reliably yields exactly two
+    // chunks per reply (one per line) rather than a mid-line hard split.
+    const replyA: ReplyMessage = {
+      v: PROTOCOL_VERSION,
+      type: "reply",
+      slug: "test-session",
+      topic_id: "3",
+      text: `${"A".repeat(3000)}\n${"a".repeat(3000)}`,
+    };
+    const replyB: ReplyMessage = {
+      v: PROTOCOL_VERSION,
+      type: "reply",
+      slug: "test-session",
+      topic_id: "3",
+      text: `${"B".repeat(3000)}\n${"b".repeat(3000)}`,
+    };
+    socket.write(encodeMessage(replyA));
+    await waitFor(() => sendCount >= 1); // A's first chunk has started (and is now blocked)
+    socket.write(encodeMessage(replyB));
+    // Give reply B's own handling plenty of time to run, if nothing were serializing it.
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    resolveFirst?.();
+
+    await waitFor(() => calls.length >= 4);
+    // Grouped per reply - A's two chunks land together, then B's two chunks - never interleaved
+    // (e.g. never A0, B0, B1, A1).
+    expect(calls[0]?.startsWith("A")).toBe(true);
+    expect(calls[1]?.startsWith("a")).toBe(true);
+    expect(calls[2]?.startsWith("B")).toBe(true);
+    expect(calls[3]?.startsWith("b")).toBe(true);
+  });
+
   test("onReplySent fires with the topic_id after a successful reply, and not on a failed one", async () => {
     const path = pipePath();
     const routing = new Routing();

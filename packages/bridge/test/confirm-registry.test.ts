@@ -90,6 +90,19 @@ describe("ConfirmRegistry.wasRecentlyAnswered", () => {
     expect(registry.wasRecentlyAnswered("a")).toBe(false);
   });
 
+  test("a card tapped once and never tapped again does not leak forever - takeExpired's own sweep prunes it too, not just a later wasRecentlyAnswered call (§9, found live 2026-08-09)", () => {
+    let now = 0;
+    const registry = new ConfirmRegistry<TestEntry>(1000, { now: () => now });
+    registry.add({ id: "a", payload: "x" });
+    registry.take("a"); // the one, never-repeated tap - the overwhelming common case in practice
+    expect(registry.answeredSize).toBe(1);
+
+    now = 61_000; // well past ANSWERED_RETENTION_MS, with no second tap ever calling wasRecentlyAnswered
+    registry.takeExpired();
+
+    expect(registry.answeredSize).toBe(0);
+  });
+
   test("takeExpired sweeping an entry also counts as answering it", () => {
     let now = 0;
     const registry = new ConfirmRegistry<TestEntry>(1000, { now: () => now });

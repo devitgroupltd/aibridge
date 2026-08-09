@@ -119,6 +119,37 @@ describe("createSessionSupervisor", () => {
     expect(supervisor.getPtyProcess("fix-bug")).toBeUndefined();
   });
 
+  test("killAndUntrack untracks before killing, so a pty whose kill() re-enters synchronously sees the entry already gone (deliberate-kill discrimination)", () => {
+    const sessionStore = new SessionStore(":memory:");
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+    });
+
+    const pty = fakePty();
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    let sawTrackedDuringKill: unknown;
+    const originalKill = pty.kill;
+    pty.kill = () => {
+      // Simulate a pty implementation whose kill() fires its own exit handler synchronously
+      // (unlike node-pty's real, asynchronous onExit) - `handleUnexpectedExit`'s own discrimination
+      // depends on `ptyProcessBySlug` already reflecting the untrack by this point.
+      sawTrackedDuringKill = supervisor.getPtyProcess("fix-bug");
+      originalKill();
+    };
+
+    supervisor.killAndUntrack("fix-bug");
+
+    expect(sawTrackedDuringKill).toBeUndefined();
+    expect(pty.wasKilled()).toBe(true);
+  });
+
   test("untrack removes the entry without killing the pty", () => {
     const sessionStore = new SessionStore(":memory:");
     const routing = new Routing();
@@ -138,6 +169,81 @@ describe("createSessionSupervisor", () => {
 
     expect(pty.wasKilled()).toBe(false);
     expect(supervisor.getPtyProcess("fix-bug")).toBeUndefined();
+  });
+
+  test("untrack also clears lastActivityAt, so a slug reused later doesn't inherit stale activity from a previous session (§9, found live 2026-08-09)", () => {
+    const sessionStore = new SessionStore(":memory:");
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+    });
+
+    const pty = fakePty();
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    pty.emitData("some real output");
+    expect(supervisor.lastActivityAt("fix-bug")).toBeGreaterThan(0);
+
+    supervisor.untrack("fix-bug");
+
+    expect(supervisor.lastActivityAt("fix-bug")).toBeUndefined();
+  });
+
+  test("untrack (and killAndUntrack, via the same helper) also clears resumeAttempts, so a slug reused by a later /new starts its own crash-backoff ladder from RESUME_BACKOFF_MS[0] rather than inheriting a stale count (§9, found live 2026-08-09)", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row());
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const delays: number[] = [];
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      delay: async (ms) => {
+        delays.push(ms);
+      },
+      launchSession: () => {
+        const nextPty = fakePty();
+        supervisor.wireSession("fix-bug", nextPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+        return {
+          worktreePath: "c:\\data\\worktrees\\fix-bug",
+          branch: "claude/fix-bug-1",
+          ptyProcess: nextPty as unknown as LaunchedSession["ptyProcess"],
+          ready: Promise.resolve({ resumeFailed: false }),
+        };
+      },
+    });
+
+    const firstPty = fakePty();
+    supervisor.wireSession("fix-bug", firstPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    firstPty.emitExit(1);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(delays).toEqual([RESUME_BACKOFF_MS[0]]);
+
+    // Simulate /kill (or /rm) tearing the slug down entirely - a later /new reusing this exact slug
+    // (slug.ts derives slugs from a prompt's own first words, so a repeat is entirely possible) must
+    // not inherit the crash-attempt count a wholly unrelated earlier session built up.
+    supervisor.untrack("fix-bug");
+
+    delays.length = 0;
+    const freshPty = fakePty();
+    supervisor.wireSession("fix-bug", freshPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    freshPty.emitExit(1);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(delays).toEqual([RESUME_BACKOFF_MS[0]]);
   });
 
   test("handleUnexpectedExit is a no-op when ptyProcessBySlug no longer points at this pty (a deliberate /kill raced the exit event)", async () => {
@@ -304,6 +410,102 @@ describe("createSessionSupervisor", () => {
     expect(launchCount).toBe(0);
     expect(sessionStore.get("fix-bug")?.state).toBe("dead");
     expect(confirm.calls.some((c) => c.text.includes("could not be resumed"))).toBe(true);
+  });
+
+  test("resumeSession is a no-op (no throw, no relaunch) when the row was removed during the resume wait (/rm raced a pending resume)", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row());
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    let launchCount = 0;
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      launchSession: () => {
+        launchCount += 1;
+        throw new Error("should not be called - the row is already gone");
+      },
+    });
+
+    const snapshot = sessionStore.get("fix-bug")!;
+    // Simulate /rm having removed the row while this snapshot (handleUnexpectedExit's own,
+    // captured before its backoff `delay`) was still in flight.
+    sessionStore.remove("fix-bug");
+
+    await supervisor.resumeSession(snapshot);
+
+    expect(launchCount).toBe(0);
+    // Silent: /rm already posted its own confirmation, this must not post a second, confusing one.
+    expect(confirm.calls.length).toBe(0);
+  });
+
+  test("resumeSession is a no-op when the row was already marked dead during the resume wait (/kill raced a pending resume)", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row());
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    let launchCount = 0;
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      launchSession: () => {
+        launchCount += 1;
+        throw new Error("should not be called - the session was already killed");
+      },
+    });
+
+    const snapshot = sessionStore.get("fix-bug")!;
+    // Simulate /kill having marked the row dead while this snapshot was still in flight.
+    sessionStore.setState("fix-bug", "dead", "2026-08-09T00:00:00.000Z");
+
+    await supervisor.resumeSession(snapshot);
+
+    expect(launchCount).toBe(0);
+    expect(confirm.calls.length).toBe(0);
+    expect(sessionStore.get("fix-bug")?.state).toBe("dead");
+  });
+
+  test("handleUnexpectedExit's pending resume does not relaunch a session removed by /rm during the backoff wait", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row());
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    let launchCount = 0;
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      // Simulate /rm firing during the backoff wait itself, before resumeSession ever runs.
+      delay: async () => {
+        sessionStore.remove("fix-bug");
+      },
+      launchSession: () => {
+        launchCount += 1;
+        throw new Error("should not be called");
+      },
+    });
+
+    const pty = fakePty();
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    pty.emitExit(1);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(launchCount).toBe(0);
+    expect(sessionStore.get("fix-bug")).toBeUndefined();
   });
 
   test("clearResumeAttempts resets the counter, so a later crash starts the backoff ladder over from RESUME_BACKOFF_MS[0]", async () => {

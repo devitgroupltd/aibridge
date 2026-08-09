@@ -1,4 +1,5 @@
 import type { ConfirmEntry, ConfirmRegistry } from "./confirm-registry.ts";
+import { fireAndForget } from "./fire-and-forget.ts";
 import type { PendingFleetConfirm } from "./fleet-confirm.ts";
 import type { PendingNlConfirm } from "./nl-confirm.ts";
 import { retryTopicKey, type RetryStore } from "./retry-store.ts";
@@ -108,7 +109,11 @@ export function createConfirmCards(opts: ConfirmCardsOptions): ConfirmCards {
    * spinner already cleared - was the exact §6.5 failure mode this project works to avoid elsewhere. */
   function notifyConfirmGone(registry: { wasRecentlyAnswered(id: string): boolean }, id: string, messageId: number | undefined): void {
     if (registry.wasRecentlyAnswered(id) || messageId === undefined) return;
-    void finalizeCard(messageId, "⌛ This confirmation is no longer valid - most likely the Bridge restarted since it was posted. Resend the command to try again.");
+    fireAndForget(
+      finalizeCard(messageId, "⌛ This confirmation is no longer valid - most likely the Bridge restarted since it was posted. Resend the command to try again."),
+      log,
+      "confirm-cards notifyConfirmGone",
+    );
   }
 
   async function finalizeFleetConfirmMessage(pending: PendingFleetConfirm, text: string): Promise<void> {

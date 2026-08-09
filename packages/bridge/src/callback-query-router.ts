@@ -1,5 +1,6 @@
 import path from "node:path";
 import { resolveAskCallback, renderAskAnsweredCard } from "./ask-callback.ts";
+import { fireAndForget } from "./fire-and-forget.ts";
 import { buildContextPrefix } from "./message-context.ts";
 import { ABOUT_TOPICS, resolveAboutCallback } from "./about.ts";
 import { listRepoCommands, listRepoSkills, renderCommandsListText, renderSkillsListText, resolveCommandAction } from "./commands.ts";
@@ -300,15 +301,15 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
         // already cleared the spinner, so returning silently here left the operator with a tap
         // that visibly did nothing - §6.5's stated failure mode.
         const pending = confirmCards.takeOrNotifyGone(fleetConfirmRegistry, fleetConfirmAction.id, ctx.callbackQuery.message?.message_id, (entry) =>
-          void confirmCards.markConfirmCardExpired(entry.messageId),
+          fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "callback-query-router markConfirmCardExpired(fleet)"),
         );
         if (!pending) return;
         if (pending.kind !== fleetConfirmAction.kind) return;
         if (!fleetConfirmAction.confirmed) {
-          void confirmCards.finalizeFleetConfirmMessage(pending, "Cancelled - nothing was changed.");
+          fireAndForget(confirmCards.finalizeFleetConfirmMessage(pending, "Cancelled - nothing was changed."), log, "callback-query-router finalizeFleetConfirmMessage(cancel)");
           return;
         }
-        void fleetConfirmFlow.executeFleetConfirm(pending);
+        fireAndForget(fleetConfirmFlow.executeFleetConfirm(pending), log, "callback-query-router executeFleetConfirm");
       },
     ),
 
@@ -402,19 +403,25 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
       "nlConfirm",
       (data) => (data ? resolveNlConfirmCallback(data) : null),
       (nlConfirmAction, ctx) => {
-        const pending = confirmCards.takeOrNotifyGone(nlConfirmRegistry, nlConfirmAction.id, ctx.callbackQuery.message?.message_id, (entry) => void confirmCards.markNlConfirmCardExpired(entry));
+        const pending = confirmCards.takeOrNotifyGone(nlConfirmRegistry, nlConfirmAction.id, ctx.callbackQuery.message?.message_id, (entry) =>
+          fireAndForget(confirmCards.markNlConfirmCardExpired(entry), log, "callback-query-router markNlConfirmCardExpired"),
+        );
         if (!pending) return;
         if (nlConfirmAction.action === "cancel") {
-          void confirmCards.finalizeNlConfirmMessage(pending, "❌ Cancelled - nothing was changed.");
+          fireAndForget(confirmCards.finalizeNlConfirmMessage(pending, "❌ Cancelled - nothing was changed."), log, "callback-query-router finalizeNlConfirmMessage(cancel)");
           return;
         }
         if (nlConfirmAction.action === "run_and_stop_asking") {
           setAssistEnabled(false);
           settingsStore.set("assist_enabled", "false");
         }
-        void confirmCards.finalizeNlConfirmMessage(
-          pending,
-          `✅ Running ${nlDispatch.describeNlCommand(pending.command)}${nlConfirmAction.action === "run_and_stop_asking" ? " (confirmation now off - /assist on to re-enable)" : ""}.`,
+        fireAndForget(
+          confirmCards.finalizeNlConfirmMessage(
+            pending,
+            `✅ Running ${nlDispatch.describeNlCommand(pending.command)}${nlConfirmAction.action === "run_and_stop_asking" ? " (confirmation now off - /assist on to re-enable)" : ""}.`,
+          ),
+          log,
+          "callback-query-router finalizeNlConfirmMessage(run)",
         );
         const pendingIsControl = isControlTopic(pending.threadId);
         nlDispatch.executeMatchedCommand(pending.command, pending.threadId, pendingIsControl, pending.currentSlug);
@@ -432,17 +439,21 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
       (data) => (data ? resolveStaleConfirmCallback(data) : null),
       (staleConfirmAction, ctx) => {
         const pending = confirmCards.takeOrNotifyGone(staleConfirmRegistry, staleConfirmAction.id, ctx.callbackQuery.message?.message_id, (entry) =>
-          void confirmCards.markConfirmCardExpired(entry.confirmCardMessageId),
+          fireAndForget(confirmCards.markConfirmCardExpired(entry.confirmCardMessageId), log, "callback-query-router markConfirmCardExpired(stale)"),
         );
         if (!pending) return;
         if (!staleConfirmAction.confirmed) {
-          void confirmCards.finalizeStaleConfirmMessage(pending, "Cancelled - not actioned.");
+          fireAndForget(confirmCards.finalizeStaleConfirmMessage(pending, "Cancelled - not actioned."), log, "callback-query-router finalizeStaleConfirmMessage(cancel)");
           return;
         }
-        void confirmCards.finalizeStaleConfirmMessage(pending, "✅ Confirmed - processing now.");
+        fireAndForget(confirmCards.finalizeStaleConfirmMessage(pending, "✅ Confirmed - processing now."), log, "callback-query-router finalizeStaleConfirmMessage(confirm)");
         const pendingIsControl = isControlTopic(pending.threadId);
         const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
-        void commandDispatch.dispatchInboundMessage(pending.messageId, pending.rawText, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin));
+        fireAndForget(
+          commandDispatch.dispatchInboundMessage(pending.messageId, pending.rawText, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin)),
+          log,
+          "callback-query-router dispatchInboundMessage(stale replay)",
+        );
       },
     ),
 
@@ -457,7 +468,7 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
       (data) => (data ? resolveVoiceConfirmCallback(data) : null),
       (voiceConfirmAction, ctx) => {
         const pending = confirmCards.takeOrNotifyGone(voiceConfirmRegistry, voiceConfirmAction.id, ctx.callbackQuery.message?.message_id, (entry) =>
-          void confirmCards.markConfirmCardExpired(entry.confirmCardMessageId),
+          fireAndForget(confirmCards.markConfirmCardExpired(entry.confirmCardMessageId), log, "callback-query-router markConfirmCardExpired(voice)"),
         );
         if (!pending) return;
         if (voiceConfirmAction.action === "send" || voiceConfirmAction.action === "send_and_stop_asking") {
@@ -465,10 +476,18 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
             setVoiceConfirmEnabled(false);
             settingsStore.set("voice_confirm_enabled", "false");
           }
-          void confirmCards.finalizeVoiceConfirmMessage(pending, voiceConfirmAction.action === "send_and_stop_asking" ? "✅ Sent (confirmation now off - /voiceconfirm on to re-enable)." : "✅ Sent.");
+          fireAndForget(
+            confirmCards.finalizeVoiceConfirmMessage(pending, voiceConfirmAction.action === "send_and_stop_asking" ? "✅ Sent (confirmation now off - /voiceconfirm on to re-enable)." : "✅ Sent."),
+            log,
+            "callback-query-router finalizeVoiceConfirmMessage(send)",
+          );
           const pendingIsControl = isControlTopic(pending.threadId);
           const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
-          void commandDispatch.dispatchInboundMessage(pending.messageId, pending.transcript, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin));
+          fireAndForget(
+            commandDispatch.dispatchInboundMessage(pending.messageId, pending.transcript, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin)),
+            log,
+            "callback-query-router dispatchInboundMessage(voice replay)",
+          );
           return;
         }
         const doneText =
@@ -477,7 +496,7 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
             : voiceConfirmAction.action === "type"
               ? "✏️ Discarded - go ahead and type it."
               : "❌ Cancelled.";
-        void confirmCards.finalizeVoiceConfirmMessage(pending, doneText);
+        fireAndForget(confirmCards.finalizeVoiceConfirmMessage(pending, doneText), log, "callback-query-router finalizeVoiceConfirmMessage(discard)");
       },
     ),
 
@@ -492,7 +511,7 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
         const voiceDir = path.dirname(voiceModelPath);
         const models = listAvailableVoiceModels(voiceDir);
         const currentName = path.basename(voiceServer!.currentModelPath()).replace(/^ggml-/, "").replace(/\.bin$/, "");
-        void voiceModeCommands.applyVoiceModelSwitch(ctx.threadId, voiceModelName, voiceDir, models, currentName);
+        fireAndForget(voiceModeCommands.applyVoiceModelSwitch(ctx.threadId, voiceModelName, voiceDir, models, currentName), log, "callback-query-router applyVoiceModelSwitch");
       },
     ),
 

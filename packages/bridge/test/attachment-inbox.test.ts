@@ -82,7 +82,7 @@ describe("writeAttachmentToInbox", () => {
     const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-attach-test-"));
     try {
       const bytes = new Uint8Array([1, 2, 3, 4]);
-      const fullPath = writeAttachmentToInbox(stateDir, "my-slug", "photo.jpg", bytes);
+      const fullPath = await writeAttachmentToInbox(stateDir, "my-slug", "photo.jpg", bytes);
 
       expect(fullPath.startsWith(path.join(stateDir, "sessions", "my-slug", "inbox"))).toBe(true);
       const written = await fs.readFile(fullPath);
@@ -95,7 +95,7 @@ describe("writeAttachmentToInbox", () => {
   test("a hostile filename never escapes the session's inbox directory", async () => {
     const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-attach-test-"));
     try {
-      const fullPath = writeAttachmentToInbox(stateDir, "my-slug", "../../../etc/passwd", new Uint8Array([9]));
+      const fullPath = await writeAttachmentToInbox(stateDir, "my-slug", "../../../etc/passwd", new Uint8Array([9]));
       const inboxDir = path.join(stateDir, "sessions", "my-slug", "inbox");
       expect(path.dirname(fullPath)).toBe(inboxDir);
       expect(path.basename(fullPath)).toContain("passwd");

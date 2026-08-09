@@ -207,6 +207,86 @@ describe("startPolling", () => {
     expect(received).toEqual([99]);
   });
 
+  test("a throwing onUpdate is reported via onUpdateError, not onError, and does not stop the rest of the batch from running (§9, found live 2026-08-09)", async () => {
+    const batches: TelegramUpdate[][] = [[{ update_id: 1 }, { update_id: 2 }, { update_id: 3 }], []];
+    const source: UpdatesSource = {
+      getUpdates: async () => {
+        const batch = batches.shift();
+        if (batch === undefined) {
+          await new Promise((resolve) => setTimeout(resolve, 50));
+          return [];
+        }
+        return batch;
+      },
+    };
+    const received: number[] = [];
+    const errors: unknown[] = [];
+    const updateErrors: Array<{ updateId: number; err: unknown }> = [];
+    const stop = startPolling(source, {
+      onUpdate: (u) => {
+        received.push(u.update_id);
+        if (u.update_id === 2) throw new Error("handler blew up");
+      },
+      onError: (e) => errors.push(e),
+      onUpdateError: (u, err) => updateErrors.push({ updateId: u.update_id, err }),
+      retryDelayMs: 5,
+    });
+
+    await waitFor(() => received.length >= 3);
+    stop();
+
+    // Every update in the batch still ran, including the ones after the failing one.
+    expect(received).toEqual([1, 2, 3]);
+    // Reported through the update-specific channel, not misattributed to a transport failure.
+    expect(errors).toEqual([]);
+    expect(updateErrors).toEqual([{ updateId: 2, err: new Error("handler blew up") }]);
+  });
+
+  test("consecutive getUpdates failures back off exponentially, capped at maxRetryDelayMs, and reset after a success", async () => {
+    // Real timers, small values - measures the actual wall-clock gap between call attempts rather
+    // than intercepting `setTimeout` globally (this file's own fakes already use real timers for
+    // every other startPolling test, and a global monkeypatch would also catch unrelated timers -
+    // this loop's own successful-poll delay, `waitFor`'s internal polling, ... - producing noise
+    // instead of a signal).
+    let calls = 0;
+    const callTimestamps: number[] = [];
+    const source: UpdatesSource = {
+      getUpdates: async () => {
+        callTimestamps.push(Date.now());
+        calls++;
+        if (calls <= 4) throw new Error("still down");
+        if (calls === 5) return [{ update_id: 1 }];
+        // Same microtask-starvation care the other tests in this file already document: a fake
+        // that resolves instantly forever turns the loop into a busy-spin that starves the event
+        // loop's timer phase, hanging `waitFor`'s own polling indefinitely.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return [];
+      },
+    };
+    const received: number[] = [];
+    const stop = startPolling(source, {
+      onUpdate: (u) => received.push(u.update_id),
+      retryDelayMs: 20,
+      maxRetryDelayMs: 60,
+    });
+    await waitFor(() => received.length >= 1);
+    stop();
+
+    // At least the 5 attempts this test cares about - `stop()` can't interrupt an in-flight 6th
+    // call already started by the time `waitFor` notices the 5th succeeded.
+    expect(callTimestamps.length).toBeGreaterThanOrEqual(5);
+    const gaps = callTimestamps.slice(1, 5).map((t, i) => t - callTimestamps[i]!);
+    // 20, 40, 60 (would be 80, capped), 60 (capped again) - asserted as a floor rather than an exact
+    // value, since real timers are never perfectly precise, but the doubling-then-capped shape must
+    // hold: each gap is at least its expected floor, and the 3rd/4th never grow past the cap.
+    expect(gaps[0]).toBeGreaterThanOrEqual(15);
+    expect(gaps[1]).toBeGreaterThanOrEqual(35);
+    expect(gaps[2]).toBeGreaterThanOrEqual(55);
+    expect(gaps[2]).toBeLessThan(100); // capped at 60 (+jitter), nowhere near an uncapped 80
+    expect(gaps[3]).toBeGreaterThanOrEqual(55);
+    expect(gaps[3]).toBeLessThan(100); // still capped, not still doubling toward 160
+  });
+
   test("delivers callback_query updates alongside message updates", async () => {
     const stub = new StubTelegramServer();
     const { baseUrl } = stub.start(0);

@@ -68,6 +68,23 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
 
 const ROUTE = { slug: "fix-bug", topicId: 5, worktreePath: "c:\\worktrees\\fix-bug" };
 
+/** `writeAttachmentToInbox` is real `fs/promises` I/O (0.10x.0 - previously synchronous, see that
+ * module's own doc comment for why it changed), so waiting out a fixed handful of microtask ticks
+ * (`await Promise.resolve()`, enough for everything else in this file, which is all in-memory) is no
+ * longer reliable for the attachment-download tests below - a real filesystem write needs real event
+ * loop turns, not just queued microtasks. Polls instead of guessing a fixed tick count. */
+function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const tick = () => {
+      if (predicate()) return resolve();
+      if (Date.now() - start > timeoutMs) return reject(new Error("waitFor timed out"));
+      setTimeout(tick, 5);
+    };
+    tick();
+  });
+}
+
 describe("createInboundMedia", () => {
   describe("routeInboundMessage", () => {
     test("a plain-text update in a routed session topic falls through to dispatchInboundMessage", async () => {
@@ -110,9 +127,7 @@ describe("createInboundMedia", () => {
       routing.add(ROUTE);
 
       inboundMedia.routeInboundMessage(message({ message_thread_id: 5, ...fields }));
-      await Promise.resolve();
-      await Promise.resolve();
-      await Promise.resolve();
+      await waitFor(() => dispatched.length >= 1);
 
       expect(dispatched.length).toBe(1);
       expect(dispatched[0]?.rawText).toContain(ROUTE.slug);

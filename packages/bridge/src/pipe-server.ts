@@ -1,10 +1,11 @@
-import { readFileSync, existsSync, statSync } from "node:fs";
+import { promises as fsPromises } from "node:fs";
 import path from "node:path";
 import net from "node:net";
 import { DEFAULT_PIPE_PATH, encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protocol";
 import type {
   ChannelMetaFields,
   HelloAck,
+  HookAnswerMessage,
   HookAskMessage,
   HookEventMessage,
   InboundMessage,
@@ -17,6 +18,7 @@ import type {
 } from "@aibridge/protocol";
 import { buildAskKeyboard, renderAskCard } from "./ask-callback.ts";
 import { AskRegistry, type PendingAsk } from "./ask-registry.ts";
+import { fireAndForget } from "./fire-and-forget.ts";
 import { isImagePath, resolveOutboxPath } from "./outbox.ts";
 import { buildPermissionKeyboard, renderPermissionCard } from "./permission-callback.ts";
 import { PermissionRegistry, type PendingPermissionRequest } from "./permission-registry.ts";
@@ -191,6 +193,24 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
   // connection for the same slug.
   const askSocketsById = new Map<string, net.Socket>();
 
+  // §9, found live 2026-08-09: `handleReply`/`handleAsk` each await a sequence of Telegram sends
+  // for one slug (a reply's own chunks, one question card per ask), but nothing serialized two
+  // *separate* `reply`/`ask` messages for that same slug arriving close together - each was simply
+  // dispatched via its own bare fire-and-forget call, so their sends could interleave on the wire
+  // (reply A chunk 1, reply B chunk 1, reply A chunk 2, ...). `serializedPerSlug` chains each new
+  // call onto the previous one for the same slug, so a slug's own sends stay strictly ordered
+  // relative to each other - unrelated slugs are unaffected (each gets its own chain).
+  const perSlugChain = new Map<string, Promise<unknown>>();
+  function serializedPerSlug(slug: string, fn: () => Promise<void>): Promise<void> {
+    const prior = perSlugChain.get(slug) ?? Promise.resolve();
+    // `.catch(() => {})` on the prior link, not on the chain this function returns: a failed
+    // earlier reply for this slug must not block a later one from running, but the caller of
+    // *this* call still needs to see its own `fn`'s real outcome (fireAndForget already logs it).
+    const next = prior.catch(() => {}).then(fn);
+    perSlugChain.set(slug, next);
+    return next;
+  }
+
   // §5.4's two control-bot lanes. Both fall back to calling `controlBot` directly when no
   // governor is supplied (existing stub-server tests), so this is additive rather than a
   // behaviour change for anything that doesn't opt in.
@@ -325,19 +345,28 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       log("WARN", `send_file for slug "${msg.slug}" rejected - "${msg.path}" is outside its outbox`);
       return;
     }
-    if (!existsSync(resolved)) {
+    // §9, found live 2026-08-09: this whole handler (stat, then a read of up to
+    // `MAX_SEND_FILE_BYTES` = 50MB) used to run entirely synchronously. The Bridge is
+    // single-threaded and serves every session at once - a 50MB `fs.readFileSync` blocks the
+    // `getUpdates` loop, every permission card, every reply, for anyone, for as long as that read
+    // takes. `fs/promises` here (the surrounding function is already `async`) yields to the event
+    // loop instead of blocking it. Existence and size are checked together via one `stat` (not a
+    // separate `existsSync` + `statSync`, which is also two syscalls where one now does).
+    let size: number;
+    try {
+      size = (await fsPromises.stat(resolved)).size;
+    } catch {
       log("WARN", `send_file for slug "${msg.slug}" rejected - "${resolved}" does not exist`);
       return;
     }
     const topicId = topicFor(msg.slug, msg.topic_id, "send_file");
     if (topicId === undefined) return;
     try {
-      const size = statSync(resolved).size;
       if (size > MAX_SEND_FILE_BYTES) {
         log("WARN", `send_file for slug "${msg.slug}" rejected - "${resolved}" is ${size} bytes, over Telegram's 50MB limit`);
         return;
       }
-      const bytes = readFileSync(resolved);
+      const bytes = await fsPromises.readFile(resolved);
       const filename = path.basename(resolved);
       const asPhoto = isImagePath(filename);
       // The caption is free text Claude supplies, same as a reply - scrub it the same way (the
@@ -472,19 +501,27 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
         handleHello(msg, socket);
         return;
       case "reply":
-        void handleReply(msg);
+        fireAndForget(
+          serializedPerSlug(msg.slug, () => handleReply(msg)),
+          log,
+          `pipe-server handleReply(${msg.slug})`,
+        );
         return;
       case "send_file":
-        void handleSendFile(msg);
+        fireAndForget(handleSendFile(msg), log, `pipe-server handleSendFile(${msg.slug})`);
         return;
       case "permission_request":
-        void handlePermissionRequest(msg);
+        fireAndForget(handlePermissionRequest(msg), log, `pipe-server handlePermissionRequest(${msg.slug})`);
         return;
       case "event":
         opts.onHookEvent?.(msg);
         return;
       case "ask":
-        void handleAsk(msg, socket);
+        fireAndForget(
+          serializedPerSlug(msg.slug, () => handleAsk(msg, socket)),
+          log,
+          `pipe-server handleAsk(${msg.slug})`,
+        );
         return;
       default:
         log("WARN", `ignoring unrecognised message type "${(msg as { type?: unknown }).type}"`);
@@ -604,27 +641,27 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     return askRegistry.answer(id, questionIndex, optionIndex);
   }
 
-  function completeAsk(id: string): boolean {
+  /** Shared by `completeAsk`/`cancelAsk` below - both pop the registry entry, forget its socket,
+   * and (if one was still live) send a `type: "answer"` message back to the blocked hook, differing
+   * only in the payload (`{ answers }` vs `{ cancel: true }`). */
+  function finishAsk(id: string, buildPayload: (entry: PendingAsk) => Pick<HookAnswerMessage, "answers" | "cancel">): boolean {
     const entry = askRegistry.get(id);
     if (!entry) return false;
-    const answers = askRegistry.buildAnswers(entry);
+    const payload = buildPayload(entry);
     const socket = askSocketsById.get(id);
     askRegistry.remove(id);
     askSocketsById.delete(id);
     if (!socket) return false;
-    socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "answer", slug: entry.slug, answers }));
+    socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "answer", slug: entry.slug, ...payload }));
     return true;
   }
 
+  function completeAsk(id: string): boolean {
+    return finishAsk(id, (entry) => ({ answers: askRegistry.buildAnswers(entry) }));
+  }
+
   function cancelAsk(id: string): boolean {
-    const entry = askRegistry.get(id);
-    if (!entry) return false;
-    const socket = askSocketsById.get(id);
-    askRegistry.remove(id);
-    askSocketsById.delete(id);
-    if (!socket) return false;
-    socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "answer", slug: entry.slug, cancel: true }));
-    return true;
+    return finishAsk(id, () => ({ cancel: true }));
   }
 
   return {

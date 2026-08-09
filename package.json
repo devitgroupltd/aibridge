@@ -6,6 +6,7 @@
   ],
   "scripts": {
     "test": "bun test",
+    "typecheck": "bash scripts/typecheck.sh",
     "setup": "powershell -ExecutionPolicy Bypass -File scripts/setup-windows.ps1",
     "bridge:start": "bash scripts/dev-bridge.sh start",
     "bridge:stop": "bash scripts/dev-bridge.sh stop",

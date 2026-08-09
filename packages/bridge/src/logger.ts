@@ -26,6 +26,16 @@ export type LogLevel = "INFO" | "WARN" | "ERROR";
 const MAX_LOG_BYTES = 10 * 1024 * 1024;
 
 let logFilePath: string | null = null;
+/** Running total of `logFilePath`'s own byte size, maintained incrementally by `log()`'s own
+ * appends rather than re-derived from a real `statSync` on every call - see `rotateIfNeeded`'s own
+ * doc comment for why a per-line syscall was worth removing and what keeps this safe. */
+let knownLogBytes = 0;
+/** False whenever `knownLogBytes` cannot yet be trusted - right after `initFileLogging` (a fresh
+ * boot/restart may already have a large `bridge.log` left over from the previous run, entirely
+ * unknown to this fresh process) and right after `resetFileLogging`. `rotateIfNeeded` re-seeds
+ * `knownLogBytes` from one real stat the next time it's needed and flips this back to true - after
+ * that, every log line updates the running total instead of asking the OS again. */
+let logBytesKnown = false;
 
 /** Call once at startup. Idempotent - a second call just repoints the sink (used by tests). Creates
  * `stateDir` if it isn't there: on a fresh machine (or before `config.ts` has created anything)
@@ -40,28 +50,49 @@ export function initFileLogging(stateDir: string): void {
     // working on its own rather than staying permanently disabled by one early failure.
   }
   logFilePath = path.join(stateDir, "bridge.log");
+  logBytesKnown = false; // this process has no idea yet how big (if at all) the file already is
 }
 
 /** Test-only escape hatch back to console-only, so one test's file sink can't leak into another's. */
 export function resetFileLogging(): void {
   logFilePath = null;
+  logBytesKnown = false;
 }
 
-/** One rotated backup (`bridge.log.1`), not a numbered series - this is "don't lose the last few
+/**
+ * One rotated backup (`bridge.log.1`), not a numbered series - this is "don't lose the last few
  * days," not a full log-retention policy. Best-effort: a rotation failure (e.g. the `.1` file is
- * open elsewhere) falls through to a normal append rather than blocking the log line entirely. */
+ * open elsewhere) falls through to a normal append rather than blocking the log line entirely.
+ *
+ * §9, found live 2026-08-09: this used to call `statSync` unconditionally on *every single* `log()`
+ * call - two synchronous syscalls (this plus `appendFileSync`) on what is, across a busy fleet, the
+ * hottest path in the whole process (every hook event, PTY chunk, feed edit, governor decision all
+ * log). `knownLogBytes` tracks the file's size incrementally from `log()`'s own appends instead, so
+ * the real syscall only happens once per "epoch" - right after `initFileLogging`/a fresh boot (this
+ * process genuinely doesn't know the file's size yet, e.g. a restart inheriting a near-cap file from
+ * the previous run) and once right after each rotation (the size resets to whatever the fresh append
+ * below adds) - not once per line in between. Nothing outside this module ever writes to
+ * `bridge.log`, so the tracked total can't silently drift out from under it between those points.
+ */
 function rotateIfNeeded(filePath: string): void {
-  try {
-    if (statSync(filePath).size <= MAX_LOG_BYTES) return;
-  } catch {
-    return; // doesn't exist yet - nothing to rotate
+  if (!logBytesKnown) {
+    try {
+      knownLogBytes = statSync(filePath).size;
+    } catch {
+      knownLogBytes = 0; // doesn't exist yet - nothing to rotate
+    }
+    logBytesKnown = true;
   }
+  if (knownLogBytes <= MAX_LOG_BYTES) return;
   const rotated = `${filePath}.1`;
   try {
     rmSync(rotated, { force: true });
     renameSync(filePath, rotated);
+    knownLogBytes = 0;
   } catch {
-    // best-effort - an in-progress append will just keep growing the current file this once
+    // best-effort - an in-progress append will just keep growing the current file this once, and
+    // `knownLogBytes` deliberately stays as-is (still over cap) so the *next* call retries the
+    // rotation rather than assuming this one succeeded.
   }
 }
 
@@ -75,6 +106,9 @@ export function log(level: LogLevel, message: string): void {
   try {
     rotateIfNeeded(logFilePath);
     appendFileSync(logFilePath, line + "\n");
+    // Byte length, not `.length` (UTF-16 code units) - `MAX_LOG_BYTES` is a byte cap and a message
+    // containing multi-byte characters would otherwise under-count against it.
+    knownLogBytes += Buffer.byteLength(line, "utf8") + 1;
   } catch {
     // best-effort - see doc comment above
   }

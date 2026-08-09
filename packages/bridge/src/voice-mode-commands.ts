@@ -1,4 +1,5 @@
 import path from "node:path";
+import { fireAndForget } from "./fire-and-forget.ts";
 import { buildVoiceModelKeyboard, listAvailableVoiceModels } from "./voice-model.ts";
 import type { WhisperServerHandle } from "./voice-transcribe.ts";
 import {
@@ -152,7 +153,7 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
         .catch((err) => log("WARN", `sendMessage (/voice) failed: ${(err as Error).message}`));
       return;
     }
-    void applyVoiceModelSwitch(topicId, cmd.model, voiceDir, models, currentName);
+    fireAndForget(applyVoiceModelSwitch(topicId, cmd.model, voiceDir, models, currentName), log, "voice-mode-commands applyVoiceModelSwitch");
   }
 
   /** Re-validates `name` against a freshly re-scanned model list rather than trusting the caller

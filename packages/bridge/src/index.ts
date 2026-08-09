@@ -5,6 +5,7 @@ import path from "node:path";
 import type * as pty from "node-pty";
 import { renderAskCancelledCard } from "./ask-callback.ts";
 import { buildRunArgs } from "./autostart.ts";
+import { fireAndForget } from "./fire-and-forget.ts";
 import { loadConfig, STATE_DIR } from "./config.ts";
 import { initFileLogging, log } from "./logger.ts";
 import { clearDeployMarker, isDeployMarkerStale, readDeployMarker, rollbackStaleDeploy } from "./deploy.ts";
@@ -15,6 +16,7 @@ import { StaleConfirmRegistry } from "./stale-confirm.ts";
 import { VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { startWhisperServer } from "./voice-transcribe.ts";
 import { NlConfirmRegistry } from "./nl-confirm.ts";
+import { LateBound } from "./late-bound.ts";
 import { RetryStore } from "./retry-store.ts";
 import { ChannelConnectCoordinator } from "./channel-connect-coordinator.ts";
 import type { RouterAction } from "./nl-router.ts";
@@ -306,11 +308,11 @@ async function main(): Promise<void> {
   // command-dispatch.ts's `dispatchFleetCommand`/`dispatchInboundMessage` are real two-way
   // dependencies with both `nlDispatch` (below) and `inboundMedia` (right below) - `commandDispatch`
   // itself isn't constructed until after `sessionLifecycle`/`fleetReporting`/`fleetConfirmFlow`/
-  // `deployLifecycle`/`voiceModeCommands`/`cardSenders`/`feedWiring`/`nlDispatch` all exist. Declared
-  // as a `let` here, before anything that needs to close over it, and assigned once with the real
-  // factory result further down - same "forward reference resolved before it's ever called, never
-  // before it's assigned" pattern as `fleetConfirmFlow` (fleet-confirm-flow.ts, item 11).
-  let commandDispatch: CommandDispatch;
+  // `deployLifecycle`/`voiceModeCommands`/`cardSenders`/`feedWiring`/`nlDispatch` all exist.
+  // `LateBound` (late-bound.ts) makes that "resolved before it's ever called, never before it's
+  // assigned" invariant explicit and checked at the point of failure, rather than resting on this
+  // comment alone - same pattern `fleetConfirmFlow` (fleet-confirm-flow.ts, item 11) uses below.
+  const commandDispatch = new LateBound<CommandDispatch>();
 
   // inbound-media.ts: voice/attachment handling plus the onUpdate plain-message routing entry
   // point - `dispatchInboundMessage` and `voiceConfirmEnabled` (read live via a getter, not a
@@ -324,7 +326,7 @@ async function main(): Promise<void> {
     voiceConfirmRegistry,
     confirmSessionCommand,
     dispatchInboundMessage: (messageId, rawText, threadId, isControl, route, currentSlug, from, contextPrefix) =>
-      commandDispatch.dispatchInboundMessage(messageId, rawText, threadId, isControl, route, currentSlug, from, contextPrefix),
+      commandDispatch.get().dispatchInboundMessage(messageId, rawText, threadId, isControl, route, currentSlug, from, contextPrefix),
     isControlTopic,
     voiceConfirmEnabled: () => voiceConfirmEnabled,
     voice: config.voice,
@@ -558,8 +560,10 @@ async function main(): Promise<void> {
   // dependency. Broken the same way a hoisted function declaration would have broken it pre-split:
   // `sessionLifecycle` is constructed first, with `postFleetConfirm`/`executeFleetActionDirect`
   // wrapped in closures over `fleetConfirmFlow` below, which isn't assigned until right after -
-  // safe, since neither closure is ever called until well after both consts exist.
-  let fleetConfirmFlow: FleetConfirmFlow;
+  // safe, since neither closure is ever called until well after both consts exist. `LateBound`
+  // (late-bound.ts) makes that safety checked rather than just documented - see `commandDispatch`'s
+  // own comment above for the full reasoning.
+  const fleetConfirmFlow = new LateBound<FleetConfirmFlow>();
 
   // session-lifecycle-commands.ts: /new, /ls, /kill, /rm, /attach, /pause, /detail, /verbose, plus
   // the shared resolveTargetSlug/resolveSessionOrBail helpers.
@@ -577,8 +581,8 @@ async function main(): Promise<void> {
     confirmSessionCommand,
     finalizePermissionMessage: (messageId, text) => pipeHandle.finalizePermissionMessage(messageId, text),
     stopIndicatorsForTopic,
-    postFleetConfirm: (kind, topicId, targets, promptText) => fleetConfirmFlow.postFleetConfirm(kind, topicId, targets, promptText),
-    executeFleetActionDirect: (kind, topicId, targets) => fleetConfirmFlow.executeFleetActionDirect(kind, topicId, targets),
+    postFleetConfirm: (kind, topicId, targets, promptText) => fleetConfirmFlow.get().postFleetConfirm(kind, topicId, targets, promptText),
+    executeFleetActionDirect: (kind, topicId, targets) => fleetConfirmFlow.get().executeFleetActionDirect(kind, topicId, targets),
     writeModeKeystrokes: voiceModeCommands.writeModeKeystrokes,
     waitForChannelConnected,
     isControlTopic,
@@ -592,19 +596,21 @@ async function main(): Promise<void> {
     log,
   });
 
-  fleetConfirmFlow = createFleetConfirmFlow({
-    controlBot,
-    routing,
-    sessionStore,
-    confirmCards,
-    fleetConfirmRegistry,
-    sessionLifecycle,
-    confirmSessionCommand,
-    usageWaiters,
-    orphanTopicNote: ORPHAN_TOPIC_NOTE,
-    supergroupChatId: config.supergroupChatId,
-    log,
-  });
+  fleetConfirmFlow.set(
+    createFleetConfirmFlow({
+      controlBot,
+      routing,
+      sessionStore,
+      confirmCards,
+      fleetConfirmRegistry,
+      sessionLifecycle,
+      confirmSessionCommand,
+      usageWaiters,
+      orphanTopicNote: ORPHAN_TOPIC_NOTE,
+      supergroupChatId: config.supergroupChatId,
+      log,
+    }),
+  );
 
   const fleetReporting = createFleetReportingCommands({
     controlBot,
@@ -640,9 +646,9 @@ async function main(): Promise<void> {
 
   // nl-dispatch.ts: NL-router matching, the destructive-command confirm gate, and executing a
   // matched command through the exact same handlers a typed command uses.
-  // `commandDispatch` (declared as a `let` above, alongside `inboundMedia`'s own forward reference
-  // to it) isn't assigned until further down - `dispatchFleetCommand` below is a closure over it,
-  // same reasoning as `inboundMedia`'s own `dispatchInboundMessage` option.
+  // `commandDispatch` (a `LateBound` above, alongside `inboundMedia`'s own forward reference to it)
+  // isn't assigned until further down - `dispatchFleetCommand` below is a closure over it, same
+  // reasoning as `inboundMedia`'s own `dispatchInboundMessage` option.
   const nlDispatch = createNlDispatch({
     controlBot,
     routing,
@@ -654,7 +660,7 @@ async function main(): Promise<void> {
     applyModeSwitch: voiceModeCommands.applyModeSwitch,
     applyEffortSwitch: voiceModeCommands.applyEffortSwitch,
     nlConfirmRegistry,
-    dispatchFleetCommand: (fleetCmd, threadId, isControl, currentSlug) => commandDispatch.dispatchFleetCommand(fleetCmd, threadId, isControl, currentSlug),
+    dispatchFleetCommand: (fleetCmd, threadId, isControl, currentSlug) => commandDispatch.get().dispatchFleetCommand(fleetCmd, threadId, isControl, currentSlug),
     nlRouterConfig: config.nlRouter,
     getNlRouterBackend: () => nlRouterBackend,
     getAssistEnabled: () => assistEnabled,
@@ -683,10 +689,10 @@ async function main(): Promise<void> {
     // operator-confirm cards too: past their TTL, strip the keyboard and say so. Doubles as the
     // sweep these four never had - entries used to be dropped only by a tap, so an untapped card
     // (and its whole replay payload) leaked for the lifetime of the daemon.
-    for (const entry of nlConfirmRegistry.takeExpired()) void confirmCards.markNlConfirmCardExpired(entry);
-    for (const entry of fleetConfirmRegistry.takeExpired()) void confirmCards.markConfirmCardExpired(entry.messageId);
-    for (const entry of staleConfirmRegistry.takeExpired()) void confirmCards.markConfirmCardExpired(entry.confirmCardMessageId);
-    for (const entry of voiceConfirmRegistry.takeExpired()) void confirmCards.markConfirmCardExpired(entry.confirmCardMessageId);
+    for (const entry of nlConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markNlConfirmCardExpired(entry), log, "index sweep markNlConfirmCardExpired");
+    for (const entry of fleetConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "index sweep markConfirmCardExpired(fleet)");
+    for (const entry of staleConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.confirmCardMessageId), log, "index sweep markConfirmCardExpired(stale)");
+    for (const entry of voiceConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.confirmCardMessageId), log, "index sweep markConfirmCardExpired(voice)");
 
     // §6.4: past the 3540s ceiling, cancel rather than let the hook's own 3600s timeout expire
     // silently - the operator sees an explicit "cancelled" card and Claude sees a `deny` it can
@@ -843,25 +849,27 @@ async function main(): Promise<void> {
   // `dispatchInboundMessage` calls `nlDispatch.postNlConfirm`/`routeOrFallback` on its own
   // fallthrough paths - the reverse of the forward reference `nlDispatch` itself took to
   // `dispatchFleetCommand` while this module didn't exist yet.
-  commandDispatch = createCommandDispatch({
-    controlBot,
-    routing,
-    ptyIo,
-    sessionStore,
-    confirmSessionCommand,
-    sessionLifecycle,
-    fleetReporting,
-    fleetConfirmFlow,
-    deployLifecycle,
-    voiceModeCommands,
-    cardSenders,
-    feedWiring,
-    retryStore,
-    nlDispatch,
-    getReposRegistry: () => reposRegistry,
-    supergroupChatId: config.supergroupChatId,
-    log,
-  });
+  commandDispatch.set(
+    createCommandDispatch({
+      controlBot,
+      routing,
+      ptyIo,
+      sessionStore,
+      confirmSessionCommand,
+      sessionLifecycle,
+      fleetReporting,
+      fleetConfirmFlow: fleetConfirmFlow.get(),
+      deployLifecycle,
+      voiceModeCommands,
+      cardSenders,
+      feedWiring,
+      retryStore,
+      nlDispatch,
+      getReposRegistry: () => reposRegistry,
+      supergroupChatId: config.supergroupChatId,
+      log,
+    }),
+  );
 
   // callback-query-router.ts: every inline-keyboard tap's callback-query handling, one namespace
   // rule per `callback_data` prefix - constructed last of all the per-concern modules since it's
@@ -880,10 +888,10 @@ async function main(): Promise<void> {
     staleConfirmRegistry,
     voiceConfirmRegistry,
     nlConfirmRegistry,
-    fleetConfirmFlow,
+    fleetConfirmFlow: fleetConfirmFlow.get(),
     browseRegistry,
     nlDispatch,
-    commandDispatch,
+    commandDispatch: commandDispatch.get(),
     voiceModeCommands,
     confirmSessionCommand,
     isControlTopic,
@@ -919,6 +927,14 @@ async function main(): Promise<void> {
     },
     onError: (err) => {
       log("WARN", `getUpdates failed, retrying: ${(err as Error).message}`);
+    },
+    // §9, found live 2026-08-09: a throw from a single update's own routing (callback query or
+    // inbound message) used to abort the rest of that batch and get logged as "getUpdates failed" -
+    // the wrong cause, and it silently dropped every other update already queued behind the failing
+    // one. Logged with the actual update_id so this is diagnosable, distinct from a real transport
+    // failure above.
+    onUpdateError: (update, err) => {
+      log("ERROR", `onUpdate threw for update_id ${update.update_id}: ${(err as Error).message}`);
     },
   });
 

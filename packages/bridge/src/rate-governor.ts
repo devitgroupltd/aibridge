@@ -137,7 +137,6 @@ export class RateGovernor {
   private readonly log: LogFn;
   private readonly now: () => number;
   private p2DroppedCount = 0;
-  private drainRetryTimerArmed = false;
   /** Guards `drainControl` against running twice concurrently (0.101.0) - see that method's own
    * doc comment for what running twice used to cost. */
   private draining = false;
@@ -272,21 +271,25 @@ export class RateGovernor {
       this.clearTimeoutFn(this.drainRetryTimer);
       this.drainRetryTimer = undefined;
     }
-    this.drainRetryTimerArmed = false;
     this.drainControl();
   }
 
   /** At most one retry timer in flight - a queue of 200 deferred tasks must not become 200 timers,
    * and while the bucket is *paused* by a 429 there is no point waking every second for what may be
-   * up to an hour (`clampRetryAfterMs`), so the wake is scheduled for when the pause actually ends. */
+   * up to an hour (`clampRetryAfterMs`), so the wake is scheduled for when the pause actually ends.
+   *
+   * §9, found live 2026-08-09: this used to track "is a wake already armed?" in a second boolean
+   * field (`drainRetryTimerArmed`) alongside `drainRetryTimer` itself - both were always set/cleared
+   * together in every one of the three places that touch either (here, `pump()`, and this timer's
+   * own callback), so the two could never actually disagree; `drainRetryTimer !== undefined` alone
+   * already carries the exact same information `drainRetryTimerArmed` did, just without a second
+   * field a future edit could accidentally desync from the first. */
   private armDrainRetry(): void {
-    if (this.drainRetryTimerArmed) return;
-    this.drainRetryTimerArmed = true;
+    if (this.drainRetryTimer !== undefined) return;
     const pausedForMs = this.controlBucket.pausedForMs();
     this.drainRetryTimer = this.setTimeoutFn(
       () => {
         this.drainRetryTimer = undefined;
-        this.drainRetryTimerArmed = false;
         this.drainControl();
       },
       pausedForMs > 0 ? pausedForMs + 50 : DRAIN_RETRY_MS,
