@@ -1,8 +1,20 @@
+import type { AttachmentKind } from "./attachment-inbox.ts";
 import { escapeForFeed } from "./feed-escape.ts";
 import type { RepoEntry } from "./repos-registry.ts";
 import type { Effort, Mode, Model } from "./session-commands.ts";
 import { EFFORTS, MODELS, MODES } from "./session-commands.ts";
 import type { SessionRow } from "./session-store.ts";
+
+/** Bytes for an attachment sent alongside a control-topic `/new <repo> <prompt>` caption
+ * (attachment-triggered-session-creation-plan.md) - carried in memory (never written to a temp
+ * file) until `handleNewCommand` knows the session's `slug`, at which point it's moved into that
+ * session's own inbox the same way an existing-session attachment already is
+ * (`attachment-inbox.ts`'s `writeAttachmentToInbox`). */
+export interface PendingAttachment {
+  kind: AttachmentKind;
+  name: string;
+  bytes: Uint8Array;
+}
 
 /**
  * §4.2's fleet-scoped commands. `/new`/`/ls`/`/budget` are control-topic only (no target to act on
@@ -22,7 +34,7 @@ import type { SessionRow } from "./session-store.ts";
 export type RmBulkFilter = { mode: "dead" } | { mode: "prefix"; prefix: string } | { mode: "all" };
 
 export type FleetCommand =
-  | { kind: "new"; repo: string; prompt: string; model?: Model; sourceText?: string }
+  | { kind: "new"; repo: string; prompt: string; model?: Model; sourceText?: string; pendingAttachment?: PendingAttachment }
   | { kind: "ls" }
   | { kind: "kill"; slug?: string; all?: boolean; force?: boolean }
   | { kind: "rm"; slug?: string; bulk?: RmBulkFilter; force?: boolean }
@@ -670,7 +682,9 @@ export function renderHelp(): string {
   return [
     "Fleet commands (control topic; also /help, /?, /h, or bare ? here):",
     "  /about - what this bot can do, with examples (start here if you're new)",
-    "  /new [--model] <repo> <prompt> - start a new session",
+    "  /new [--model] <repo> <prompt> - start a new session (or send a photo/file into this topic",
+    "    with that same text as its caption, to start the session with that attachment already in",
+    "    its inbox)",
     "  /ls - list sessions, with what's running/waiting on each",
     "  /kill [<slug>|--all [--force]] - stop a session (or all, confirm-gated unless --force)",
     "  /rm [<slug>|--dead|--prefix <text>|--all [--force]] - remove a dead session row (--all is",
@@ -750,7 +764,7 @@ export function isKnownCommandText(text: string | undefined): boolean {
 export function botCommandList(): { command: string; description: string }[] {
   return [
     { command: "about", description: "What this bot can do, with examples" },
-    { command: "new", description: "Start a new session: /new [--model] <repo> <prompt>" },
+    { command: "new", description: "Start a new session: /new [--model] <repo> <prompt> (or a captioned attachment here)" },
     { command: "ls", description: "List sessions, with what's running/waiting on each" },
     { command: "kill", description: "Stop a session: /kill [<slug>|--all [--force]]" },
     { command: "rm", description: "Remove a dead session row: /rm [<slug>|--dead|--prefix <text>|--all [--force]]" },

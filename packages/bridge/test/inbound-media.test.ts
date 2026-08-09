@@ -42,6 +42,7 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
   const voiceConfirmRegistry = new VoiceConfirmRegistry();
   const dispatched: Array<{ messageId: number; rawText: string; threadId: number | undefined }> = [];
   const confirmed: Array<{ topicId: number | undefined; text: string }> = [];
+  const createdFromAttachment: Array<{ cmd: unknown; controlTopicId: number | undefined }> = [];
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-inbound-media-test-"));
   const inboundMedia = createInboundMedia({
     controlBot,
@@ -56,6 +57,10 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
     dispatchInboundMessage: async (messageId, rawText, threadId) => {
       dispatched.push({ messageId, rawText, threadId });
     },
+    createSessionFromAttachment: async (cmd, controlTopicId) => {
+      createdFromAttachment.push({ cmd, controlTopicId });
+    },
+    disableCaptionNew: false,
     isControlTopic: (threadId) => threadId === undefined || threadId === 1,
     voiceConfirmEnabled: () => true,
     voice: { enabled: true, ffmpegPath: "ffmpeg", port: 8123 },
@@ -63,7 +68,7 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
     stateDir,
     ...overrides,
   });
-  return { inboundMedia, controlBot, routing, sessionStore, staleConfirmRegistry, voiceConfirmRegistry, dispatched, confirmed, stateDir };
+  return { inboundMedia, controlBot, routing, sessionStore, staleConfirmRegistry, voiceConfirmRegistry, dispatched, confirmed, createdFromAttachment, stateDir };
 }
 
 const ROUTE = { slug: "fix-bug", topicId: 5, worktreePath: "c:\\worktrees\\fix-bug" };
@@ -225,6 +230,62 @@ describe("createInboundMedia", () => {
 
       expect(confirmed).toEqual([]);
       expect(dispatched).toEqual([]);
+    });
+
+    // attachment-triggered-session-creation-plan.md: a captioned attachment in the control topic
+    // with no route.
+    describe("caption-triggered /new in the control topic", () => {
+      test("a /new <repo> <prompt> caption creates a session via createSessionFromAttachment", async () => {
+        const { inboundMedia, confirmed, createdFromAttachment } = await setup();
+
+        await inboundMedia.handleAttachmentMessage("image", "i1", undefined, undefined, undefined, 1, undefined, true, 1, "/new demo-repo add a README", "op", message());
+
+        expect(confirmed).toEqual([]);
+        expect(createdFromAttachment.length).toBe(1);
+        expect(createdFromAttachment[0]?.controlTopicId).toBe(1);
+        expect(createdFromAttachment[0]?.cmd).toMatchObject({
+          kind: "new",
+          repo: "demo-repo",
+          prompt: "add a README",
+          pendingAttachment: { kind: "image", name: expect.any(String), bytes: expect.any(Uint8Array) },
+        });
+      });
+
+      test("a caption that isn't a /new invocation still gets the plain rejection reply", async () => {
+        const { inboundMedia, confirmed, createdFromAttachment } = await setup();
+
+        await inboundMedia.handleAttachmentMessage("image", "i1", undefined, undefined, undefined, 1, undefined, true, 1, "check this out", "op", message());
+
+        expect(createdFromAttachment).toEqual([]);
+        expect(confirmed[0]?.text).toContain("session topic");
+      });
+
+      test("/new with no prompt (fails parseNew's grammar) falls back to the plain rejection reply", async () => {
+        const { inboundMedia, confirmed, createdFromAttachment } = await setup();
+
+        await inboundMedia.handleAttachmentMessage("image", "i1", undefined, undefined, undefined, 1, undefined, true, 1, "/new demo-repo", "op", message());
+
+        expect(createdFromAttachment).toEqual([]);
+        expect(confirmed[0]?.text).toContain("session topic");
+      });
+
+      test("the kill switch (disableCaptionNew) falls back to the plain rejection reply even for a valid caption", async () => {
+        const { inboundMedia, confirmed, createdFromAttachment } = await setup({ disableCaptionNew: true });
+
+        await inboundMedia.handleAttachmentMessage("image", "i1", undefined, undefined, undefined, 1, undefined, true, 1, "/new demo-repo add a README", "op", message());
+
+        expect(createdFromAttachment).toEqual([]);
+        expect(confirmed[0]?.text).toContain("session topic");
+      });
+
+      test("an oversized attachment with a valid /new caption is rejected without downloading", async () => {
+        const { inboundMedia, confirmed, createdFromAttachment } = await setup();
+
+        await inboundMedia.handleAttachmentMessage("video", "v1", 25 * 1024 * 1024, undefined, undefined, 1, undefined, true, 1, "/new demo-repo add a README", "op", message());
+
+        expect(createdFromAttachment).toEqual([]);
+        expect(confirmed[0]?.text).toContain("Bot API caps");
+      });
     });
   });
 

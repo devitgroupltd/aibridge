@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
+import { promises as fsPromises } from "node:fs";
 import { renderAskInterruptedCard } from "./ask-callback.ts";
 import { AskRegistry } from "./ask-registry.ts";
+import { buildAttachmentAnnouncement, writeAttachmentToInbox } from "./attachment-inbox.ts";
 import { CostTracker } from "./cost-tracker.ts";
 import { cleanupDiffRefs } from "./diff-review.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry } from "./fleet-confirm.ts";
@@ -72,6 +74,10 @@ export interface SessionLifecycleCommandsOptions {
   selfCheckSlug: string;
   fleetWorktreesRoot: string | undefined;
   otlpPort: number;
+  /** Where `cmd.pendingAttachment` (attachment-triggered-session-creation-plan.md) gets moved into
+   * once `slug` is known - same `$STATE` root `attachment-inbox.ts`'s existing-session attachment
+   * path already writes into, via the same `writeAttachmentToInbox` function. */
+  stateDir: string;
   log?: LogFn;
   /** Injectable clock, same convention as quota-alarms.ts. */
   now?: () => string;
@@ -127,6 +133,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     selfCheckSlug,
     fleetWorktreesRoot,
     otlpPort,
+    stateDir,
   } = opts;
   const log = opts.log ?? (() => {});
   const nowIso = opts.now ?? (() => new Date().toISOString());
@@ -239,10 +246,21 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     }
   }
 
-  async function handleNewCommand(cmd: Extract<FleetCommand, { kind: "new" }>, controlTopicId: number | undefined): Promise<void> {
+  async function handleNewCommand(cmd0: Extract<FleetCommand, { kind: "new" }>, controlTopicId: number | undefined): Promise<void> {
+    // Reassigned below, once the attachment (if any) is moved into the inbox and `sourceText` is
+    // set - never before the topic-creation confirmation just under `topic` is created, which
+    // must render the clean `cmd.prompt`, not an announcement string carrying a raw file path
+    // (attachment-triggered-session-creation-plan.md's Attachment-to-Session Handoff section).
+    let cmd = cmd0;
+    // Every early `return` below happens before the attachment (if any) is ever written anywhere -
+    // `cmd.pendingAttachment`'s bytes are only held in memory at this point and would otherwise be
+    // silently discarded with no indication to the operator that resending the file, not just
+    // fixing the repo name or freeing up fleet capacity, is required (code-review finding).
+    const attachmentLostNote = cmd.pendingAttachment ? " The attachment you sent was not saved - resend it once this is fixed." : "";
+
     const reposRegistry = getReposRegistry();
     if (!reposRegistry) {
-      confirmSessionCommand(controlTopicId, "No repos.toml registered yet - see §7.5.");
+      confirmSessionCommand(controlTopicId, `No repos.toml registered yet - see §7.5.${attachmentLostNote}`);
       return;
     }
     let repo = reposRegistry.get(cmd.repo);
@@ -255,7 +273,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         repo = fuzzy;
         confirmSessionCommand(controlTopicId, `Unknown repo "${cmd.repo}" - using closest match "${fuzzy.name}".`);
       } else {
-        confirmSessionCommand(controlTopicId, `Unknown repo "${cmd.repo}". Registered: ${reposRegistry.names().join(", ") || "(none)"}`);
+        confirmSessionCommand(controlTopicId, `Unknown repo "${cmd.repo}". Registered: ${reposRegistry.names().join(", ") || "(none)"}${attachmentLostNote}`);
         return;
       }
     }
@@ -267,7 +285,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     if (!capCheck.ok) {
       confirmSessionCommand(
         controlTopicId,
-        `Refused: the fleet is already at ${capCheck.current}/${WEIGHTED_CAP} weighted units - adding a ${model} session would bring it to ${capCheck.wouldBe}. Kill or /rm a session first.`,
+        `Refused: the fleet is already at ${capCheck.current}/${WEIGHTED_CAP} weighted units - adding a ${model} session would bring it to ${capCheck.wouldBe}. Kill or /rm a session first.${attachmentLostNote}`,
       );
       return;
     }
@@ -290,6 +308,29 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // which targets `controlTopicId`) since this belongs in the new topic itself.
     confirmSessionCommand(topic.message_thread_id, newSessionContent(cmd));
 
+    // Attachment-triggered-session-creation-plan.md's Attachment-to-Session Handoff section: must
+    // run strictly *after* the topic-creation confirmation above (which shows the clean `cmd.prompt`,
+    // untouched) and *before* the PTY send further below (which must show the announcement). This
+    // is also the one window with no existing cleanup path - the inbox write happens after the topic
+    // already exists but isn't covered by the launch-failure catch below, so a failure here needs
+    // its own topic cleanup, mirroring that catch's.
+    let attachmentAbsPath: string | undefined;
+    if (cmd.pendingAttachment) {
+      const { kind, name, bytes } = cmd.pendingAttachment;
+      try {
+        attachmentAbsPath = await writeAttachmentToInbox(stateDir, slug, name, bytes);
+        cmd = { ...cmd, sourceText: buildAttachmentAnnouncement(kind, attachmentAbsPath, cmd.prompt) };
+      } catch (err) {
+        try {
+          await controlBot.deleteForumTopic(supergroupChatId, topic.message_thread_id);
+        } catch (deleteErr) {
+          log("WARN", `failed to clean up topic for "${slug}" after a failed attachment save: ${(deleteErr as Error).message}`);
+        }
+        confirmSessionCommand(controlTopicId, `Failed to save the attachment for "${slug}": ${(err as Error).message}`);
+        return;
+      }
+    }
+
     let session: ReturnType<typeof launchSession>;
     try {
       session = launchSession({
@@ -310,6 +351,13 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         await controlBot.deleteForumTopic(supergroupChatId, topic.message_thread_id);
       } catch (deleteErr) {
         log("WARN", `failed to clean up topic for "${slug}" after a failed launch: ${(deleteErr as Error).message}`);
+      }
+      if (attachmentAbsPath) {
+        try {
+          await fsPromises.unlink(attachmentAbsPath);
+        } catch (unlinkErr) {
+          log("WARN", `failed to clean up inbox file for "${slug}" after a failed launch: ${(unlinkErr as Error).message}`);
+        }
       }
       confirmSessionCommand(controlTopicId, `Failed to launch session "${slug}": ${(err as Error).message}`);
       return;
@@ -336,6 +384,12 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       createdUtc: nowIso(),
       lastEventUtc: nowIso(),
     });
+
+    if (cmd.pendingAttachment) {
+      // Distinct from a text-typed /new (attachment-triggered-session-creation-plan.md's
+      // Observability note) - the only place this trigger source is recorded anywhere.
+      log("INFO", `session "${slug}" created from a control-topic attachment caption (${cmd.pendingAttachment.kind})`);
+    }
 
     // Deep-links straight into the new topic (buildTopicDeepLink's own doc comment) rather than
     // making the operator find it by hand in the topic list - a `url` button, so no round trip

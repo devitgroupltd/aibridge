@@ -1,8 +1,12 @@
 import { describe, expect, test } from "bun:test";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { AskRegistry } from "../src/ask-registry.ts";
 import { CostTracker } from "../src/cost-tracker.ts";
 import { FleetConfirmRegistry } from "../src/fleet-confirm.ts";
 import { PermissionRegistry } from "../src/permission-registry.ts";
+import { ReposRegistry } from "../src/repos-registry.ts";
 import { Routing } from "../src/routing.ts";
 import { createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE } from "../src/session-lifecycle-commands.ts";
 import { SessionStore, type SessionRow } from "../src/session-store.ts";
@@ -136,6 +140,7 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
     selfCheckSlug: "self-check",
     fleetWorktreesRoot: undefined,
     otlpPort: 4318,
+    stateDir: "c:\\does\\not\\exist\\state",
     ...overrides,
   });
 
@@ -483,6 +488,73 @@ describe("createSessionLifecycleCommands", () => {
       const taken = fleetConfirmRegistry.take(id!);
       expect(taken?.entry.kind).toBe("rm-topic");
       expect(taken?.entry.topicId).toBe(77);
+    });
+  });
+
+  // attachment-triggered-session-creation-plan.md's `cmd.pendingAttachment` handling - the parts of
+  // `handleNewCommand` that don't require a real `launchSession` (git worktree + PTY spawn), which
+  // isn't injectable here (session-lifecycle-commands.ts imports it directly, not via options).
+  describe("handleNewCommand with a pendingAttachment", () => {
+    test("an early rejection (unknown repo) tells the operator the attachment was lost, not just the repo error", async () => {
+      const { sessionLifecycle, confirmed } = setup({ getReposRegistry: () => new ReposRegistry([]) });
+
+      await sessionLifecycle.handleNewCommand(
+        { kind: "new", repo: "not-a-real-repo", prompt: "add a README", pendingAttachment: { kind: "image", name: "shot.png", bytes: new Uint8Array([1, 2, 3]) } },
+        1,
+      );
+
+      expect(confirmed[0]?.text).toContain('Unknown repo "not-a-real-repo"');
+      expect(confirmed[0]?.text).toContain("attachment you sent was not saved");
+    });
+
+    test("an early rejection with no pendingAttachment does not mention a lost attachment", async () => {
+      const { sessionLifecycle, confirmed } = setup({ getReposRegistry: () => new ReposRegistry([]) });
+
+      await sessionLifecycle.handleNewCommand({ kind: "new", repo: "not-a-real-repo", prompt: "add a README" }, 1);
+
+      expect(confirmed[0]?.text).not.toContain("attachment you sent was not saved");
+    });
+
+    test("a fleet-at-capacity refusal also carries the lost-attachment note", async () => {
+      const reposRegistry = new ReposRegistry([{ name: "demo-repo", path: "c:\\does\\not\\exist\\demo-repo" }]);
+      const { sessionLifecycle, sessionStore, confirmed } = setup({ getReposRegistry: () => reposRegistry });
+      // checkConcurrencyCap (concurrency-cap.ts, WEIGHTED_CAP = 4, sonnet weight = 1): four live
+      // sonnet rows already sit exactly at the cap, so one more of any weight is refused - rather
+      // than asserting the exact cap value here (that's concurrency-cap.test.ts's own job).
+      for (let i = 0; i < 4; i++) {
+        sessionStore.insert(row({ slug: `filler-${i}`, topicId: 100 + i, sessionId: `filler-sess-${i}`, state: "working" }));
+      }
+
+      await sessionLifecycle.handleNewCommand(
+        { kind: "new", repo: "demo-repo", prompt: "add a README", pendingAttachment: { kind: "image", name: "shot.png", bytes: new Uint8Array([1, 2, 3]) } },
+        1,
+      );
+
+      expect(confirmed[0]?.text).toContain("Refused:");
+      expect(confirmed[0]?.text).toContain("attachment you sent was not saved");
+    });
+
+    test("an inbox-write failure after topic creation deletes the orphaned topic and reports failure, not the topic's own confirmation", async () => {
+      const reposRegistry = new ReposRegistry([{ name: "demo-repo", path: "c:\\does\\not\\exist\\demo-repo" }]);
+      const badStateDir = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-session-lifecycle-test-"));
+      // Forces writeAttachmentToInbox's `mkdir(..., { recursive: true })` to fail with ENOTDIR: the
+      // "sessions" path segment it needs to create already exists as a plain file, not a directory.
+      await fs.writeFile(path.join(badStateDir, "sessions"), "not a directory");
+      const { sessionLifecycle, controlBot, sessionStore, confirmed } = setup({ getReposRegistry: () => reposRegistry, stateDir: badStateDir });
+
+      await sessionLifecycle.handleNewCommand(
+        { kind: "new", repo: "demo-repo", prompt: "add a README", pendingAttachment: { kind: "image", name: "shot.png", bytes: new Uint8Array([1, 2, 3]) } },
+        1,
+      );
+
+      // The topic-creation confirmation (rendering the clean prompt, posted into the new topic
+      // itself - topicId 999, fakeControlBot's fixed createForumTopic id) went out before the
+      // failing write - but the failure reply (posted to controlTopicId 1) and the orphaned-topic
+      // cleanup must still follow.
+      expect(confirmed.some((c) => c.topicId === 999 && c.text === "add a README")).toBe(true);
+      expect(controlBot.forumTopicCalls.deleted).toEqual([999]);
+      expect(confirmed.some((c) => c.topicId === 1 && c.text.includes("Failed to save the attachment"))).toBe(true);
+      expect(sessionStore.all()).toEqual([]); // no session row was ever inserted
     });
   });
 });

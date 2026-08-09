@@ -1,7 +1,8 @@
 import type { AttachmentKind } from "./attachment-inbox.ts";
 import { attachmentKindLabel, buildAttachmentAnnouncement, guessAttachmentFilename, TELEGRAM_MAX_DOWNLOAD_BYTES, writeAttachmentToInbox } from "./attachment-inbox.ts";
 import { fireAndForget } from "./fire-and-forget.ts";
-import { isKnownCommandText } from "./fleet-commands.ts";
+import type { FleetCommand } from "./fleet-commands.ts";
+import { isKnownCommandText, parseFleetCommand } from "./fleet-commands.ts";
 import { buildContextPrefix, type MessageOrigin } from "./message-context.ts";
 import { randomUUID } from "node:crypto";
 import type { RateGovernor } from "./rate-governor.ts";
@@ -48,6 +49,16 @@ export interface InboundMediaOptions {
   voiceConfirmRegistry: VoiceConfirmRegistry;
   confirmSessionCommand: (topicId: number | undefined, text: string) => void;
   dispatchInboundMessage: DispatchInboundMessage;
+  /** Injected rather than imported - `session-lifecycle-commands.ts`'s `handleNewCommand` isn't
+   * constructed until well after this module (see `index.ts`'s `LateBound`), same forward-reference
+   * shape as `dispatchInboundMessage` above. Lets a control-topic attachment whose caption is a
+   * `/new <repo> <prompt>` invocation create a session exactly as the text-only command does
+   * (attachment-triggered-session-creation-plan.md). */
+  createSessionFromAttachment: (cmd: Extract<FleetCommand, { kind: "new" }>, controlTopicId: number | undefined) => Promise<void>;
+  /** Kill switch for the caption-triggered `/new` path only - if set, a captioned attachment in
+   * the control topic falls back to today's plain rejection reply, same as any other malformed
+   * caption. See that plan's Attachment-to-Session Handoff section for why this exists. */
+  disableCaptionNew: boolean;
   /** §4.1's control-topic predicate - injected rather than imported since it's index.ts's one free
    * top-level function today, with call sites remaining in not-yet-extracted modules too. */
   isControlTopic: (threadId: number | undefined) => boolean;
@@ -95,7 +106,23 @@ export interface InboundMedia {
 }
 
 export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
-  const { controlBot, feedGovernor, routing, sessionStore, staleConfirmRegistry, voiceConfirmRegistry, confirmSessionCommand, dispatchInboundMessage, isControlTopic, voiceConfirmEnabled, voice, supergroupChatId, stateDir } = opts;
+  const {
+    controlBot,
+    feedGovernor,
+    routing,
+    sessionStore,
+    staleConfirmRegistry,
+    voiceConfirmRegistry,
+    confirmSessionCommand,
+    dispatchInboundMessage,
+    createSessionFromAttachment,
+    disableCaptionNew,
+    isControlTopic,
+    voiceConfirmEnabled,
+    voice,
+    supergroupChatId,
+    stateDir,
+  } = opts;
   const log = opts.log ?? (() => {});
 
   /** §7.4's stale-inbound path: posts the "received while offline, still want this?" card instead
@@ -204,6 +231,59 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     }
   }
 
+  /** attachment-triggered-session-creation-plan.md: a photo/document/video/audio/video-note landed
+   * in the control topic (§5.6's `!route` branch), with a caption that's a `/new <repo> <prompt>`
+   * invocation - reuses the real `parseFleetCommand`/`parseNew` grammar (the caption already starts
+   * with `/new`, so no synthetic string or exported-`parseNew` shortcut is needed), the exact same
+   * parser the text-only command uses. Anything else - no caption, a caption that isn't `/new`, or
+   * the kill switch set - falls back unchanged to today's fixed rejection reply. */
+  /** The size-check + download + filename-guess shared by both attachment paths below (a
+   * control-topic caption-triggered `/new`, and an existing session's own inbox) - identical up to
+   * the point each does something different with the result (code-review DRY finding). Returns
+   * `null` after already posting whatever rejection/failure reply applies - callers' only job on
+   * `null` is to return. */
+  async function downloadAttachment(
+    kind: AttachmentKind,
+    fileId: string,
+    fileSize: number | undefined,
+    fileName: string | undefined,
+    mimeType: string | undefined,
+    threadId: number | undefined,
+  ): Promise<{ bytes: Uint8Array; name: string } | null> {
+    if (fileSize !== undefined && fileSize > TELEGRAM_MAX_DOWNLOAD_BYTES) {
+      confirmSessionCommand(threadId, `That's too large to download (${Math.round(fileSize / (1024 * 1024))} MB) - Telegram's Bot API caps bot downloads at 20 MB.`);
+      return null;
+    }
+    try {
+      const { file_path } = await controlBot.getFile(fileId);
+      const bytes = await controlBot.downloadFile(file_path);
+      return { bytes, name: guessAttachmentFilename(kind, fileName, mimeType) };
+    } catch (err) {
+      log("WARN", `attachment download failed: ${(err as Error).message}`);
+      confirmSessionCommand(threadId, `Couldn't download that ${kind} - try sending it again.`);
+      return null;
+    }
+  }
+
+  async function handleControlTopicAttachment(
+    kind: AttachmentKind,
+    fileId: string,
+    fileSize: number | undefined,
+    fileName: string | undefined,
+    mimeType: string | undefined,
+    threadId: number | undefined,
+    caption: string | undefined,
+  ): Promise<void> {
+    const fleetCmd: FleetCommand | null = caption ? parseFleetCommand(caption) : null;
+    if (disableCaptionNew || !fleetCmd || fleetCmd.kind !== "new") {
+      confirmSessionCommand(threadId, `Send ${attachmentKindLabel(kind)} in a session topic - the control topic has no session to hand it to.`);
+      return;
+    }
+    const downloaded = await downloadAttachment(kind, fileId, fileSize, fileName, mimeType, threadId);
+    if (!downloaded) return;
+    await createSessionFromAttachment({ ...fleetCmd, pendingAttachment: { kind, name: downloaded.name, bytes: downloaded.bytes } }, threadId);
+  }
+
   /** Inbound photos/documents/videos/audio/video-notes (§5.6): downloaded into the session's own
    * `inbox/` directory and announced by path - "no protocol extension is needed, because a path
    * in context is enough." Unlike voice input, there's no transcription step and no confirm card:
@@ -226,18 +306,15 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     origin: MessageOrigin,
   ): Promise<void> {
     if (!route) {
-      if (isControl) confirmSessionCommand(threadId, `Send ${attachmentKindLabel(kind)} in a session topic - the control topic has no session to hand it to.`);
+      if (isControl) {
+        await handleControlTopicAttachment(kind, fileId, fileSize, fileName, mimeType, threadId, caption);
+      }
       return;
     }
-    if (fileSize !== undefined && fileSize > TELEGRAM_MAX_DOWNLOAD_BYTES) {
-      confirmSessionCommand(threadId, `That's too large to download (${Math.round(fileSize / (1024 * 1024))} MB) - Telegram's Bot API caps bot downloads at 20 MB.`);
-      return;
-    }
+    const downloaded = await downloadAttachment(kind, fileId, fileSize, fileName, mimeType, threadId);
+    if (!downloaded) return;
     try {
-      const { file_path } = await controlBot.getFile(fileId);
-      const bytes = await controlBot.downloadFile(file_path);
-      const suggestedName = guessAttachmentFilename(kind, fileName, mimeType);
-      const absPath = await writeAttachmentToInbox(stateDir, route.slug, suggestedName, bytes);
+      const absPath = await writeAttachmentToInbox(stateDir, route.slug, downloaded.name, downloaded.bytes);
       const announcement = buildAttachmentAnnouncement(kind, absPath, caption);
       fireAndForget(
         dispatchInboundMessage(messageId, announcement, threadId, isControl, route, route.slug, from, buildContextPrefix(origin)),

@@ -50,6 +50,7 @@ import { createQuotaAlarms, DEFAULT_BURN_RATE_THRESHOLD_USD } from "./quota-alar
 import { createConfirmCards } from "./confirm-cards.ts";
 import { createInboundMedia } from "./inbound-media.ts";
 import { createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE } from "./session-lifecycle-commands.ts";
+import type { SessionLifecycleCommands } from "./session-lifecycle-commands.ts";
 import { createFleetReportingCommands } from "./fleet-reporting-commands.ts";
 import { createDeployLifecycleCommands, createProcessRunner } from "./deploy-lifecycle-commands.ts";
 import { createVoiceModeCommands } from "./voice-mode-commands.ts";
@@ -318,6 +319,13 @@ async function main(): Promise<void> {
   // comment alone - same pattern `fleetConfirmFlow` (fleet-confirm-flow.ts, item 11) uses below.
   const commandDispatch = new LateBound<CommandDispatch>();
 
+  // `sessionLifecycle` (session-lifecycle-commands.ts) isn't constructed until well after
+  // `inboundMedia` - same forward-reference shape as `commandDispatch` just above, needed so a
+  // control-topic attachment's `/new`-caption path (inbound-media.ts) can reach
+  // `handleNewCommand` without a static import in either direction
+  // (attachment-triggered-session-creation-plan.md's Module Ownership & Wiring section).
+  const sessionLifecycleLate = new LateBound<SessionLifecycleCommands>();
+
   // inbound-media.ts: voice/attachment handling plus the onUpdate plain-message routing entry
   // point - `dispatchInboundMessage` and `voiceConfirmEnabled` (read live via a getter, not a
   // snapshot, since `/voiceconfirm` flips it at runtime) are both injected.
@@ -331,6 +339,12 @@ async function main(): Promise<void> {
     confirmSessionCommand,
     dispatchInboundMessage: (messageId, rawText, threadId, isControl, route, currentSlug, from, contextPrefix) =>
       commandDispatch.get().dispatchInboundMessage(messageId, rawText, threadId, isControl, route, currentSlug, from, contextPrefix),
+    createSessionFromAttachment: (cmd, controlTopicId) => sessionLifecycleLate.get().handleNewCommand(cmd, controlTopicId),
+    // Kill switch (attachment-triggered-session-creation-plan.md's Attachment-to-Session Handoff
+    // section) - a cheap, reversible way to disable just this trigger path without touching
+    // anything else, given this plan documents a couple of risks (the widened slug race, git
+    // worktree collisions) it deliberately doesn't fully close.
+    disableCaptionNew: process.env.AIBRIDGE_DISABLE_CAPTION_NEW === "1",
     isControlTopic,
     voiceConfirmEnabled: () => voiceConfirmEnabled,
     voice: config.voice,
@@ -597,8 +611,10 @@ async function main(): Promise<void> {
     selfCheckSlug: config.selfCheck.slug,
     fleetWorktreesRoot,
     otlpPort,
+    stateDir: STATE_DIR,
     log,
   });
+  sessionLifecycleLate.set(sessionLifecycle);
 
   fleetConfirmFlow.set(
     createFleetConfirmFlow({
