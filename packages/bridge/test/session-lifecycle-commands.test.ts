@@ -100,6 +100,7 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
   const confirmed: Array<{ topicId: number | undefined; text: string }> = [];
   const postFleetConfirmCalls: Array<{ kind: string; topicId: number | undefined; targets: string[] }> = [];
   const executeFleetActionDirectCalls: Array<{ kind: string; topicId: number | undefined; targets: string[] }> = [];
+  const finalizedMessages: Array<{ messageId: number; text: string }> = [];
 
   const sessionLifecycle = createSessionLifecycleCommands({
     sessionStore,
@@ -114,6 +115,9 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
     fleetConfirmRegistry,
     confirmSessionCommand: (topicId, text) => {
       confirmed.push({ topicId, text });
+    },
+    finalizePermissionMessage: async (messageId, text) => {
+      finalizedMessages.push({ messageId, text });
     },
     stopIndicatorsForTopic: () => {},
     postFleetConfirm: async (kind, topicId, targets) => {
@@ -135,7 +139,20 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
     ...overrides,
   });
 
-  return { sessionLifecycle, sessionStore, routing, controlBot, sessionSupervisor, fleetConfirmRegistry, confirmed, postFleetConfirmCalls, executeFleetActionDirectCalls };
+  return {
+    sessionLifecycle,
+    sessionStore,
+    routing,
+    controlBot,
+    sessionSupervisor,
+    fleetConfirmRegistry,
+    permissionRegistry,
+    askRegistry,
+    confirmed,
+    finalizedMessages,
+    postFleetConfirmCalls,
+    executeFleetActionDirectCalls,
+  };
 }
 
 describe("createSessionLifecycleCommands", () => {
@@ -193,6 +210,116 @@ describe("createSessionLifecycleCommands", () => {
       sessionLifecycle.handlePauseCommand({ kind: "pause", slug: "fix-bug" }, 1, undefined);
       expect(sessionStore.get("fix-bug")?.paused).toBe(true);
       expect(confirmed[0]?.text).toContain("Paused");
+    });
+
+    test("handleStopCommand reports a clear failure for an unknown slug", () => {
+      const { sessionLifecycle, confirmed } = setup();
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "ghost" }, 1, undefined);
+      expect(confirmed[0]?.text).toContain('unknown slug "ghost"');
+    });
+
+    test("handleStopCommand writes a bare Escape to the session's PTY, no trailing \\r", () => {
+      const { sessionLifecycle, sessionStore, routing, confirmed } = setup();
+      sessionStore.insert(row());
+      const written: string[] = [];
+      routing.setPtyWrite("fix-bug", (text) => written.push(text));
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+      expect(written).toEqual(["\x1b"]);
+      expect(confirmed[0]?.text).toContain('Sent stop to "fix-bug"');
+    });
+
+    test("handleStopCommand on a session with no tracked PTY write is a harmless no-op", () => {
+      const { sessionLifecycle, sessionStore, confirmed } = setup();
+      sessionStore.insert(row());
+      expect(() => sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined)).not.toThrow();
+      expect(confirmed[0]?.text).toContain('Sent stop to "fix-bug"');
+    });
+
+    // Live-verified 2026-08-09: interrupting a session mid-tool-call abandons a still-pending
+    // permission/ask outright, leaving it stuck in permissionRegistry/askRegistry forever (never
+    // resolved by an operator tap or an at-terminal answer) - /ls kept misreporting the session as
+    // awaiting_input over a request Claude had already dropped. handleStopCommand now clears both.
+    test("handleStopCommand clears a stale pending permission for that slug, mentions it, and edits its card in place", () => {
+      const { sessionLifecycle, sessionStore, permissionRegistry, confirmed, finalizedMessages } = setup();
+      sessionStore.insert(row());
+      permissionRegistry.add({
+        requestId: "req-1",
+        slug: "fix-bug",
+        toolName: "Bash",
+        description: "run a command",
+        inputPreview: '{ "command": "echo hi" }',
+        topicId: 1,
+        messageId: 10,
+      });
+
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+
+      expect(permissionRegistry.get("req-1")).toBeUndefined();
+      expect(confirmed[0]?.text).toContain('Sent stop to "fix-bug"');
+      expect(confirmed[0]?.text).toContain("cleared 1 stale pending prompt");
+      expect(finalizedMessages).toEqual([{ messageId: 10, text: "🛑 interrupted: Bash (session was stopped before this was answered)" }]);
+    });
+
+    test("handleStopCommand clears a stale pending ask for that slug, mentions it, and edits its card in place", () => {
+      const { sessionLifecycle, sessionStore, askRegistry, confirmed, finalizedMessages } = setup();
+      sessionStore.insert(row());
+      askRegistry.add({
+        id: "toolu_1",
+        slug: "fix-bug",
+        questions: [{ question: "Pick a color", header: "Color", options: [{ label: "Red" }], topicId: 1, messageId: 10 }],
+      });
+
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+
+      expect(askRegistry.get("toolu_1")).toBeUndefined();
+      expect(confirmed[0]?.text).toContain("cleared 1 stale pending prompt");
+      expect(finalizedMessages).toEqual([{ messageId: 10, text: "❓ fix-bug asks (Color):\n\nPick a color\n\n🛑 interrupted - session was stopped before this was answered" }]);
+    });
+
+    test("handleStopCommand does not edit an already-answered question's card", () => {
+      const { sessionLifecycle, sessionStore, askRegistry, finalizedMessages } = setup();
+      sessionStore.insert(row());
+      askRegistry.add({
+        id: "toolu_1",
+        slug: "fix-bug",
+        questions: [
+          { question: "Pick a color", options: [{ label: "Red" }], topicId: 1, messageId: 10, answerLabel: "Red" },
+          { question: "Pick a size", options: [{ label: "S" }], topicId: 1, messageId: 11 },
+        ],
+      });
+
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+
+      // only the unanswered second question's card gets edited
+      expect(finalizedMessages.map((m) => m.messageId)).toEqual([11]);
+    });
+
+    test("handleStopCommand does not mention clearing anything when nothing was pending", () => {
+      const { sessionLifecycle, sessionStore, confirmed } = setup();
+      sessionStore.insert(row());
+
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+
+      expect(confirmed[0]?.text).toBe('Sent stop to "fix-bug".');
+    });
+
+    test("handleStopCommand does not clear a pending permission belonging to a different session", () => {
+      const { sessionLifecycle, sessionStore, permissionRegistry } = setup();
+      sessionStore.insert(row());
+      sessionStore.insert(row({ slug: "other-session", topicId: 6, sessionId: "sess-2" }));
+      permissionRegistry.add({
+        requestId: "req-1",
+        slug: "other-session",
+        toolName: "Bash",
+        description: "run a command",
+        inputPreview: '{ "command": "echo hi" }',
+        topicId: 6,
+        messageId: 10,
+      });
+
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+
+      expect(permissionRegistry.get("req-1")).toBeDefined();
     });
 
     test("handleDetailCommand reports a clear failure for an unknown slug", () => {

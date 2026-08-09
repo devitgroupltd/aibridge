@@ -105,6 +105,7 @@ export const ROUTER_KINDS = [
   "rm",
   "attach",
   "pause",
+  "stop",
   "usage",
   "budget",
   "restart",
@@ -249,6 +250,10 @@ const SYSTEM_INSTRUCTIONS_BASE =
   "for being brief. The same goes for a clear instruction to redeploy (kind='deploy', with 'slug' if a " +
   "session was named), or to kill/remove a specific named session or explicitly 'all' sessions " +
   "(kind='kill'/'rm', with 'slug' or 'all' set accordingly). " +
+  "A request to stop, interrupt, cancel, or halt what a session is currently doing - without asking to " +
+  "kill/remove the session itself - is kind='stop' (with 'slug' if named); this is a short, non-" +
+  "destructive interrupt that leaves the session alive, so a brief one-word message ('stop', 'cancel " +
+  "that') is enough on its own, same as 'restart' above. " +
   "If it's ambiguous, conversational, or addressed to a coding assistant rather than the fleet itself, " +
   "respond with kind='forward' - the caution against guessing a destructive command (kill/rm/restart/" +
   "deploy/repos-rm) means don't infer one from a joke or unrelated chatter, not that an unambiguous " +
@@ -363,6 +368,8 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
         return { kind: "attach", slug: raw.slug };
       case "pause":
         return { kind: "pause", slug: raw.slug };
+      case "stop":
+        return { kind: "stop", slug: raw.slug };
       case "usage":
         return { kind: "usage", slug: raw.slug };
       case "budget":

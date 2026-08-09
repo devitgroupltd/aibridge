@@ -76,6 +76,31 @@ describe("PermissionRegistry", () => {
     expect(registry.get("aaaaa")).toBeDefined(); // expired() does not consume entries
   });
 
+  // `/stop` (§4.2): live-verified 2026-08-09 that interrupting a session mid-tool-call abandons a
+  // still-pending permission ask outright, so it needs a way to drop that stale entry.
+  describe("removeForSlug", () => {
+    test("removes every pending entry for the given slug and returns the removed entries", () => {
+      const registry = new PermissionRegistry();
+      registry.add(entry({ requestId: "aaaaa", slug: "session-a" }));
+      registry.add(entry({ requestId: "bbbbb", slug: "session-a" }));
+      registry.add(entry({ requestId: "ccccc", slug: "session-b" }));
+
+      expect(registry.removeForSlug("session-a").map((e) => e.requestId).sort()).toEqual(["aaaaa", "bbbbb"]);
+      expect(registry.get("aaaaa")).toBeUndefined();
+      expect(registry.get("bbbbb")).toBeUndefined();
+      // a different session's pending entry is untouched
+      expect(registry.get("ccccc")).toBeDefined();
+    });
+
+    test("returns an empty array without throwing when nothing is pending for that slug", () => {
+      const registry = new PermissionRegistry();
+      registry.add(entry({ requestId: "aaaaa", slug: "session-a" }));
+
+      expect(registry.removeForSlug("ghost")).toEqual([]);
+      expect(registry.get("aaaaa")).toBeDefined();
+    });
+  });
+
   // Found live 2026-08-04: the expiry sweep edited the Telegram card to "expired" but never sent
   // a deny verdict, leaving the channel server's blocked permission call - and the Claude process
   // behind it - waiting forever. Four concurrent endurance-run sessions each wedged this way.

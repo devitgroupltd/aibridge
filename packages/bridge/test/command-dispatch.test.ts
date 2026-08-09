@@ -81,6 +81,7 @@ function fakeSessionLifecycle() {
     handleDetailCommand: record("handleDetailCommand"),
     handleVerboseCommand: record("handleVerboseCommand"),
     handlePauseCommand: record("handlePauseCommand"),
+    handleStopCommand: record("handleStopCommand"),
     calls,
   };
 }
@@ -246,6 +247,9 @@ describe("dispatchFleetCommand", () => {
     // "pause" has no explicit branch - falls through to handlePauseCommand by construction.
     s.commandDispatch.dispatchFleetCommand({ kind: "pause", slug: "fix-bug" }, 5, true, "fix-bug");
     expect(s.sessionLifecycle.calls.map((c) => c.fn)).toContain("handlePauseCommand");
+
+    s.commandDispatch.dispatchFleetCommand({ kind: "stop", slug: "fix-bug" }, 5, true, "fix-bug");
+    expect(s.sessionLifecycle.calls.map((c) => c.fn)).toContain("handleStopCommand");
   });
 
   test("/new, /budget and /default are rejected outside the control topic", () => {

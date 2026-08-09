@@ -29,6 +29,7 @@ export type FleetCommand =
   | { kind: "attach"; slug?: string }
   | { kind: "pause"; slug?: string }
   | { kind: "usage"; slug?: string }
+  | { kind: "stop"; slug?: string }
   | { kind: "budget" }
   | { kind: "restart" }
   | { kind: "deploy"; slug: string }
@@ -118,7 +119,7 @@ export function newSessionContent(cmd: { prompt: string; sourceText?: string }):
   return cmd.sourceText ?? cmd.prompt;
 }
 
-function parseSlugArg(kind: "attach" | "pause" | "usage", rest: string): FleetCommand {
+function parseSlugArg(kind: "attach" | "pause" | "usage" | "stop", rest: string): FleetCommand {
   const slug = rest.trim();
   return { kind, slug: slug.length > 0 ? slug : undefined };
 }
@@ -401,7 +402,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
   const match = trimmed.match(
-    /^\/(new|ls|kill|rm|attach|pause|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default)\b(.*)$/s,
+    /^\/(new|ls|kill|rm|attach|pause|stop|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default)\b(.*)$/s,
   );
   if (!match) return null;
   const [, cmd, rawRest] = match as [string, string, string];
@@ -448,6 +449,7 @@ export function parseFleetCommand(text: string): FleetCommand | null {
     case "attach":
     case "pause":
     case "usage":
+    case "stop":
       return parseSlugArg(cmd, rest);
     default:
       return null;
@@ -738,6 +740,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "kill", description: "Stop a session: /kill [<slug>|--all [--force]]" },
     { command: "rm", description: "Remove a dead session row: /rm [<slug>|--dead|--prefix <text>|--all [--force]]" },
     { command: "attach", description: "Show a session's PTY tail" },
+    { command: "stop", description: "Interrupt the current turn (Escape) - session stays alive: /stop [<slug>]" },
     { command: "pause", description: "Pause a session" },
     { command: "usage", description: "Token/cost usage" },
     { command: "budget", description: "Fleet spend (5h/7d)" },

@@ -203,6 +203,11 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/usage")).toEqual({ kind: "usage", slug: undefined });
   });
 
+  test("/stop with and without a slug", () => {
+    expect(parseFleetCommand("/stop fix-bug")).toEqual({ kind: "stop", slug: "fix-bug" });
+    expect(parseFleetCommand("/stop")).toEqual({ kind: "stop", slug: undefined });
+  });
+
   test("/budget takes no argument", () => {
     expect(parseFleetCommand("/budget")).toEqual({ kind: "budget" });
   });

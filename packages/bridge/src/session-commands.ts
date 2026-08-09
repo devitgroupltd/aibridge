@@ -30,6 +30,12 @@ export const DEFAULT_EFFORT: Effort = "medium";
 /** Standard xterm Shift+Tab (back-tab). One press advances the picker by exactly one entry. */
 export const SHIFT_TAB = "\x1b[Z";
 
+/** Plain Escape. `/stop` (§4.2) writes this raw to the PTY - the same interrupt-current-turn
+ * keystroke the Claude Code TUI's own "stop" button/Esc-while-working binding sends, as opposed to
+ * Ctrl+C (`\x03`) which is a harder "exit" signal most TUIs treat as a second, more drastic
+ * request. No trailing `\r`: it's a control byte the TUI consumes immediately, not a typed line. */
+export const ESCAPE = "\x1b";
+
 export type SessionCommand =
   | { kind: "model"; model: Model }
   | { kind: "mode"; mode: Mode }

@@ -46,7 +46,7 @@ export interface CommandDispatchOptions {
   confirmSessionCommand: ConfirmSessionCommand;
   sessionLifecycle: Pick<
     SessionLifecycleCommands,
-    "handleNewCommand" | "handleLsCommand" | "handleKillCommand" | "handleRmCommand" | "handleAttachCommand" | "handleDetailCommand" | "handleVerboseCommand" | "handlePauseCommand"
+    "handleNewCommand" | "handleLsCommand" | "handleKillCommand" | "handleRmCommand" | "handleAttachCommand" | "handleDetailCommand" | "handleVerboseCommand" | "handlePauseCommand" | "handleStopCommand"
   >;
   fleetReporting: FleetReportingCommands;
   fleetConfirmFlow: Pick<FleetConfirmFlow, "handleUsageCommand">;
@@ -240,6 +240,10 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
         return;
       }
       voiceModeCommands.handleDefaultCommand(fleetCmd, threadId);
+      return;
+    }
+    if (fleetCmd.kind === "stop") {
+      sessionLifecycle.handleStopCommand(fleetCmd, threadId, currentSlug);
       return;
     }
     sessionLifecycle.handlePauseCommand(fleetCmd, threadId, currentSlug);

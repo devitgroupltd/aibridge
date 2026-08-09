@@ -65,6 +65,22 @@ export class AskRegistry {
     this.pending.delete(id);
   }
 
+  /** `/stop`'s counterpart to `PermissionRegistry.removeForSlug` (see its own doc comment for the
+   * live-verified 2026-08-09 finding this closes) - an interrupted `AskUserQuestion` leaves its
+   * entry here just as unanswerable as an interrupted permission ask leaves one there. Returns the
+   * removed entries themselves (not just a count), same reasoning as `PermissionRegistry`'s
+   * sibling method - `handleStopCommand` needs each one's per-question `messageId`s to edit their
+   * Telegram cards in place. */
+  removeForSlug(slug: string): PendingAsk[] {
+    const removed: PendingAsk[] = [];
+    for (const [id, entry] of this.pending) {
+      if (entry.slug !== slug) continue;
+      this.pending.delete(id);
+      removed.push(entry);
+    }
+    return removed;
+  }
+
   /**
    * Records the tapped option's label for one question in a (possibly multi-question) ask.
    * Returns `null` for an unknown id/question index or a question already answered - a stale or

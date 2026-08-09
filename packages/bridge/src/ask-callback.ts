@@ -37,3 +37,11 @@ export function renderAskAnsweredCard(slug: string, question: string, header: st
 export function renderAskCancelledCard(slug: string, question: string, header: string | undefined): string {
   return `${renderAskCard(slug, question, header)}\n\n⌛ no answer in an hour - cancelled`;
 }
+
+/** `/stop`'s card-edit counterpart to `renderAskCancelledCard` above - same "don't leave a
+ * tappable-looking button that silently does nothing" principle (§6.5), triggered by an operator
+ * interrupt instead of the 3540s ceiling, so the wording says what actually happened rather than
+ * reusing the TTL card's "no answer in an hour" text verbatim. */
+export function renderAskInterruptedCard(slug: string, question: string, header: string | undefined): string {
+  return `${renderAskCard(slug, question, header)}\n\n🛑 interrupted - session was stopped before this was answered`;
+}

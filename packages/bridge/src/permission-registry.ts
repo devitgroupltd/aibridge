@@ -114,6 +114,29 @@ export class PermissionRegistry {
   remove(requestId: string): void {
     this.pending.delete(requestId);
   }
+
+  /**
+   * `/stop` (§4.2): live-verified 2026-08-09 that interrupting a session mid-tool-call leaves any
+   * *still-pending-permission* entry for it behind - Claude abandons the call outright rather than
+   * ever resolving the ask, so neither `resolve` (an operator button tap) nor
+   * `resolveByToolMatch` (an at-terminal answer) ever fires for it, and `/ls`'s "awaiting_input /
+   * waiting: permission" join (`buildLsDetail`) kept reporting a request that no longer has
+   * anything on the other end - Telegram's own Allow/Deny buttons stay up too, tapping either now
+   * a guaranteed-stale no-op via `resolve`'s own "unknown/expired request_id" tolerance. Same
+   * `removeForSlug` shape as `AskRegistry`'s sibling method below, for the parallel gap there
+   * (an interrupted `AskUserQuestion`). Returns the removed entries themselves (not just a count) -
+   * added 2026-08-09, so `handleStopCommand` can also edit each one's Telegram card in place
+   * (§6.5's own "a stale button must never look tappable and silently do nothing" rule, applied
+   * here the same way `sweepExpiredPermissions` already applies it to a naturally-expired one). */
+  removeForSlug(slug: string): PendingPermissionRequest[] {
+    const removed: PendingPermissionRequest[] = [];
+    for (const [requestId, entry] of this.pending) {
+      if (entry.slug !== slug) continue;
+      this.pending.delete(requestId);
+      removed.push(entry);
+    }
+    return removed;
+  }
 }
 
 /**

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { renderAskInterruptedCard } from "./ask-callback.ts";
 import { AskRegistry } from "./ask-registry.ts";
 import { CostTracker } from "./cost-tracker.ts";
 import { cleanupDiffRefs } from "./diff-review.ts";
@@ -12,7 +13,7 @@ import type { ReposRegistry } from "./repos-registry.ts";
 import { resolveRepoNameFuzzy } from "./repos-registry.ts";
 import type { Routing } from "./routing.ts";
 import { launchSession } from "./session-launcher.ts";
-import { DEFAULT_EFFORT, DEFAULT_MODE, type Effort, type Mode } from "./session-commands.ts";
+import { DEFAULT_EFFORT, DEFAULT_MODE, ESCAPE, type Effort, type Mode } from "./session-commands.ts";
 import type { PtyIo } from "./pty-io.ts";
 import type { SessionSupervisor } from "./session-supervisor.ts";
 import { SessionStore, type SessionRow } from "./session-store.ts";
@@ -41,6 +42,10 @@ export interface SessionLifecycleCommandsOptions {
   costTracker: CostTracker;
   fleetConfirmRegistry: FleetConfirmRegistry;
   confirmSessionCommand: (topicId: number | undefined, text: string, parseMode?: "HTML", keyboard?: InlineKeyboardMarkup) => void;
+  /** `pipeHandle.finalizePermissionMessage` (pipe-server.ts) - edits a permission/ask card's text
+   * in place and strips its keyboard. Already used for two other stale-card cases (the TTL sweep's
+   * "expired", an ask's own "cancelled" ceiling); `/stop` (`handleStopCommand`) is a third. */
+  finalizePermissionMessage: (messageId: number, text: string) => Promise<void>;
   /** Injected rather than imported, same "not yet extracted, avoid a forward reference into a
    * sibling module's own future file" treatment as `dispatchInboundMessage` in inbound-media.ts -
    * `stopIndicatorsForTopic`/`postFleetConfirm`/`executeFleetActionDirect` are fleet-confirm-flow.ts
@@ -83,6 +88,7 @@ export interface SessionLifecycleCommands {
   handleRmCommand(cmd: Extract<FleetCommand, { kind: "rm" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void>;
   handleAttachCommand(cmd: Extract<FleetCommand, { kind: "attach" }>, topicId: number | undefined, currentSlug: string | undefined): void;
   handlePauseCommand(cmd: Extract<FleetCommand, { kind: "pause" }>, topicId: number | undefined, currentSlug: string | undefined): void;
+  handleStopCommand(cmd: Extract<FleetCommand, { kind: "stop" }>, topicId: number | undefined, currentSlug: string | undefined): void;
   handleDetailCommand(cmd: Extract<FleetCommand, { kind: "detail" }>, topicId: number | undefined, currentSlug: string | undefined): void;
   handleVerboseCommand(cmd: Extract<FleetCommand, { kind: "verbose" }>, topicId: number | undefined, currentSlug: string | undefined): void;
 }
@@ -107,6 +113,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     costTracker,
     fleetConfirmRegistry,
     confirmSessionCommand,
+    finalizePermissionMessage,
     stopIndicatorsForTopic,
     postFleetConfirm,
     executeFleetActionDirect,
@@ -473,6 +480,67 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
   }
 
   /**
+   * `/stop [<slug>]`: interrupt whatever the session is doing mid-turn, the same Escape keystroke
+   * the Claude Code TUI's own "stop" button sends - not `/kill`, which tears the whole session
+   * down. Raw PTY write via `routing.getPtyWrite`, same "bypass `renderChannelTag` entirely"
+   * mechanism `/model`/`/mode` already use (§4.2.1/§4.2.2), just without the trailing `\r` since
+   * Escape is a control byte the TUI consumes immediately rather than a typed+submitted line.
+   *
+   * Deliberately does not touch `sessionStore.setState` - the `working -> idle` transition is the
+   * hook pipeline's job once Claude actually aborts the turn (`Stop`/`StopFailure`), and asserting
+   * it directly here would race that. No ack comes back from the PTY either (same as
+   * `/model`/`/mode`), so this only confirms that the keystroke was sent, not that a turn was
+   * actually in flight to interrupt - sending Escape to an idle session is a harmless no-op.
+   *
+   * DOES clear `permissionRegistry`/`askRegistry` entries for this slug, unlike `sessionStore`
+   * above - live-verified 2026-08-09: interrupting a session mid-tool-call abandons the call
+   * outright, so a still-pending permission/ask for it never resolves through either registry's
+   * normal path (an operator button tap, an at-terminal answer, or an answered question) and would
+   * otherwise sit there until its own TTL/cancel sweep, with `/ls` misreporting `awaiting_input`
+   * and Telegram's own Allow/Deny buttons staying up over a request Claude has already dropped.
+   * Only mentioned in the confirmation when something was actually cleared, so the common case
+   * (no ask/permission was pending) doesn't grow the reply for no reason.
+   *
+   * Also edits each cleared entry's own Telegram card in place (added 2026-08-09) - §6.5's "a
+   * stale button must never look tappable and silently do nothing" rule, already applied to the
+   * TTL sweep's naturally-expired cards and to a cancelled ask's ceiling; leaving a `/stop`-cleared
+   * card's live Allow/Deny/question buttons up would be the one inconsistent exception. No verdict
+   * is sent back over the pipe the way `sweepExpiredPermissions`/`cancelAsk` do for their own
+   * cases - live-verified 2026-08-09 that Claude's own interrupt handling already unblocks the
+   * hook client that was waiting on the answer, so there is nothing left on the other end for a
+   * verdict to reach; this is a display-only fix; `finalizePermissionMessage` failures are logged,
+   * not thrown - a Telegram edit failing must never stop the stop from having happened.
+   */
+  function handleStopCommand(cmd: Extract<FleetCommand, { kind: "stop" }>, topicId: number | undefined, currentSlug: string | undefined): void {
+    const row = resolveSessionOrBail(cmd.slug, currentSlug, topicId);
+    if (!row) return;
+    routing.getPtyWrite(row.slug)?.(ESCAPE);
+
+    const clearedPermissions = permissionRegistry.removeForSlug(row.slug);
+    for (const entry of clearedPermissions) {
+      finalizePermissionMessage(entry.messageId, `🛑 interrupted: ${entry.toolName} (session was stopped before this was answered)`).catch((err) =>
+        log("WARN", `failed to mark permission as interrupted for "${row.slug}": ${(err as Error).message}`),
+      );
+    }
+
+    const clearedAsks = askRegistry.removeForSlug(row.slug);
+    let clearedQuestions = 0;
+    for (const entry of clearedAsks) {
+      for (const q of entry.questions) {
+        if (q.answerLabel !== undefined) continue; // already answered - nothing stale to edit
+        clearedQuestions++;
+        finalizePermissionMessage(q.messageId, renderAskInterruptedCard(entry.slug, q.question, q.header)).catch((err) =>
+          log("WARN", `failed to mark question as interrupted for "${row.slug}": ${(err as Error).message}`),
+        );
+      }
+    }
+
+    const cleared = clearedPermissions.length + clearedQuestions;
+    const clearedNote = cleared > 0 ? ` (cleared ${cleared} stale pending prompt${cleared === 1 ? "" : "s"})` : "";
+    confirmSessionCommand(topicId, `Sent stop to "${row.slug}".${clearedNote}`);
+  }
+
+  /**
    * §5.9's `/detail [<slug>] [compact|full]`: how much of each tool call the feed card shows for
    * this one session - "full" wraps each line's untruncated input in a `<blockquote expandable>`
    * instead of the 80-char one-liner; no argument reports the current setting rather than
@@ -521,6 +589,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     handleRmCommand,
     handleAttachCommand,
     handlePauseCommand,
+    handleStopCommand,
     handleDetailCommand,
     handleVerboseCommand,
   };

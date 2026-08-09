@@ -73,4 +73,28 @@ describe("AskRegistry", () => {
     expect(registry.expired().map((e) => e.id)).toEqual(["toolu_5"]);
     expect(registry.get("toolu_5")).toBeDefined();
   });
+
+  // `/stop`'s counterpart to PermissionRegistry.removeForSlug - an interrupted AskUserQuestion
+  // leaves its entry here just as unanswerable as an interrupted permission ask.
+  describe("removeForSlug", () => {
+    test("removes every pending ask for the given slug and returns the removed entries", () => {
+      const registry = new AskRegistry();
+      registry.add({ id: "toolu_a", slug: "session-a", questions: [question()] });
+      registry.add({ id: "toolu_b", slug: "session-a", questions: [question()] });
+      registry.add({ id: "toolu_c", slug: "session-b", questions: [question()] });
+
+      expect(registry.removeForSlug("session-a").map((e) => e.id).sort()).toEqual(["toolu_a", "toolu_b"]);
+      expect(registry.get("toolu_a")).toBeUndefined();
+      expect(registry.get("toolu_b")).toBeUndefined();
+      expect(registry.get("toolu_c")).toBeDefined();
+    });
+
+    test("returns an empty array without throwing when nothing is pending for that slug", () => {
+      const registry = new AskRegistry();
+      registry.add({ id: "toolu_a", slug: "session-a", questions: [question()] });
+
+      expect(registry.removeForSlug("ghost")).toEqual([]);
+      expect(registry.get("toolu_a")).toBeDefined();
+    });
+  });
 });

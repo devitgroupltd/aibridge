@@ -575,6 +575,7 @@ async function main(): Promise<void> {
     costTracker,
     fleetConfirmRegistry,
     confirmSessionCommand,
+    finalizePermissionMessage: (messageId, text) => pipeHandle.finalizePermissionMessage(messageId, text),
     stopIndicatorsForTopic,
     postFleetConfirm: (kind, topicId, targets, promptText) => fleetConfirmFlow.postFleetConfirm(kind, topicId, targets, promptText),
     executeFleetActionDirect: (kind, topicId, targets) => fleetConfirmFlow.executeFleetActionDirect(kind, topicId, targets),
