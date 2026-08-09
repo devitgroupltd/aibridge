@@ -447,6 +447,20 @@ async function main(): Promise<void> {
     otlpPort,
     log,
     usageWaiters,
+    // See `SessionSupervisorOptions.clearThinkingPlaceholder`'s own doc comment: a crash mid-turn
+    // leaves that turn's placeholder stuck with nothing left to consume it - `handleUnexpectedExit`
+    // calls this once it confirms a real crash, so the next inbound message after a resume gets its
+    // own visible indicator instead of silently no-op'ing against a stale one.
+    clearThinkingPlaceholder: (topicId) => {
+      fireAndForget(
+        thinkingPlaceholder.consume(String(topicId)).then((messageId) => {
+          if (messageId === undefined || !controlBot.deleteMessage) return;
+          return controlBot.deleteMessage(config.supergroupChatId, messageId);
+        }),
+        log,
+        "index clearThinkingPlaceholder(crash)",
+      );
+    },
   });
 
   // pty-io.ts: PTY write primitives, the lost-Enter detector, and its wedged-session auto-recovery.

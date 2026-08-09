@@ -315,6 +315,73 @@ describe("createSessionSupervisor", () => {
     expect(confirm.calls.some((c) => c.text.includes("resumed"))).toBe(true);
   });
 
+  test("handleUnexpectedExit clears the topic's pending thinking placeholder before attempting to resume", async () => {
+    // 2026-08-09, live-observed as a "resumed session, next message gets no visible indicator at
+    // all" report: whatever turn was in flight when the crash happened isn't coming back, but
+    // without this call `thinking-placeholder.ts`'s `start` would keep no-op'ing against the stale
+    // entry for every message sent after the resume, right up until some later reply happened to
+    // consume it - the exact same "disappears several messages late" shape as the pipe-server bug.
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row());
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const cleared: number[] = [];
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      delay: async () => {},
+      launchSession: () => ({
+        worktreePath: "c:\\data\\worktrees\\fix-bug",
+        branch: "claude/fix-bug-1",
+        ptyProcess: fakePty() as unknown as LaunchedSession["ptyProcess"],
+        ready: Promise.resolve({ resumeFailed: false }),
+      }),
+      clearThinkingPlaceholder: (topicId) => {
+        cleared.push(topicId);
+      },
+    });
+
+    const pty = fakePty();
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    pty.emitExit(1);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(cleared).toEqual([2]);
+  });
+
+  test("handleUnexpectedExit is a no-op for `clearThinkingPlaceholder` when the exit was a deliberate /kill (no option supplied, or row already gone)", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row());
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const cleared: number[] = [];
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      clearThinkingPlaceholder: (topicId) => {
+        cleared.push(topicId);
+      },
+    });
+
+    const pty = fakePty();
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.killAndUntrack("fix-bug"); // a deliberate kill - untracks before the exit event fires
+    pty.emitExit(0);
+    await Promise.resolve();
+
+    expect(cleared).toEqual([]); // handleUnexpectedExit's own ptyProcessBySlug guard returns first
+  });
+
   test("handleUnexpectedExit marks the row dead after MAX_CONSECUTIVE_RESUME_ATTEMPTS immediate re-exits, without resuming again", async () => {
     const sessionStore = new SessionStore(":memory:");
     sessionStore.insert(row());

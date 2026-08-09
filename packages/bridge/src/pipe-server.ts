@@ -308,7 +308,6 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
         }
         return;
       }
-      const placeholderId = await opts.thinkingPlaceholder?.consume(routedTopic);
       // 0.104.0: this used to *edit* the placeholder into the reply's own text instead of sending a
       // new message - which meant the reply's visible position in the topic was permanently pinned
       // to wherever "🤔 Thinking..." first landed (turn-start, sent immediately and unthrottled by
@@ -322,6 +321,15 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       // and the placeholder is deleted afterward rather than reused, so the operator still gets the
       // same instant "something's happening" feedback at turn-start with no stale text left behind.
       await p1(() => opts.controlBot.sendMessage(opts.chatId, topicId, chunks[0]!));
+      // Consumed only *after* that send has actually landed (2026-08-09, same live-observed symptom
+      // as the empty-chunks case above): consuming first and sending second meant a send that threw
+      // (network blip, governor giving up) popped the placeholder from the map without ever deleting
+      // it - the outer catch below just logs the error, so that "🤔 Thinking..." would be orphaned
+      // for good, unlike the empty-chunks case which at least still had a live map entry for some
+      // later reply to self-heal. Consuming after a successful send means a failed one instead
+      // leaves the placeholder right where the empty-chunks case leaves it too: still pending, so
+      // whatever reply eventually does get through still clears it.
+      const placeholderId = await opts.thinkingPlaceholder?.consume(routedTopic);
       if (placeholderId !== undefined && opts.controlBot.deleteMessage) {
         // Best-effort: a delete failing (already gone, past Telegram's edit/delete window, etc.)
         // must never take the reply down with it - the reply above has already landed either way,

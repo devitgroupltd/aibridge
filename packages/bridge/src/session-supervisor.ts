@@ -63,6 +63,20 @@ export interface SessionSupervisorOptions {
    * `resumeFailed` branch and the whole crash-resume loop are otherwise only reachable by actually
    * spawning a `claude` PTY process. Defaults to the real `launchSession`. */
   launchSession?: (opts: SessionLaunchOptions) => LaunchedSession;
+  /** Best-effort consume-and-delete for a topic's pending "🤔 Thinking..." placeholder (§5,
+   * thinking-placeholder.ts), pre-built by the composition root the same way `confirmSessionCommand`
+   * is - this module only knows a `ChatActionSource`, not the send/delete/governor plumbing needed
+   * to act on one directly. §9, found live 2026-08-09 (the exact gap behind the original "resumed
+   * session, couple-second silent gap before the next reply" report): a crash mid-turn leaves
+   * whatever placeholder was covering that turn stuck in the map with nothing left to consume it -
+   * `thinking-placeholder.ts`'s `start` no-ops while it's still "pending", so the *next* real inbound
+   * message after a resume gets no visible indicator of its own at all, silent right up until a
+   * reply finally lands and sweeps up the stale entry. Called once `handleUnexpectedExit` confirms a
+   * real crash (not a deliberate `/kill`/`/rm`, which already goes through `stopIndicatorsForTopic`
+   * instead - that one also edits the bubble to "Session ended.", wrong here since the session is
+   * about to resume, not end). Optional so existing tests that never exercise this don't need to
+   * supply one. */
+  clearThinkingPlaceholder?: (topicId: number) => void;
 }
 
 export interface SessionSupervisor {
@@ -232,6 +246,9 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
     routing.clearPtyWrite(slug);
     const row = sessionStore.get(slug);
     if (!row || row.state === "dead") return;
+    // Whatever turn was in flight when the crash happened isn't coming back - see this option's own
+    // doc comment for why leaving it pending here is what caused the original live-observed bug.
+    opts.clearThinkingPlaceholder?.(topicId);
     // An immediate re-exit is the dangerous case, not a one-off crash: a stale `session_id` makes
     // `claude --resume` fail instantly ("No conversation found with session ID: ..." - observed for
     // three sessions at once), and since `launchSession` itself succeeds, nothing self-limits. The
