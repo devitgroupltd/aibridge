@@ -15,6 +15,7 @@
 import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync, statSync, realpathSync, existsSync } from "node:fs";
 import path from "node:path";
+import { INBOX_DIR_NAME } from "./attachment-inbox.ts";
 import { scrubSecrets } from "./secret-scrub.ts";
 
 function toPosix(p: string): string {
@@ -22,8 +23,11 @@ function toPosix(p: string): string {
 }
 
 /** Directories never listed or descended into - build/vendor output that would otherwise dominate
- * every listing and search, plus `.git` (never useful here, and its internals aren't "the project"). */
-const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "target", "bin", "obj", ".venv"]);
+ * every listing and search, plus `.git` (never useful here, and its internals aren't "the project").
+ * `INBOX_DIR_NAME` (attachment-inbox.ts) lives inside the worktree now too - git-ignored, but this
+ * feature does its own `readdirSync` walk rather than going through git, so being git-ignored alone
+ * doesn't hide it here; needs its own entry in this shared exclusion set. */
+const SKIP_DIRS = new Set([".git", "node_modules", "dist", "build", "target", "bin", "obj", ".venv", INBOX_DIR_NAME]);
 
 /** Filename shapes denied independently of `settings.ts`'s Claude-facing `Read(.env)`/`Read(~/**)`
  * rules (§6.2) - this feature never goes through Claude's own permission engine, so it needs its own

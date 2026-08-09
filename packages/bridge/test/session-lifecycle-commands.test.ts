@@ -1,14 +1,11 @@
 import { describe, expect, test } from "bun:test";
-import fs from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
 import { AskRegistry } from "../src/ask-registry.ts";
 import { CostTracker } from "../src/cost-tracker.ts";
 import { FleetConfirmRegistry } from "../src/fleet-confirm.ts";
 import { PermissionRegistry } from "../src/permission-registry.ts";
 import { ReposRegistry } from "../src/repos-registry.ts";
 import { Routing } from "../src/routing.ts";
-import { createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE } from "../src/session-lifecycle-commands.ts";
+import { applyPendingAttachment, createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE } from "../src/session-lifecycle-commands.ts";
 import { SessionStore, type SessionRow } from "../src/session-store.ts";
 
 function row(overrides: Partial<SessionRow> = {}): SessionRow {
@@ -140,7 +137,6 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
     selfCheckSlug: "self-check",
     fleetWorktreesRoot: undefined,
     otlpPort: 4318,
-    stateDir: "c:\\does\\not\\exist\\state",
     ...overrides,
   });
 
@@ -493,7 +489,11 @@ describe("createSessionLifecycleCommands", () => {
 
   // attachment-triggered-session-creation-plan.md's `cmd.pendingAttachment` handling - the parts of
   // `handleNewCommand` that don't require a real `launchSession` (git worktree + PTY spawn), which
-  // isn't injectable here (session-lifecycle-commands.ts imports it directly, not via options).
+  // isn't injectable here (session-lifecycle-commands.ts imports it directly, not via options). The
+  // attachment write itself now happens *after* `launchSession` succeeds (it lands inside the
+  // freshly-created worktree - attachment-inbox.ts's own doc comment on `writeAttachmentToInbox`
+  // explains why), so a write-failure-after-a-successful-launch scenario isn't reachable from here
+  // either; `attachment-inbox.test.ts` covers `writeAttachmentToInbox`'s own failure modes directly.
   describe("handleNewCommand with a pendingAttachment", () => {
     test("an early rejection (unknown repo) tells the operator the attachment was lost, not just the repo error", async () => {
       const { sessionLifecycle, confirmed } = setup({ getReposRegistry: () => new ReposRegistry([]) });
@@ -533,28 +533,70 @@ describe("createSessionLifecycleCommands", () => {
       expect(confirmed[0]?.text).toContain("Refused:");
       expect(confirmed[0]?.text).toContain("attachment you sent was not saved");
     });
+  });
 
-    test("an inbox-write failure after topic creation deletes the orphaned topic and reports failure, not the topic's own confirmation", async () => {
-      const reposRegistry = new ReposRegistry([{ name: "demo-repo", path: "c:\\does\\not\\exist\\demo-repo" }]);
-      const badStateDir = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-session-lifecycle-test-"));
-      // Forces writeAttachmentToInbox's `mkdir(..., { recursive: true })` to fail with ENOTDIR: the
-      // "sessions" path segment it needs to create already exists as a plain file, not a directory.
-      await fs.writeFile(path.join(badStateDir, "sessions"), "not a directory");
-      const { sessionLifecycle, controlBot, sessionStore, confirmed } = setup({ getReposRegistry: () => reposRegistry, stateDir: badStateDir });
+  // Extracted from handleNewCommand (code-review finding: the post-launch write-failure branch had
+  // no coverage at all, since handleNewCommand itself can't be unit-tested past a real launchSession
+  // call) - directly exercises the note text/log line/sourceText-override logic with an injected
+  // fake `write`, no real filesystem or launchSession involved.
+  describe("applyPendingAttachment", () => {
+    test("no pendingAttachment - returns cmd unchanged with no note", async () => {
+      const cmd = { kind: "new" as const, repo: "demo-repo", prompt: "add a README" };
+      const logs: Array<{ level: string; message: string }> = [];
+      const result = await applyPendingAttachment(cmd, "c:\\worktree", "slug-1", (level, message) => logs.push({ level, message }));
+      expect(result).toEqual({ cmd, note: "", saved: false });
+      expect(logs).toEqual([]);
+    });
 
-      await sessionLifecycle.handleNewCommand(
-        { kind: "new", repo: "demo-repo", prompt: "add a README", pendingAttachment: { kind: "image", name: "shot.png", bytes: new Uint8Array([1, 2, 3]) } },
-        1,
-      );
+    test("a successful write overrides sourceText, returns no note, and reports saved: true", async () => {
+      const cmd = {
+        kind: "new" as const,
+        repo: "demo-repo",
+        prompt: "add a README",
+        pendingAttachment: { kind: "image" as const, name: "shot.png", bytes: new Uint8Array([1]) },
+      };
+      const fakeWrite = async () => "c:\\worktree\\.aibridge-inbox\\shot.png";
 
-      // The topic-creation confirmation (rendering the clean prompt, posted into the new topic
-      // itself - topicId 999, fakeControlBot's fixed createForumTopic id) went out before the
-      // failing write - but the failure reply (posted to controlTopicId 1) and the orphaned-topic
-      // cleanup must still follow.
-      expect(confirmed.some((c) => c.topicId === 999 && c.text === "add a README")).toBe(true);
-      expect(controlBot.forumTopicCalls.deleted).toEqual([999]);
-      expect(confirmed.some((c) => c.topicId === 1 && c.text.includes("Failed to save the attachment"))).toBe(true);
-      expect(sessionStore.all()).toEqual([]); // no session row was ever inserted
+      const result = await applyPendingAttachment(cmd, "c:\\worktree", "slug-1", () => {}, fakeWrite);
+
+      expect(result.note).toBe("");
+      expect(result.saved).toBe(true);
+      expect(result.cmd.sourceText).toBe("operator sent an image: c:\\worktree\\.aibridge-inbox\\shot.png\nadd a README");
+    });
+
+    test("a successful write prefers the raw caption over the clean prompt", async () => {
+      const cmd = {
+        kind: "new" as const,
+        repo: "demo-repo",
+        prompt: "add a README",
+        pendingAttachment: { kind: "document" as const, name: "spec.pdf", bytes: new Uint8Array([1]), rawCaption: "create a session for demo-repo and add a README" },
+      };
+      const fakeWrite = async () => "c:\\worktree\\.aibridge-inbox\\spec.pdf";
+
+      const result = await applyPendingAttachment(cmd, "c:\\worktree", "slug-1", () => {}, fakeWrite);
+
+      expect(result.cmd.sourceText).toContain("create a session for demo-repo and add a README");
+    });
+
+    test("a failing write logs a WARN and returns a note without mutating cmd", async () => {
+      const cmd = {
+        kind: "new" as const,
+        repo: "demo-repo",
+        prompt: "add a README",
+        pendingAttachment: { kind: "document" as const, name: "spec.pdf", bytes: new Uint8Array([1]) },
+      };
+      const logs: Array<{ level: string; message: string }> = [];
+      const fakeWrite = async () => {
+        throw new Error("disk full");
+      };
+
+      const result = await applyPendingAttachment(cmd, "c:\\worktree", "slug-1", (level, message) => logs.push({ level, message }), fakeWrite);
+
+      expect(result.cmd).toBe(cmd);
+      expect(result.saved).toBe(false);
+      expect(result.note).toContain("couldn't save the attachment - disk full");
+      expect(result.note).toContain("re-send it in this topic once it's open");
+      expect(logs).toEqual([{ level: "WARN", message: 'failed to save the attachment for "slug-1" into its worktree: disk full' }]);
     });
   });
 });

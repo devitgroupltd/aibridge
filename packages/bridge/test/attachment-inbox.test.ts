@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -6,7 +7,9 @@ import {
   attachmentKindLabel,
   buildAttachmentAnnouncement,
   buildInboxFilename,
+  forgetInboxGitignoreCache,
   guessAttachmentFilename,
+  INBOX_DIR_NAME,
   sanitizeAttachmentFilename,
   writeAttachmentToInbox,
 } from "../src/attachment-inbox.ts";
@@ -78,30 +81,125 @@ describe("buildInboxFilename", () => {
 });
 
 describe("writeAttachmentToInbox", () => {
-  test("lands the file under $STATE/sessions/<slug>/inbox/, creating the directory if missing", async () => {
-    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-attach-test-"));
+  test("lands the file under <worktree>/.aibridge-inbox/, creating the directory if missing", async () => {
+    const worktreePath = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-attach-test-"));
     try {
       const bytes = new Uint8Array([1, 2, 3, 4]);
-      const fullPath = await writeAttachmentToInbox(stateDir, "my-slug", "photo.jpg", bytes);
+      const fullPath = await writeAttachmentToInbox(worktreePath, "photo.jpg", bytes);
 
-      expect(fullPath.startsWith(path.join(stateDir, "sessions", "my-slug", "inbox"))).toBe(true);
+      expect(fullPath.startsWith(path.join(worktreePath, INBOX_DIR_NAME))).toBe(true);
       const written = await fs.readFile(fullPath);
       expect(new Uint8Array(written)).toEqual(bytes);
     } finally {
-      await fs.rm(stateDir, { recursive: true, force: true });
+      await fs.rm(worktreePath, { recursive: true, force: true });
     }
   });
 
-  test("a hostile filename never escapes the session's inbox directory", async () => {
-    const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-attach-test-"));
+  test("a hostile filename never escapes the inbox directory", async () => {
+    const worktreePath = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-attach-test-"));
     try {
-      const fullPath = await writeAttachmentToInbox(stateDir, "my-slug", "../../../etc/passwd", new Uint8Array([9]));
-      const inboxDir = path.join(stateDir, "sessions", "my-slug", "inbox");
+      const fullPath = await writeAttachmentToInbox(worktreePath, "../../../etc/passwd", new Uint8Array([9]));
+      const inboxDir = path.join(worktreePath, INBOX_DIR_NAME);
       expect(path.dirname(fullPath)).toBe(inboxDir);
       expect(path.basename(fullPath)).toContain("passwd");
     } finally {
-      await fs.rm(stateDir, { recursive: true, force: true });
+      await fs.rm(worktreePath, { recursive: true, force: true });
     }
+  });
+
+  test("not a git repo at all - the write still succeeds (best-effort gitignore, never blocking)", async () => {
+    const worktreePath = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-attach-test-"));
+    try {
+      const fullPath = await writeAttachmentToInbox(worktreePath, "photo.jpg", new Uint8Array([1]));
+      expect(new Uint8Array(await fs.readFile(fullPath))).toEqual(new Uint8Array([1]));
+    } finally {
+      await fs.rm(worktreePath, { recursive: true, force: true });
+    }
+  });
+
+  describe("in a real git repo", () => {
+    test("appends .aibridge-inbox/ to the shared info/exclude, never a tracked .gitignore", async () => {
+      const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-attach-git-test-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: repoPath });
+        await writeAttachmentToInbox(repoPath, "photo.jpg", new Uint8Array([1]));
+
+        const excludePath = path.join(repoPath, ".git", "info", "exclude");
+        const excludeContent = await fs.readFile(excludePath, "utf8");
+        expect(excludeContent).toContain(`${INBOX_DIR_NAME}/`);
+        await expect(fs.access(path.join(repoPath, ".gitignore"))).rejects.toThrow();
+      } finally {
+        await fs.rm(repoPath, { recursive: true, force: true });
+      }
+    });
+
+    test("two attachments in the same repo don't duplicate the exclude line", async () => {
+      const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-attach-git-test-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: repoPath });
+        await writeAttachmentToInbox(repoPath, "a.jpg", new Uint8Array([1]));
+        await writeAttachmentToInbox(repoPath, "b.jpg", new Uint8Array([2]));
+
+        const excludeContent = await fs.readFile(path.join(repoPath, ".git", "info", "exclude"), "utf8");
+        const occurrences = excludeContent.split("\n").filter((line) => line.trim() === `${INBOX_DIR_NAME}/`).length;
+        expect(occurrences).toBe(1);
+      } finally {
+        await fs.rm(repoPath, { recursive: true, force: true });
+      }
+    });
+
+    // Code-review finding on an earlier version of this cache: it was keyed by the resolved common
+    // dir, which `gitCommonDir` has to be *called* to even learn - so it only skipped the
+    // info/exclude file I/O, not `gitCommonDir`'s own synchronous git subprocess spawn, meaning a
+    // second attachment still shelled out to git every time. Proven here by wiping the exclude file
+    // out-of-band between two writes to the same repo: if the second `writeAttachmentToInbox` call
+    // actually re-ran the "ensure" logic (whether via a live subprocess or not), it would see the
+    // line missing and re-add it - it doesn't, because the per-worktree/per-common-dir caches
+    // short-circuit before that logic runs at all on the second call.
+    test("a second attachment to the same repo is a true no-op - an externally-cleared exclude file is not re-populated", async () => {
+      const repoPath = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-attach-git-test-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: repoPath });
+        await writeAttachmentToInbox(repoPath, "a.jpg", new Uint8Array([1]));
+
+        const excludePath = path.join(repoPath, ".git", "info", "exclude");
+        await fs.writeFile(excludePath, ""); // simulate the exclude file having been reset out-of-band
+
+        await writeAttachmentToInbox(repoPath, "b.jpg", new Uint8Array([2]));
+
+        expect(await fs.readFile(excludePath, "utf8")).toBe("");
+      } finally {
+        await fs.rm(repoPath, { recursive: true, force: true });
+      }
+    });
+
+    // Code-review finding: worktreePath is always <worktreesRoot>/<slug> (session-launcher.ts), and
+    // `/rm` frees a slug's name - and therefore that exact path - for a later /new to hand to a
+    // completely different repo. Without invalidating the cache, the new repo's own info/exclude
+    // would never get the line at all, since the stale cache would report "already gitignored" for
+    // what is now a different repo's common dir.
+    test("forgetInboxGitignoreCache lets a reused worktreePath re-resolve for a different repo after /rm frees it", async () => {
+      const worktreePath = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-attach-reuse-test-"));
+      try {
+        execFileSync("git", ["init", "-q"], { cwd: worktreePath });
+        await writeAttachmentToInbox(worktreePath, "a.jpg", new Uint8Array([1]));
+        const firstExclude = await fs.readFile(path.join(worktreePath, ".git", "info", "exclude"), "utf8");
+        expect(firstExclude).toContain(`${INBOX_DIR_NAME}/`);
+
+        // Simulate /rm: the worktree (and its .git) is torn down, the slug/path freed for reuse.
+        await fs.rm(path.join(worktreePath, ".git"), { recursive: true, force: true });
+        forgetInboxGitignoreCache(worktreePath);
+
+        // A later /new hands the identical path to an unrelated repo.
+        execFileSync("git", ["init", "-q"], { cwd: worktreePath });
+        await writeAttachmentToInbox(worktreePath, "b.jpg", new Uint8Array([2]));
+
+        const secondExclude = await fs.readFile(path.join(worktreePath, ".git", "info", "exclude"), "utf8");
+        expect(secondExclude).toContain(`${INBOX_DIR_NAME}/`);
+      } finally {
+        await fs.rm(worktreePath, { recursive: true, force: true });
+      }
+    });
   });
 });
 

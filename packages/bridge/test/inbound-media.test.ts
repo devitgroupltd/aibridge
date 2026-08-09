@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -43,7 +43,6 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
   const dispatched: Array<{ messageId: number; rawText: string; threadId: number | undefined; replyToText: string | undefined }> = [];
   const confirmed: Array<{ topicId: number | undefined; text: string }> = [];
   const createdFromAttachment: Array<{ cmd: unknown; controlTopicId: number | undefined }> = [];
-  const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-inbound-media-test-"));
   const inboundMedia = createInboundMedia({
     controlBot,
     feedGovernor,
@@ -70,13 +69,26 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
     voiceConfirmEnabled: () => true,
     voice: { enabled: true, ffmpegPath: "ffmpeg", port: 8123 },
     supergroupChatId: "-100",
-    stateDir,
     ...overrides,
   });
-  return { inboundMedia, controlBot, routing, sessionStore, staleConfirmRegistry, voiceConfirmRegistry, dispatched, confirmed, createdFromAttachment, stateDir };
+  return { inboundMedia, controlBot, routing, sessionStore, staleConfirmRegistry, voiceConfirmRegistry, dispatched, confirmed, createdFromAttachment };
 }
 
-const ROUTE = { slug: "fix-bug", topicId: 5, worktreePath: "c:\\worktrees\\fix-bug" };
+// A real temp directory, not a bare string literal - `writeAttachmentToInbox` (attachment-inbox.ts)
+// now writes into `route.worktreePath` directly (moved there from `$STATE` to dodge settings.ts's
+// `Read(~/**)` deny rule), so any test that lands an attachment needs a real, writable path here
+// rather than a fake `c:\worktrees\...` string that was never actually touched before this move.
+let routeWorktreeDir: string;
+let ROUTE: { slug: string; topicId: number; worktreePath: string };
+
+beforeAll(async () => {
+  routeWorktreeDir = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-inbound-media-worktree-"));
+  ROUTE = { slug: "fix-bug", topicId: 5, worktreePath: routeWorktreeDir };
+});
+
+afterAll(async () => {
+  await fs.rm(routeWorktreeDir, { recursive: true, force: true });
+});
 
 /** `writeAttachmentToInbox` is real `fs/promises` I/O (0.10x.0 - previously synchronous, see that
  * module's own doc comment for why it changed), so waiting out a fixed handful of microtask ticks
@@ -233,7 +245,10 @@ describe("createInboundMedia", () => {
       await waitFor(() => dispatched.length >= 1);
 
       expect(dispatched.length).toBe(1);
-      expect(dispatched[0]?.rawText).toContain(ROUTE.slug);
+      // Lands inside the route's own worktree (attachment-inbox.ts's INBOX_DIR_NAME), not under a
+      // slug-named $STATE path anymore - see writeAttachmentToInbox's own doc comment for why.
+      expect(dispatched[0]?.rawText).toContain(ROUTE.worktreePath);
+      expect(dispatched[0]?.rawText).toContain(".aibridge-inbox");
     });
 
     test("a voice update routes to handleVoiceMessage instead of dispatchInboundMessage", async () => {

@@ -355,7 +355,6 @@ async function main(): Promise<void> {
     voiceConfirmEnabled: () => voiceConfirmEnabled,
     voice: config.voice,
     supergroupChatId: config.supergroupChatId,
-    stateDir: STATE_DIR,
     log,
   });
 
@@ -617,7 +616,6 @@ async function main(): Promise<void> {
     selfCheckSlug: config.selfCheck.slug,
     fleetWorktreesRoot,
     otlpPort,
-    stateDir: STATE_DIR,
     log,
   });
   sessionLifecycleLate.set(sessionLifecycle);

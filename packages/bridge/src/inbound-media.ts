@@ -92,7 +92,6 @@ export interface InboundMediaOptions {
   voiceConfirmEnabled: () => boolean;
   voice: { enabled: boolean; ffmpegPath: string; port: number };
   supergroupChatId: string;
-  stateDir: string;
   log?: LogFn;
 }
 
@@ -148,7 +147,6 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     voiceConfirmEnabled,
     voice,
     supergroupChatId,
-    stateDir,
   } = opts;
   const log = opts.log ?? (() => {});
   const routeText = opts.routeText ?? realRouteText;
@@ -374,7 +372,7 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     const downloaded = await downloadAttachment(kind, fileId, fileSize, fileName, mimeType, threadId);
     if (!downloaded) return;
     try {
-      const absPath = await writeAttachmentToInbox(stateDir, route.slug, downloaded.name, downloaded.bytes);
+      const absPath = await writeAttachmentToInbox(route.worktreePath, downloaded.name, downloaded.bytes, log);
       const announcement = buildAttachmentAnnouncement(kind, absPath, caption);
       fireAndForget(
         dispatchInboundMessage(messageId, announcement, threadId, isControl, route, route.slug, from, buildContextPrefix(origin)),

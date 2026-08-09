@@ -74,6 +74,27 @@ v020_touched_sections:
 >   message would; `TelegramReplyTarget` (`telegram.ts`) was extended with the same media fields
 >   `TelegramMessage` already carries so this has something to read.
 >
+> **Follow-up fix (2026-08-09): the attachment inbox moved from `$STATE` into the worktree.**
+> Live-verifying the reply-to-retry fix above surfaced a real permission-settings gap: a session's
+> `Read`/`Bash cat` on the announced inbox path was *denied outright*, every time, regardless of
+> retry. Root cause - `settings.ts`'s `Read(~/**)`/`Edit(~/**)` deny rule (added to close off
+> `%APPDATA%\aibridge` and other secret-shaped files under the user's home directory) also caught
+> `$STATE/sessions/<slug>/inbox/`, since `$STATE` (`%LOCALAPPDATA%\aibridge`) is itself under `~` -
+> and deny always wins over allow regardless of specificity (§6.2, live-verified), so no amount of
+> narrowing an allow rule for just the inbox path could have fixed this from the allow side.
+> Rather than weaken that deny rule (the alternative - enumerating specific secret paths instead of
+> a blanket `~/**` - is exactly the coverage gap that rule's own 0.64.0 broadening was written to
+> close), the attachment inbox itself moved: `attachment-inbox.ts`'s `writeAttachmentToInbox` now
+> writes into `<worktreePath>/.aibridge-inbox/` instead of `$STATE/sessions/<slug>/inbox/`. The
+> worktree lives entirely outside `~` (`c:\data\worktrees\<slug>` by default), so this sidesteps the
+> conflict without touching the secret-protection rule at all. The directory is excluded from git via
+> the worktree's shared `.git/info/exclude` (not a tracked `.gitignore`, so it never shows as a diff
+> in the target repo) and from `/browse`/`/find`'s own scan via `worktree-fs.ts`'s `SKIP_DIRS`. One
+> behavioral consequence: for the caption-triggered `/new` path (`session-lifecycle-commands.ts`),
+> the attachment write now happens *after* `launchSession` succeeds (the worktree must exist first),
+> not before - a write failure there degrades gracefully (session still launches, confirmation notes
+> the loss) rather than tearing down an already-live topic/worktree/PTY.
+>
 
 ## Overview
 

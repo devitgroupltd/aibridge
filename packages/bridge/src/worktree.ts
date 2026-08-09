@@ -68,7 +68,10 @@ function tryGit(cwd: string, args: readonly string[]): boolean {
   }
 }
 
-function gitCommonDir(cwd: string): string | null {
+/** Exported for `attachment-inbox.ts`'s `ensureInboxGitignored` too - both need "the real, canonical
+ * common git dir for this path" and there's no reason for a second, less battle-tested copy of the
+ * relative-vs-absolute/realpath handling below. */
+export function gitCommonDir(cwd: string): string | null {
   try {
     const out = execFileSync("git", ["rev-parse", "--git-common-dir"], { cwd, encoding: "utf8" }).trim();
     if (out.length === 0) return null;

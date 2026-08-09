@@ -1,8 +1,7 @@
 import { randomUUID } from "node:crypto";
-import { promises as fsPromises } from "node:fs";
 import { renderAskInterruptedCard } from "./ask-callback.ts";
 import { AskRegistry } from "./ask-registry.ts";
-import { buildAttachmentAnnouncement, writeAttachmentToInbox } from "./attachment-inbox.ts";
+import { buildAttachmentAnnouncement, forgetInboxGitignoreCache, writeAttachmentToInbox } from "./attachment-inbox.ts";
 import { CostTracker } from "./cost-tracker.ts";
 import { cleanupDiffRefs } from "./diff-review.ts";
 import { buildFleetConfirmKeyboard, FleetConfirmRegistry } from "./fleet-confirm.ts";
@@ -74,10 +73,6 @@ export interface SessionLifecycleCommandsOptions {
   selfCheckSlug: string;
   fleetWorktreesRoot: string | undefined;
   otlpPort: number;
-  /** Where `cmd.pendingAttachment` (attachment-triggered-session-creation-plan.md) gets moved into
-   * once `slug` is known - same `$STATE` root `attachment-inbox.ts`'s existing-session attachment
-   * path already writes into, via the same `writeAttachmentToInbox` function. */
-  stateDir: string;
   log?: LogFn;
   /** Injectable clock, same convention as quota-alarms.ts. */
   now?: () => string;
@@ -106,6 +101,34 @@ export interface SessionLifecycleCommands {
  * (§4.5.2's `rm-topic` confirm below, keyed off the orphaned topic's own thread id). */
 export const ORPHAN_TOPIC_NOTE = " (Telegram topic itself could not be deleted - send /rm inside it directly to clean it up)";
 
+/** Extracted out of `handleNewCommand` so the pendingAttachment-after-launch logic (note text, log
+ * line, `sourceText` override) is independently testable - `handleNewCommand` itself can't be, past
+ * this point, without a real `launchSession` call (git worktree + PTY spawn), which isn't injectable
+ * here (see this module's own test file for that boundary). `write` defaults to the real
+ * `writeAttachmentToInbox`, overridable so a test can make it throw on demand without touching disk.
+ *
+ * Returns `saved` explicitly rather than leaving the caller to infer success from `note`'s emptiness
+ * (code-review finding: two booleans - `cmd.pendingAttachment` truthiness and `!note` - had to stay
+ * in sync for a downstream `if` to mean what its own comment claimed) - `saved` is `false` both when
+ * there was nothing to save and when saving it failed, `true` only on an actual successful write. */
+export async function applyPendingAttachment(
+  cmd: Extract<FleetCommand, { kind: "new" }>,
+  worktreePath: string,
+  slug: string,
+  log: LogFn,
+  write: typeof writeAttachmentToInbox = writeAttachmentToInbox,
+): Promise<{ cmd: Extract<FleetCommand, { kind: "new" }>; note: string; saved: boolean }> {
+  if (!cmd.pendingAttachment) return { cmd, note: "", saved: false };
+  const { kind, name, bytes, rawCaption } = cmd.pendingAttachment;
+  try {
+    const attachmentAbsPath = await write(worktreePath, name, bytes, log);
+    return { cmd: { ...cmd, sourceText: buildAttachmentAnnouncement(kind, attachmentAbsPath, rawCaption ?? cmd.prompt) }, note: "", saved: true };
+  } catch (err) {
+    log("WARN", `failed to save the attachment for "${slug}" into its worktree: ${(err as Error).message}`);
+    return { cmd, note: ` (couldn't save the attachment - ${(err as Error).message}; re-send it in this topic once it's open.)`, saved: false };
+  }
+}
+
 export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOptions): SessionLifecycleCommands {
   const {
     sessionStore,
@@ -133,7 +156,6 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     selfCheckSlug,
     fleetWorktreesRoot,
     otlpPort,
-    stateDir,
   } = opts;
   const log = opts.log ?? (() => {});
   const nowIso = opts.now ?? (() => new Date().toISOString());
@@ -213,6 +235,11 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     } catch (err) {
       log("WARN", `removeWorktree failed for "${slug}": ${(err as Error).message}`);
     }
+    // attachment-inbox.ts's own doc comment on `commonDirByWorktree`: this path (always
+    // `<worktreesRoot>/<slug>`) is about to be freed for `/new` to hand to an unrelated repo -
+    // forget the cached common-dir mapping now, unconditionally, regardless of whether the
+    // `removeWorktree` above actually succeeded (a failed removal still frees the slug/row below).
+    forgetInboxGitignoreCache(row.worktreePath);
     let topicDeleted = true;
     try {
       await controlBot.deleteForumTopic(supergroupChatId, row.topicId);
@@ -308,29 +335,6 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // which targets `controlTopicId`) since this belongs in the new topic itself.
     confirmSessionCommand(topic.message_thread_id, newSessionContent(cmd));
 
-    // Attachment-triggered-session-creation-plan.md's Attachment-to-Session Handoff section: must
-    // run strictly *after* the topic-creation confirmation above (which shows the clean `cmd.prompt`,
-    // untouched) and *before* the PTY send further below (which must show the announcement). This
-    // is also the one window with no existing cleanup path - the inbox write happens after the topic
-    // already exists but isn't covered by the launch-failure catch below, so a failure here needs
-    // its own topic cleanup, mirroring that catch's.
-    let attachmentAbsPath: string | undefined;
-    if (cmd.pendingAttachment) {
-      const { kind, name, bytes, rawCaption } = cmd.pendingAttachment;
-      try {
-        attachmentAbsPath = await writeAttachmentToInbox(stateDir, slug, name, bytes);
-        cmd = { ...cmd, sourceText: buildAttachmentAnnouncement(kind, attachmentAbsPath, rawCaption ?? cmd.prompt) };
-      } catch (err) {
-        try {
-          await controlBot.deleteForumTopic(supergroupChatId, topic.message_thread_id);
-        } catch (deleteErr) {
-          log("WARN", `failed to clean up topic for "${slug}" after a failed attachment save: ${(deleteErr as Error).message}`);
-        }
-        confirmSessionCommand(controlTopicId, `Failed to save the attachment for "${slug}": ${(err as Error).message}`);
-        return;
-      }
-    }
-
     let session: ReturnType<typeof launchSession>;
     try {
       session = launchSession({
@@ -352,16 +356,24 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       } catch (deleteErr) {
         log("WARN", `failed to clean up topic for "${slug}" after a failed launch: ${(deleteErr as Error).message}`);
       }
-      if (attachmentAbsPath) {
-        try {
-          await fsPromises.unlink(attachmentAbsPath);
-        } catch (unlinkErr) {
-          log("WARN", `failed to clean up inbox file for "${slug}" after a failed launch: ${(unlinkErr as Error).message}`);
-        }
-      }
-      confirmSessionCommand(controlTopicId, `Failed to launch session "${slug}": ${(err as Error).message}`);
+      confirmSessionCommand(controlTopicId, `Failed to launch session "${slug}": ${(err as Error).message}${attachmentLostNote}`);
       return;
     }
+
+    // Attachment-triggered-session-creation-plan.md's Attachment-to-Session Handoff section: must
+    // run strictly *after* the topic-creation confirmation above (which shows the clean `cmd.prompt`,
+    // untouched) and *before* the PTY send further below (which must show the announcement). Runs
+    // after `launchSession` rather than before it (as an earlier version of this did) because the
+    // attachment now lands inside the session's own worktree (`attachment-inbox.ts`'s
+    // `writeAttachmentToInbox`, moved there to dodge `settings.ts`'s `Read(~/**)` deny rule) - and
+    // that worktree does not exist until `ensureWorktree` inside `launchSession` has already created
+    // it. A failure here no longer tears the topic/session down: both are already live at this point
+    // (worktree cut, PTY spawned), so the fix is to degrade gracefully - note the loss in the
+    // confirmation and still send the plain prompt - rather than discard a session that otherwise
+    // launched fine.
+    const applied = await applyPendingAttachment(cmd, session.worktreePath, slug, log);
+    cmd = applied.cmd;
+    const attachmentNote = applied.note;
 
     routing.add({ slug, topicId: topic.message_thread_id, worktreePath: session.worktreePath });
     sessionSupervisor.wireSession(slug, session.ptyProcess, topic.message_thread_id);
@@ -385,16 +397,17 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       lastEventUtc: nowIso(),
     });
 
-    if (cmd.pendingAttachment) {
+    if (applied.saved) {
       // Distinct from a text-typed /new (attachment-triggered-session-creation-plan.md's
-      // Observability note) - the only place this trigger source is recorded anywhere.
-      log("INFO", `session "${slug}" created from a control-topic attachment caption (${cmd.pendingAttachment.kind})`);
+      // Observability note) - the only place this trigger source is recorded anywhere. Skipped when
+      // the save itself failed - that path already logged its own WARN inside applyPendingAttachment.
+      log("INFO", `session "${slug}" created from a control-topic attachment caption (${cmd.pendingAttachment!.kind})`);
     }
 
     // Deep-links straight into the new topic (buildTopicDeepLink's own doc comment) rather than
     // making the operator find it by hand in the topic list - a `url` button, so no round trip
     // through the Bridge and no callback-registry entry to track or ever expire.
-    confirmSessionCommand(controlTopicId, `Created "${slug}" (${model}) in a new topic.`, undefined, {
+    confirmSessionCommand(controlTopicId, `Created "${slug}" (${model}) in a new topic.${attachmentNote}`, undefined, {
       inline_keyboard: [[{ text: `↪️ Open "${slug}"`, url: buildTopicDeepLink(supergroupChatId, topic.message_thread_id) }]],
     });
 
