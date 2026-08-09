@@ -41,6 +41,7 @@ import { findRemoteBranchContaining, parseGithubOwnerRepo } from "./worktree-fs.
 export interface DiffReviewResult {
   kind: "empty" | "link" | "document";
   filesChanged: number;
+  filePaths: string[];
   untrackedFiles: string[];
   url?: string;
   diffText?: string;
@@ -76,10 +77,10 @@ function parseStatusPorcelain(status: string): { tracked: boolean; untracked: st
 
 /** Falls back to a scrubbed unified-diff document. Shared by both the "push failed" and "no GitHub
  * remote" branches of `buildDiffReview` so the two failure modes can't drift. */
-function fallbackDocument(root: string, filesChanged: number, untrackedFiles: string[]): DiffReviewResult {
+function fallbackDocument(root: string, filesChanged: number, filePaths: string[], untrackedFiles: string[]): DiffReviewResult {
   const raw = git(root, ["diff", "HEAD"]);
   const scrubbed = scrubSecrets(raw).text;
-  return { kind: "document", diffText: scrubbed, filesChanged, untrackedFiles };
+  return { kind: "document", diffText: scrubbed, filesChanged, filePaths, untrackedFiles };
 }
 
 /**
@@ -92,12 +93,13 @@ export function buildDiffReview(worktreeRoot: string, slug: string): DiffReviewR
     const status = parseStatusPorcelain(git(root, ["status", "--porcelain"]));
     const stashSha = git(root, ["stash", "create"]);
     if (stashSha.length === 0) {
-      return { kind: "empty", filesChanged: 0, untrackedFiles: status.untracked };
+      return { kind: "empty", filesChanged: 0, filePaths: [], untrackedFiles: status.untracked };
     }
 
-    const filesChanged = git(root, ["diff", "--name-only", "HEAD", stashSha])
+    const filePaths = git(root, ["diff", "--name-only", "HEAD", stashSha])
       .split("\n")
-      .filter((l) => l.length > 0).length;
+      .filter((l) => l.length > 0);
+    const filesChanged = filePaths.length;
 
     const headSha = git(root, ["rev-parse", "HEAD"]);
     const reusedBase = findRemoteBranchContaining(root, headSha);
@@ -112,23 +114,32 @@ export function buildDiffReview(worktreeRoot: string, slug: string): DiffReviewR
     try {
       execFileSync("git", ["push", "--force", "origin", ...refspecs], { cwd: root, stdio: "pipe" });
     } catch {
-      return fallbackDocument(root, filesChanged, status.untracked);
+      return fallbackDocument(root, filesChanged, filePaths, status.untracked);
     }
 
     const owned = parseGithubOwnerRepo(root);
     if (!owned) {
-      return fallbackDocument(root, filesChanged, status.untracked);
+      return fallbackDocument(root, filesChanged, filePaths, status.untracked);
     }
 
     const url = `https://github.com/${owned.owner}/${owned.repo}/compare/${baseRefName}...${headBranch}`;
-    return { kind: "link", url, filesChanged, untrackedFiles: status.untracked };
+    return { kind: "link", url, filesChanged, filePaths, untrackedFiles: status.untracked };
   } catch {
     try {
-      return fallbackDocument(root, 0, []);
+      return fallbackDocument(root, 0, [], []);
     } catch {
-      return { kind: "empty", filesChanged: 0, untrackedFiles: [] };
+      return { kind: "empty", filesChanged: 0, filePaths: [], untrackedFiles: [] };
     }
   }
+}
+
+/** Renders the "N file(s) changed" line `/diff` leads with, listing each changed path (relative to
+ * the worktree root) rather than just the count - callers append their own untracked-file caveat. */
+export function renderFilesChangedSummary(review: DiffReviewResult): string {
+  if (review.filePaths.length === 0) {
+    return `${review.filesChanged} file(s) changed.`;
+  }
+  return `${review.filesChanged} file(s) changed:\n${review.filePaths.map((p) => `- ${p}`).join("\n")}`;
 }
 
 /** Best-effort teardown of the throwaway branches this session may have pushed - called from session

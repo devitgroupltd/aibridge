@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { buildDiffReview, cleanupDiffRefs } from "../src/diff-review.ts";
+import { buildDiffReview, cleanupDiffRefs, renderFilesChangedSummary } from "../src/diff-review.ts";
 
 /**
  * A local bare repo stands in for GitHub's actual server (no network in CI), but `origin`'s
@@ -51,7 +51,7 @@ function bareBranches(): string[] {
 describe("buildDiffReview - no changes", () => {
   test("no tracked or untracked changes -> kind empty, no push attempted", () => {
     const result = buildDiffReview(workDir, "test-slug");
-    expect(result).toEqual({ kind: "empty", filesChanged: 0, untrackedFiles: [] });
+    expect(result).toEqual({ kind: "empty", filesChanged: 0, filePaths: [], untrackedFiles: [] });
     expect(bareBranches()).toEqual([]);
   });
 
@@ -73,6 +73,7 @@ describe("buildDiffReview - link happy path", () => {
 
     expect(result.kind).toBe("link");
     expect(result.filesChanged).toBe(1);
+    expect(result.filePaths).toEqual(["README.md"]);
     expect(result.url).toBe("https://github.com/testowner/testrepo/compare/main...aibridge-review/test-slug-head");
     expect(bareBranches().sort()).toEqual(["aibridge-review/test-slug-head", "main"]);
   });
@@ -141,6 +142,23 @@ describe("buildDiffReview - fallback to a scrubbed document", () => {
     expect(result.kind).toBe("document");
     expect(result.diffText).not.toContain("AKIAABCDEFGHIJKLMNOP");
     expect(result.diffText).toContain("[redacted:");
+  });
+});
+
+describe("renderFilesChangedSummary", () => {
+  test("lists each changed path under the count, not just the count", () => {
+    const text = renderFilesChangedSummary({
+      kind: "link",
+      filesChanged: 2,
+      filePaths: ["src/foo.ts", "src/bar.ts"],
+      untrackedFiles: [],
+    });
+    expect(text).toBe("2 file(s) changed:\n- src/foo.ts\n- src/bar.ts");
+  });
+
+  test("falls back to the bare count when there are no file paths", () => {
+    const text = renderFilesChangedSummary({ kind: "document", filesChanged: 0, filePaths: [], untrackedFiles: [] });
+    expect(text).toBe("0 file(s) changed.");
   });
 });
 

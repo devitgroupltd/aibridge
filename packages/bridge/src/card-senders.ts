@@ -1,7 +1,7 @@
 import { buildAboutKeyboard, renderAbout } from "./about.ts";
 import { buildCommandKeyboard, listRepoCommands, listRepoSkills, renderCommandsListText, renderSkillsListText } from "./commands.ts";
 import { renderHelp } from "./fleet-commands.ts";
-import { buildDiffReview } from "./diff-review.ts";
+import { buildDiffReview, renderFilesChangedSummary } from "./diff-review.ts";
 import { buildDirKeyboard, buildHitsKeyboard, BrowseRegistry, renderDirText, renderHitsText } from "./browse-nav.ts";
 import { listDirectory, searchWorktree } from "./worktree-fs.ts";
 import type { SessionRoute } from "./routing.ts";
@@ -115,13 +115,14 @@ export function createCardSenders(opts: CardSendersOptions): CardSenders {
     }
     const review = buildDiffReview(route.worktreePath, route.slug);
     const untrackedNote = review.untrackedFiles.length > 0 ? ` ${review.untrackedFiles.length} new file(s) not shown - /browse to view: ${review.untrackedFiles.join(", ")}` : "";
+    const changedSummary = renderFilesChangedSummary(review);
     if (review.kind === "empty") {
       confirmSessionCommand(threadId, review.untrackedFiles.length > 0 ? `No tracked changes.${untrackedNote}` : "No pending changes.");
       return;
     }
     if (review.kind === "link" && review.url) {
       controlBot
-        .sendMessage(supergroupChatId, threadId, `${review.filesChanged} file(s) changed.${untrackedNote}`, {
+        .sendMessage(supergroupChatId, threadId, `${changedSummary}${untrackedNote}`, {
           inline_keyboard: [[{ text: "Open diff on GitHub", url: review.url }]],
         })
         .catch((err) => log("WARN", `sendMessage (/diff) failed: ${(err as Error).message}`));
@@ -129,7 +130,7 @@ export function createCardSenders(opts: CardSendersOptions): CardSenders {
     }
     if (review.kind === "document" && review.diffText !== undefined && controlBot.sendDocumentFile) {
       controlBot
-        .sendDocumentFile(supergroupChatId, threadId, `${route.slug}.diff`, new TextEncoder().encode(review.diffText), `${review.filesChanged} file(s) changed.${untrackedNote}`)
+        .sendDocumentFile(supergroupChatId, threadId, `${route.slug}.diff`, new TextEncoder().encode(review.diffText), `${changedSummary}${untrackedNote}`)
         .catch((err) => log("WARN", `sendDocumentFile (/diff) failed: ${(err as Error).message}`));
     }
   }

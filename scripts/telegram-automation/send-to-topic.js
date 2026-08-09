@@ -1,20 +1,17 @@
-// One-off: send a prompt into a specific session's own topic (not the control topic) and read
-// back what it does with it. Live-verifies §5.8's send_file/outbox path (screenshot -> outbox ->
-// send_file -> Telegram photo/document) - not a permanent part of the toolkit, kept here per
-// CLAUDE.md's "write a small one-off script" guidance.
+// Sends a message into a named session topic (not the control topic) and prints whatever new
+// messages arrive - send-command.js only targets "General"/the control topic, and check-topic.js
+// only reads, so this covers the gap of driving a session's own topic directly.
 //
-// Usage: node send-to-topic.js "<topic name substring>" "<prompt>" [waitRounds]
+// Usage: node send-to-topic.js "<topic substring>" "<message>"
 const { connect, openGroup, openTopic, sendMessage, getMessageTexts, getMessageCount } = require("./client.js");
 
 function log(msg) {
   console.error(`[${new Date().toISOString()}] ${msg}`);
 }
 
-const topicSubstring = process.argv[2];
-const prompt = process.argv[3];
-const waitRounds = Number(process.argv[4] ?? 40);
-if (!topicSubstring || !prompt) {
-  console.error('usage: node send-to-topic.js "<topic name substring>" "<prompt>" [waitRounds]');
+const [topicSubstring, message] = process.argv.slice(2);
+if (!topicSubstring || !message) {
+  console.error('usage: node send-to-topic.js "<topic substring>" "<message>"');
   process.exit(1);
 }
 
@@ -24,17 +21,19 @@ if (!topicSubstring || !prompt) {
   await openTopic(page, topicSubstring);
 
   const before = await getMessageCount(page);
-  await sendMessage(page, prompt);
-  log(`sent: ${prompt}`);
+  await sendMessage(page, message);
+  log(`sent: ${message}`);
 
   let texts = [];
-  for (let i = 0; i < waitRounds; i++) {
-    await page.waitForTimeout(3000);
+  for (let i = 0; i < 20; i++) {
+    await page.waitForTimeout(2000);
     const total = await getMessageCount(page);
     if (total <= before) continue;
     texts = await getMessageTexts(page, total - before);
     break;
   }
   log(`response: ${texts.join(" | ") || "(none within timeout)"}`);
+
   await context.close();
+  console.log(JSON.stringify(texts, null, 2));
 })();

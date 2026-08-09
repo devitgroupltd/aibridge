@@ -60,6 +60,8 @@ boundary as `scripts/dev-bridge.sh`).
   message-matching pitfalls).
 - `send-command.js "<cmd>"` — sends a real control-topic command and prints what comes back.
 - `check-topic.js "<substring>" [count]` — reads the last N messages from a session's own topic.
+- `send-to-topic.js "<substring>" "<message>"` — sends into a session's own topic (not the control
+  topic) and prints what comes back; `send-command.js` only covers the control topic.
 - `list-topics.js`, `inspect-last-message.js`, `inspect-topic.js`, `tap-button.js`,
   `tap-topic-button.js` — narrower inspection/interaction helpers; read before writing a new one-off
   script, most needs are already covered.
