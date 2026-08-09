@@ -191,21 +191,35 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     const topicIdStr = threadId !== undefined ? String(threadId) : undefined;
     // The router call itself is the latency gap with no existing "something is happening" signal
     // (unlike a forwarded turn, which sendChannelText already covers) - live-observed as a silent
-    // multi-second wait on the CLI backend. Reuses §5's two existing indicators rather than
-    // inventing a third: `typingIndicator` (cheap, self-expiring, safe to start/stop repeatedly)
-    // always; the message-based `thinkingPlaceholder` only for `!ctx.hasSession, where nothing
-    // else will start one a moment later - starting it unconditionally would leak an orphaned
-    // placeholder in the `hasSession` branch, since `sendChannelText`'s own `start()` a few lines
-    // below `onNoMatch()` overwrites the pending entry without consuming this one first
-    // (`thinking-placeholder.ts` has no built-in dedup the way `typing-indicator.ts` does).
-    const usePlaceholder = !ctx.hasSession && topicIdStr !== undefined;
+    // multi-second wait on the CLI backend, in *both* the no-session (control-topic `/new`) and the
+    // hasSession (plain text into an existing session's own topic, e.g. "Continue") cases. Reuses
+    // §5's two existing indicators rather than inventing a third: `typingIndicator` always,
+    // `thinkingPlaceholder` unconditionally too now (2026-08-09) - it used to be gated to
+    // `!ctx.hasSession` specifically to avoid orphaning a message when `sendChannelText`'s own
+    // `start()` a few lines below `onNoMatch()` fired a moment later, but `thinking-placeholder.ts`
+    // now de-dupes `start()` per topic instead, so that second call is a safe no-op covering the
+    // same wait rather than a second message to leak.
+    const usePlaceholder = topicIdStr !== undefined;
     if (topicIdStr) typingIndicator.start(topicIdStr);
     if (usePlaceholder) thinkingPlaceholder.start(topicIdStr!);
 
     const result = await routeText(text, ctx, { ...nlRouterConfig, backend: getNlRouterBackend() }, log);
 
     if (topicIdStr) typingIndicator.stop(topicIdStr);
-    if (usePlaceholder) {
+    // `kind === "new"` is the one outcome whose own latency (topic creation, worktree, PTY spawn -
+    // session-lifecycle-commands.ts's `handleNewCommand`) dwarfs the router call this placeholder was
+    // covering - deleting it here just reopens the same silent gap one step later, live-observed as a
+    // multi-second wait between this message and "Created ... in a new topic." Left pending in
+    // `thinkingPlaceholder`'s map instead, so `handleNewCommand` (which knows the topic that map entry
+    // is keyed under, `controlTopicId` = this same `threadId`) can consume/clear it once its own work
+    // is actually done, rather than every other outcome's "gone the instant routing finishes" shape.
+    const deferPlaceholderToNew = usePlaceholder && result.matched && result.command.kind === "new";
+    // Symmetric case for the hasSession side: no match here means `onNoMatch` below forwards this
+    // text straight into the PTY via `sendChannelText` for a real Claude turn, which can run far
+    // longer than this router call did - `pipe-server.ts`'s `onReplySent` is the one that actually
+    // clears this placeholder, once that turn's reply lands, not this function.
+    const deferPlaceholderToForward = usePlaceholder && ctx.hasSession && !result.matched;
+    if (usePlaceholder && !deferPlaceholderToNew && !deferPlaceholderToForward) {
       const placeholderMsgId = await thinkingPlaceholder.consume(topicIdStr!);
       // Removed outright, not edited into a final state - no single text fits every outcome below
       // (a command's own reply, a confirm card, or "Unrecognised control-topic command" are all

@@ -321,14 +321,20 @@ describe("createNlDispatch", () => {
       expect(dispatchFleetCommandCalls).toEqual([[command, 1, true, undefined]]);
     });
 
-    test("a hasSession context never uses the thinking placeholder (typing indicator only)", async () => {
+    test("a hasSession context with no match starts the placeholder but leaves it pending for the forward to clear", async () => {
+      // 2026-08-09: covers the router-call latency for a plain message into an existing session's
+      // own topic (e.g. "Continue") too, not just the no-session `/new` path - but since `onNoMatch`
+      // here forwards into the PTY for a real Claude turn, this function must not consume/delete it
+      // itself; `sendChannelText`'s own `start()` no-ops against it (thinking-placeholder.ts's
+      // dedup), and `pipe-server.ts`'s `onReplySent` is what actually clears it once the reply lands.
       const routeText = async () => ({ matched: false as const });
-      const { nlDispatch, thinkingPlaceholder, typingIndicator } = await setup({ routeText });
+      const { nlDispatch, thinkingPlaceholder, typingIndicator, controlBot } = await setup({ routeText });
 
       await nlDispatch.routeOrFallback("hi", { isControl: false, hasSession: true }, 5, false, "fix-bug", () => {}, () => {});
 
-      expect(thinkingPlaceholder.started).toEqual([]);
+      expect(thinkingPlaceholder.started).toEqual(["5"]);
       expect(typingIndicator.started).toEqual(["5"]);
+      expect(controlBot.deleted).toEqual([]); // not consumed here - left pending
     });
 
     test("a no-session context starts and consumes the thinking placeholder, deleting the message", async () => {

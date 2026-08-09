@@ -121,6 +121,7 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
       finalizedMessages.push({ messageId, text });
     },
     stopIndicatorsForTopic: () => {},
+    thinkingPlaceholder: { start: () => {}, consume: async () => undefined },
     postFleetConfirm: async (kind, topicId, targets) => {
       postFleetConfirmCalls.push({ kind, topicId, targets: targets.map((r) => r.slug) });
     },

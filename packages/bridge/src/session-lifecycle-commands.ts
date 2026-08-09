@@ -20,6 +20,7 @@ import type { SessionSupervisor } from "./session-supervisor.ts";
 import { SessionStore, type SessionRow } from "./session-store.ts";
 import { slugFromPrompt, uniqueSlug } from "./slug.ts";
 import { buildTopicDeepLink, type ForumTopicSource, type InlineKeyboardMarkup, type SendMessageSource } from "./telegram.ts";
+import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import { removeWorktree } from "./worktree.ts";
 
 type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
@@ -52,6 +53,12 @@ export interface SessionLifecycleCommandsOptions {
    * `stopIndicatorsForTopic`/`postFleetConfirm`/`executeFleetActionDirect` are fleet-confirm-flow.ts
    * (item 11)'s own functions, still sitting in index.ts today. */
   stopIndicatorsForTopic: (topicId: number) => void;
+  /** `nl-dispatch.ts`'s `routeOrFallback` leaves its "🤔 Thinking..." placeholder pending (not
+   * deleted) when it matches a `new` command, specifically so `handleNewCommand` can clear it once
+   * its own slower work (topic creation, worktree, PTY spawn) is actually done - see that module's
+   * comment. A typed `/new` never started one, so `consume` resolving `undefined` there is the
+   * normal, harmless case. */
+  thinkingPlaceholder: ThinkingPlaceholder;
   postFleetConfirm: (kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[], promptText: string) => Promise<void>;
   executeFleetActionDirect: (kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[]) => Promise<void>;
   /** voice-mode-commands.ts (item 10)'s own function - injected for the same reason. */
@@ -144,6 +151,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     confirmSessionCommand,
     finalizePermissionMessage,
     stopIndicatorsForTopic,
+    thinkingPlaceholder,
     postFleetConfirm,
     executeFleetActionDirect,
     writeModeKeystrokes,
@@ -285,8 +293,26 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // fixing the repo name or freeing up fleet capacity, is required (code-review finding).
     const attachmentLostNote = cmd.pendingAttachment ? " The attachment you sent was not saved - resend it once this is fixed." : "";
 
+    // nl-dispatch.ts's `routeOrFallback` leaves its "🤔 Thinking..." placeholder pending (rather than
+    // deleting it right after the NL match) specifically for this function's own latency - topic
+    // creation, worktree, PTY spawn. A typed `/new` never started one, so `consume` resolving
+    // `undefined` here is the normal case and this is a no-op. Called once, right before every
+    // terminal `confirmSessionCommand(controlTopicId, ...)` below, so the placeholder disappears in
+    // the same beat the real outcome (success or error) lands, instead of sitting there for however
+    // long the rest of this function takes after the NL match resolved.
+    const controlTopicIdStr = controlTopicId !== undefined ? String(controlTopicId) : undefined;
+    let placeholderCleared = false;
+    async function clearThinkingPlaceholder(): Promise<void> {
+      if (placeholderCleared || !controlTopicIdStr) return;
+      placeholderCleared = true;
+      const messageId = await thinkingPlaceholder.consume(controlTopicIdStr);
+      if (messageId === undefined || !controlBot.deleteMessage) return;
+      await controlBot.deleteMessage(supergroupChatId, messageId).catch((err: unknown) => log("WARN", `failed to delete /new thinking placeholder: ${(err as Error).message}`));
+    }
+
     const reposRegistry = getReposRegistry();
     if (!reposRegistry) {
+      await clearThinkingPlaceholder();
       confirmSessionCommand(controlTopicId, `No repos.toml registered yet - see §7.5.${attachmentLostNote}`);
       return;
     }
@@ -300,6 +326,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         repo = fuzzy;
         confirmSessionCommand(controlTopicId, `Unknown repo "${cmd.repo}" - using closest match "${fuzzy.name}".`);
       } else {
+        await clearThinkingPlaceholder();
         confirmSessionCommand(controlTopicId, `Unknown repo "${cmd.repo}". Registered: ${reposRegistry.names().join(", ") || "(none)"}${attachmentLostNote}`);
         return;
       }
@@ -310,6 +337,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // debris the way a launch failure further down deliberately cleans up after itself.
     const capCheck = checkConcurrencyCap(sessionStore.all(), model);
     if (!capCheck.ok) {
+      await clearThinkingPlaceholder();
       confirmSessionCommand(
         controlTopicId,
         `Refused: the fleet is already at ${capCheck.current}/${WEIGHTED_CAP} weighted units - adding a ${model} session would bring it to ${capCheck.wouldBe}. Kill or /rm a session first.${attachmentLostNote}`,
@@ -324,6 +352,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     try {
       topic = await controlBot.createForumTopic(supergroupChatId, cmd.prompt.slice(0, 128));
     } catch (err) {
+      await clearThinkingPlaceholder();
       confirmSessionCommand(controlTopicId, `Failed to create a topic for "${slug}": ${(err as Error).message}`);
       return;
     }
@@ -356,6 +385,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       } catch (deleteErr) {
         log("WARN", `failed to clean up topic for "${slug}" after a failed launch: ${(deleteErr as Error).message}`);
       }
+      await clearThinkingPlaceholder();
       confirmSessionCommand(controlTopicId, `Failed to launch session "${slug}": ${(err as Error).message}${attachmentLostNote}`);
       return;
     }
@@ -374,6 +404,26 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     const applied = await applyPendingAttachment(cmd, session.worktreePath, slug, log);
     cmd = applied.cmd;
     const attachmentNote = applied.note;
+
+    // Operator-requested 2026-08-09: `applyPendingAttachment` above only ever puts the file on disk
+    // and tells *Claude* where it is (a plain-text path typed into its terminal, never rendered as a
+    // Telegram message per §5.6's own doc comment) - the operator who just sent it never sees it
+    // again anywhere in the new topic. This is the purely-cosmetic mirror: best-effort, into the new
+    // topic itself (not `controlTopicId` - it belongs with the session it was attached to), for the
+    // operator's own visual reference. Never blocks or fails session creation - a delivery failure
+    // here is a WARN, not a reason to touch `attachmentNote` (already finalized above) or retry.
+    if (applied.saved && cmd.pendingAttachment) {
+      const { kind, name, bytes } = cmd.pendingAttachment;
+      try {
+        if (kind === "image" && controlBot.sendPhotoFile) {
+          await controlBot.sendPhotoFile(supergroupChatId, topic.message_thread_id, name, bytes);
+        } else if (controlBot.sendDocumentFile) {
+          await controlBot.sendDocumentFile(supergroupChatId, topic.message_thread_id, name, bytes);
+        }
+      } catch (err) {
+        log("WARN", `failed to forward the attachment for "${slug}" into its new topic: ${(err as Error).message}`);
+      }
+    }
 
     routing.add({ slug, topicId: topic.message_thread_id, worktreePath: session.worktreePath });
     sessionSupervisor.wireSession(slug, session.ptyProcess, topic.message_thread_id);
@@ -407,6 +457,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // Deep-links straight into the new topic (buildTopicDeepLink's own doc comment) rather than
     // making the operator find it by hand in the topic list - a `url` button, so no round trip
     // through the Bridge and no callback-registry entry to track or ever expire.
+    await clearThinkingPlaceholder();
     confirmSessionCommand(controlTopicId, `Created "${slug}" (${model}) in a new topic.${attachmentNote}`, undefined, {
       inline_keyboard: [[{ text: `↪️ Open "${slug}"`, url: buildTopicDeepLink(supergroupChatId, topic.message_thread_id) }]],
     });

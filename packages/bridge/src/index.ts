@@ -604,6 +604,7 @@ async function main(): Promise<void> {
     confirmSessionCommand,
     finalizePermissionMessage: (messageId, text) => pipeHandle.finalizePermissionMessage(messageId, text),
     stopIndicatorsForTopic,
+    thinkingPlaceholder,
     postFleetConfirm: (kind, topicId, targets, promptText) => fleetConfirmFlow.get().postFleetConfirm(kind, topicId, targets, promptText),
     executeFleetActionDirect: (kind, topicId, targets) => fleetConfirmFlow.get().executeFleetActionDirect(kind, topicId, targets),
     writeModeKeystrokes: voiceModeCommands.writeModeKeystrokes,
