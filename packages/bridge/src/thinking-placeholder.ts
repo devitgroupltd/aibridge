@@ -18,7 +18,7 @@
 export interface ThinkingPlaceholderOptions {
   /** Sends the placeholder message for `topicId`, returning its message_id for later editing. */
   send: (topicId: string) => Promise<number>;
-  log?: (level: "WARN", message: string) => void;
+  log?: (level: "INFO" | "WARN", message: string) => void;
 }
 
 export interface ThinkingPlaceholder {
@@ -33,7 +33,16 @@ export function createThinkingPlaceholder(opts: ThinkingPlaceholderOptions): Thi
 
   function start(topicId: string): void {
     if (pending.has(topicId)) return; // already covering this topic's in-flight turn - see doc comment above
-    const promise = opts.send(topicId).catch((err: unknown) => {
+    // Low-volume, permanent (not a throwaway debug flag): one line per turn-start and one per
+    // successful send. Cheap enough to leave in always, and the only way to tell - after the fact,
+    // from bridge.log - whether a live-observed missing "🤔 Thinking..." (still unexplained as of
+    // 2026-08-09, despite several other placeholder races found/fixed the same day) was a call that
+    // never happened here at all vs. one whose `send()` never resolved.
+    log("INFO", `thinking placeholder starting for topic "${topicId}"`);
+    const promise = opts.send(topicId).then((id) => {
+      log("INFO", `thinking placeholder sent for topic "${topicId}" (message_id=${id})`);
+      return id;
+    }).catch((err: unknown) => {
       log("WARN", `failed to send thinking placeholder for topic "${topicId}": ${(err as Error).message}`);
       return undefined;
     });
