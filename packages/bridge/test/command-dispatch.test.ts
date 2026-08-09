@@ -120,6 +120,16 @@ function fakeDeployLifecycle() {
   };
 }
 
+function fakeOsPowerCommands() {
+  const calls: Array<{ fn: string; args: unknown[] }> = [];
+  return {
+    handleOsCommand: async (...args: unknown[]) => {
+      calls.push({ fn: "handleOsCommand", args });
+    },
+    calls,
+  };
+}
+
 function fakeVoiceModeCommands() {
   const calls: Array<{ fn: string; args: unknown[] }> = [];
   const record = (fn: string) => (...args: unknown[]) => calls.push({ fn, args });
@@ -170,6 +180,7 @@ function setup(overrides: Partial<{ sessionStore: SessionStore }> = {}) {
   const fleetReporting = fakeFleetReporting();
   const fleetConfirmFlow = fakeFleetConfirmFlow();
   const deployLifecycle = fakeDeployLifecycle();
+  const osPowerCommands = fakeOsPowerCommands();
   const voiceModeCommands = fakeVoiceModeCommands();
   const feedWiring = fakeFeedWiring();
   const nlDispatch = fakeNlDispatch();
@@ -187,6 +198,7 @@ function setup(overrides: Partial<{ sessionStore: SessionStore }> = {}) {
     fleetReporting: fleetReporting as never,
     fleetConfirmFlow: fleetConfirmFlow as never,
     deployLifecycle: deployLifecycle as never,
+    osPowerCommands: osPowerCommands as never,
     voiceModeCommands: voiceModeCommands as never,
     cardSenders: cardSenders as never,
     feedWiring: feedWiring as never,
@@ -207,6 +219,7 @@ function setup(overrides: Partial<{ sessionStore: SessionStore }> = {}) {
     fleetReporting,
     fleetConfirmFlow,
     deployLifecycle,
+    osPowerCommands,
     voiceModeCommands,
     feedWiring,
     nlDispatch,

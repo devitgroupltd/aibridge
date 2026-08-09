@@ -212,6 +212,17 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/budget")).toEqual({ kind: "budget" });
   });
 
+  test("/os shutdown|reboot|cancel", () => {
+    expect(parseFleetCommand("/os shutdown")).toEqual({ kind: "os", action: "shutdown" });
+    expect(parseFleetCommand("/os reboot")).toEqual({ kind: "os", action: "reboot" });
+    expect(parseFleetCommand("/os cancel")).toEqual({ kind: "os", action: "cancel" });
+  });
+
+  test("/os with no argument, or an unrecognised argument, is invalid - no safe default", () => {
+    expect(parseFleetCommand("/os")).toBeNull();
+    expect(parseFleetCommand("/os poweroff")).toBeNull();
+  });
+
   test("/rm --dead requests the bulk dead-row filter", () => {
     expect(parseFleetCommand("/rm --dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
   });

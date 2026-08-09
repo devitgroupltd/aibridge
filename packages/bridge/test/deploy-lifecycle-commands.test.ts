@@ -61,7 +61,7 @@ async function setup(overrides: Partial<Parameters<typeof createDeployLifecycleC
     },
     runPowershell: async (script) => {
       runPowershellCalls.push(script);
-      return { stderr: "", failed: false };
+      return { stdout: "", stderr: "", failed: false };
     },
     respawnSelfAndExit: async () => {
       respawnCalls.push(1);
@@ -193,7 +193,7 @@ describe("createDeployLifecycleCommands", () => {
 
     test("install reports (but doesn't undo) a failed settings fix-up", async () => {
       const { deployLifecycle, confirmed } = await setup({
-        runPowershell: async () => ({ stderr: "access denied", failed: true }),
+        runPowershell: async () => ({ stdout: "", stderr: "access denied", failed: true }),
       });
 
       await deployLifecycle.handleAutostartCommand({ kind: "autostart", action: "install" }, undefined);
@@ -250,12 +250,12 @@ describe("createProcessRunner", () => {
     expect(result).toEqual({ stdout: "", stderr: "", failed: false });
   });
 
-  test("runPowershell resolves the same shape without a stdout field", async () => {
-    const runner = createProcessRunner((_cmd, _args, _opts, cb) => cb(null, "", ""));
+  test("runPowershell resolves stdout/stderr/failed", async () => {
+    const runner = createProcessRunner((_cmd, _args, _opts, cb) => cb(null, "1", ""));
 
     const result = await runner.runPowershell("Get-ScheduledTask");
 
-    expect(result).toEqual({ stderr: "", failed: false });
+    expect(result).toEqual({ stdout: "1", stderr: "", failed: false });
   });
 
   test("runPowershell reports failure on a non-zero exit", async () => {
@@ -263,6 +263,22 @@ describe("createProcessRunner", () => {
 
     const result = await runner.runPowershell("Set-ScheduledTask");
 
-    expect(result).toEqual({ stderr: "access denied", failed: true });
+    expect(result).toEqual({ stdout: "", stderr: "access denied", failed: true });
+  });
+
+  test("runShutdown resolves with failed:false on a clean exit", async () => {
+    const runner = createProcessRunner((_cmd, _args, _opts, cb) => cb(null, "", ""));
+
+    const result = await runner.runShutdown(["/a"]);
+
+    expect(result).toEqual({ stdout: "", stderr: "", failed: false });
+  });
+
+  test("runShutdown resolves with failed:true (not a rejection) on a non-zero exit", async () => {
+    const runner = createProcessRunner((_cmd, _args, _opts, cb) => cb(new Error("boom"), "", "nothing to abort"));
+
+    const result = await runner.runShutdown(["/a"]);
+
+    expect(result).toEqual({ stdout: "", stderr: "nothing to abort", failed: true });
   });
 });

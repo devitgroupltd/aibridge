@@ -46,7 +46,8 @@ export type FleetCommand =
   | { kind: "voiceconfirm"; action: "status" | "on" | "off" }
   | { kind: "default"; category: "status" }
   | { kind: "default"; category: "mode"; value?: Mode }
-  | { kind: "default"; category: "effort"; value?: Effort };
+  | { kind: "default"; category: "effort"; value?: Effort }
+  | { kind: "os"; action: "shutdown" | "reboot" | "cancel" };
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
 
@@ -209,6 +210,16 @@ function parseRm(rest: string): FleetCommand {
   const prefixMatch = trimmed.match(/^--prefix\s+(\S+)$/);
   if (prefixMatch?.[1]) return { kind: "rm", bulk: { mode: "prefix", prefix: prefixMatch[1] } };
   return { kind: "rm", slug: trimmed.length > 0 ? trimmed : undefined };
+}
+
+/** `/os shutdown|reboot|cancel` - host power control (plans/swirling-crafting-pixel.md), gated
+ * behind a Yes/No confirm card in index.ts/os-power-commands.ts exactly like `/kill --all`. Unlike
+ * `/autostart`'s bare-defaults-to-status shape, there is no safe default here - a bare `/os` with
+ * no argument is rejected rather than assumed to mean anything. */
+function parseOs(rest: string): FleetCommand | null {
+  const action = rest.trim();
+  if (action !== "shutdown" && action !== "reboot" && action !== "cancel") return null;
+  return { kind: "os", action };
 }
 
 /** `/autostart` with no argument defaults to `status`; anything besides `status`/`install`/
@@ -402,7 +413,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
   const match = trimmed.match(
-    /^\/(new|ls|kill|rm|attach|pause|stop|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default)\b(.*)$/s,
+    /^\/(new|ls|kill|rm|attach|pause|stop|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b(.*)$/s,
   );
   if (!match) return null;
   const [, cmd, rawRest] = match as [string, string, string];
@@ -436,6 +447,8 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return parseVoiceConfirm(rest);
     case "default":
       return parseDefault(rest);
+    case "os":
+      return parseOs(rest);
     case "repos":
       return parseRepos(rest);
     case "voice": {
@@ -668,6 +681,8 @@ export function renderHelp(): string {
     "  /usage [<slug>] - token/cost usage",
     "  /budget - fleet spend (5h/7d)",
     "  /restart - restart the Bridge daemon",
+    "  /os shutdown|reboot|cancel - ⚠️ shut down or restart the WHOLE HOST MACHINE (not just the",
+    "    Bridge), confirm-gated with a 60s window to /os cancel",
     "  /deploy <slug> - merge that session's branch into its repo, run tests, and (if the repo is",
     "    aibridge's own) restart the Bridge to pick up the fix (§5.9)",
     "  /detail [<slug>] [compact|full] - how much of each tool call the feed card shows (default",
@@ -745,6 +760,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "usage", description: "Token/cost usage" },
     { command: "budget", description: "Fleet spend (5h/7d)" },
     { command: "restart", description: "Restart the Bridge daemon" },
+    { command: "os", description: "Shut down or reboot the HOST MACHINE (not just the Bridge): /os shutdown|reboot|cancel - confirm-gated" },
     { command: "deploy", description: "Merge a session's branch and run tests: /deploy <slug> (restarts if it's aibridge's own repo)" },
     { command: "detail", description: "Feed card detail level: /detail [<slug>] [compact|full]" },
     { command: "verbose", description: "Show real tool output on the feed card: /verbose [<slug>] [on|off]" },

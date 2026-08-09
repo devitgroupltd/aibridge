@@ -68,12 +68,18 @@ describe("ROUTER_KINDS completeness", () => {
     clear: "builtin",
   };
 
-  /** `/retry` (retry-store.ts) is the one deliberate exception: `isRetryPhrase` intercepts it (and
-   * its "try again"/"do it again" equivalents) in `dispatchInboundMessage` *before* the NL router is
+  /** `/retry` (retry-store.ts) is one deliberate exception: `isRetryPhrase` intercepts it (and its
+   * "try again"/"do it again" equivalents) in `dispatchInboundMessage` *before* the NL router is
    * ever consulted, and what it re-arms is per-topic in-memory state (`retryStore`) the router has
    * no way to produce as structured output anyway - there is no `FleetCommand`/`SessionCommand`
-   * shape for "the thing that just expired here" to map to. */
-  const NEVER_ROUTED = new Set(["retry"]);
+   * shape for "the thing that just expired here" to map to.
+   *
+   * `/os` (os-power-commands.ts) is the second, for a different reason: it's a real `FleetCommand`
+   * kind with a real router-shaped output, deliberately kept OUT of `ROUTER_KINDS` on purpose - a
+   * misparsed natural-language phrase must never be able to shut down or reboot the host machine,
+   * confirmed with the operator (plans/swirling-crafting-pixel.md). Exact `/os shutdown|reboot|cancel`
+   * syntax only. */
+  const NEVER_ROUTED = new Set(["retry", "os"]);
 
   test("every command in botCommandList() (Telegram's own autocomplete source) maps to a known router kind", () => {
     const kinds: readonly string[] = ROUTER_KINDS;

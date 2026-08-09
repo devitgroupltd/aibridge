@@ -33,6 +33,7 @@ import type { SessionLifecycleCommands } from "./session-lifecycle-commands.ts";
 import type { FleetReportingCommands } from "./fleet-reporting-commands.ts";
 import type { FleetConfirmFlow } from "./fleet-confirm-flow.ts";
 import type { DeployLifecycleCommands } from "./deploy-lifecycle-commands.ts";
+import type { OsPowerCommands } from "./os-power-commands.ts";
 import type { VoiceModeCommands } from "./voice-mode-commands.ts";
 import type { CardSenders } from "./card-senders.ts";
 import type { FeedWiring } from "./feed-wiring.ts";
@@ -52,6 +53,7 @@ export interface CommandDispatchOptions {
   fleetReporting: FleetReportingCommands;
   fleetConfirmFlow: Pick<FleetConfirmFlow, "handleUsageCommand">;
   deployLifecycle: Pick<DeployLifecycleCommands, "handleRestartCommand" | "handleDeployCommand" | "handleAutostartCommand">;
+  osPowerCommands: Pick<OsPowerCommands, "handleOsCommand">;
   voiceModeCommands: Pick<
     VoiceModeCommands,
     "handleVoiceModelCommand" | "handleAssistCommand" | "handleRouterBackendCommand" | "handleVoiceConfirmCommand" | "handleDefaultCommand" | "applyModelSwitch" | "applyModeSwitch" | "applyEffortSwitch"
@@ -136,6 +138,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     fleetReporting,
     fleetConfirmFlow,
     deployLifecycle,
+    osPowerCommands,
     voiceModeCommands,
     cardSenders,
     feedWiring,
@@ -193,6 +196,10 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     }
     if (fleetCmd.kind === "restart") {
       fireAndForget(deployLifecycle.handleRestartCommand(threadId), log, "command-dispatch handleRestartCommand");
+      return;
+    }
+    if (fleetCmd.kind === "os") {
+      fireAndForget(osPowerCommands.handleOsCommand(fleetCmd, threadId), log, "command-dispatch handleOsCommand");
       return;
     }
     if (fleetCmd.kind === "deploy") {

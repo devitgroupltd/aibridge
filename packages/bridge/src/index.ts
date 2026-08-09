@@ -12,6 +12,7 @@ import { clearDeployMarker, isDeployMarkerStale, readDeployMarker, rollbackStale
 import { DetailsAnchorStore, DETAILS_ANCHOR_RETENTION_MS } from "./details-anchor-store.ts";
 import { BrowseRegistry } from "./browse-nav.ts";
 import { FleetConfirmRegistry } from "./fleet-confirm.ts";
+import { createOsPowerCommands, OsConfirmRegistry } from "./os-power-commands.ts";
 import { StaleConfirmRegistry } from "./stale-confirm.ts";
 import { VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { startWhisperServer } from "./voice-transcribe.ts";
@@ -280,6 +281,9 @@ async function main(): Promise<void> {
   // on every live session at once, so they go through the same confirm-button pattern as a
   // permission prompt instead of executing on the same message (fleet-confirm.ts).
   const fleetConfirmRegistry = new FleetConfirmRegistry();
+  // `/os shutdown|reboot` (os-power-commands.ts) - same confirm-button pattern as `/kill --all`
+  // above, for a strictly more consequential action (kills the Bridge itself, not just a session).
+  const osConfirmRegistry = new OsConfirmRegistry();
   const staleConfirmRegistry = new StaleConfirmRegistry();
   // Voice input (self-hosted Whisper via whisper.cpp) - a transcribed voice note is never
   // dispatched directly, only replayed from a tap on its own Send/Re-record/Type-instead card
@@ -644,6 +648,21 @@ async function main(): Promise<void> {
     log,
   });
 
+  // os-power-commands.ts: `/os shutdown|reboot|cancel` (plans/swirling-crafting-pixel.md) - host
+  // power control, confirm-gated the same way `/kill --all` is (fleet-confirm-flow.ts above), for a
+  // strictly more consequential action.
+  const osPowerCommands = createOsPowerCommands({
+    controlBot,
+    confirmSessionCommand,
+    finalizeCard: confirmCards.finalizeCard,
+    isControlTopic,
+    osConfirmRegistry,
+    runShutdown: processRunner.runShutdown,
+    runPowershell: processRunner.runPowershell,
+    supergroupChatId: config.supergroupChatId,
+    log,
+  });
+
   // nl-dispatch.ts: NL-router matching, the destructive-command confirm gate, and executing a
   // matched command through the exact same handlers a typed command uses.
   // `commandDispatch` (a `LateBound` above, alongside `inboundMedia`'s own forward reference to it)
@@ -691,6 +710,7 @@ async function main(): Promise<void> {
     // (and its whole replay payload) leaked for the lifetime of the daemon.
     for (const entry of nlConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markNlConfirmCardExpired(entry), log, "index sweep markNlConfirmCardExpired");
     for (const entry of fleetConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "index sweep markConfirmCardExpired(fleet)");
+    for (const entry of osConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "index sweep markConfirmCardExpired(os)");
     for (const entry of staleConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.confirmCardMessageId), log, "index sweep markConfirmCardExpired(stale)");
     for (const entry of voiceConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.confirmCardMessageId), log, "index sweep markConfirmCardExpired(voice)");
 
@@ -860,6 +880,7 @@ async function main(): Promise<void> {
       fleetReporting,
       fleetConfirmFlow: fleetConfirmFlow.get(),
       deployLifecycle,
+      osPowerCommands,
       voiceModeCommands,
       cardSenders,
       feedWiring,
@@ -888,7 +909,9 @@ async function main(): Promise<void> {
     staleConfirmRegistry,
     voiceConfirmRegistry,
     nlConfirmRegistry,
+    osConfirmRegistry,
     fleetConfirmFlow: fleetConfirmFlow.get(),
+    osPowerCommands,
     browseRegistry,
     nlDispatch,
     commandDispatch: commandDispatch.get(),

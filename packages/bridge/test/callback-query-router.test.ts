@@ -6,6 +6,7 @@ import { createCallbackQueryRouter } from "../src/callback-query-router.ts";
 import { RateGovernor } from "../src/rate-governor.ts";
 import { Routing } from "../src/routing.ts";
 import { FleetConfirmRegistry } from "../src/fleet-confirm.ts";
+import { OsConfirmRegistry } from "../src/os-power-commands.ts";
 import { StaleConfirmRegistry } from "../src/stale-confirm.ts";
 import { VoiceConfirmRegistry } from "../src/voice-confirm.ts";
 import { NlConfirmRegistry } from "../src/nl-confirm.ts";
@@ -118,6 +119,11 @@ function fakeFleetConfirmFlow() {
   return { executeFleetConfirm: async (pending: unknown) => void executed.push(pending), executed };
 }
 
+function fakeOsPowerCommands() {
+  const executed: unknown[] = [];
+  return { executeOsConfirm: async (pending: unknown) => void executed.push(pending), executed };
+}
+
 function fakeNlDispatch() {
   const executed: unknown[][] = [];
   return {
@@ -174,7 +180,9 @@ function setup() {
   const staleConfirmRegistry = new StaleConfirmRegistry();
   const voiceConfirmRegistry = new VoiceConfirmRegistry();
   const nlConfirmRegistry = new NlConfirmRegistry();
+  const osConfirmRegistry = new OsConfirmRegistry();
   const fleetConfirmFlow = fakeFleetConfirmFlow();
+  const osPowerCommands = fakeOsPowerCommands();
   const browseRegistry = new BrowseRegistry();
   const nlDispatch = fakeNlDispatch();
   const commandDispatch = fakeCommandDispatch();
@@ -199,7 +207,9 @@ function setup() {
     staleConfirmRegistry,
     voiceConfirmRegistry,
     nlConfirmRegistry,
+    osConfirmRegistry,
     fleetConfirmFlow: fleetConfirmFlow as never,
+    osPowerCommands: osPowerCommands as never,
     browseRegistry,
     nlDispatch: nlDispatch as never,
     commandDispatch: commandDispatch as never,
@@ -232,7 +242,9 @@ function setup() {
     staleConfirmRegistry,
     voiceConfirmRegistry,
     nlConfirmRegistry,
+    osConfirmRegistry,
     fleetConfirmFlow,
+    osPowerCommands,
     browseRegistry,
     nlDispatch,
     commandDispatch,

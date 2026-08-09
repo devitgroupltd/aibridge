@@ -19,6 +19,7 @@ import {
 } from "./browse-nav.ts";
 import { listDirectory, MAX_SEND_BYTES, prepareFileForSend, readForPreview, resolveGithubLink } from "./worktree-fs.ts";
 import { FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
+import { OsConfirmRegistry, resolveOsConfirmCallback } from "./os-power-commands.ts";
 import { resolveStaleConfirmCallback, StaleConfirmRegistry } from "./stale-confirm.ts";
 import { resolveVoiceConfirmCallback, VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { NlConfirmRegistry, resolveNlConfirmCallback } from "./nl-confirm.ts";
@@ -48,6 +49,7 @@ import type { PipeServerHandle } from "./pipe-server.ts";
 import type { FeedWiring } from "./feed-wiring.ts";
 import type { ConfirmCards } from "./confirm-cards.ts";
 import type { FleetConfirmFlow } from "./fleet-confirm-flow.ts";
+import type { OsPowerCommands } from "./os-power-commands.ts";
 import type { NlDispatch } from "./nl-dispatch.ts";
 import type { CommandDispatch } from "./command-dispatch.ts";
 import type { VoiceModeCommands } from "./voice-mode-commands.ts";
@@ -84,7 +86,9 @@ export interface CallbackQueryRouterOptions {
   staleConfirmRegistry: StaleConfirmRegistry;
   voiceConfirmRegistry: VoiceConfirmRegistry;
   nlConfirmRegistry: NlConfirmRegistry;
+  osConfirmRegistry: OsConfirmRegistry;
   fleetConfirmFlow: Pick<FleetConfirmFlow, "executeFleetConfirm">;
+  osPowerCommands: Pick<OsPowerCommands, "executeOsConfirm">;
   browseRegistry: BrowseRegistry;
   nlDispatch: Pick<NlDispatch, "describeNlCommand" | "executeMatchedCommand">;
   commandDispatch: Pick<CommandDispatch, "dispatchInboundMessage">;
@@ -161,7 +165,9 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
     staleConfirmRegistry,
     voiceConfirmRegistry,
     nlConfirmRegistry,
+    osConfirmRegistry,
     fleetConfirmFlow,
+    osPowerCommands,
     browseRegistry,
     nlDispatch,
     commandDispatch,
@@ -310,6 +316,26 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
           return;
         }
         fireAndForget(fleetConfirmFlow.executeFleetConfirm(pending), log, "callback-query-router executeFleetConfirm");
+      },
+    ),
+
+    // `/os shutdown|reboot`'s own confirm keyboard (os-power-commands.ts) - "os:", a fresh
+    // namespace alongside "fc:" - same "an expired card has to say it expired" reasoning as
+    // "fleetConfirm" above, for a strictly more consequential action.
+    rule(
+      "osConfirm",
+      (data) => (data ? resolveOsConfirmCallback(data) : null),
+      (osConfirmAction, ctx) => {
+        const pending = confirmCards.takeOrNotifyGone(osConfirmRegistry, osConfirmAction.id, ctx.callbackQuery.message?.message_id, (entry) =>
+          fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "callback-query-router markConfirmCardExpired(os)"),
+        );
+        if (!pending) return;
+        if (pending.action !== osConfirmAction.action) return;
+        if (!osConfirmAction.confirmed) {
+          fireAndForget(confirmCards.finalizeCard(pending.messageId, "Cancelled - nothing was changed."), log, "callback-query-router finalizeCard(os cancel)");
+          return;
+        }
+        fireAndForget(osPowerCommands.executeOsConfirm(pending), log, "callback-query-router executeOsConfirm");
       },
     ),
 

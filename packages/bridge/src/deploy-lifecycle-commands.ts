@@ -33,8 +33,15 @@ export interface ProcessRunner {
   runSchtasks(args: string[]): Promise<ProcessRunResult>;
   /** Runs a PowerShell one-liner and reports success/failure the same shape as `runSchtasks` -
    * `schtasks.exe` alone can't fix the two task-settings defaults `buildFixTaskSettingsScript`
-   * targets, so `/autostart install` needs this second tool as well. */
-  runPowershell(script: string): Promise<{ stderr: string; failed: boolean }>;
+   * targets, so `/autostart install` needs this second tool as well. `stdout` was added for
+   * `os-power-commands.ts`'s `checkAutoLogonEnabled` (needs the actual registry value back, not
+   * just success/failure) - every existing caller only ever read `stderr`/`failed`, so this is a
+   * pure addition, not a behaviour change for them. */
+  runPowershell(script: string): Promise<{ stdout: string; stderr: string; failed: boolean }>;
+  /** Wraps `shutdown.exe` (built into Windows) - `/os shutdown|reboot|cancel` (os-power-commands.ts).
+   * A third method on this same interface rather than a separate injectable, so there's still only
+   * one process-runner shape to fake in tests. */
+  runShutdown(args: string[]): Promise<ProcessRunResult>;
 }
 
 export function createProcessRunner(execFileFn: ExecFileFn = execFile as unknown as ExecFileFn): ProcessRunner {
@@ -46,15 +53,23 @@ export function createProcessRunner(execFileFn: ExecFileFn = execFile as unknown
     });
   }
 
-  function runPowershell(script: string): Promise<{ stderr: string; failed: boolean }> {
+  function runPowershell(script: string): Promise<{ stdout: string; stderr: string; failed: boolean }> {
     return new Promise((resolve) => {
-      execFileFn("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true }, (err, _stdout, stderr) => {
-        resolve({ stderr: stderr ?? "", failed: err !== null });
+      execFileFn("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true }, (err, stdout, stderr) => {
+        resolve({ stdout: stdout ?? "", stderr: stderr ?? "", failed: err !== null });
       });
     });
   }
 
-  return { runSchtasks, runPowershell };
+  function runShutdown(args: string[]): Promise<ProcessRunResult> {
+    return new Promise((resolve) => {
+      execFileFn("shutdown", args, { windowsHide: true }, (err, stdout, stderr) => {
+        resolve({ stdout: stdout ?? "", stderr: stderr ?? "", failed: err !== null });
+      });
+    });
+  }
+
+  return { runSchtasks, runPowershell, runShutdown };
 }
 
 export interface DeployLifecycleCommandsOptions {
