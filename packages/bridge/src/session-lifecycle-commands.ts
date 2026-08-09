@@ -426,7 +426,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     }
 
     routing.add({ slug, topicId: topic.message_thread_id, worktreePath: session.worktreePath });
-    sessionSupervisor.wireSession(slug, session.ptyProcess, topic.message_thread_id);
+    sessionSupervisor.wireSession(slug, session.ptyProcess, topic.message_thread_id, session.ready);
 
     sessionStore.insert({
       slug,

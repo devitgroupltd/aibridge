@@ -780,7 +780,7 @@ async function main(): Promise<void> {
       log,
     });
 
-    sessionSupervisor.wireSession(config.selfCheck.slug, session.ptyProcess, config.selfCheck.topicId);
+    sessionSupervisor.wireSession(config.selfCheck.slug, session.ptyProcess, config.selfCheck.topicId, session.ready);
     // Without this, the self-check row's ptyPid stays whatever it was set to on the row's one-time
     // insert above (0, since that always predates the first-ever launch) forever after - unlike
     // every fleet session, which gets this same call on each `resumeSession` relaunch (§4.5).

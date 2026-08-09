@@ -89,7 +89,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const pty = fakePty();
-    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
 
     expect(supervisor.getPtyProcess("fix-bug")).toBe(pty as unknown as Parameters<typeof supervisor.wireSession>[1]);
     expect(supervisor.lastActivityAt("fix-bug")).toBeUndefined();
@@ -112,7 +112,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const pty = fakePty();
-    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     supervisor.killAndUntrack("fix-bug");
 
     expect(pty.wasKilled()).toBe(true);
@@ -133,7 +133,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const pty = fakePty();
-    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     let sawTrackedDuringKill: unknown;
     const originalKill = pty.kill;
     pty.kill = () => {
@@ -164,7 +164,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const pty = fakePty();
-    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     supervisor.untrack("fix-bug");
 
     expect(pty.wasKilled()).toBe(false);
@@ -185,7 +185,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const pty = fakePty();
-    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     pty.emitData("some real output");
     expect(supervisor.lastActivityAt("fix-bug")).toBeGreaterThan(0);
 
@@ -212,7 +212,7 @@ describe("createSessionSupervisor", () => {
       },
       launchSession: () => {
         const nextPty = fakePty();
-        supervisor.wireSession("fix-bug", nextPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+        supervisor.wireSession("fix-bug", nextPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
         return {
           worktreePath: "c:\\data\\worktrees\\fix-bug",
           branch: "claude/fix-bug-1",
@@ -223,7 +223,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const firstPty = fakePty();
-    supervisor.wireSession("fix-bug", firstPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", firstPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     firstPty.emitExit(1);
     await Promise.resolve();
     await Promise.resolve();
@@ -237,7 +237,7 @@ describe("createSessionSupervisor", () => {
 
     delays.length = 0;
     const freshPty = fakePty();
-    supervisor.wireSession("fix-bug", freshPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", freshPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     freshPty.emitExit(1);
     await Promise.resolve();
     await Promise.resolve();
@@ -262,7 +262,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const pty = fakePty();
-    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     // Simulate a deliberate /kill: untrack before the exit event fires.
     supervisor.untrack("fix-bug");
     pty.emitExit(0);
@@ -303,7 +303,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const pty = fakePty();
-    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     pty.emitExit(1);
     await Promise.resolve();
     await Promise.resolve();
@@ -346,7 +346,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const pty = fakePty();
-    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     pty.emitExit(1);
     await Promise.resolve();
     await Promise.resolve();
@@ -374,7 +374,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const pty = fakePty();
-    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     supervisor.killAndUntrack("fix-bug"); // a deliberate kill - untracks before the exit event fires
     pty.emitExit(0);
     await Promise.resolve();
@@ -401,7 +401,7 @@ describe("createSessionSupervisor", () => {
         const nextPty = fakePty();
         // Every relaunch immediately exits again - the crash-loop case this backoff exists for.
         queueMicrotask(() => nextPty.emitExit(1));
-        supervisor.wireSession("fix-bug", nextPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+        supervisor.wireSession("fix-bug", nextPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
         return {
           worktreePath: "c:\\data\\worktrees\\fix-bug",
           branch: "claude/fix-bug-1",
@@ -412,7 +412,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const firstPty = fakePty();
-    supervisor.wireSession("fix-bug", firstPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", firstPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     firstPty.emitExit(1);
 
     // Flush enough microtask turns for MAX_CONSECUTIVE_RESUME_ATTEMPTS relaunches to cascade.
@@ -564,7 +564,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const pty = fakePty();
-    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", pty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     pty.emitExit(1);
     await Promise.resolve();
     await Promise.resolve();
@@ -593,7 +593,7 @@ describe("createSessionSupervisor", () => {
       },
       launchSession: () => {
         const nextPty = fakePty();
-        supervisor.wireSession("fix-bug", nextPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+        supervisor.wireSession("fix-bug", nextPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
         return {
           worktreePath: "c:\\data\\worktrees\\fix-bug",
           branch: "claude/fix-bug-1",
@@ -604,7 +604,7 @@ describe("createSessionSupervisor", () => {
     });
 
     const firstPty = fakePty();
-    supervisor.wireSession("fix-bug", firstPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2);
+    supervisor.wireSession("fix-bug", firstPty as unknown as Parameters<typeof supervisor.wireSession>[1], 2, Promise.resolve({ resumeFailed: false }));
     firstPty.emitExit(1);
     await Promise.resolve();
     await Promise.resolve();

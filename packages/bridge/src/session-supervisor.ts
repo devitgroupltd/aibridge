@@ -84,7 +84,7 @@ export interface SessionSupervisor {
   reapRowsWithDeletedTopics(rows: readonly SessionRow[]): Promise<SessionRow[]>;
   reportOrphanProcesses(): Promise<void>;
   runStartupReconciliation(): Promise<void>;
-  wireSession(slug: string, ptyProcess: pty.IPty, topicId: number): void;
+  wireSession(slug: string, ptyProcess: pty.IPty, topicId: number, ready: Promise<{ resumeFailed: boolean }>): void;
   handleUnexpectedExit(slug: string, ptyProcess: pty.IPty, topicId: number, exitCode: number): Promise<void>;
   resumeSession(row: SessionRow): Promise<void>;
   /** Read accessor for consumers that need to reach a tracked PTY without owning the map
@@ -204,15 +204,74 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
     }
   }
 
+  /**
+   * Queues text destined for a just-(re)launched session's PTY until `ready` resolves, instead of
+   * handing it straight to the real (guarded) write function - see `wireSession`'s own doc comment
+   * for the race this closes. Preserves call order (a FIFO queue, flushed in order once `ready`
+   * settles) rather than dropping anything outright, so a message that arrives one tick into a
+   * resume's startup window is delivered late instead of lost.
+   *
+   * If the session never actually starts (`resumeFailed` - `claude --resume` found no matching
+   * conversation, and `resumeSession` is about to kill this PTY), the queue is dropped instead of
+   * flushed into a process that's already being torn down; logged loudly (not merely the WARN
+   * `sendChannelText` already logs for "no live session at all") since this is the one case where an
+   * operator message was accepted, queued, and then silently thrown away rather than delivered.
+   */
+  function gateWriteUntilReady(
+    rawWrite: (text: string) => void,
+    ready: Promise<{ resumeFailed: boolean }>,
+    slug: string,
+    logFn: LogFn,
+  ): (text: string) => void {
+    let flush: ((text: string) => void) | null = null;
+    let gaveUp = false;
+    const queue: string[] = [];
+
+    ready.then(({ resumeFailed }) => {
+      if (resumeFailed) {
+        gaveUp = true;
+        if (queue.length > 0) {
+          logFn("WARN", `session "${slug}" failed to resume - dropping ${queue.length} inbound write(s) queued during its startup`);
+        }
+        return;
+      }
+      flush = rawWrite;
+      for (const text of queue) flush(text);
+      queue.length = 0;
+    });
+
+    return (text: string) => {
+      if (flush) {
+        flush(text);
+        return;
+      }
+      if (gaveUp) return;
+      queue.push(text);
+    };
+  }
+
   /** Wires up a freshly-spawned (or resumed) session's PTY: the routing table's write/output-tail
    * plumbing, the `ptyProcessBySlug` liveness map, and this module's crash detector. Shared by
-   * the self-check launch, `/new`, and every `resumeSession` relaunch so the three don't drift. */
-  function wireSession(slug: string, ptyProcess: pty.IPty, topicId: number): void {
+   * the self-check launch, `/new`, and every `resumeSession` relaunch so the three don't drift.
+   *
+   * `ready` gates the exposed write path, not just the routing wiring - found live 2026-08-09:
+   * `resumeSession` used to call this (making the slug immediately writable/routable) and only
+   * `await session.ready` afterward, so an inbound message dispatched via `command-dispatch.ts`'s
+   * `sendChannelText` during a crash-resume's multi-second startup window could land mid-splash and
+   * be silently corrupted or lost - the operator's question vanished with no reply and no error, and
+   * the turn's own activity log showed nothing at all because Claude never received anything coherent
+   * to act on. `/new`'s own initial-prompt write already has to wait on this exact `ready` signal for
+   * the same reason (see `LaunchedSession.ready`'s doc comment); an *operator* message racing that
+   * same window is the identical hazard one layer up, and every `wireSession` caller has a `ready`
+   * promise in hand already, so gating it here closes the race for all of them at once rather than
+   * relying on each caller to remember to check it itself. */
+  function wireSession(slug: string, ptyProcess: pty.IPty, topicId: number, ready: Promise<{ resumeFailed: boolean }>): void {
     // See pty-write-guard.ts's own doc comment for why both the write try/catch and the `'error'`
     // listener are required - one alone left one stale keystroke (or, live 2026-08-06, `/new`'s very
     // first write into a session whose `waitForChannelConnected` wait had already given up) able to
     // crash the whole daemon and every other session with it.
-    routing.setPtyWrite(slug, attachPtyWriteGuard(ptyProcess as unknown as PtyLike, slug, { log }));
+    const guardedWrite = attachPtyWriteGuard(ptyProcess as unknown as PtyLike, slug, { log });
+    routing.setPtyWrite(slug, gateWriteUntilReady(guardedWrite, ready, slug, log));
     ptyProcess.onData((data) => {
       // An onData event alone is too loose a signal - confirmed live 2026-08-04 that a wedged
       // session still periodically emits ANSI-only chunks (cursor blink, resize repaint) with no
@@ -335,7 +394,7 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
         otlpPort,
         log,
       });
-      wireSession(slug, session.ptyProcess, topicId);
+      wireSession(slug, session.ptyProcess, topicId, session.ready);
       sessionStore.setPtyPid(slug, session.ptyProcess.pid ?? 0);
       // Without this, `routing.getByTopicId(topicId)` stays undefined for this session forever
       // after this restart (only the self-check slot and freshly-`/new`'d sessions ever call
