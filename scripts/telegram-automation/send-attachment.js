@@ -30,10 +30,15 @@ if (!topicSubstring || !filePath) {
   // which triggers a native file-picker dialog - intercepted here via Playwright's `filechooser`
   // event instead of an OS dialog, exactly the pattern client.js's own doc comments favour
   // (disambiguate real UI elements, don't fight overlays).
+  // `.last()`, not `.first()` - confirmed live 2026-08-09 that "Document" matches four elements on
+  // a chat with any message history (sidebar chat-list previews and message-bubble text can contain
+  // the word too), and the actual attach-menu item is reliably the last one in DOM order, not the
+  // first. `.first()` silently clicked one of the other three, leaving the menu open and the
+  // filechooser event never firing (a 30s timeout with no visible cause in the log).
   const fileChooserPromise = page.waitForEvent("filechooser");
   await page.locator('button[title="Attach"], .btn-icon.attach-file, button.attach-file').first().click({ force: true });
-  await page.waitForTimeout(500);
-  await page.getByText("Document", { exact: false }).first().click({ force: true });
+  await page.waitForTimeout(1200);
+  await page.getByText("Document", { exact: false }).last().click({ force: true });
   const fileChooser = await fileChooserPromise;
   await fileChooser.setFiles(filePath);
   await page.waitForTimeout(1500);
