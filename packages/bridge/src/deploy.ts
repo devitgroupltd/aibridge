@@ -129,17 +129,23 @@ export function truncateForTelegram(text: string, maxLen = 3500): string {
 
 /**
  * Merges `branch` into `repoRoot`'s current HEAD via fast-forward only - never a real merge
- * commit, a diverged branch is a "rebase it yourself" case, not something to resolve
- * automatically over Telegram - then runs `runGate`. Any failure (a dirty tree, a non-ff branch, a
- * failing test or typecheck) leaves `repoRoot` exactly as it was: a dirty tree or non-ff branch
- * never merges at all, and a gate failure after a real merge is rolled back with
- * `git reset --hard` to the commit recorded before the merge started.
+ * commit - then runs `runGate`. If the ff-only merge fails because `branch` has diverged (main
+ * moved on since the branch was cut) and `worktreePath` is given (the session's own worktree,
+ * where `branch` is actually checked out), this auto-rebases `branch` onto `repoRoot`'s current
+ * HEAD there and retries the merge once - the same `git rebase main` an operator would run by
+ * hand, just done automatically so `/ship`/`/deploy` don't dead-end on "main moved on" alone. A
+ * rebase that hits real conflicts is aborted (never left half-done) and reported as a failure to
+ * resolve by hand. Any other failure (a dirty tree, a missing branch, a failing test or
+ * typecheck) leaves `repoRoot` exactly as it was: nothing merges at all, and a gate failure after
+ * a real merge is rolled back with `git reset --hard` to the commit recorded before the merge
+ * started.
  */
 export async function deployBranch(
   repoRoot: string,
   branch: string,
   packageDirs: readonly string[],
   run: CommandRunner = defaultRunner,
+  worktreePath?: string,
 ): Promise<DeployOutcome> {
   const status = await run("git", ["status", "--porcelain"], repoRoot);
   if (status.status !== 0) return { ok: false, rolledBack: false, message: `git status failed: ${status.stderr || status.stdout}` };
@@ -154,12 +160,26 @@ export async function deployBranch(
   const verify = await run("git", ["rev-parse", "--verify", branch], repoRoot);
   if (verify.status !== 0) return { ok: false, rolledBack: false, message: `branch "${branch}" not found: ${verify.stderr || verify.stdout}` };
 
-  const merge = await run("git", ["merge", "--ff-only", branch], repoRoot);
+  let merge = await run("git", ["merge", "--ff-only", branch], repoRoot);
+  let autoRebased = false;
+  if (merge.status !== 0 && worktreePath) {
+    const rebase = await run("git", ["rebase", previousHead], worktreePath);
+    if (rebase.status !== 0) {
+      await run("git", ["rebase", "--abort"], worktreePath);
+      return {
+        ok: false,
+        rolledBack: false,
+        message: `"${branch}" diverged from ${repoRoot} and auto-rebase onto it hit conflicts (aborted, worktree left clean) - resolve by hand in ${worktreePath} and retry: ${rebase.stderr || rebase.stdout}`,
+      };
+    }
+    autoRebased = true;
+    merge = await run("git", ["merge", "--ff-only", branch], repoRoot);
+  }
   if (merge.status !== 0) {
     return {
       ok: false,
       rolledBack: false,
-      message: `"${branch}" isn't a fast-forward of HEAD (diverged, or main has moved on) - rebase it and retry: ${merge.stderr || merge.stdout}`,
+      message: `"${branch}" isn't a fast-forward of HEAD (diverged, or main has moved on)${autoRebased ? " even after auto-rebasing onto it" : ""} - rebase it and retry: ${merge.stderr || merge.stdout}`,
     };
   }
 
@@ -185,7 +205,7 @@ export async function deployBranch(
     rolledBack: false,
     previousHeadSha: previousHead,
     newHeadSha: newHead,
-    message: `Merged "${branch}" into ${repoRoot} (${previousHead.slice(0, 8)} -> ${newHead.slice(0, 8)}) - gate passed.`,
+    message: `${autoRebased ? `Auto-rebased "${branch}" onto ${previousHead.slice(0, 8)}, then m` : "M"}erged into ${repoRoot} (${previousHead.slice(0, 8)} -> ${newHead.slice(0, 8)}) - gate passed.`,
   };
 }
 

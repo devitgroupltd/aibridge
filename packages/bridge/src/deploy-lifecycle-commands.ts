@@ -189,7 +189,9 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
    * §5.9's `/deploy <slug>`: lets a fix written by a Claude session - including one against
    * aibridge's own repo, registered like any other project (§7.5) - land without a desk. Merges
    * that session's own branch into its repo's main checkout via `deployBranch` (fast-forward only,
-   * rolled back automatically on a gate failure), then only if the repo being merged into is this
+   * rolled back automatically on a gate failure; if main has moved on since the branch was cut,
+   * `deployBranch` auto-rebases the branch in `worktreePath` onto main's current tip and retries
+   * once before giving up), then only if the repo being merged into is this
    * Bridge's own checkout (`isSelfRepo` - any other project's branch is just a merge+test, there is
    * no "Bridge" to restart for it) does the same self-respawn `/restart` already does, first
    * writing `deployMarker` so a boot that never comes up cleanly gets rolled back automatically
@@ -206,7 +208,7 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
       confirmSessionCommand(topicId, `No session "${slug}".`);
       return;
     }
-    const { repoPath, branch } = row;
+    const { repoPath, branch, worktreePath } = row;
     try {
       await controlBot.sendMessage(supergroupChatId, topicId, `Deploying "${branch}" (session "${slug}") into ${repoPath}…`);
     } catch (err) {
@@ -214,7 +216,7 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     }
     log("INFO", `/deploy requested for slug "${slug}" -> merging "${branch}" into ${repoPath}`);
     const packageDirs = discoverTypecheckedPackages(repoPath);
-    const outcome = await deployBranch(repoPath, branch, packageDirs);
+    const outcome = await deployBranch(repoPath, branch, packageDirs, undefined, worktreePath);
     if (!outcome.ok) {
       log("WARN", `/deploy failed for "${branch}": ${outcome.message}`);
       try {
@@ -284,7 +286,7 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     }
 
     const packageDirs = discoverTypecheckedPackages(repoPath);
-    const outcome = await deployBranch(repoPath, branch, packageDirs);
+    const outcome = await deployBranch(repoPath, branch, packageDirs, undefined, worktreePath);
     if (!outcome.ok) {
       log("WARN", `/ship failed for "${branch}": ${outcome.message}`);
       try {

@@ -189,6 +189,57 @@ describe("deployBranch", () => {
     expect(calls.some(([cmd, args]) => cmd === "git" && args[0] === "reset")).toBe(false);
   });
 
+  test("with a worktreePath, auto-rebases a diverged branch and retries the merge", async () => {
+    const { run, calls } = scriptedRunner([
+      OK, // status
+      { status: 0, stdout: "abc1234\n", stderr: "" }, // HEAD before
+      OK, // verify
+      { status: 1, stdout: "", stderr: "not possible to fast-forward" }, // merge #1 - diverged
+      OK, // rebase abc1234 (in worktree)
+      OK, // merge #2 - retried, now ff
+      { status: 0, stdout: "def5678\n", stderr: "" }, // HEAD after
+      OK, // bun test
+    ]);
+    const outcome = await deployBranch("C:\\repo", "claude/diverged", [], run, "C:\\wt\\diverged");
+    expect(outcome.ok).toBe(true);
+    expect(outcome.message).toContain("Auto-rebased");
+    expect(outcome.message).toContain("abc1234 -> def5678");
+    expect(calls).toContainEqual(["git", ["rebase", "abc1234"], "C:\\wt\\diverged"]);
+    expect(calls.filter(([cmd, args]) => cmd === "git" && args[0] === "merge")).toHaveLength(2);
+  });
+
+  test("with a worktreePath, aborts the rebase and reports conflicts without touching repoRoot", async () => {
+    const { run, calls } = scriptedRunner([
+      OK, // status
+      { status: 0, stdout: "abc1234\n", stderr: "" }, // HEAD before
+      OK, // verify
+      { status: 1, stdout: "", stderr: "not possible to fast-forward" }, // merge #1 - diverged
+      { status: 1, stdout: "", stderr: "CONFLICT" }, // rebase - conflicts
+      OK, // rebase --abort
+    ]);
+    const outcome = await deployBranch("C:\\repo", "claude/conflicted", [], run, "C:\\wt\\conflicted");
+    expect(outcome.ok).toBe(false);
+    expect(outcome.rolledBack).toBe(false);
+    expect(outcome.message).toContain("auto-rebase");
+    expect(outcome.message).toContain("conflicts");
+    expect(calls).toContainEqual(["git", ["rebase", "--abort"], "C:\\wt\\conflicted"]);
+    expect(calls.some(([cmd, args]) => cmd === "git" && args[0] === "reset")).toBe(false);
+  });
+
+  test("with a worktreePath, still reports failure if the retried merge is also non-ff", async () => {
+    const { run } = scriptedRunner([
+      OK,
+      { status: 0, stdout: "abc1234\n", stderr: "" },
+      OK,
+      { status: 1, stdout: "", stderr: "not possible to fast-forward" }, // merge #1
+      OK, // rebase succeeds
+      { status: 1, stdout: "", stderr: "still not possible" }, // merge #2 - still fails
+    ]);
+    const outcome = await deployBranch("C:\\repo", "claude/still-stuck", [], run, "C:\\wt\\still-stuck");
+    expect(outcome.ok).toBe(false);
+    expect(outcome.message).toContain("even after auto-rebasing");
+  });
+
   test("reports nothing-to-deploy when the branch is already merged (HEAD unchanged)", async () => {
     const { run } = scriptedRunner([
       OK,
