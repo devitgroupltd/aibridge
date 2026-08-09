@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import path from "node:path";
 
 /**
@@ -81,10 +81,20 @@ function gitCommonDir(cwd: string): string | null {
 }
 
 /** Windows paths compare case-insensitively and routinely differ in drive-letter case between what
- * git prints and what the config carries; a naive `===` here would reject a perfectly good worktree. */
+ * git prints and what the config carries; a naive `===` here would reject a perfectly good worktree.
+ * They can also differ in 8.3-short-name vs. long-name form - e.g. GitHub's Windows runners report
+ * `os.tmpdir()` as `C:\Users\RUNNER~1\...` while git resolves an absolute `--git-common-dir` through
+ * its own long-form realpath - so resolve through the OS's real path first; `path.resolve` alone
+ * only normalizes `.`/`..`/separators and leaves short names untouched. */
 function canonical(p: string): string {
   const resolved = path.resolve(p);
-  return process.platform === "win32" ? resolved.toLowerCase() : resolved;
+  let real: string;
+  try {
+    real = realpathSync.native(resolved);
+  } catch {
+    real = resolved;
+  }
+  return process.platform === "win32" ? real.toLowerCase() : real;
 }
 
 function currentBranch(worktreePath: string): string | null {
