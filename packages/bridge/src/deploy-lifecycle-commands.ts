@@ -1,7 +1,16 @@
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { buildCreateArgs, buildDeleteArgs, buildFixTaskSettingsScript, buildQueryArgs, parseQueryOutput, renderAutostartStatus, TASK_NAME } from "./autostart.ts";
-import { deployBranch as realDeployBranch, discoverTypecheckedPackages, isSelfRepo, resolveBridgeRepoRoot, truncateForTelegram, writeDeployMarker } from "./deploy.ts";
+import {
+  commitIfDirty as realCommitIfDirty,
+  deployBranch as realDeployBranch,
+  discoverTypecheckedPackages,
+  isSelfRepo,
+  pushCurrentBranch as realPushCurrentBranch,
+  resolveBridgeRepoRoot,
+  truncateForTelegram,
+  writeDeployMarker,
+} from "./deploy.ts";
 import { resolveNodeExecutable } from "./session-launcher.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
@@ -95,17 +104,62 @@ export interface DeployLifecycleCommandsOptions {
    * self-repo restart + deploy-marker sequencing) is unit-testable without a real git repo or a
    * real `bun test`/`tsc` gate run. */
   deployBranch?: typeof realDeployBranch;
+  /** Injectable for the same reason as `deployBranch` - `/ship`'s auto-commit and post-merge push
+   * steps need to be exercised in tests without a real git worktree/remote. */
+  commitIfDirty?: typeof realCommitIfDirty;
+  pushCurrentBranch?: typeof realPushCurrentBranch;
 }
 
 export interface DeployLifecycleCommands {
   handleRestartCommand(topicId: number | undefined): Promise<void>;
   handleDeployCommand(topicId: number | undefined, slug: string): Promise<void>;
+  handleShipCommand(topicId: number | undefined, slug: string): Promise<void>;
   handleAutostartCommand(cmd: Extract<FleetCommand, { kind: "autostart" }>, topicId: number | undefined): Promise<void>;
 }
 
 export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptions): DeployLifecycleCommands {
   const { sessionStore, controlBot, confirmSessionCommand, isControlTopic, runSchtasks, runPowershell, respawnSelfAndExit, stateDir, supergroupChatId, entryScriptDir, log } = opts;
   const deployBranch = opts.deployBranch ?? realDeployBranch;
+  const commitIfDirty = opts.commitIfDirty ?? realCommitIfDirty;
+  const pushCurrentBranch = opts.pushCurrentBranch ?? realPushCurrentBranch;
+
+  /**
+   * The self-repo-restart tail shared by `/deploy` and `/ship`: once a merge into `repoPath` has
+   * already succeeded, only if that repo is this Bridge's own checkout (`isSelfRepo`) does landing
+   * the fix also mean respawning to run it - any other project's branch is just a merge+test, there
+   * is no "Bridge" to restart for it. Writes `deployMarker` first so a boot that never comes up
+   * cleanly gets rolled back automatically (see the startup check near the end of `main()`) rather
+   * than crash-looping on a bad commit with no way to say so. Extracted so `/ship` gets the exact
+   * same self-repo behaviour as `/deploy` without duplicating it.
+   */
+  async function restartIfSelfRepo(commandLabel: string, repoPath: string, branch: string, outcome: { previousHeadSha?: string; newHeadSha?: string }, topicId: number | undefined): Promise<void> {
+    const bridgeRepoRoot = resolveBridgeRepoRoot(entryScriptDir);
+    if (!isSelfRepo(repoPath, bridgeRepoRoot)) {
+      log("INFO", `${commandLabel}: "${repoPath}" isn't this Bridge's own repo - merged only, no restart`);
+      return;
+    }
+
+    writeDeployMarker(stateDir, {
+      previousHeadSha: outcome.previousHeadSha ?? "",
+      newHeadSha: outcome.newHeadSha ?? "",
+      repoRoot: repoPath,
+      branch,
+      chatId: supergroupChatId,
+      topicId,
+      deployedAtIso: new Date().toISOString(),
+    });
+    try {
+      await controlBot.sendMessage(
+        supergroupChatId,
+        topicId,
+        "This is aibridge's own repo - restarting now to apply the fix (§5.9). If it doesn't come back up cleanly within a minute, it rolls itself back automatically and restarts again.",
+      );
+    } catch (err) {
+      log("WARN", `failed to send ${commandLabel} restart notice: ${(err as Error).message}`);
+    }
+    log("INFO", `${commandLabel}: self-repo, respawning and exiting`);
+    await respawnSelfAndExit();
+  }
 
   /**
    * §4.5.1's `/restart`: self-respawn, not an external supervisor. Every live session dies with
@@ -176,32 +230,65 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
       log("WARN", `failed to send /deploy success message: ${(err as Error).message}`);
     }
 
-    const bridgeRepoRoot = resolveBridgeRepoRoot(entryScriptDir);
-    if (!isSelfRepo(repoPath, bridgeRepoRoot)) {
-      log("INFO", `/deploy: "${repoPath}" isn't this Bridge's own repo - merged only, no restart`);
+    await restartIfSelfRepo("/deploy", repoPath, branch, outcome, topicId);
+  }
+
+  /**
+   * `/ship <slug>`: the one-shot "land it, I'm done" command askable from the General/control
+   * topic without opening the session first. Three steps chained together, each already its own
+   * tested piece: auto-commit the session's worktree if it's dirty (`commitIfDirty` - a session may
+   * still have uncommitted work sitting there), then exactly what `/deploy` does (merge+gate,
+   * rolled back automatically on failure, self-repo restart), then - only on a successful merge -
+   * `git push origin <branch>` from `repoPath` so the fast-forward actually reaches the remote
+   * instead of staying local to this machine's checkout (`deployBranch` alone never pushes).
+   * A push failure is reported on its own: the merge already happened and stays merged either way,
+   * only "did it reach origin" is in question at that point.
+   */
+  async function handleShipCommand(topicId: number | undefined, slug: string): Promise<void> {
+    if (!isControlTopic(topicId)) {
+      confirmSessionCommand(topicId, "/ship only works from the control topic.");
+      return;
+    }
+    const row = sessionStore.get(slug);
+    if (!row) {
+      confirmSessionCommand(topicId, `No session "${slug}".`);
+      return;
+    }
+    const { repoPath, branch, worktreePath } = row;
+    try {
+      await controlBot.sendMessage(supergroupChatId, topicId, `Shipping "${branch}" (session "${slug}") to main…`);
+    } catch (err) {
+      log("WARN", `failed to send /ship ack: ${(err as Error).message}`);
+    }
+    log("INFO", `/ship requested for slug "${slug}" -> committing+merging "${branch}" into ${repoPath}`);
+
+    const commitOutcome = await commitIfDirty(worktreePath);
+    if (commitOutcome.committed) {
+      log("INFO", `/ship: ${commitOutcome.message}`);
+    }
+
+    const packageDirs = discoverTypecheckedPackages(repoPath);
+    const outcome = await deployBranch(repoPath, branch, packageDirs);
+    if (!outcome.ok) {
+      log("WARN", `/ship failed for "${branch}": ${outcome.message}`);
+      try {
+        await controlBot.sendMessage(supergroupChatId, topicId, truncateForTelegram(outcome.message));
+      } catch (err) {
+        log("WARN", `failed to send /ship failure message: ${(err as Error).message}`);
+      }
       return;
     }
 
-    writeDeployMarker(stateDir, {
-      previousHeadSha: outcome.previousHeadSha ?? "",
-      newHeadSha: outcome.newHeadSha ?? "",
-      repoRoot: repoPath,
-      branch,
-      chatId: supergroupChatId,
-      topicId,
-      deployedAtIso: new Date().toISOString(),
-    });
+    const push = await pushCurrentBranch(repoPath);
+    const pushNote = push.status === 0 ? "Pushed to origin." : `Merged locally, but the push to origin failed: ${push.stderr || push.stdout}`;
+    if (push.status !== 0) log("WARN", `/ship: push failed for ${repoPath}: ${push.stderr || push.stdout}`);
     try {
-      await controlBot.sendMessage(
-        supergroupChatId,
-        topicId,
-        "This is aibridge's own repo - restarting now to apply the fix (§5.9). If it doesn't come back up cleanly within a minute, it rolls itself back automatically and restarts again.",
-      );
+      await controlBot.sendMessage(supergroupChatId, topicId, `${truncateForTelegram(outcome.message)}\n${pushNote}`);
     } catch (err) {
-      log("WARN", `failed to send /deploy restart notice: ${(err as Error).message}`);
+      log("WARN", `failed to send /ship success message: ${(err as Error).message}`);
     }
-    log("INFO", "/deploy: self-repo, respawning and exiting");
-    await respawnSelfAndExit();
+
+    await restartIfSelfRepo("/ship", repoPath, branch, outcome, topicId);
   }
 
   /** `/autostart status|install|uninstall`: §7.2's Task Scheduler entry, made reachable from
@@ -244,5 +331,5 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     }
   }
 
-  return { handleRestartCommand, handleDeployCommand, handleAutostartCommand };
+  return { handleRestartCommand, handleDeployCommand, handleShipCommand, handleAutostartCommand };
 }

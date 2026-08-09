@@ -5,6 +5,7 @@ import path from "node:path";
 import type { CommandResult, CommandRunner, DeployMarker } from "../src/deploy.ts";
 import {
   clearDeployMarker,
+  commitIfDirty,
   deployBranch,
   deployMarkerPath,
   discoverTypecheckedPackages,
@@ -12,6 +13,7 @@ import {
   DEPLOY_CRASH_LOOP_THRESHOLD_MS,
   isDeployMarkerStale,
   isSelfRepo,
+  pushCurrentBranch,
   readDeployMarker,
   resolveBridgeRepoRoot,
   rollbackStaleDeploy,
@@ -233,6 +235,65 @@ describe("deployBranch", () => {
     expect(outcome.previousHeadSha).toBe("abc1234");
     expect(outcome.newHeadSha).toBe("def5678");
     expect(outcome.message).toContain("abc1234 -> def5678");
+  });
+});
+
+describe("commitIfDirty", () => {
+  test("no-op on a clean worktree", async () => {
+    const { run, calls } = scriptedRunner([OK]);
+    const outcome = await commitIfDirty("C:\\wt\\session-1", run);
+    expect(outcome.committed).toBe(false);
+    expect(outcome.message).toContain("already clean");
+    expect(calls).toHaveLength(1);
+    expect(calls[0]).toEqual(["git", ["status", "--porcelain"], "C:\\wt\\session-1"]);
+  });
+
+  test("stages and commits everything when the worktree is dirty", async () => {
+    const { run, calls } = scriptedRunner([
+      { status: 0, stdout: " M some/file.ts\n", stderr: "" }, // status
+      OK, // add -A
+      OK, // commit
+    ]);
+    const outcome = await commitIfDirty("C:\\wt\\session-1", run);
+    expect(outcome.committed).toBe(true);
+    expect(outcome.message).toContain("Auto-committed");
+    expect(calls[1]).toEqual(["git", ["add", "-A"], "C:\\wt\\session-1"]);
+    expect(calls[2]?.[1]).toEqual(["commit", "-m", "chore: auto-commit uncommitted work for /ship"]);
+  });
+
+  test("reports a git status failure without attempting to commit", async () => {
+    const { run, calls } = scriptedRunner([{ status: 128, stdout: "", stderr: "not a git repository" }]);
+    const outcome = await commitIfDirty("C:\\wt\\gone", run);
+    expect(outcome.committed).toBe(false);
+    expect(outcome.message).toContain("git status failed");
+    expect(calls).toHaveLength(1);
+  });
+
+  test("reports a commit failure (e.g. nothing staged after add)", async () => {
+    const { run } = scriptedRunner([
+      { status: 0, stdout: " M some/file.ts\n", stderr: "" },
+      OK,
+      { status: 1, stdout: "", stderr: "nothing to commit" },
+    ]);
+    const outcome = await commitIfDirty("C:\\wt\\session-1", run);
+    expect(outcome.committed).toBe(false);
+    expect(outcome.message).toContain("git commit failed");
+  });
+});
+
+describe("pushCurrentBranch", () => {
+  test("pushes whatever branch is currently checked out to origin", async () => {
+    const { run, calls } = scriptedRunner([{ status: 0, stdout: "main\n", stderr: "" }, OK]);
+    const result = await pushCurrentBranch("C:\\repo", run);
+    expect(result.status).toBe(0);
+    expect(calls[1]).toEqual(["git", ["push", "origin", "main"], "C:\\repo"]);
+  });
+
+  test("does not attempt a push when the branch name can't be resolved", async () => {
+    const { run, calls } = scriptedRunner([{ status: 128, stdout: "", stderr: "not a git repository" }]);
+    const result = await pushCurrentBranch("C:\\repo", run);
+    expect(result.status).toBe(128);
+    expect(calls).toHaveLength(1);
   });
 });
 

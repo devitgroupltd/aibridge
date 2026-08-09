@@ -115,6 +115,7 @@ function fakeDeployLifecycle() {
   return {
     handleRestartCommand: record("handleRestartCommand"),
     handleDeployCommand: record("handleDeployCommand"),
+    handleShipCommand: record("handleShipCommand"),
     handleAutostartCommand: record("handleAutostartCommand"),
     calls,
   };
@@ -266,6 +267,9 @@ describe("dispatchFleetCommand", () => {
 
     s.commandDispatch.dispatchFleetCommand({ kind: "deploy", slug: "fix-bug" }, 5, true, undefined);
     expect(s.deployLifecycle.calls.map((c) => c.fn)).toContain("handleDeployCommand");
+
+    s.commandDispatch.dispatchFleetCommand({ kind: "ship", slug: "fix-bug" }, 5, true, undefined);
+    expect(s.deployLifecycle.calls.map((c) => c.fn)).toContain("handleShipCommand");
 
     s.commandDispatch.dispatchFleetCommand({ kind: "voice" }, 5, true, undefined);
     expect(s.voiceModeCommands.calls.map((c) => c.fn)).toContain("handleVoiceModelCommand");

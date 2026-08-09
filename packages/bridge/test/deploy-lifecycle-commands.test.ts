@@ -163,6 +163,120 @@ describe("createDeployLifecycleCommands", () => {
     });
   });
 
+  describe("handleShipCommand", () => {
+    test("outside the control topic, refuses without touching the session store", async () => {
+      const { deployLifecycle, confirmed } = await setup();
+
+      await deployLifecycle.handleShipCommand(5, "fix-bug");
+
+      expect(confirmed[0]?.text).toContain("only works from the control topic");
+    });
+
+    test("an unknown slug reports it's missing", async () => {
+      const { deployLifecycle, confirmed } = await setup();
+
+      await deployLifecycle.handleShipCommand(undefined, "no-such-session");
+
+      expect(confirmed[0]?.text).toContain('No session "no-such-session"');
+    });
+
+    test("commits a dirty worktree before merging, then pushes on success", async () => {
+      const okOutcome: DeployOutcome = { ok: true, rolledBack: false, message: "merged cleanly", previousHeadSha: "aaa", newHeadSha: "bbb" };
+      const commitCalls: string[] = [];
+      const pushCalls: string[] = [];
+      const { deployLifecycle, sessionStore, controlBot, respawnCalls } = await setup({
+        deployBranch: async () => okOutcome,
+        commitIfDirty: async (worktreePath) => {
+          commitCalls.push(worktreePath);
+          return { committed: true, message: "Auto-committed uncommitted work." };
+        },
+        pushCurrentBranch: async (repoPath) => {
+          pushCalls.push(repoPath);
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      sessionStore.insert(row({ repoPath: "c:\\some-other-project\\repo", worktreePath: "c:\\wt\\fix-bug" }));
+
+      await deployLifecycle.handleShipCommand(undefined, "fix-bug");
+
+      expect(commitCalls).toEqual(["c:\\wt\\fix-bug"]);
+      expect(pushCalls).toEqual(["c:\\some-other-project\\repo"]);
+      expect(controlBot.sent.some((m) => m.text.includes("merged cleanly"))).toBe(true);
+      expect(controlBot.sent.some((m) => m.text.includes("Pushed to origin"))).toBe(true);
+      expect(respawnCalls).toEqual([]);
+    });
+
+    test("a clean worktree is not committed, only merged and pushed", async () => {
+      const okOutcome: DeployOutcome = { ok: true, rolledBack: false, message: "merged cleanly", previousHeadSha: "aaa", newHeadSha: "bbb" };
+      const commitCalls: string[] = [];
+      const { deployLifecycle, sessionStore } = await setup({
+        deployBranch: async () => okOutcome,
+        commitIfDirty: async (worktreePath) => {
+          commitCalls.push(worktreePath);
+          return { committed: false, message: "worktree already clean - nothing to auto-commit." };
+        },
+        pushCurrentBranch: async () => ({ status: 0, stdout: "", stderr: "" }),
+      });
+      sessionStore.insert(row({ repoPath: "c:\\some-other-project\\repo" }));
+
+      await deployLifecycle.handleShipCommand(undefined, "fix-bug");
+
+      expect(commitCalls).toHaveLength(1);
+    });
+
+    test("a failing gate reports the failure, never pushes, never restarts", async () => {
+      const failingOutcome: DeployOutcome = { ok: false, rolledBack: true, message: "typecheck failed" };
+      const pushCalls: string[] = [];
+      const { deployLifecycle, sessionStore, controlBot, respawnCalls } = await setup({
+        deployBranch: async () => failingOutcome,
+        commitIfDirty: async () => ({ committed: false, message: "clean" }),
+        pushCurrentBranch: async (repoPath) => {
+          pushCalls.push(repoPath);
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      sessionStore.insert(row());
+
+      await deployLifecycle.handleShipCommand(undefined, "fix-bug");
+
+      expect(controlBot.sent.some((m) => m.text.includes("typecheck failed"))).toBe(true);
+      expect(pushCalls).toEqual([]);
+      expect(respawnCalls).toEqual([]);
+    });
+
+    test("a successful merge but a failed push reports the push failure without undoing the merge", async () => {
+      const okOutcome: DeployOutcome = { ok: true, rolledBack: false, message: "merged cleanly", previousHeadSha: "aaa", newHeadSha: "bbb" };
+      const { deployLifecycle, sessionStore, controlBot } = await setup({
+        deployBranch: async () => okOutcome,
+        commitIfDirty: async () => ({ committed: false, message: "clean" }),
+        pushCurrentBranch: async () => ({ status: 1, stdout: "", stderr: "remote rejected" }),
+      });
+      sessionStore.insert(row({ repoPath: "c:\\some-other-project\\repo" }));
+
+      await deployLifecycle.handleShipCommand(undefined, "fix-bug");
+
+      expect(controlBot.sent.some((m) => m.text.includes("merged cleanly"))).toBe(true);
+      expect(controlBot.sent.some((m) => m.text.includes("push to origin failed"))).toBe(true);
+    });
+
+    test("a successful ship against aibridge's own repo writes the deploy marker and respawns", async () => {
+      const okOutcome: DeployOutcome = { ok: true, rolledBack: false, message: "merged cleanly", previousHeadSha: "aaa", newHeadSha: "bbb" };
+      const { deployLifecycle, sessionStore, controlBot, respawnCalls, stateDir } = await setup({
+        deployBranch: async () => okOutcome,
+        commitIfDirty: async () => ({ committed: false, message: "clean" }),
+        pushCurrentBranch: async () => ({ status: 0, stdout: "", stderr: "" }),
+      });
+      sessionStore.insert(row({ repoPath: "c:\\bridge-repo" }));
+
+      await deployLifecycle.handleShipCommand(undefined, "fix-bug");
+
+      expect(controlBot.sent.some((m) => m.text.includes("restarting now"))).toBe(true);
+      expect(respawnCalls).toEqual([1]);
+      const marker = readDeployMarker(stateDir);
+      expect(marker?.branch).toBe("claude/fix-bug-1");
+    });
+  });
+
   describe("handleAutostartCommand", () => {
     test("outside the control topic, refuses", async () => {
       const { deployLifecycle, confirmed } = await setup();

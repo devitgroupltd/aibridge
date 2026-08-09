@@ -52,7 +52,7 @@ export interface CommandDispatchOptions {
   >;
   fleetReporting: FleetReportingCommands;
   fleetConfirmFlow: Pick<FleetConfirmFlow, "handleUsageCommand">;
-  deployLifecycle: Pick<DeployLifecycleCommands, "handleRestartCommand" | "handleDeployCommand" | "handleAutostartCommand">;
+  deployLifecycle: Pick<DeployLifecycleCommands, "handleRestartCommand" | "handleDeployCommand" | "handleShipCommand" | "handleAutostartCommand">;
   osPowerCommands: Pick<OsPowerCommands, "handleOsCommand">;
   voiceModeCommands: Pick<
     VoiceModeCommands,
@@ -205,6 +205,10 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     }
     if (fleetCmd.kind === "deploy") {
       fireAndForget(deployLifecycle.handleDeployCommand(threadId, fleetCmd.slug), log, "command-dispatch handleDeployCommand");
+      return;
+    }
+    if (fleetCmd.kind === "ship") {
+      fireAndForget(deployLifecycle.handleShipCommand(threadId, fleetCmd.slug), log, "command-dispatch handleShipCommand");
       return;
     }
     if (fleetCmd.kind === "detail") {

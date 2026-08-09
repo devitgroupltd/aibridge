@@ -77,7 +77,7 @@ export type RouterResult = { matched: false } | { matched: true; command: FleetC
 function isDestructive(command: FleetCommand | SessionCommand | RouterAction): boolean {
   if (command.kind === "kill") return !command.all;
   if (command.kind === "rm") return command.bulk?.mode !== "all";
-  if (command.kind === "restart" || command.kind === "deploy") return true;
+  if (command.kind === "restart" || command.kind === "deploy" || command.kind === "ship") return true;
   if (command.kind === "repos" && command.action === "rm") return true;
   // Turning a guard *off* is at least as destructive as the actions it guards, and these are the
   // easiest of all commands to trigger by accident from natural language: "stop asking me for
@@ -119,6 +119,7 @@ export const ROUTER_KINDS = [
   "budget",
   "restart",
   "deploy",
+  "ship",
   "detail",
   "verbose",
   "settings",

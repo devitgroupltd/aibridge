@@ -289,6 +289,12 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/deploy   ")).toBeNull();
   });
 
+  test("/ship requires a slug", () => {
+    expect(parseFleetCommand("/ship fix-the-thing")).toEqual({ kind: "ship", slug: "fix-the-thing" });
+    expect(parseFleetCommand("/ship")).toBeNull();
+    expect(parseFleetCommand("/ship   ")).toBeNull();
+  });
+
   test("/detail bare reports (no slug, no level)", () => {
     expect(parseFleetCommand("/detail")).toEqual({ kind: "detail", slug: undefined, level: undefined });
   });
@@ -518,6 +524,7 @@ describe("renderHelp", () => {
       "/budget",
       "/restart",
       "/deploy",
+      "/ship",
       "/detail",
       "/verbose",
       "/settings",

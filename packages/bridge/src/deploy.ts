@@ -189,6 +189,54 @@ export async function deployBranch(
   };
 }
 
+export interface CommitOutcome {
+  committed: boolean;
+  message: string;
+}
+
+/**
+ * `/ship <slug>`'s auto-commit step: a session's worktree may have work still sitting uncommitted
+ * when the operator wants it landed without a detour into the session's own topic first. Stages
+ * everything (`git add -A`) and commits with a fixed, clearly-auto-generated message so the
+ * authorship of "I meant to write this commit" versus "the Bridge committed this for me" is never
+ * ambiguous in `git log`. A clean worktree is a no-op, not an error - most `/ship` calls will find
+ * the session already committed its own work.
+ */
+export async function commitIfDirty(worktreePath: string, run: CommandRunner = defaultRunner): Promise<CommitOutcome> {
+  const status = await run("git", ["status", "--porcelain"], worktreePath);
+  if (status.status !== 0) {
+    return { committed: false, message: `git status failed in ${worktreePath}: ${status.stderr || status.stdout}` };
+  }
+  if (status.stdout.trim().length === 0) {
+    return { committed: false, message: "worktree already clean - nothing to auto-commit." };
+  }
+
+  const add = await run("git", ["add", "-A"], worktreePath);
+  if (add.status !== 0) {
+    return { committed: false, message: `git add -A failed in ${worktreePath}: ${add.stderr || add.stdout}` };
+  }
+  const commit = await run("git", ["commit", "-m", "chore: auto-commit uncommitted work for /ship"], worktreePath);
+  if (commit.status !== 0) {
+    return { committed: false, message: `git commit failed in ${worktreePath}: ${commit.stderr || commit.stdout}` };
+  }
+  return { committed: true, message: `Auto-committed uncommitted work in ${worktreePath}.` };
+}
+
+/**
+ * `/ship <slug>`'s final step: `deployBranch` only ever advances `repoRoot`'s local checkout, so
+ * without this the merge never leaves the machine. Pushes whatever branch is actually checked out
+ * in `repoRoot` (not a hardcoded "main"/"master" - §7.5 repos can name their default branch either
+ * way) to its `origin` remote. Only ever called after `deployBranch` has already reported success,
+ * so a push failure here (no configured remote, no network, a protected-branch rejection) is
+ * reported as its own distinct failure rather than rolled back - the merge already happened and is
+ * safe to leave in place; only the "did it reach GitHub" step is in question.
+ */
+export async function pushCurrentBranch(repoRoot: string, run: CommandRunner = defaultRunner): Promise<CommandResult> {
+  const branch = await run("git", ["rev-parse", "--abbrev-ref", "HEAD"], repoRoot);
+  if (branch.status !== 0) return branch;
+  return run("git", ["push", "origin", branch.stdout.trim()], repoRoot);
+}
+
 /**
  * The crash-loop safety net for the self-restart path (`isSelfRepo`). Written right before the
  * old process spawns its detached successor and exits (§4.5.1's own `/restart` pattern) - if the

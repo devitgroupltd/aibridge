@@ -52,6 +52,7 @@ export type FleetCommand =
   | { kind: "budget" }
   | { kind: "restart" }
   | { kind: "deploy"; slug: string }
+  | { kind: "ship"; slug: string }
   | { kind: "detail"; slug?: string; level?: "compact" | "full" }
   | { kind: "verbose"; slug?: string; on?: boolean }
   | { kind: "settings" }
@@ -432,7 +433,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
   const match = trimmed.match(
-    /^\/(new|ls|kill|rm|attach|pause|stop|usage|budget|restart|deploy|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b(.*)$/s,
+    /^\/(new|ls|kill|rm|attach|pause|stop|usage|budget|restart|deploy|ship|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b(.*)$/s,
   );
   if (!match) return null;
   const [, cmd, rawRest] = match as [string, string, string];
@@ -449,6 +450,10 @@ export function parseFleetCommand(text: string): FleetCommand | null {
     case "deploy": {
       const slug = rest.trim();
       return slug.length > 0 ? { kind: "deploy", slug } : null;
+    }
+    case "ship": {
+      const slug = rest.trim();
+      return slug.length > 0 ? { kind: "ship", slug } : null;
     }
     case "detail":
       return parseDetail(rest);
@@ -706,6 +711,9 @@ export function renderHelp(): string {
     "    Bridge), confirm-gated with a 60s window to /os cancel",
     "  /deploy <slug> - merge that session's branch into its repo, run tests, and (if the repo is",
     "    aibridge's own) restart the Bridge to pick up the fix (§5.9)",
+    "  /ship <slug> - one-shot land to main: auto-commits uncommitted work in that session's",
+    "    worktree, does /deploy's merge+gate, then pushes origin",
+
     "  /detail [<slug>] [compact|full] - how much of each tool call the feed card shows (default",
     "    compact); bare from inside a session's own topic, or with <slug> from the control topic",
     "  /verbose [<slug>] [on|off] - also show real tool output, not just what was asked for (default",
@@ -717,7 +725,7 @@ export function renderHelp(): string {
     "  /voiceconfirm [on|off] - whether a transcribed voice note shows a Send/Re-record/Type-instead",
     "    card first before it's dispatched (default on)",
     "  /assist [on|off] - whether a natural-language-matched destructive command (kill/rm/",
-    "    restart/deploy/repos rm) shows a confirm card first (default on)",
+    "    restart/deploy/ship/repos rm) shows a confirm card first (default on)",
     "  /router [api|cli] - natural-language routing backend: 'cli' uses your Claude Code",
     "    subscription (slower, no extra cost), 'api' uses a funded ANTHROPIC_API_KEY (faster, real",
     "    but small per-message cost). Defaults to 'cli' even if a key is configured - switch on",
@@ -783,6 +791,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "restart", description: "Restart the Bridge daemon" },
     { command: "os", description: "Shut down or reboot the HOST MACHINE (not just the Bridge): /os shutdown|reboot|cancel - confirm-gated" },
     { command: "deploy", description: "Merge a session's branch and run tests: /deploy <slug> (restarts if it's aibridge's own repo)" },
+    { command: "ship", description: "One-shot land to main: /ship <slug> - auto-commits uncommitted work, /deploy's merge+gate, then pushes origin main" },
     { command: "detail", description: "Feed card detail level: /detail [<slug>] [compact|full]" },
     { command: "verbose", description: "Show real tool output on the feed card: /verbose [<slug>] [on|off]" },
     { command: "settings", description: "Registered repos + concurrency budget" },

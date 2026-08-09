@@ -1,7 +1,7 @@
 ---
-version: 0.104.0
+version: 0.105.0
 status: solid
-last_modified_utc: 2026-08-08T19:02:00Z
+last_modified_utc: 2026-08-09T17:10:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,25 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.105.0 (2026-08-09): added `/ship <slug>` (§5.9) alongside `/deploy` - operator asked for a
+    one-command way to land a session's work to main, from the control topic without opening the
+    session first, and from inside the session itself. Control-topic `/ship` chains
+    `commitIfDirty` (auto-commits a still-dirty worktree with a fixed, clearly-auto-generated
+    message) -> `deployBranch` (the same merge+gate+rollback `/deploy` already runs) ->
+    `pushCurrentBranch` (pushes whatever's checked out to `origin`, since `deployBranch` alone
+    never leaves the local checkout) -> the same self-repo restart tail `/deploy` uses, extracted
+    into a shared `restartIfSelfRepo` helper so the two commands can't drift apart on that
+    behaviour. Marked destructive in the NL router alongside `/restart`/`/deploy`. The in-session
+    half (`.claude/commands/commit.md`/`push.md`/`ship.md`) is a different mechanism, not the same
+    code path: a session's worktree can't check out the default branch to fast-forward it locally
+    (only one branch per worktree, and the default branch is checked out elsewhere), so its `/ship`
+    runs this project's own gate, commits, pushes, and lands via `gh pr merge` server-side instead.
+    Both still go through the same `permissions.ask` buttons `git commit`/`git push`/`gh pr *`
+    already sit behind (§6.1.1) - fewer manual steps, not a new bypass. 8 new tests
+    (`deploy.test.ts`: `commitIfDirty`/`pushCurrentBranch`; `deploy-lifecycle-commands.test.ts`:
+    `handleShipCommand`'s dirty/clean/gate-failure/push-failure/self-repo-restart paths;
+    `fleet-commands.test.ts`/`command-dispatch.test.ts`: parsing and dispatch), full suite green
+    (1310 total), `tsc --noEmit` clean across all 5 packages."
   - "0.104.0 (2026-08-08): closed the last piece of the reply/feed-ordering saga that 0.103.0's
     live-testing surfaced but deliberately left as a documented trade-off rather than a blind fix -
     operator asked for a recommendation, then approved implementing it. Root cause:
@@ -2073,6 +2092,55 @@ worktree branch, running the gate, restarting) produced the four expected Telegr
 - ack, merge+gate result with real pre/post SHAs, restart notice, post-respawn success - with the
 `deploy-pending.json` crash-loop marker confirmed written before the respawn and cleared after, and
 both pre-existing sessions reconciling cleanly afterward.
+
+**`/ship <slug>`, control-topic only - `/deploy` plus the two steps an operator otherwise had to do
+by hand.** `/deploy` assumes the session already committed and that landing the merge locally is
+enough; in practice an operator wanting to close out a session from the control topic (no desk, no
+need to open the session's own topic first) is usually looking at a still-dirty worktree and a merge
+that then needs to actually reach the remote. `/ship` is that one command:
+
+1. **Auto-commit if dirty.** `commitIfDirty` runs `git status --porcelain` against the session's
+   `worktreePath`; if it's not clean, `git add -A` then a commit with a fixed, clearly-auto-generated
+   message (`chore: auto-commit uncommitted work for /ship`) - never freeform, so "the Bridge
+   committed this for me" is never mistaken for an intentional commit message in `git log`. A clean
+   worktree (the session already committed its own work) is a no-op, not an error.
+2. **Merge + gate**, identical to `/deploy` step 1-2 above, via the same `deployBranch`.
+3. **Push.** `deployBranch` only ever advances `repoPath`'s local checkout - without this the merge
+   never leaves the machine. `pushCurrentBranch` pushes whatever's actually checked out (not a
+   hardcoded `main`/`master` - §7.5 repos can name their default branch either way) to its `origin`
+   remote. Only reached after a successful merge; a push failure here is reported as its own
+   distinct failure rather than rolled back - the merge already happened and stays merged, only "did
+   it reach the remote" is in question.
+4. **Restart, only if self-repo** - the exact same tail `/deploy` runs (`restartIfSelfRepo`, shared
+   between both commands so they can never drift apart on this behaviour).
+
+Marked destructive in the NL router (`isDestructive`) alongside `/restart`/`/deploy`, so a natural-
+language match still gets a confirm card under `/assist` before it runs.
+
+**The in-session half: `/commit`, `/push`, `/ship` as `.claude/commands/*.md`.** `/ship <slug>` above
+is reachable only from the control topic and needs the session to have *stopped* touching the
+worktree first. The complementary gap is landing work from *inside* the session's own topic, in one
+command, without a control-topic round-trip - but a session's worktree can never check out the
+default branch itself to fast-forward it the way `/deploy`/`/ship <slug>` do (only one branch can be
+checked out per worktree, and the default branch is checked out elsewhere), so "land to main" from
+in here goes through GitHub instead: push the branch, then `gh pr merge` server-side. Three commands,
+each independently useful and the latter two reusing the former's steps:
+
+- `/commit` - stage + a real commit message + commit.
+- `/push` - push the branch + `gh pr create` against the default branch if none exists yet.
+- `/ship` - runs this project's own gate first (§9), then commit → push → `gh pr merge`.
+
+All three still go through the same `permissions.ask` buttons `git commit`/`git push`/`gh pr *`
+already sit behind (§6.1.1) - nothing here is a new bypass, just fewer manual steps between "the fix
+is done" and "the button is in front of the operator." The asymmetry with the control-topic `/ship`
+is deliberate, not a bug: the two land to `origin/<default-branch>` via different git plumbing (local
+fast-forward+push vs. a GitHub-side PR merge) because that's the mechanism actually available in
+each execution context; either one leaves any *other* local checkout of the default branch behind
+until it's next pulled.
+
+Implemented 2026-08-09 (`deploy.ts`'s `commitIfDirty`/`pushCurrentBranch`, wired into
+`deploy-lifecycle-commands.ts`'s `handleShipCommand`; unit-tested the same way as `/deploy` via the
+same injectable `CommandRunner`).
 
 ### 5.10 Detail on demand: `/detail` and `/verbose`
 
