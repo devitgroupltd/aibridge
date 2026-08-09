@@ -161,6 +161,12 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         "Bash(bun test *)",
         "Bash(bun run *)",
         "Bash(bun install)",
+        // Safety net for direct `tsc.cmd --noEmit` invocations (`cd <pkg> && ../../node_modules/.bin/tsc.cmd
+        // --noEmit ... | tail -N`) rather than routing through the pre-approved `bun run typecheck` script -
+        // same `&&`/`|` metacharacter combo that already defeats `deriveAlwaysRule`'s guard (see
+        // rule-derivation.ts), so "Always allow this pattern" can never persist a rule for it either.
+        // Read-only against a committed tsconfig, same trust level as the build/test entries above.
+        "Bash(cd * && *tsc.cmd --noEmit *)",
         "Bash(ls *)",
         "Bash(cat *)",
         "Bash(rg *)",

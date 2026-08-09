@@ -77,6 +77,13 @@ describe("generateSettings", () => {
     expect(settings.permissions.allow).toContain("Bash(bun install)");
   });
 
+  // A direct `cd <pkg> && ../../node_modules/.bin/tsc.cmd --noEmit ... | tail -N` invocation carries
+  // both `&&` and `|`, which also defeats `deriveAlwaysRule`'s metacharacter guard - "Always allow
+  // this pattern" can't fix this one, so it needs a baseline rule instead of relying on that button.
+  test("pre-approves a direct cd && tsc.cmd --noEmit invocation", () => {
+    expect(settings.permissions.allow).toContain("Bash(cd * && *tsc.cmd --noEmit *)");
+  });
+
   // §9 scenario 12: path rules use safe anchors and canonical tool names.
   test("every path-shaped rule is home-anchored, // absolute, or a bare gitignore-style name - never a single leading slash", () => {
     const allRules = [...settings.permissions.deny, ...settings.permissions.ask, ...settings.permissions.allow];
