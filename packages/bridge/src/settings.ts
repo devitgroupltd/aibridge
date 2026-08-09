@@ -151,6 +151,16 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         "Bash(dotnet test *)",
         "Bash(npm run *)",
         "Bash(npm ci)",
+        // aibridge's own repo (and any target repo standardised on Bun, per its CLAUDE.md) runs
+        // these dozens of times a session - `bun run *` mirrors the `npm run *` precedent right
+        // above (any package.json script, not just `typecheck` - same breadth tradeoff already
+        // accepted for npm). Added after a live session hit an unnecessary prompt for
+        // `bun run typecheck` (piped through `tail`, which also defeats `deriveAlwaysRule`'s
+        // metacharacter guard - see rule-derivation.ts - so "Always allow this pattern" couldn't
+        // even help there).
+        "Bash(bun test *)",
+        "Bash(bun run *)",
+        "Bash(bun install)",
         "Bash(ls *)",
         "Bash(cat *)",
         "Bash(rg *)",

@@ -66,6 +66,17 @@ describe("generateSettings", () => {
     expect(settings.permissions.allow).toContain("Bash(cat *)");
   });
 
+  // Bun is the runtime this very repo's CLAUDE.md standardises on (`bun test`, `bun run typecheck`),
+  // same trust level as the dotnet/npm build-and-test entries above - all read-only against a
+  // committed lockfile. Missing this meant every session hit an avoidable prompt for a command it
+  // ran dozens of times, and `bun run typecheck ... | tail -60`-style piping also defeats
+  // `deriveAlwaysRule`'s metacharacter guard, so "Always allow this pattern" couldn't fix it either.
+  test("pre-approves bun test/run/install alongside the dotnet and npm build/test entries", () => {
+    expect(settings.permissions.allow).toContain("Bash(bun test *)");
+    expect(settings.permissions.allow).toContain("Bash(bun run *)");
+    expect(settings.permissions.allow).toContain("Bash(bun install)");
+  });
+
   // §9 scenario 12: path rules use safe anchors and canonical tool names.
   test("every path-shaped rule is home-anchored, // absolute, or a bare gitignore-style name - never a single leading slash", () => {
     const allRules = [...settings.permissions.deny, ...settings.permissions.ask, ...settings.permissions.allow];
