@@ -52,6 +52,7 @@ export interface NlDispatch {
     isControl: boolean,
     currentSlug: string | undefined,
     onNoMatch: () => void,
+    onRetryMatch: () => void | Promise<void>,
   ): Promise<void>;
 }
 
@@ -138,6 +139,11 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
       cardSenders.sendDiffCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined);
       return;
     }
+    // Never actually reached - `routeOrFallback` intercepts `kind === "retry"` itself before calling
+    // here (see its own comment) - kept only so this function's `FleetCommand | SessionCommand |
+    // RouterAction` parameter type still narrows the fall-through `dispatchFleetCommand(command, ...)`
+    // call below to `FleetCommand`, which `retry` (a `RouterAction`) isn't.
+    if (command.kind === "retry") return;
     if (command.kind === "model" || command.kind === "mode" || command.kind === "effort") {
       if (!currentSlug || threadId === undefined) return;
       if (command.kind === "model") applyModelSwitch(currentSlug, threadId, command.model);
@@ -176,6 +182,7 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     isControl: boolean,
     currentSlug: string | undefined,
     onNoMatch: () => void,
+    onRetryMatch: () => void | Promise<void>,
   ): Promise<void> {
     if (!nlRouterConfig.enabled) {
       onNoMatch();
@@ -210,6 +217,16 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
 
     if (!result.matched) {
       onNoMatch();
+      return;
+    }
+    // `retry` is a `RouterAction` in name only - it has no card/handler of its own the way
+    // `help`/`browse`/etc. do. `command-dispatch.ts` owns the actual retry mechanics (replying to
+    // the earlier message vs. the topic-keyed `retryStore`), the same ones `isRetryPhrase`'s regex
+    // fast-path already triggers - this just widens what triggers them to any-language natural
+    // phrasing, so it's intercepted here rather than falling into `executeMatchedCommand`'s switch
+    // (which has no branch for it and would silently drop it into `dispatchFleetCommand`).
+    if (result.command.kind === "retry") {
+      await onRetryMatch();
       return;
     }
     // The router's own `prompt` field is an emergent English paraphrase (its classification prompt

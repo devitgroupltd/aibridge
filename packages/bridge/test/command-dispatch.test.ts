@@ -154,17 +154,33 @@ function fakeFeedWiring() {
 function fakeNlDispatch() {
   const postNlConfirmCalls: unknown[][] = [];
   const routeOrFallbackCalls: unknown[][] = [];
-  let onNoMatchResult: "call" | "skip" = "call";
+  let matchMode: "noMatch" | "retry" = "noMatch";
   return {
     postNlConfirm: async (...args: unknown[]) => {
       postNlConfirmCalls.push(args);
     },
-    routeOrFallback: async (text: string, ctx: unknown, threadId: unknown, isControl: unknown, currentSlug: unknown, onNoMatch: () => void) => {
+    routeOrFallback: async (
+      text: string,
+      ctx: unknown,
+      threadId: unknown,
+      isControl: unknown,
+      currentSlug: unknown,
+      onNoMatch: () => void,
+      onRetryMatch: () => void | Promise<void>,
+    ) => {
       routeOrFallbackCalls.push([text, ctx, threadId, isControl, currentSlug]);
-      if (onNoMatchResult === "call") onNoMatch();
+      // "retry" simulates nl-router.ts's `kind='retry'` match (any-language natural phrasing
+      // `isRetryPhrase`'s regex missed) - command-dispatch.ts must wire its own `handleRetry` in as
+      // `onRetryMatch` so this fires the exact same reply-to-retry/retryStore mechanics the regex
+      // fast-path uses, not a silent no-op.
+      if (matchMode === "retry") await onRetryMatch();
+      else onNoMatch();
     },
     setNoMatchBehavior(mode: "call" | "skip") {
-      onNoMatchResult = mode;
+      matchMode = mode === "call" ? "noMatch" : "noMatch";
+    },
+    setRetryMatch() {
+      matchMode = "retry";
     },
     postNlConfirmCalls,
     routeOrFallbackCalls,
@@ -430,6 +446,26 @@ describe("dispatchInboundMessage - non-exact-syntax fallthrough", () => {
       "just chatting",
     );
     expect(s.ptyIo.channel).toEqual([{ slug: "fix-bug", topicId: 5, content: "just chatting", msgId: "1", from: "op" }]);
+  });
+
+  // nl-router.ts's `kind='retry'` (2026-08-09): a natural-language phrase in any language that
+  // `isRetryPhrase`'s exact-match regex misses (e.g. "Retry again as you already could handle such
+  // messages", or a Russian/Azerbaijani equivalent) still reaches the same retry mechanics, just via
+  // the NL router's `onRetryMatch` callback instead of the regex fast-path.
+  test("an AI-matched retry (regex miss) still re-posts the pending retryStore entry via postNlConfirm", async () => {
+    const s = setup();
+    s.retryStore.add({ id: "5", command: { kind: "restart" } as never, threadId: 5, currentSlug: "fix-bug" });
+    s.nlDispatch.setRetryMatch();
+    await s.commandDispatch.dispatchInboundMessage(1, "Retry again as you already could handle such messages", 5, false, undefined, "fix-bug", "op");
+    expect(s.nlDispatch.postNlConfirmCalls.length).toBe(1);
+    expect(s.confirmSessionCommand.calls).toEqual([]);
+  });
+
+  test("an AI-matched retry (regex miss) on a reply re-runs the replied-to message's own text", async () => {
+    const s = setup();
+    s.nlDispatch.setRetryMatch();
+    await s.commandDispatch.dispatchInboundMessage(1, "Retry again as you already could handle such messages", 1, true, undefined, undefined, "op", undefined, "/new seowrite fix the bug");
+    expect(s.sessionLifecycle.calls.map((c) => c.fn)).toEqual(["handleNewCommand"]);
   });
 
   test("no exact-syntax rule matches and there's no session: falls back to NL routing with hasSession false", async () => {

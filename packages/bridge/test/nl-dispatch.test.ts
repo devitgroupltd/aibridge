@@ -158,6 +158,20 @@ describe("createNlDispatch", () => {
       ]);
     });
 
+    // In real dispatch this branch is dead code - `routeOrFallback` intercepts `kind === "retry"`
+    // itself and never calls `executeMatchedCommand` with it (see the "retry" describe block below).
+    // Still worth a direct test: it's the only thing stopping a future `RouterAction` addition from
+    // silently falling into `dispatchFleetCommand(command, ...)` with a shape that isn't a real
+    // `FleetCommand`.
+    test("retry is a silent no-op, not a fall-through to dispatchFleetCommand", async () => {
+      const { nlDispatch, dispatchFleetCommandCalls, cardSenders } = await setup();
+
+      nlDispatch.executeMatchedCommand({ kind: "retry" } as never, 1, true, undefined);
+
+      expect(dispatchFleetCommandCalls).toEqual([]);
+      expect(cardSenders.calls).toEqual([]);
+    });
+
     test("builtin writes the raw command straight into the session's PTY", async () => {
       const { nlDispatch, ptyIoCalls } = await setup();
 
@@ -234,9 +248,17 @@ describe("createNlDispatch", () => {
       const { nlDispatch, typingIndicator } = await setup({ nlRouterConfig: { enabled: false, apiKey: undefined, model: "m" } });
       let noMatchCalled = false;
 
-      await nlDispatch.routeOrFallback("hello", { isControl: true, hasSession: false }, 1, true, undefined, () => {
-        noMatchCalled = true;
-      });
+      await nlDispatch.routeOrFallback(
+        "hello",
+        { isControl: true, hasSession: false },
+        1,
+        true,
+        undefined,
+        () => {
+          noMatchCalled = true;
+        },
+        () => {},
+      );
 
       expect(noMatchCalled).toBe(true);
       expect(typingIndicator.started).toEqual([]);
@@ -247,9 +269,17 @@ describe("createNlDispatch", () => {
       const { nlDispatch, typingIndicator } = await setup({ routeText });
       let noMatchCount = 0;
 
-      await nlDispatch.routeOrFallback("gibberish", { isControl: true, hasSession: true }, 5, true, "fix-bug", () => {
-        noMatchCount += 1;
-      });
+      await nlDispatch.routeOrFallback(
+        "gibberish",
+        { isControl: true, hasSession: true },
+        5,
+        true,
+        "fix-bug",
+        () => {
+          noMatchCount += 1;
+        },
+        () => {},
+      );
 
       expect(noMatchCount).toBe(1);
       expect(typingIndicator.started).toEqual(["5"]);
@@ -261,7 +291,7 @@ describe("createNlDispatch", () => {
       const routeText = async () => ({ matched: true as const, command, destructive: false });
       const { nlDispatch, cardSenders, controlBot } = await setup({ routeText });
 
-      await nlDispatch.routeOrFallback("tell me about this", { isControl: true, hasSession: false }, 1, true, undefined, () => {});
+      await nlDispatch.routeOrFallback("tell me about this", { isControl: true, hasSession: false }, 1, true, undefined, () => {}, () => {});
 
       expect(cardSenders.calls.map((c) => c.fn)).toEqual(["sendAboutCard"]);
       expect(controlBot.sent).toEqual([]); // no confirm card posted
@@ -272,7 +302,7 @@ describe("createNlDispatch", () => {
       const routeText = async () => ({ matched: true as const, command, destructive: true });
       const { nlDispatch, cardSenders, controlBot, dispatchFleetCommandCalls } = await setup({ routeText });
 
-      await nlDispatch.routeOrFallback("kill everything", { isControl: true, hasSession: false }, 1, true, undefined, () => {});
+      await nlDispatch.routeOrFallback("kill everything", { isControl: true, hasSession: false }, 1, true, undefined, () => {}, () => {});
 
       expect(controlBot.sent[0]?.text).toContain("/kill --all");
       expect(cardSenders.calls).toEqual([]);
@@ -285,7 +315,7 @@ describe("createNlDispatch", () => {
       const { nlDispatch, controlBot, dispatchFleetCommandCalls, setAssistEnabled } = await setup({ routeText });
       setAssistEnabled(false);
 
-      await nlDispatch.routeOrFallback("restart the bridge", { isControl: true, hasSession: false }, 1, true, undefined, () => {});
+      await nlDispatch.routeOrFallback("restart the bridge", { isControl: true, hasSession: false }, 1, true, undefined, () => {}, () => {});
 
       expect(controlBot.sent).toEqual([]); // no confirm card
       expect(dispatchFleetCommandCalls).toEqual([[command, 1, true, undefined]]);
@@ -295,7 +325,7 @@ describe("createNlDispatch", () => {
       const routeText = async () => ({ matched: false as const });
       const { nlDispatch, thinkingPlaceholder, typingIndicator } = await setup({ routeText });
 
-      await nlDispatch.routeOrFallback("hi", { isControl: false, hasSession: true }, 5, false, "fix-bug", () => {});
+      await nlDispatch.routeOrFallback("hi", { isControl: false, hasSession: true }, 5, false, "fix-bug", () => {}, () => {});
 
       expect(thinkingPlaceholder.started).toEqual([]);
       expect(typingIndicator.started).toEqual(["5"]);
@@ -305,10 +335,64 @@ describe("createNlDispatch", () => {
       const routeText = async () => ({ matched: false as const });
       const { nlDispatch, thinkingPlaceholder, controlBot } = await setup({ routeText });
 
-      await nlDispatch.routeOrFallback("hi", { isControl: true, hasSession: false }, 5, true, undefined, () => {});
+      await nlDispatch.routeOrFallback("hi", { isControl: true, hasSession: false }, 5, true, undefined, () => {}, () => {});
 
       expect(thinkingPlaceholder.started).toEqual(["5"]);
       expect(controlBot.deleted).toEqual([77]);
+    });
+
+    // nl-router.ts's `kind='retry'` (added 2026-08-09, any-language natural phrasing that
+    // `isRetryPhrase`'s exact-match regex was never going to catch) - `onRetryMatch` must fire
+    // instead of `onNoMatch`, and `executeMatchedCommand`'s own machinery (card senders, confirm
+    // cards, dispatchFleetCommand) must never run for it.
+    describe("a matched 'retry' kind", () => {
+      test("calls onRetryMatch instead of onNoMatch, without touching executeMatchedCommand's machinery", async () => {
+        const routeText = async () => ({ matched: true as const, command: { kind: "retry" } as never, destructive: false });
+        const { nlDispatch, cardSenders, controlBot, dispatchFleetCommandCalls } = await setup({ routeText });
+        let noMatchCalled = false;
+        let retryMatchCalled = false;
+
+        await nlDispatch.routeOrFallback(
+          "retry again as you already could handle such messages",
+          { isControl: true, hasSession: false },
+          1,
+          true,
+          undefined,
+          () => {
+            noMatchCalled = true;
+          },
+          () => {
+            retryMatchCalled = true;
+          },
+        );
+
+        expect(retryMatchCalled).toBe(true);
+        expect(noMatchCalled).toBe(false);
+        expect(cardSenders.calls).toEqual([]);
+        expect(controlBot.sent).toEqual([]);
+        expect(dispatchFleetCommandCalls).toEqual([]);
+      });
+
+      test("awaits an async onRetryMatch before returning", async () => {
+        const routeText = async () => ({ matched: true as const, command: { kind: "retry" } as never, destructive: false });
+        const { nlDispatch } = await setup({ routeText });
+        let settled = false;
+
+        await nlDispatch.routeOrFallback(
+          "повтори",
+          { isControl: false, hasSession: true },
+          5,
+          false,
+          "fix-bug",
+          () => {},
+          async () => {
+            await Promise.resolve();
+            settled = true;
+          },
+        );
+
+        expect(settled).toBe(true);
+      });
     });
   });
 });

@@ -44,8 +44,16 @@ export type RouterContext = {
  * reason - completeness, not because any one of them was separately reported broken. `browse`/`find`
  * were added 2026-08-06 for the same reason again (a voice note - "give me a file package.json" -
  * fell through to "Unrecognised control-topic command" with no `/browse`/`/find` intent to catch it,
- * since browse-nav.ts's own parsers only ever recognised literal `/browse`/`/find` syntax). None are
- * ever destructive. */
+ * since browse-nav.ts's own parsers only ever recognised literal `/browse`/`/find` syntax). `retry`
+ * was added 2026-08-09: `retry-store.ts`'s `isRetryPhrase` only ever matched an exact, anchored
+ * "retry"/"try again"/"do it again" - live-observed the same day, a reply reading "Retry again as you
+ * already could handle such messages" (real intent, extra words) fell straight through to
+ * "Unrecognised control-topic command" with no AI fallback at all, and the same gap applies to any
+ * non-English phrasing (Russian, Azerbaijani, ...) the regex was never going to catch either. Handled
+ * here rather than as a fifth alternative in `RETRY_PHRASE` because natural language, in any
+ * language, is exactly what this classifier - not a regex - exists for; `command-dispatch.ts` still
+ * owns the actual retry mechanics (replying-to-the-earlier-message vs. the topic-keyed `retryStore`),
+ * this just widens what triggers them. None of `RouterAction`'s kinds are ever destructive. */
 export type RouterAction =
   | { kind: "help" }
   | { kind: "about" }
@@ -54,7 +62,8 @@ export type RouterAction =
   | { kind: "builtin"; name: "compact" | "clear" }
   | { kind: "browse"; path: string }
   | { kind: "find"; query: string }
-  | { kind: "diff" };
+  | { kind: "diff" }
+  | { kind: "retry" };
 
 export type RouterResult = { matched: false } | { matched: true; command: FleetCommand | SessionCommand | RouterAction; destructive: boolean };
 
@@ -131,6 +140,7 @@ export const ROUTER_KINDS = [
   "browse",
   "find",
   "diff",
+  "retry",
   "forward",
 ] as const;
 type RouterKind = (typeof ROUTER_KINDS)[number];
@@ -254,6 +264,13 @@ const SYSTEM_INSTRUCTIONS_BASE =
   "kill/remove the session itself - is kind='stop' (with 'slug' if named); this is a short, non-" +
   "destructive interrupt that leaves the session alive, so a brief one-word message ('stop', 'cancel " +
   "that') is enough on its own, same as 'restart' above. " +
+  "A message whose main, clear point is asking to retry, redo, repeat, or re-run the previous action " +
+  "or command - in any language, not just English, and whether it's a bare word or a full sentence " +
+  "built around that same request (e.g. 'retry', 'try again', 'повтори', 'ещё раз', 'yenidən cəhd et', " +
+  "or 'retry again as you already could handle such messages') - is kind='retry'. Only use it when " +
+  "that's genuinely the message's point, not merely because it contains the word 'again' in passing " +
+  "or is otherwise addressed to the coding assistant as a new instruction - those still go to " +
+  "kind='forward'. " +
   "If it's ambiguous, conversational, or addressed to a coding assistant rather than the fleet itself, " +
   "respond with kind='forward' - the caution against guessing a destructive command (kill/rm/restart/" +
   "deploy/repos-rm) means don't infer one from a joke or unrelated chatter, not that an unambiguous " +
@@ -419,6 +436,8 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
         return raw.query ? { kind: "find", query: raw.query } : null;
       case "diff":
         return { kind: "diff" };
+      case "retry":
+        return { kind: "retry" };
       case "session_model":
         return isModel(raw.model) ? { kind: "model", model: raw.model } : null;
       case "session_mode":

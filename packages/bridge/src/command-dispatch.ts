@@ -471,7 +471,13 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     // Bounded, not recursive-forever: the recursive call below passes no `replyToText` of its own
     // (Telegram's `reply_to_message` doesn't nest), so even a chain of "retry" replies falls to the
     // `retryStore` branch on the second hop rather than recursing indefinitely.
-    if (isRetryPhrase(text)) {
+    //
+    // Pulled into its own function (2026-08-09) so the NL router's `kind='retry'` match (nl-router.ts,
+    // any-language natural phrasing like "Retry again as you already could handle such messages" or a
+    // Russian/Azerbaijani equivalent - `isRetryPhrase`'s regex is intentionally exact-match-only and
+    // was never going to catch either) can trigger the exact same mechanics as the regex fast-path
+    // below, not a second copy of it.
+    async function handleRetry(): Promise<void> {
       if (replyToText) {
         // No `contextPrefix` here (code-review finding): the outer message's own `contextPrefix`
         // was built from *its* `reply_to_message` - which is exactly `replyToText` - so passing it
@@ -486,6 +492,10 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
         return;
       }
       fireAndForget(nlDispatch.postNlConfirm(pendingRetry.command, pendingRetry.threadId, pendingRetry.currentSlug), log, "command-dispatch postNlConfirm(retry)");
+    }
+
+    if (isRetryPhrase(text)) {
+      await handleRetry();
       return;
     }
 
@@ -514,9 +524,17 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
       // Natural-language routing (nl-router.ts) - only reached once every exact-syntax rule above
       // has already rejected this text. `hasSession: false` narrows the offered commands to the
       // control-topic-only subset (`/new`/`/budget`); on no match, today's exact behaviour.
-      await nlDispatch.routeOrFallback(text, { isControl, hasSession: false, repoNames: getReposRegistry()?.names() }, threadId, isControl, undefined, () => {
-        if (isControl) confirmSessionCommand(threadId, "Unrecognised control-topic command. Try /new, /ls or /help.");
-      });
+      await nlDispatch.routeOrFallback(
+        text,
+        { isControl, hasSession: false, repoNames: getReposRegistry()?.names() },
+        threadId,
+        isControl,
+        undefined,
+        () => {
+          if (isControl) confirmSessionCommand(threadId, "Unrecognised control-topic command. Try /new, /ls or /help.");
+        },
+        handleRetry,
+      );
       return;
     }
 
@@ -562,13 +580,21 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     // Natural-language routing again - this time with a real session to either act on
     // (`hasSession: true`, so `/model`/`/mode`/`/effort` are also offered) or forward to on no
     // match, exactly as §10.1.2's note below always did.
-    await nlDispatch.routeOrFallback(text, { isControl, hasSession: true, repoNames: getReposRegistry()?.names() }, threadId, isControl, currentSlug, () => {
-      // §10.1.2: notifications/claude/channel is confirmed broken upstream (getClientCapabilities()
-      // never negotiates the capability), so inbound delivery writes the same <channel> tag
-      // Claude Code would have rendered itself directly to the session's PTY, exactly as an
-      // operator typing it and pressing Enter would.
-      ptyIo.sendChannelText(currentSlug, threadId, contextPrefix + rawText, String(messageId), from);
-    });
+    await nlDispatch.routeOrFallback(
+      text,
+      { isControl, hasSession: true, repoNames: getReposRegistry()?.names() },
+      threadId,
+      isControl,
+      currentSlug,
+      () => {
+        // §10.1.2: notifications/claude/channel is confirmed broken upstream (getClientCapabilities()
+        // never negotiates the capability), so inbound delivery writes the same <channel> tag
+        // Claude Code would have rendered itself directly to the session's PTY, exactly as an
+        // operator typing it and pressing Enter would.
+        ptyIo.sendChannelText(currentSlug, threadId, contextPrefix + rawText, String(messageId), from);
+      },
+      handleRetry,
+    );
   }
 
   return { dispatchFleetCommand, dispatchInboundMessage };

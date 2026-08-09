@@ -363,6 +363,15 @@ describe("mapRouterOutput - one case per kind", () => {
     expect(mapRouterOutput({ kind: "forward" }, SESSION)).toEqual({ matched: false });
   });
 
+  // 2026-08-09: `isRetryPhrase`'s exact-match regex (retry-store.ts) only ever caught a bare
+  // "retry"/"try again"/"do it again" - a full sentence built around the same request, in English or
+  // any other language, needs the classifier instead. Never gated by hasSession/isControl: a retry
+  // can be asked for from the control topic or from inside a session's own topic alike.
+  test("retry: matches in both control and session contexts, never destructive", () => {
+    expect(mapRouterOutput({ kind: "retry" }, CONTROL)).toEqual({ matched: true, command: { kind: "retry" }, destructive: false });
+    expect(mapRouterOutput({ kind: "retry" }, SESSION)).toEqual({ matched: true, command: { kind: "retry" }, destructive: false });
+  });
+
   test("an unrecognised or missing kind is a no-match, not a throw", () => {
     expect(() => mapRouterOutput({}, CONTROL)).not.toThrow();
     expect(mapRouterOutput({}, CONTROL)).toEqual({ matched: false });
