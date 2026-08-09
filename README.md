@@ -112,7 +112,7 @@ Things that go wrong and what to do about them, without touching code:
 - **After a restart, a session looks dead but its worktree/topic still exist.** This is what startup
   reconciliation is for - every non-`dead` row is resumed via `claude --resume` automatically on Bridge
   boot (§4.5), live-verified across real restarts. Give it a few seconds, then check `/ls`. If it's
-  still wrong, `/rm --dead` clears rows reconciliation itself gave up on, without touching live ones.
+  still wrong, `/remove --dead` clears rows reconciliation itself gave up on, without touching live ones.
 - **A `claude.exe` process is running but doesn't show up in `/ls`.** Startup reconciliation's orphan
   scan flags exactly this to the control topic for manual review - it is never auto-killed, because
   deciding to kill an unrecognized live process is the operator's call, not a heuristic's (§4.5).

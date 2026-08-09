@@ -66,6 +66,7 @@ describe("ROUTER_KINDS completeness", () => {
     effort: "session_effort",
     compact: "builtin",
     clear: "builtin",
+    remove: "rm",
   };
 
   /** `/retry` (retry-store.ts) is one deliberate exception: `isRetryPhrase` intercepts it (and its

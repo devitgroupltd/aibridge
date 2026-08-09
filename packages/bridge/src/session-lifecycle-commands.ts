@@ -106,7 +106,7 @@ export interface SessionLifecycleCommands {
  * (as happened live: two such orphans had accumulated with nothing pointing at them). Naming
  * `/rm` explicitly rather than just describing the fix, since that's the exact recovery step
  * (§4.5.2's `rm-topic` confirm below, keyed off the orphaned topic's own thread id). */
-export const ORPHAN_TOPIC_NOTE = " (Telegram topic itself could not be deleted - send /rm inside it directly to clean it up)";
+export const ORPHAN_TOPIC_NOTE = " (Telegram topic itself could not be deleted - send /remove inside it directly to clean it up)";
 
 /** Extracted out of `handleNewCommand` so the pendingAttachment-after-launch logic (note text, log
  * line, `sourceText` override) is independently testable - `handleNewCommand` itself can't be, past
@@ -340,7 +340,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       await clearThinkingPlaceholder();
       confirmSessionCommand(
         controlTopicId,
-        `Refused: the fleet is already at ${capCheck.current}/${WEIGHTED_CAP} weighted units - adding a ${model} session would bring it to ${capCheck.wouldBe}. Kill or /rm a session first.${attachmentLostNote}`,
+        `Refused: the fleet is already at ${capCheck.current}/${WEIGHTED_CAP} weighted units - adding a ${model} session would bring it to ${capCheck.wouldBe}. Kill or /remove a session first.${attachmentLostNote}`,
       );
       return;
     }
@@ -517,7 +517,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     const row = resolveSessionOrBail(cmd.slug, currentSlug, topicId);
     if (!row) return;
     await killSessionRow(row);
-    confirmSessionCommand(topicId, `Killed "${row.slug}". Worktree left in place - \`/rm ${row.slug}\` to remove it.`);
+    confirmSessionCommand(topicId, `Killed "${row.slug}". Worktree left in place - \`/remove ${row.slug}\` to remove it.`);
   }
 
   async function handleRmCommand(cmd: Extract<FleetCommand, { kind: "rm" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {

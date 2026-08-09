@@ -198,6 +198,15 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/pause fix-bug")).toEqual({ kind: "pause", slug: "fix-bug" });
   });
 
+  test("/remove is an alias for /rm, including its bulk forms", () => {
+    expect(parseFleetCommand("/remove fix-bug")).toEqual({ kind: "rm", slug: "fix-bug" });
+    expect(parseFleetCommand("/remove")).toEqual({ kind: "rm", slug: undefined });
+    expect(parseFleetCommand("/remove --dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
+    expect(parseFleetCommand("/remove --prefix say-hello")).toEqual({ kind: "rm", bulk: { mode: "prefix", prefix: "say-hello" } });
+    expect(parseFleetCommand("/remove --all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
+    expect(parseFleetCommand("/remove --all --force")).toEqual({ kind: "rm", bulk: { mode: "all" }, force: true });
+  });
+
   test("/usage with and without a slug", () => {
     expect(parseFleetCommand("/usage fix-bug")).toEqual({ kind: "usage", slug: "fix-bug" });
     expect(parseFleetCommand("/usage")).toEqual({ kind: "usage", slug: undefined });

@@ -215,16 +215,19 @@ function parseKill(rest: string): FleetCommand {
   return { kind: "kill", slug: trimmed.length > 0 ? trimmed : undefined };
 }
 
-/** `/rm --dead` removes every `dead`-state row; `/rm --prefix <text>` removes every `dead`-state
- * row whose slug starts with `<text>` (still `dead`-only, for the same reason `--dead` is - see
- * `RmBulkFilter`'s own note); `/rm --all` requests fleet-confirm-gated removal of every session
- * regardless of state. Anything else falls through to the ordinary single-slug form.
+/** `/remove --dead` removes every `dead`-state row; `/remove --prefix <text>` removes every
+ * `dead`-state row whose slug starts with `<text>` (still `dead`-only, for the same reason
+ * `--dead` is - see `RmBulkFilter`'s own note); `/remove --all` requests fleet-confirm-gated
+ * removal of every session regardless of state. Anything else falls through to the ordinary
+ * single-slug form. `/rm` is kept as a bare alias for the whole command (renamed 2026-08-09 -
+ * "remove" reads more naturally, but the short form was already muscle memory).
  *
  * `--force` is `parseKill`'s same escape hatch, scoped the same way: only meaningful alongside
- * `--all`, since that's the only `/rm` form that posts a confirm card - `--dead`/`--prefix` already
- * execute immediately (never touch a live session, so there was never anything to confirm), and a
- * bare `/rm <slug>` does too. A stray `--force` on any of those is harmlessly stripped rather than
- * rejected, same tolerance the dash-normalisation above already extends to typos. */
+ * `--all`, since that's the only `/remove` form that posts a confirm card - `--dead`/`--prefix`
+ * already execute immediately (never touch a live session, so there was never anything to
+ * confirm), and a bare `/remove <slug>` does too. A stray `--force` on any of those is harmlessly
+ * stripped rather than rejected, same tolerance the dash-normalisation above already extends to
+ * typos. */
 function parseRm(rest: string): FleetCommand {
   const tokens = rest.trim().split(/\s+/).filter((t) => t.length > 0);
   const force = tokens.includes("--force");
@@ -433,7 +436,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
 
 /** Shared between `parseFleetCommand` and `matchFleetCommandName` below - the list of command
  * *names* this module recognises, independent of whether the rest of the message parses. */
-const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|rm|attach|pause|stop|usage|budget|restart|deploy|ship|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b/;
+const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|rm|remove|attach|pause|stop|usage|budget|restart|deploy|ship|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b/;
 
 /**
  * Same command-name match as `parseFleetCommand`, but returns the bare word even when the rest of
@@ -506,6 +509,7 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return { kind: "voice", model: model.length > 0 ? model : undefined };
     }
     case "rm":
+    case "remove":
       return parseRm(rest);
     case "kill":
       return parseKill(rest);
@@ -725,9 +729,9 @@ export function renderHelp(): string {
     "    its inbox)",
     "  /ls - list sessions, with what's running/waiting on each",
     "  /kill [<slug>|--all [--force]] - stop a session (or all, confirm-gated unless --force)",
-    "  /rm [<slug>|--dead|--prefix <text>|--all [--force]] - remove a dead session row (--all is",
-    "    confirm-gated unless --force)",
-    "  /rm (bare, inside a topic with no tracked session) - offers to delete that orphaned Telegram topic itself, confirm-gated",
+    "  /remove [<slug>|--dead|--prefix <text>|--all [--force]] - remove a dead session row (--all is",
+    "    confirm-gated unless --force; /rm is an alias)",
+    "  /remove (bare, inside a topic with no tracked session) - offers to delete that orphaned Telegram topic itself, confirm-gated",
     "  /attach [<slug>] - show a session's PTY tail",
     "  /pause [<slug>] - pause a session",
     "  /usage [<slug>] - token/cost usage",
@@ -751,7 +755,7 @@ export function renderHelp(): string {
     "  /voice [<model>] - show/switch the Whisper model used for voice-note transcription",
     "  /voiceconfirm [on|off] - whether a transcribed voice note shows a Send/Re-record/Type-instead",
     "    card first before it's dispatched (default on)",
-    "  /assist [on|off] - whether a natural-language-matched destructive command (kill/rm/",
+    "  /assist [on|off] - whether a natural-language-matched destructive command (kill/remove/",
     "    restart/deploy/ship/repos rm) shows a confirm card first (default on)",
     "  /router [api|cli] - natural-language routing backend: 'cli' uses your Claude Code",
     "    subscription (slower, no extra cost), 'api' uses a funded ANTHROPIC_API_KEY (faster, real",
@@ -809,7 +813,8 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "new", description: "Start a new session: /new [--model] <repo> <prompt> (or a captioned attachment here)" },
     { command: "ls", description: "List sessions, with what's running/waiting on each" },
     { command: "kill", description: "Stop a session: /kill [<slug>|--all [--force]]" },
-    { command: "rm", description: "Remove a dead session row: /rm [<slug>|--dead|--prefix <text>|--all [--force]]" },
+    { command: "remove", description: "Remove a dead session row: /remove [<slug>|--dead|--prefix <text>|--all [--force]] (/rm is an alias)" },
+    { command: "rm", description: "Alias for /remove" },
     { command: "attach", description: "Show a session's PTY tail" },
     { command: "stop", description: "Interrupt the current turn (Escape) - session stays alive: /stop [<slug>]" },
     { command: "pause", description: "Pause a session" },

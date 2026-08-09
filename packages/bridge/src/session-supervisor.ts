@@ -323,7 +323,7 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
       log("ERROR", `session "${slug}" exited immediately ${attempts} times in a row - marking it dead instead of resuming again`);
       confirmSessionCommand(
         topicId,
-        `⚠️ Session "${slug}" exited immediately ${attempts} times in a row (last code ${exitCode}) - giving up on automatic resume. Worktree preserved at ${row.worktreePath}; /rm to clear it.`,
+        `⚠️ Session "${slug}" exited immediately ${attempts} times in a row (last code ${exitCode}) - giving up on automatic resume. Worktree preserved at ${row.worktreePath}; /remove to clear it.`,
       );
       return;
     }

@@ -192,8 +192,8 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
     confirmSessionCommand(
       topicId,
       assistEnabled
-        ? "Natural-language destructive-command confirmation is now on - kill/rm/restart/deploy/ship/repos-rm matched from plain text or voice will ask first."
-        : "Natural-language destructive-command confirmation is now off - kill/rm/restart/deploy/ship/repos-rm matched from plain text or voice will run immediately.",
+        ? "Natural-language destructive-command confirmation is now on - kill/remove/restart/deploy/ship/repos-rm matched from plain text or voice will ask first."
+        : "Natural-language destructive-command confirmation is now off - kill/remove/restart/deploy/ship/repos-rm matched from plain text or voice will run immediately.",
     );
   }
 

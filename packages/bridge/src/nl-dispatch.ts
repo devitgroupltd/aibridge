@@ -85,10 +85,10 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
       case "kill":
         return command.all ? "/kill --all" : `/kill${command.slug ? ` ${command.slug}` : ""}`;
       case "rm":
-        if (command.bulk?.mode === "all") return "/rm --all";
-        if (command.bulk?.mode === "dead") return "/rm --dead";
-        if (command.bulk?.mode === "prefix") return `/rm --prefix ${command.bulk.prefix}`;
-        return `/rm${command.slug ? ` ${command.slug}` : ""}`;
+        if (command.bulk?.mode === "all") return "/remove --all";
+        if (command.bulk?.mode === "dead") return "/remove --dead";
+        if (command.bulk?.mode === "prefix") return `/remove --prefix ${command.bulk.prefix}`;
+        return `/remove${command.slug ? ` ${command.slug}` : ""}`;
       case "restart":
         return "/restart";
       case "deploy":
