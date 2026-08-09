@@ -489,6 +489,56 @@ describe("startPipeServer", () => {
       expect(sent).toEqual([{ text: "hi" }]);
     });
 
+    test("a reply that scrubs down to empty still consumes and deletes the pending placeholder", async () => {
+      // 2026-08-09, live-observed as a "Thinking..." bubble that only disappeared several messages
+      // later than expected: the old code `return`ed on an empty-after-scrub reply *before* ever
+      // reaching the consume/delete call below it, so the placeholder from that turn sat there,
+      // unrelated to anything currently running, until some later reply happened to consume it.
+      const path = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const sent: Array<{ text: string }> = [];
+      const deleted: number[] = [];
+      const warnings: string[] = [];
+      const controlBot: SendMessageSource = {
+        sendMessage: async (_chatId, _threadId, text) => {
+          sent.push({ text });
+          return { message_id: 1 };
+        },
+        deleteMessage: async (_chatId, messageId) => {
+          deleted.push(messageId);
+        },
+      };
+      const thinkingPlaceholder = createThinkingPlaceholder({ send: async () => 55 });
+      thinkingPlaceholder.start("3");
+
+      const handle = startPipeServer({
+        pipePath: path,
+        routing,
+        controlBot,
+        chatId: "-1",
+        thinkingPlaceholder,
+        log: (level, message) => {
+          if (level === "WARN") warnings.push(message);
+        },
+      });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket } = connectClient(path);
+      await waitFor(() => socket.readyState === "open");
+      // Whitespace-only scrubs down to nothing via `splitForTelegram` - nothing to send, but the
+      // placeholder must still clear.
+      socket.write(
+        encodeMessage({ v: PROTOCOL_VERSION, type: "reply", slug: "test-session", topic_id: "3", text: "   " } satisfies ReplyMessage),
+      );
+
+      await waitFor(() => deleted.length >= 1);
+      expect(deleted).toEqual([55]);
+      expect(sent).toEqual([]);
+      expect(warnings.some((w) => w.includes("empty after scrubbing"))).toBe(true);
+    });
+
     test("a deleteMessage failure is logged but never blocks or fails the reply", async () => {
       const path = pipePath();
       const routing = new Routing();

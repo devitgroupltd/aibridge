@@ -286,16 +286,28 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       // governor cannot retry its way out of - and since the placeholder is consumed either way,
       // the failure used to leave a permanent "🤔 Thinking..." and no answer at all in the topic.
       const chunks = splitForTelegram(text);
-      if (chunks.length === 0) {
-        log("WARN", `reply for slug "${msg.slug}" was empty after scrubbing - nothing to send`);
-        return;
-      }
       // Both of these are keyed by topic too, and both must use the *routed* topic rather than the
       // claimed one. `consume` pops a placeholder by topic, and a claimed-but-wrong topic would
       // otherwise have written this session's reply into another session's topic, leaving that
       // session's turn permanently unfinished. `onReplySent` drives §4.4's rename-once, so the same
       // mismatch would have retitled the wrong topic and consumed its one rename.
       const routedTopic = String(topicId);
+      if (chunks.length === 0) {
+        // 2026-08-09 (live-observed as a "Thinking..." bubble that only disappeared 2-4 messages
+        // later than expected): this used to `return` here *before* the consume/delete below ever
+        // ran, so a reply that scrubbed down to nothing left the placeholder dangling - it then sat
+        // there, unrelated to any turn actually in flight, until whatever *later* reply happened to
+        // land finally consumed it. A turn that resolves to "nothing to say" still resolves - the
+        // placeholder has to clear here too, not just on the path that sends real text.
+        log("WARN", `reply for slug "${msg.slug}" was empty after scrubbing - nothing to send`);
+        const placeholderId = await opts.thinkingPlaceholder?.consume(routedTopic);
+        if (placeholderId !== undefined && opts.controlBot.deleteMessage) {
+          await opts.controlBot.deleteMessage(opts.chatId, placeholderId).catch((err) =>
+            log("WARN", `failed to delete the thinking placeholder for slug "${msg.slug}": ${(err as Error).message}`),
+          );
+        }
+        return;
+      }
       const placeholderId = await opts.thinkingPlaceholder?.consume(routedTopic);
       // 0.104.0: this used to *edit* the placeholder into the reply's own text instead of sending a
       // new message - which meant the reply's visible position in the topic was permanently pinned
