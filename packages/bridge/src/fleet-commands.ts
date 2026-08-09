@@ -431,14 +431,30 @@ export function parseSkillsQuery(text: string): { term: string } | null {
   return { term: (match[1] ?? "").trim() };
 }
 
+/** Shared between `parseFleetCommand` and `matchFleetCommandName` below - the list of command
+ * *names* this module recognises, independent of whether the rest of the message parses. */
+const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|rm|attach|pause|stop|usage|budget|restart|deploy|ship|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b/;
+
+/**
+ * Same command-name match as `parseFleetCommand`, but returns the bare word even when the rest of
+ * the message doesn't parse (missing/malformed required argument, e.g. `/new` with no repo, `/deploy`
+ * with no slug, `/repos add` with no name). Lets `command-dispatch.ts` tell "not a fleet command at
+ * all" (fall through to NL routing/forwarding as plain chat) apart from "recognised command, invalid
+ * argument" (surface help/usage instead) - operator-reported: a mistyped `/new` or `/deploy` was
+ * otherwise silently swallowed into the NL router or forwarded into the session as literal chat text.
+ */
+export function matchFleetCommandName(text: string): string | null {
+  const match = text.trim().match(FLEET_COMMAND_NAME_RE);
+  return match ? match[1]! : null;
+}
+
 /** Returns null for anything that isn't one of these commands. A recognised command with a
  * malformed argument (e.g. `/new` with no repo) also returns null - same "not for us" vs.
- * "for us, but invalid" split as `session-commands.ts`'s parser. */
+ * "for us, but invalid" split as `session-commands.ts`'s parser; `matchFleetCommandName` above is
+ * how a caller distinguishes the two. */
 export function parseFleetCommand(text: string): FleetCommand | null {
   const trimmed = text.trim();
-  const match = trimmed.match(
-    /^\/(new|ls|kill|rm|attach|pause|stop|usage|budget|restart|deploy|ship|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b(.*)$/s,
-  );
+  const match = trimmed.match(new RegExp(FLEET_COMMAND_NAME_RE.source + "(.*)$", "s"));
   if (!match) return null;
   const [, cmd, rawRest] = match as [string, string, string];
   const rest = normalizeDashFlags(rawRest);

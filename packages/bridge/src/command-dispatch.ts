@@ -12,7 +12,7 @@ import { parseBrowseCommand, parseDiffCommand, parseFindCommand } from "./browse
 import { fireAndForget } from "./fire-and-forget.ts";
 import { isRetryPhrase, retryTopicKey, type RetryStore } from "./retry-store.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
-import { isHelpCommand, parseCommandsQuery, parseFleetCommand, parseSkillsQuery, stripBotMention } from "./fleet-commands.ts";
+import { isHelpCommand, matchFleetCommandName, parseCommandsQuery, parseFleetCommand, parseSkillsQuery, stripBotMention } from "./fleet-commands.ts";
 import {
   buildEffortKeyboard,
   buildModeKeyboard,
@@ -458,6 +458,17 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     const fleetCmd = parseFleetCommand(text);
     if (fleetCmd) {
       dispatchFleetCommand(fleetCmd, threadId, isControl, currentSlug);
+      return;
+    }
+
+    // A recognised fleet-command name (`/new`, `/deploy`, `/repos`, ...) whose argument didn't
+    // parse (missing/malformed required arg) - `parseFleetCommand` returns null for this exact same
+    // as for "not a fleet command at all", so without this check the message falls through to NL
+    // routing or (inside a session topic) gets forwarded to Claude as literal chat text. Surface the
+    // help card (usage + command list) instead, same idea as `sessionCommandAttemptRejected` below
+    // does for a malformed `/model`/`/mode`/`/effort`.
+    if (matchFleetCommandName(text)) {
+      cardSenders.sendHelpCard(threadId, route);
       return;
     }
 

@@ -1558,9 +1558,12 @@ queued or silently dropped, which is the one case the table above does not cover
 ### 4.4 Naming
 
 Topics are created immediately at `/new` with a provisional title derived from the prompt (first 5
-words, truncated to Telegram's 128-char topic-name cap). When the session first calls `reply`, the
-Bridge issues `editForumTopic` once to upgrade the name. Renaming is capped at one per session to avoid
-burning rate-limit budget on cosmetics.
+words, truncated to Telegram's 128-char topic-name cap). That title is never changed automatically
+afterwards - the rename-once-on-first-reply upgrade this section originally specified was removed
+2026-08-09 at operator request: a topic name, once set, should only change when the operator renames
+it themselves (Telegram's own topic-settings UI), never from reply content. `sessionStore`'s `renamed`
+column and `setRenamed` are unused leftovers from that mechanism, kept rather than migrated out for a
+now-dead flag.
 
 **Retired (0.74.0): the second trigger this section originally also named** - "or when a `SessionStart`
 hook reports a `sessionTitle`" - rested on a premise checked directly against Claude Code's own hooks

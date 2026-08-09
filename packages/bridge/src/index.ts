@@ -36,7 +36,6 @@ import { Routing } from "./routing.ts";
 import { DEFAULT_EFFORT, DEFAULT_MODE, EFFORTS, MODES } from "./session-commands.ts";
 import type { Effort, Mode, SessionCommand } from "./session-commands.ts";
 import { SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
-import { looksEnglishEnough } from "./language-heuristic.ts";
 import { startPolling, TelegramClient, validateTokens } from "./telegram.ts";
 import type { InlineKeyboardMarkup } from "./telegram.ts";
 import { loadOffset, saveOffset } from "./telegram-offset.ts";
@@ -519,23 +518,15 @@ async function main(): Promise<void> {
     // (via `onFlush` below, now itself promise-returning) is a promise `pipe-server.ts` actually
     // awaits (bounded by its own timeout), not just a fire-and-forget head start.
     onBeforeReply: (slug) => feedWiring.resetCoalescer(slug),
-    onReplySent: (topicId, text) => {
+    onReplySent: (topicId) => {
       typingIndicator.stop(topicId);
-      // §4.4's rename-once: the first real reply upgrades the topic off its provisional
-      // `/new`-prompt title, capped so a later reply never renames it again.
-      const row = sessionStore.getByTopicId(Number(topicId));
-      if (row && !row.renamed) {
-        sessionStore.setRenamed(row.slug); // marked regardless - a one-shot decision, not a retry loop
-        // The reply may now be in the operator's own language (the language-mirroring system
-        // prompt), but the topic title is meant to stay a stable English label like the
-        // slug/worktree/branch already do - so a reply that isn't English enough leaves the topic
-        // on its original /new-derived (English) title instead of flipping it to another script.
-        if (looksEnglishEnough(text)) {
-          controlBot
-            .editForumTopic(config.supergroupChatId, Number(topicId), text.slice(0, 128) || row.slug)
-            .catch((err: unknown) => log("WARN", `editForumTopic (rename-once) failed for "${row.slug}": ${(err as Error).message}`));
-        }
-      }
+      // §4.4's rename-once (auto-upgrading the topic off its provisional `/new`-prompt title using
+      // the session's first real reply text) was removed 2026-08-09 at operator request: a topic
+      // name, once set - whether the provisional `/new`-derived one or a manual rename via
+      // Telegram's own topic-settings UI - should only ever change when the operator renames it
+      // themselves, never automatically from reply content. `sessionStore`'s `renamed` column/
+      // `setRenamed` are left in place (schema churn for a now-unused flag isn't worth it) but are
+      // no longer written from here.
     },
     onHookEvent: feedWiring.handleHookEvent,
     onAwaitingInput: (slug) => feedWiring.maybeSetState(slug, "awaiting_input"),
