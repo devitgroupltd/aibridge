@@ -66,7 +66,13 @@ v020_touched_sections:
 >   "try again" re-runs that earlier message's own text through today's dispatch logic, taking
 >   priority over `retry-store.ts`'s narrower topic-keyed expired-confirmation stash. See
 >   `command-dispatch.ts`'s `isRetryPhrase` branch and `inbound-media.ts`'s `reply_to_message`
->   threading.
+>   threading. Extended once more (2026-08-09): the first cut only threaded the replied-to
+>   message's *text/caption* through - retrying a captioned photo/document silently dropped the
+>   attachment itself, leaving Claude with only the caption on the second attempt.
+>   `inbound-media.ts`'s `attachmentFromReplyTarget` now detects when the reply target carried
+>   media and re-downloads/re-announces it via `handleAttachmentMessage`, same as a live attachment
+>   message would; `TelegramReplyTarget` (`telegram.ts`) was extended with the same media fields
+>   `TelegramMessage` already carries so this has something to read.
 >
 
 ## Overview

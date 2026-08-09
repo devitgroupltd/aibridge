@@ -161,6 +161,62 @@ describe("createInboundMedia", () => {
 
         expect(dispatched[0]?.replyToText).toBeUndefined();
       });
+
+      // Reply-to-retry over an attachment: replying "retry" to a message that carried a photo/
+      // document/video/audio/video-note must re-download and re-announce the attachment itself, not
+      // just forward its caption as bare text - otherwise Claude sees only the caption on retry and
+      // silently loses whatever the operator actually wanted analyzed.
+      test("retry replying to a photo message re-downloads and re-announces the attachment, not just the caption", async () => {
+        const { inboundMedia, routing, dispatched } = await setup();
+        routing.add(ROUTE);
+
+        inboundMedia.routeInboundMessage(
+          message({
+            message_thread_id: 5,
+            text: "retry",
+            reply_to_message: { message_id: 1, caption: "check this bug", photo: [{ file_id: "p1", width: 10, height: 10 }] },
+          }),
+        );
+        await waitFor(() => dispatched.length >= 1);
+
+        expect(dispatched.length).toBe(1);
+        expect(dispatched[0]?.rawText).toContain("operator sent an image");
+        expect(dispatched[0]?.rawText).toContain("check this bug");
+        // This went through handleAttachmentMessage's own dispatch, not the plain-text replyToText
+        // fallback - replyToText stays unset on this call.
+        expect(dispatched[0]?.replyToText).toBeUndefined();
+      });
+
+      test("try again replying to a document in the control topic re-runs the caption-triggered /new", async () => {
+        const { inboundMedia, createdFromAttachment } = await setup();
+
+        inboundMedia.routeInboundMessage(
+          message({
+            message_thread_id: 1,
+            text: "try again",
+            reply_to_message: { message_id: 1, caption: "/new demo-repo add a README", document: { file_id: "d1", file_name: "spec.pdf" } },
+          }),
+        );
+        await waitFor(() => createdFromAttachment.length >= 1);
+
+        expect(createdFromAttachment.length).toBe(1);
+      });
+
+      test("a non-retry reply to a photo message is left as plain-text reply-to-retry threading, not attachment retry", async () => {
+        const { inboundMedia, routing, dispatched } = await setup();
+        routing.add(ROUTE);
+
+        inboundMedia.routeInboundMessage(
+          message({
+            message_thread_id: 5,
+            text: "looks good",
+            reply_to_message: { message_id: 1, caption: "check this bug", photo: [{ file_id: "p1", width: 10, height: 10 }] },
+          }),
+        );
+        await Promise.resolve();
+
+        expect(dispatched).toEqual([{ messageId: 1, rawText: "looks good", threadId: 5, replyToText: "check this bug" }]);
+      });
     });
 
     test.each([

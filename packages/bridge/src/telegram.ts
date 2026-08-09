@@ -17,6 +17,16 @@ export interface TelegramReplyTarget {
   message_id: number;
   text?: string;
   caption?: string;
+  /** Same media fields as the top-level `TelegramMessage` below - Telegram includes them verbatim
+   * on `reply_to_message` too. Carried through so reply-to-retry (inbound-media.ts) can re-run an
+   * attachment message, not just its caption, when the operator replies "retry" to a photo/document/
+   * video/audio/video-note rather than to a plain-text message - without these, that reply silently
+   * dropped the actual file/image and forwarded only the bare caption text. */
+  photo?: Array<{ file_id: string; file_size?: number; width: number; height: number }>;
+  document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  video?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  audio?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  video_note?: { file_id: string; file_size?: number };
 }
 
 export interface TelegramMessage {

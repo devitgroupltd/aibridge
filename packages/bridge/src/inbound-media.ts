@@ -8,11 +8,12 @@ import { randomUUID } from "node:crypto";
 import { routeText as realRouteText } from "./nl-router.ts";
 import type { RateGovernor } from "./rate-governor.ts";
 import type { ReposRegistry } from "./repos-registry.ts";
+import { isRetryPhrase } from "./retry-store.ts";
 import type { Routing, SessionRoute } from "./routing.ts";
 import type { SessionStore } from "./session-store.ts";
 import { buildStaleConfirmKeyboard, type StaleConfirmRegistry } from "./stale-confirm.ts";
 import { formatStaleAge, hasAttachment, isStaleInbound } from "./stale-inbound.ts";
-import type { SendMessageSource, TelegramMessage } from "./telegram.ts";
+import type { SendMessageSource, TelegramMessage, TelegramReplyTarget } from "./telegram.ts";
 import { buildVoiceConfirmKeyboard, type VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { transcribeVoiceNote } from "./voice-transcribe.ts";
 
@@ -386,6 +387,38 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     }
   }
 
+  /** Reply-to-retry's own media-kind sniffing, against a `reply_to_message` rather than the
+   * top-level message - mirrors the mutually-exclusive photo/document/video/audio/video-note checks
+   * `routeInboundMessage` below runs against a live message. Returns `null` when the replied-to
+   * message carried no attachment at all (plain text/caption - handled separately by the
+   * `replyToText` path). */
+  function attachmentFromReplyTarget(target: TelegramReplyTarget): {
+    kind: AttachmentKind;
+    fileId: string;
+    fileSize: number | undefined;
+    fileName: string | undefined;
+    mimeType: string | undefined;
+    caption: string | undefined;
+  } | null {
+    if (target.photo && target.photo.length > 0) {
+      const largest = target.photo[target.photo.length - 1]!;
+      return { kind: "image", fileId: largest.file_id, fileSize: largest.file_size, fileName: undefined, mimeType: undefined, caption: target.caption };
+    }
+    if (target.document) {
+      return { kind: "document", fileId: target.document.file_id, fileSize: target.document.file_size, fileName: target.document.file_name, mimeType: target.document.mime_type, caption: target.caption };
+    }
+    if (target.video) {
+      return { kind: "video", fileId: target.video.file_id, fileSize: target.video.file_size, fileName: target.video.file_name, mimeType: target.video.mime_type, caption: target.caption };
+    }
+    if (target.audio) {
+      return { kind: "audio", fileId: target.audio.file_id, fileSize: target.audio.file_size, fileName: target.audio.file_name, mimeType: target.audio.mime_type, caption: target.caption };
+    }
+    if (target.video_note) {
+      return { kind: "video note", fileId: target.video_note.file_id, fileSize: target.video_note.file_size, fileName: undefined, mimeType: undefined, caption: target.caption };
+    }
+    return null;
+  }
+
   function routeInboundMessage(message: TelegramMessage): void {
     if (String(message.chat.id) !== supergroupChatId) return;
 
@@ -505,6 +538,39 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     }
 
     if (!message.text) return;
+
+    // Reply-to-retry over an attachment: replying "retry"/"try again" to a message that itself
+    // carried a photo/document/video/audio/video-note must re-run the *attachment* path - a fresh
+    // download plus the original caption - not just forward the caption as plain text through
+    // `replyToText` below. Without this, "retry" on a captioned screenshot silently dropped the
+    // image and Claude only ever saw the caption on the second attempt. Checked ahead of the
+    // plain-text case since the two are mutually exclusive on the replied-to message (Telegram
+    // allows at most one kind of content per message) - `attachmentFromReplyTarget` returns `null`
+    // for a plain-text/caption-only reply target, falling through to the text case below unchanged.
+    if (isRetryPhrase(message.text) && message.reply_to_message) {
+      const attachment = attachmentFromReplyTarget(message.reply_to_message);
+      if (attachment) {
+        fireAndForget(
+          handleAttachmentMessage(
+            attachment.kind,
+            attachment.fileId,
+            attachment.fileSize,
+            attachment.fileName,
+            attachment.mimeType,
+            threadId,
+            route,
+            isControl,
+            message.message_id,
+            attachment.caption,
+            from,
+            message,
+          ),
+          log,
+          `inbound-media handleAttachmentMessage(reply-to-retry ${attachment.kind})`,
+        );
+        return;
+      }
+    }
 
     // Reply-to-retry: Telegram's own `reply_to_message` already carries the replied-to message's
     // text/caption verbatim (no Bridge-side cache needed) - passed through so command-dispatch.ts's
