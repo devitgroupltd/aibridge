@@ -208,7 +208,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
       return;
     }
     if (fleetCmd.kind === "ship") {
-      fireAndForget(deployLifecycle.handleShipCommand(threadId, fleetCmd.slug), log, "command-dispatch handleShipCommand");
+      fireAndForget(deployLifecycle.handleShipCommand(threadId, fleetCmd.slug, currentSlug), log, "command-dispatch handleShipCommand");
       return;
     }
     if (fleetCmd.kind === "detail") {

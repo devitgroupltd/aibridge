@@ -164,20 +164,63 @@ describe("createDeployLifecycleCommands", () => {
   });
 
   describe("handleShipCommand", () => {
-    test("outside the control topic, refuses without touching the session store", async () => {
+    test("an explicit slug outside the control topic refuses without touching the session store", async () => {
       const { deployLifecycle, confirmed } = await setup();
 
-      await deployLifecycle.handleShipCommand(5, "fix-bug");
+      await deployLifecycle.handleShipCommand(5, "fix-bug", undefined);
 
-      expect(confirmed[0]?.text).toContain("only works from the control topic");
+      expect(confirmed[0]?.text).toContain("needs a slug from the control topic");
+    });
+
+    test("bare, with no current session and outside the control topic, reports usage", async () => {
+      const { deployLifecycle, confirmed } = await setup();
+
+      await deployLifecycle.handleShipCommand(5, undefined, undefined);
+
+      expect(confirmed[0]?.text).toContain("needs a slug from the control topic");
+    });
+
+    test("bare, with no current session but from the control topic, reports usage", async () => {
+      const { deployLifecycle, confirmed } = await setup();
+
+      await deployLifecycle.handleShipCommand(undefined, undefined, undefined);
+
+      expect(confirmed[0]?.text).toContain("usage: /ship <slug>");
     });
 
     test("an unknown slug reports it's missing", async () => {
       const { deployLifecycle, confirmed } = await setup();
 
-      await deployLifecycle.handleShipCommand(undefined, "no-such-session");
+      await deployLifecycle.handleShipCommand(undefined, "no-such-session", undefined);
 
       expect(confirmed[0]?.text).toContain('No session "no-such-session"');
+    });
+
+    test("bare, from inside that session's own topic, targets it without needing the control topic", async () => {
+      const okOutcome: DeployOutcome = { ok: true, rolledBack: false, message: "merged cleanly", previousHeadSha: "aaa", newHeadSha: "bbb" };
+      const { deployLifecycle, sessionStore, controlBot } = await setup({
+        deployBranch: async () => okOutcome,
+        commitIfDirty: async () => ({ committed: false, message: "clean" }),
+        pushCurrentBranch: async () => ({ status: 0, stdout: "", stderr: "" }),
+      });
+      sessionStore.insert(row({ repoPath: "c:\\some-other-project\\repo" }));
+
+      // topicId 5 is that session's own topic (not the control topic per this fake's isControlTopic),
+      // no explicit slug - resolved from currentSlug, exactly like /kill's own bare-in-topic form.
+      await deployLifecycle.handleShipCommand(5, undefined, "fix-bug");
+
+      expect(controlBot.sent.some((m) => m.text.includes("merged cleanly"))).toBe(true);
+    });
+
+    test("an explicit slug naming a different session, sent from inside a session's own topic, still refuses", async () => {
+      const { deployLifecycle, confirmed, sessionStore } = await setup();
+      sessionStore.insert(row({ slug: "other-session" }));
+
+      // topicId 5 is *this* session's own topic; naming a different slug isn't "targeting own
+      // session" - only the control topic can direct /ship at a session other than the one you're in.
+      await deployLifecycle.handleShipCommand(5, "other-session", "fix-bug");
+
+      expect(confirmed[0]?.text).toContain("needs a slug from the control topic");
     });
 
     test("commits a dirty worktree before merging, then pushes on success", async () => {
@@ -197,7 +240,7 @@ describe("createDeployLifecycleCommands", () => {
       });
       sessionStore.insert(row({ repoPath: "c:\\some-other-project\\repo", worktreePath: "c:\\wt\\fix-bug" }));
 
-      await deployLifecycle.handleShipCommand(undefined, "fix-bug");
+      await deployLifecycle.handleShipCommand(undefined, "fix-bug", undefined);
 
       expect(commitCalls).toEqual(["c:\\wt\\fix-bug"]);
       expect(pushCalls).toEqual(["c:\\some-other-project\\repo"]);
@@ -219,7 +262,7 @@ describe("createDeployLifecycleCommands", () => {
       });
       sessionStore.insert(row({ repoPath: "c:\\some-other-project\\repo" }));
 
-      await deployLifecycle.handleShipCommand(undefined, "fix-bug");
+      await deployLifecycle.handleShipCommand(undefined, "fix-bug", undefined);
 
       expect(commitCalls).toHaveLength(1);
     });
@@ -237,7 +280,7 @@ describe("createDeployLifecycleCommands", () => {
       });
       sessionStore.insert(row());
 
-      await deployLifecycle.handleShipCommand(undefined, "fix-bug");
+      await deployLifecycle.handleShipCommand(undefined, "fix-bug", undefined);
 
       expect(controlBot.sent.some((m) => m.text.includes("typecheck failed"))).toBe(true);
       expect(pushCalls).toEqual([]);
@@ -253,7 +296,7 @@ describe("createDeployLifecycleCommands", () => {
       });
       sessionStore.insert(row({ repoPath: "c:\\some-other-project\\repo" }));
 
-      await deployLifecycle.handleShipCommand(undefined, "fix-bug");
+      await deployLifecycle.handleShipCommand(undefined, "fix-bug", undefined);
 
       expect(controlBot.sent.some((m) => m.text.includes("merged cleanly"))).toBe(true);
       expect(controlBot.sent.some((m) => m.text.includes("push to origin failed"))).toBe(true);
@@ -268,7 +311,7 @@ describe("createDeployLifecycleCommands", () => {
       });
       sessionStore.insert(row({ repoPath: "c:\\bridge-repo" }));
 
-      await deployLifecycle.handleShipCommand(undefined, "fix-bug");
+      await deployLifecycle.handleShipCommand(undefined, "fix-bug", undefined);
 
       expect(controlBot.sent.some((m) => m.text.includes("restarting now"))).toBe(true);
       expect(respawnCalls).toEqual([1]);

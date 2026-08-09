@@ -1,7 +1,7 @@
 ---
-version: 0.105.0
+version: 0.106.0
 status: solid
-last_modified_utc: 2026-08-09T17:10:00Z
+last_modified_utc: 2026-08-09T19:10:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,23 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.106.0 (2026-08-09): made `/ship`'s `<slug>` optional (§5.9), matching `/kill`/`/rm`/`/pause`/
+    `/usage`'s existing bare-inside-a-session's-own-topic convention instead of `/deploy`'s
+    control-topic-only restriction - live use the same day found that a bare `/ship` typed inside a
+    session's own topic didn't match `parseFleetCommand` at all (missing slug -> `null`), so it fell
+    through and was forwarded to that session's own Claude process as ordinary chat text; if that
+    session's worktree predated the in-session `ship.md` custom command too, Claude went searching
+    the repo for what \"/ship\" might mean instead of anything happening - a confusing Bash-permission
+    prompt with nothing behind it. Now a bare `/ship` resolves against the topic's own `currentSlug`
+    and runs the exact same control-topic logic (still trusted Bridge code via `CommandRunner`, never
+    through that session's own `permissions.ask` gate - there is no Telegram button for this path at
+    all). An *explicit* slug naming a different session still requires the control topic either way;
+    only a bare invocation resolving to the session already in view skips that check.
+    `handleShipCommand` now takes `(topicId, explicitSlug, currentSlug)` instead of a required
+    `slug`; `parseFleetCommand(\"/ship\")` now returns `{kind:\"ship\", slug: undefined}` rather than
+    `null`. 4 new tests (bare-in-own-topic succeeds, bare-outside-any-topic-context reports usage,
+    explicit-slug-from-a-different-topic still refuses, existing explicit-slug/control-topic paths
+    unchanged), full suite green (1314 total), `tsc --noEmit` clean across all 5 packages."
   - "0.105.0 (2026-08-09): added `/ship <slug>` (§5.9) alongside `/deploy` - operator asked for a
     one-command way to land a session's work to main, from the control topic without opening the
     session first, and from inside the session itself. Control-topic `/ship` chains
@@ -2093,11 +2110,10 @@ worktree branch, running the gate, restarting) produced the four expected Telegr
 `deploy-pending.json` crash-loop marker confirmed written before the respawn and cleared after, and
 both pre-existing sessions reconciling cleanly afterward.
 
-**`/ship <slug>`, control-topic only - `/deploy` plus the two steps an operator otherwise had to do
-by hand.** `/deploy` assumes the session already committed and that landing the merge locally is
-enough; in practice an operator wanting to close out a session from the control topic (no desk, no
-need to open the session's own topic first) is usually looking at a still-dirty worktree and a merge
-that then needs to actually reach the remote. `/ship` is that one command:
+**`/ship [<slug>]` - `/deploy` plus the two steps an operator otherwise had to do by hand.**
+`/deploy` assumes the session already committed and that landing the merge locally is enough; in
+practice an operator wanting to close out a session is usually looking at a still-dirty worktree and
+a merge that then needs to actually reach the remote. `/ship` is that one command:
 
 1. **Auto-commit if dirty.** `commitIfDirty` runs `git status --porcelain` against the session's
    `worktreePath`; if it's not clean, `git add -A` then a commit with a fixed, clearly-auto-generated
@@ -2117,14 +2133,32 @@ that then needs to actually reach the remote. `/ship` is that one command:
 Marked destructive in the NL router (`isDestructive`) alongside `/restart`/`/deploy`, so a natural-
 language match still gets a confirm card under `/assist` before it runs.
 
-**The in-session half: `/commit`, `/push`, `/ship` as `.claude/commands/*.md`.** `/ship <slug>` above
-is reachable only from the control topic and needs the session to have *stopped* touching the
-worktree first. The complementary gap is landing work from *inside* the session's own topic, in one
-command, without a control-topic round-trip - but a session's worktree can never check out the
-default branch itself to fast-forward it the way `/deploy`/`/ship <slug>` do (only one branch can be
-checked out per worktree, and the default branch is checked out elsewhere), so "land to main" from
-in here goes through GitHub instead: push the branch, then `gh pr merge` server-side. Three commands,
-each independently useful and the latter two reusing the former's steps:
+**Unlike `/deploy`, `/ship` takes its `<slug>` optionally - the §4.2 `/kill`/`/rm`/`/pause`/`/usage`
+convention, not `/deploy`'s control-topic-only restriction.** Sent bare from inside a session's own
+topic, it resolves against that topic's own `currentSlug` and runs exactly the same four steps above
+- still entirely as trusted Bridge code via a direct `CommandRunner`, never through that session's own
+Claude process or its `permissions.ask` gate, so there is no Telegram permission button to tap at all
+for this path (a real `git commit`/`git push` invoked *by the session itself* still goes through that
+gate as always - `/ship` bypasses nothing there, it simply never asks the session to run those
+commands in the first place). This closed a real, observed failure mode (2026-08-09 live use): typing
+bare `/ship` inside a session's own topic *before* this existed didn't match `parseFleetCommand` at
+all (a missing slug returned `null`), so it fell through and was forwarded to the session's own Claude
+process as ordinary chat text - which, if that session's worktree predated this feature and had no
+`ship.md` custom command either, led Claude to go searching the repo for what "/ship" might mean
+rather than anything happening. An *explicit* slug naming a session other than the one you're
+currently in still requires the control topic either way - only a bare invocation resolving to the
+session already in view skips that check, since that's exactly as deliberate an operator action as
+typing the slug from the control topic, just aimed at the session already on screen.
+
+**The in-session half: `/commit`, `/push`, `/ship` as `.claude/commands/*.md`.** The command above
+runs as Bridge code and can land a session without ever opening it - but it needs the session to have
+*stopped* touching the worktree first. The complementary gap is landing work from *inside* the
+session's own topic, in one command, while the session is still the one doing the work - but a
+session's worktree can never check out the default branch itself to fast-forward it the way the
+Bridge-level `/ship` does (only one branch can be checked out per worktree, and the default branch is
+checked out elsewhere), so "land to main" from in here goes through GitHub instead: push the branch,
+then `gh pr merge` server-side. Three commands, each independently useful and the latter two reusing
+the former's steps:
 
 - `/commit` - stage + a real commit message + commit.
 - `/push` - push the branch + `gh pr create` against the default branch if none exists yet.

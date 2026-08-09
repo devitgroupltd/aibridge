@@ -289,10 +289,10 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/deploy   ")).toBeNull();
   });
 
-  test("/ship requires a slug", () => {
+  test("/ship takes an optional slug - bare resolves later against currentSlug, not left to fall through as chat text", () => {
     expect(parseFleetCommand("/ship fix-the-thing")).toEqual({ kind: "ship", slug: "fix-the-thing" });
-    expect(parseFleetCommand("/ship")).toBeNull();
-    expect(parseFleetCommand("/ship   ")).toBeNull();
+    expect(parseFleetCommand("/ship")).toEqual({ kind: "ship", slug: undefined });
+    expect(parseFleetCommand("/ship   ")).toEqual({ kind: "ship", slug: undefined });
   });
 
   test("/detail bare reports (no slug, no level)", () => {

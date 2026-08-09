@@ -25,9 +25,13 @@ export interface PendingAttachment {
 
 /**
  * §4.2's fleet-scoped commands. `/new`/`/ls`/`/budget` are control-topic only (no target to act on
- * besides the fleet itself); `/kill`/`/rm`/`/attach`/`/pause`/`/usage` take an optional `<slug>` so
- * they can be sent from the control topic *or* bare from inside the session's own topic (§4.2:
- * "`/kill` with no argument inside a session topic kills that session").
+ * besides the fleet itself); `/kill`/`/rm`/`/attach`/`/pause`/`/usage`/`/ship` take an optional
+ * `<slug>` so they can be sent from the control topic *or* bare from inside the session's own topic
+ * (§4.2: "`/kill` with no argument inside a session topic kills that session"). `/deploy` stays the
+ * one exception requiring an explicit `<slug>` from the control topic only (§5.9) - `/ship` runs the
+ * identical merge+gate, so a bare invocation is exactly as deliberate an action from inside that
+ * session's own topic, but an *explicit* slug naming a different session still needs the control
+ * topic either way (`deploy-lifecycle-commands.ts`'s `handleShipCommand`).
  */
 /**
  * `/rm`'s bulk forms (added 2026-08-04, live testing produced dozens of `dead` rows within a
@@ -52,7 +56,7 @@ export type FleetCommand =
   | { kind: "budget" }
   | { kind: "restart" }
   | { kind: "deploy"; slug: string }
-  | { kind: "ship"; slug: string }
+  | { kind: "ship"; slug?: string }
   | { kind: "detail"; slug?: string; level?: "compact" | "full" }
   | { kind: "verbose"; slug?: string; on?: boolean }
   | { kind: "settings" }
@@ -452,8 +456,14 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return slug.length > 0 ? { kind: "deploy", slug } : null;
     }
     case "ship": {
+      // Unlike `/deploy`, a bare slug is allowed here - resolved against `currentSlug` (the
+      // dispatch layer, per §4.2's existing convention for `/kill`/`/rm`/`/pause`/`/usage`) when
+      // sent from inside a session's own topic, so "ship" typed there is never left to fall through
+      // as plain chat text to the session's own Claude process (which - lacking any real command by
+      // that name if the worktree predates this feature - would otherwise go off trying to guess
+      // what "/ship" meant, rather than the Bridge just running it).
       const slug = rest.trim();
-      return slug.length > 0 ? { kind: "ship", slug } : null;
+      return { kind: "ship", slug: slug.length > 0 ? slug : undefined };
     }
     case "detail":
       return parseDetail(rest);
@@ -711,8 +721,9 @@ export function renderHelp(): string {
     "    Bridge), confirm-gated with a 60s window to /os cancel",
     "  /deploy <slug> - merge that session's branch into its repo, run tests, and (if the repo is",
     "    aibridge's own) restart the Bridge to pick up the fix (§5.9)",
-    "  /ship <slug> - one-shot land to main: auto-commits uncommitted work in that session's",
-    "    worktree, does /deploy's merge+gate, then pushes origin",
+    "  /ship [<slug>] - one-shot land to main: auto-commits uncommitted work in that session's",
+    "    worktree, does /deploy's merge+gate, then pushes origin (bare, from inside that session's",
+    "    own topic, targets that session - no permission buttons, this runs as trusted Bridge code)",
 
     "  /detail [<slug>] [compact|full] - how much of each tool call the feed card shows (default",
     "    compact); bare from inside a session's own topic, or with <slug> from the control topic",
@@ -791,7 +802,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "restart", description: "Restart the Bridge daemon" },
     { command: "os", description: "Shut down or reboot the HOST MACHINE (not just the Bridge): /os shutdown|reboot|cancel - confirm-gated" },
     { command: "deploy", description: "Merge a session's branch and run tests: /deploy <slug> (restarts if it's aibridge's own repo)" },
-    { command: "ship", description: "One-shot land to main: /ship <slug> - auto-commits uncommitted work, /deploy's merge+gate, then pushes origin main" },
+    { command: "ship", description: "One-shot land to main: /ship [<slug>] - auto-commits uncommitted work, /deploy's merge+gate, then pushes origin (bare, inside a session's own topic, targets that session)" },
     { command: "detail", description: "Feed card detail level: /detail [<slug>] [compact|full]" },
     { command: "verbose", description: "Show real tool output on the feed card: /verbose [<slug>] [on|off]" },
     { command: "settings", description: "Registered repos + concurrency budget" },

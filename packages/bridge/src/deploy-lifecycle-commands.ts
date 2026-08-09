@@ -113,7 +113,7 @@ export interface DeployLifecycleCommandsOptions {
 export interface DeployLifecycleCommands {
   handleRestartCommand(topicId: number | undefined): Promise<void>;
   handleDeployCommand(topicId: number | undefined, slug: string): Promise<void>;
-  handleShipCommand(topicId: number | undefined, slug: string): Promise<void>;
+  handleShipCommand(topicId: number | undefined, explicitSlug: string | undefined, currentSlug: string | undefined): Promise<void>;
   handleAutostartCommand(cmd: Extract<FleetCommand, { kind: "autostart" }>, topicId: number | undefined): Promise<void>;
 }
 
@@ -234,19 +234,35 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
   }
 
   /**
-   * `/ship <slug>`: the one-shot "land it, I'm done" command askable from the General/control
-   * topic without opening the session first. Three steps chained together, each already its own
-   * tested piece: auto-commit the session's worktree if it's dirty (`commitIfDirty` - a session may
-   * still have uncommitted work sitting there), then exactly what `/deploy` does (merge+gate,
-   * rolled back automatically on failure, self-repo restart), then - only on a successful merge -
-   * `git push origin <branch>` from `repoPath` so the fast-forward actually reaches the remote
-   * instead of staying local to this machine's checkout (`deployBranch` alone never pushes).
-   * A push failure is reported on its own: the merge already happened and stays merged either way,
-   * only "did it reach origin" is in question at that point.
+   * `/ship <slug>` (control topic) or bare `/ship` (a session's own topic, §4.2's existing
+   * `/kill`/`/rm`/`/pause`/`/usage` convention): the one-shot "land it, I'm done" command, reachable
+   * without opening a control-topic round-trip *or* going through the session's own Claude process
+   * at all - this runs as trusted Bridge code via a direct `CommandRunner`, the same way `/deploy`
+   * always has, so it never touches (and never needs a Telegram button from) the session's own
+   * `permissions.ask` gate the way an equivalent in-session `git commit`/`git push` would. An
+   * explicit slug naming a *different* session still requires the control topic - only a bare
+   * invocation resolving to *this* topic's own session skips that check, since typing "ship" while
+   * sitting inside session X's own topic is exactly as deliberate an operator action as typing
+   * "/ship X" from the control topic, just aimed at the one session already in view.
+   *
+   * Three steps chained together, each already its own tested piece: auto-commit the session's
+   * worktree if it's dirty (`commitIfDirty` - a session may still have uncommitted work sitting
+   * there), then exactly what `/deploy` does (merge+gate, rolled back automatically on failure,
+   * self-repo restart), then - only on a successful merge - `git push origin <branch>` from
+   * `repoPath` so the fast-forward actually reaches the remote instead of staying local to this
+   * machine's checkout (`deployBranch` alone never pushes). A push failure is reported on its own:
+   * the merge already happened and stays merged either way, only "did it reach origin" is in
+   * question at that point.
    */
-  async function handleShipCommand(topicId: number | undefined, slug: string): Promise<void> {
-    if (!isControlTopic(topicId)) {
-      confirmSessionCommand(topicId, "/ship only works from the control topic.");
+  async function handleShipCommand(topicId: number | undefined, explicitSlug: string | undefined, currentSlug: string | undefined): Promise<void> {
+    const targetingOwnSession = !explicitSlug && currentSlug !== undefined;
+    if (!isControlTopic(topicId) && !targetingOwnSession) {
+      confirmSessionCommand(topicId, "/ship needs a slug from the control topic, or send it bare from inside that session's own topic.");
+      return;
+    }
+    const slug = explicitSlug ?? currentSlug;
+    if (!slug) {
+      confirmSessionCommand(topicId, "usage: /ship <slug> (or send it bare from inside that session's own topic)");
       return;
     }
     const row = sessionStore.get(slug);
