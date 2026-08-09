@@ -78,6 +78,7 @@ export interface CommandDispatch {
     currentSlug: string | undefined,
     from: string,
     contextPrefix?: string,
+    replyToText?: string,
   ): Promise<void>;
 }
 
@@ -436,6 +437,10 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     // at the one "this reaches the session" send below - never mixed into `text`/`rawText` itself,
     // which every `/command` parse in this function still needs byte-identical to what was typed.
     contextPrefix = "",
+    // Reply-to-retry (attachment-triggered-session-creation-plan.md's follow-up): the text/caption
+    // of the message this one replies to, if any - see the `isRetryPhrase` branch below and
+    // inbound-media.ts's `routeInboundMessage` for where this comes from.
+    replyToText?: string,
   ): Promise<void> {
     // Strip a Telegram-inserted "@botusername" before any command parsing below - see
     // stripBotMention's doc comment for why this has to happen exactly once, here.
@@ -456,7 +461,25 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     // holds something for this topic - so a plain "retry"/"try again" meant for Claude, in a topic
     // with nothing pending, still falls through to the session untouched instead of being swallowed
     // on the strength of the phrase alone.
+    //
+    // Reply-to-retry (added as a follow-up, same phrase gate): replying to an *earlier* message with
+    // "retry"/"try again" re-runs that earlier message's own text through this same function, fresh
+    // - a general "reprocess this under today's logic" rather than `retryStore`'s narrower "replay
+    // the one thing that just expired in this topic." `replyToText` takes priority when present:
+    // it's a strictly more specific request (the operator picked *which* message to retry) than the
+    // topic-keyed stash, which only ever holds the single most recent expired confirm card anyway.
+    // Bounded, not recursive-forever: the recursive call below passes no `replyToText` of its own
+    // (Telegram's `reply_to_message` doesn't nest), so even a chain of "retry" replies falls to the
+    // `retryStore` branch on the second hop rather than recursing indefinitely.
     if (isRetryPhrase(text)) {
+      if (replyToText) {
+        // No `contextPrefix` here (code-review finding): the outer message's own `contextPrefix`
+        // was built from *its* `reply_to_message` - which is exactly `replyToText` - so passing it
+        // through would prefix the re-run text with a quote of that same text, sent right in front
+        // of itself if this falls through to the plain-passthrough branch below.
+        await dispatchInboundMessage(messageId, replyToText, threadId, isControl, route, currentSlug, from);
+        return;
+      }
       const pendingRetry = retryStore.resolve(retryTopicKey(threadId));
       if (!pendingRetry) {
         confirmSessionCommand(threadId, "Nothing to retry - no expired confirmation is waiting here.");

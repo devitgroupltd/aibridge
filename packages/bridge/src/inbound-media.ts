@@ -5,7 +5,9 @@ import type { FleetCommand } from "./fleet-commands.ts";
 import { isKnownCommandText, parseFleetCommand } from "./fleet-commands.ts";
 import { buildContextPrefix, type MessageOrigin } from "./message-context.ts";
 import { randomUUID } from "node:crypto";
+import { routeText as realRouteText } from "./nl-router.ts";
 import type { RateGovernor } from "./rate-governor.ts";
+import type { ReposRegistry } from "./repos-registry.ts";
 import type { Routing, SessionRoute } from "./routing.ts";
 import type { SessionStore } from "./session-store.ts";
 import { buildStaleConfirmKeyboard, type StaleConfirmRegistry } from "./stale-confirm.ts";
@@ -36,6 +38,11 @@ export type DispatchInboundMessage = (
   currentSlug: string | undefined,
   from: string,
   contextPrefix?: string,
+  /** Reply-to-retry: the text/caption of the message this one replies to (Telegram's own
+   * `reply_to_message`), passed through only so `command-dispatch.ts`'s existing `isRetryPhrase`
+   * branch can re-run *that* text instead of consulting `retryStore`'s narrower "replay the last
+   * expired NL-confirm card in this topic" stash - see `routeInboundMessage`'s own doc comment. */
+  replyToText?: string,
 ) => Promise<void>;
 
 export interface InboundMediaOptions {
@@ -59,6 +66,22 @@ export interface InboundMediaOptions {
    * the control topic falls back to today's plain rejection reply, same as any other malformed
    * caption. See that plan's Attachment-to-Session Handoff section for why this exists. */
   disableCaptionNew: boolean;
+  /** Feature A of the caption-triggered `/new` follow-up: when a control-topic attachment's caption
+   * isn't literal `/new <repo> <prompt>` syntax, route it through the same NL-router
+   * (`nl-router.ts`'s `routeText`) every other unmatched control-topic message already goes through,
+   * before falling back to the fixed rejection reply. Plain values/getters, not `LateBound`
+   * callbacks - unlike `createSessionFromAttachment`, `routeText` is imported directly (no circular
+   * dependency: `nl-router.ts` has no dependency on this module), and `reposRegistry`/
+   * `nlRouterBackend` are both already-constructed values by the time `index.ts` builds this
+   * module, same as `session-lifecycle-commands.ts`'s own `getReposRegistry` option. */
+  nlRouterConfig: { enabled: boolean; apiKey: string | undefined; model: string };
+  getNlRouterBackend: () => "api" | "cli";
+  getReposRegistry: () => ReposRegistry | undefined;
+  /** Defaults to the real `nl-router.ts` implementation - injectable so `handleControlTopicAttachment`'s
+   * own control flow (the literal-vs-NL branch, the pendingAttachment shape) is unit-testable
+   * without a real CLI/API backend call, same convention `nl-dispatch.ts`'s own `routeText` option
+   * already uses. */
+  routeText?: typeof realRouteText;
   /** §4.1's control-topic predicate - injected rather than imported since it's index.ts's one free
    * top-level function today, with call sites remaining in not-yet-extracted modules too. */
   isControlTopic: (threadId: number | undefined) => boolean;
@@ -117,6 +140,9 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     dispatchInboundMessage,
     createSessionFromAttachment,
     disableCaptionNew,
+    nlRouterConfig,
+    getNlRouterBackend,
+    getReposRegistry,
     isControlTopic,
     voiceConfirmEnabled,
     voice,
@@ -124,6 +150,7 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     stateDir,
   } = opts;
   const log = opts.log ?? (() => {});
+  const routeText = opts.routeText ?? realRouteText;
 
   /** §7.4's stale-inbound path: posts the "received while offline, still want this?" card instead
    * of dispatching a backlog message directly, and registers the replay payload. Mirrors
@@ -265,6 +292,28 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     }
   }
 
+  /** Feature A: when a control-topic attachment's caption isn't literal `/new <repo> <prompt>`
+   * syntax, try the same NL router every other unmatched control-topic message already goes
+   * through (`command-dispatch.ts`'s `nlDispatch.routeOrFallback` fallthrough) before giving up -
+   * "create a session for aibridge and fix the login bug" on a screenshot should work as well as
+   * "/new aibridge fix the login bug" does. Deliberately narrow: only a `kind: "new"` match is
+   * acted on here - an attachment caption that NL-matches something else (e.g. "list my sessions")
+   * still falls through to the fixed rejection reply rather than executing an arbitrary command,
+   * since there's no existing precedent for running non-`/new` commands from an image caption and
+   * widening that surface isn't this feature's job. `/assist`'s confirm gate never applies either
+   * way - `new` is never in `isDestructive`'s set (nl-router.ts), same as a typed NL `/new` today. */
+  async function routeCaptionToNewCommand(caption: string): Promise<Extract<FleetCommand, { kind: "new" }> | null> {
+    if (!nlRouterConfig.enabled) return null;
+    const result = await routeText(
+      caption,
+      { isControl: true, hasSession: false, repoNames: getReposRegistry()?.names() },
+      { ...nlRouterConfig, backend: getNlRouterBackend() },
+      log,
+    );
+    if (!result.matched || result.command.kind !== "new") return null;
+    return result.command;
+  }
+
   async function handleControlTopicAttachment(
     kind: AttachmentKind,
     fileId: string,
@@ -274,14 +323,24 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     threadId: number | undefined,
     caption: string | undefined,
   ): Promise<void> {
-    const fleetCmd: FleetCommand | null = caption ? parseFleetCommand(caption) : null;
-    if (disableCaptionNew || !fleetCmd || fleetCmd.kind !== "new") {
+    const literalCmd: FleetCommand | null = caption ? parseFleetCommand(caption) : null;
+    const isLiteralNew = !disableCaptionNew && literalCmd?.kind === "new";
+    // The NL fallback below carries its own LLM round-trip - only worth it once the literal syntax
+    // has ruled out `kind: "new"`, and only for a caption that isn't already some *other* known
+    // fleet command (code-review finding: a captioned "/ls" or "/help" would otherwise fire an LLM
+    // call just to be told it doesn't match "new" either, before the same rejection reply as before).
+    const nlCmd = !isLiteralNew && !disableCaptionNew && caption && !literalCmd ? await routeCaptionToNewCommand(caption) : null;
+    if (!isLiteralNew && !nlCmd) {
       confirmSessionCommand(threadId, `Send ${attachmentKindLabel(kind)} in a session topic - the control topic has no session to hand it to.`);
       return;
     }
     const downloaded = await downloadAttachment(kind, fileId, fileSize, fileName, mimeType, threadId);
     if (!downloaded) return;
-    await createSessionFromAttachment({ ...fleetCmd, pendingAttachment: { kind, name: downloaded.name, bytes: downloaded.bytes } }, threadId);
+    const matched = isLiteralNew ? (literalCmd as Extract<FleetCommand, { kind: "new" }>) : (nlCmd as Extract<FleetCommand, { kind: "new" }>);
+    // `rawCaption` only set for the NL path - the literal path's `cmd.prompt` is already verbatim
+    // (see PendingAttachment's own doc comment).
+    const rawCaption = isLiteralNew ? undefined : caption;
+    await createSessionFromAttachment({ ...matched, pendingAttachment: { kind, name: downloaded.name, bytes: downloaded.bytes, rawCaption } }, threadId);
   }
 
   /** Inbound photos/documents/videos/audio/video-notes (§5.6): downloaded into the session's own
@@ -447,10 +506,19 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
 
     if (!message.text) return;
 
+    // Reply-to-retry: Telegram's own `reply_to_message` already carries the replied-to message's
+    // text/caption verbatim (no Bridge-side cache needed) - passed through so command-dispatch.ts's
+    // existing `isRetryPhrase` branch can re-run *that* text fresh instead of consulting
+    // `retryStore`'s narrower "replay the last expired NL-confirm card in this topic" stash. Only
+    // fires when this message's own text is a retry phrase ("retry"/"try again"/etc.) - an ordinary
+    // reply used as commentary must still reach the session untouched, same reasoning `isRetryPhrase`
+    // already documents for the topic-keyed case.
+    const replyToText = message.reply_to_message?.text ?? message.reply_to_message?.caption;
+
     // §7.4's gate already ran above, before any content branch - nothing below ever sees a stale
     // message.
     fireAndForget(
-      dispatchInboundMessage(message.message_id, message.text, threadId, isControl, route, currentSlug, from, buildContextPrefix(message)),
+      dispatchInboundMessage(message.message_id, message.text, threadId, isControl, route, currentSlug, from, buildContextPrefix(message), replyToText),
       log,
       "inbound-media dispatchInboundMessage",
     );

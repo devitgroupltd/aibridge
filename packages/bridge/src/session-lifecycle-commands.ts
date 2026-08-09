@@ -316,10 +316,10 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // its own topic cleanup, mirroring that catch's.
     let attachmentAbsPath: string | undefined;
     if (cmd.pendingAttachment) {
-      const { kind, name, bytes } = cmd.pendingAttachment;
+      const { kind, name, bytes, rawCaption } = cmd.pendingAttachment;
       try {
         attachmentAbsPath = await writeAttachmentToInbox(stateDir, slug, name, bytes);
-        cmd = { ...cmd, sourceText: buildAttachmentAnnouncement(kind, attachmentAbsPath, cmd.prompt) };
+        cmd = { ...cmd, sourceText: buildAttachmentAnnouncement(kind, attachmentAbsPath, rawCaption ?? cmd.prompt) };
       } catch (err) {
         try {
           await controlBot.deleteForumTopic(supergroupChatId, topic.message_thread_id);

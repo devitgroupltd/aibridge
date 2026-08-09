@@ -56,6 +56,19 @@ v020_touched_sections:
 
 # Attachment-Triggered Session Creation (control-topic `/new` via caption)
 
+> **Status: implemented and shipped**, including two follow-ups added after live use surfaced
+> real gaps (both live-verified working):
+> - **NL-router fallback** for a freeform caption (not literal `/new <repo> <prompt>` syntax) -
+>   routes through the same `nl-router.ts`/`routeText` every other unmatched control-topic message
+>   already uses, narrowly scoped to `kind: "new"` matches only. See
+>   `inbound-media.ts`'s `routeCaptionToNewCommand`/`handleControlTopicAttachment`.
+> - **Reply-to-retry** - replying (Telegram's native reply) to an earlier message with "retry"/
+>   "try again" re-runs that earlier message's own text through today's dispatch logic, taking
+>   priority over `retry-store.ts`'s narrower topic-keyed expired-confirmation stash. See
+>   `command-dispatch.ts`'s `isRetryPhrase` branch and `inbound-media.ts`'s `reply_to_message`
+>   threading.
+>
+
 ## Overview
 
 **Audience:** aibridge maintainer (solo operator/developer of this Bridge).

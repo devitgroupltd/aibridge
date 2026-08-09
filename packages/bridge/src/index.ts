@@ -337,14 +337,20 @@ async function main(): Promise<void> {
     staleConfirmRegistry,
     voiceConfirmRegistry,
     confirmSessionCommand,
-    dispatchInboundMessage: (messageId, rawText, threadId, isControl, route, currentSlug, from, contextPrefix) =>
-      commandDispatch.get().dispatchInboundMessage(messageId, rawText, threadId, isControl, route, currentSlug, from, contextPrefix),
+    dispatchInboundMessage: (messageId, rawText, threadId, isControl, route, currentSlug, from, contextPrefix, replyToText) =>
+      commandDispatch.get().dispatchInboundMessage(messageId, rawText, threadId, isControl, route, currentSlug, from, contextPrefix, replyToText),
     createSessionFromAttachment: (cmd, controlTopicId) => sessionLifecycleLate.get().handleNewCommand(cmd, controlTopicId),
     // Kill switch (attachment-triggered-session-creation-plan.md's Attachment-to-Session Handoff
     // section) - a cheap, reversible way to disable just this trigger path without touching
     // anything else, given this plan documents a couple of risks (the widened slug race, git
     // worktree collisions) it deliberately doesn't fully close.
     disableCaptionNew: process.env.AIBRIDGE_DISABLE_CAPTION_NEW === "1",
+    // Feature A of the caption-triggered `/new` follow-up: NL-router fallback for a freeform
+    // caption. Plain values/getters (not `LateBound`) - both already exist by this point in the
+    // composition root, same as `nlDispatch`'s own construction further down uses.
+    nlRouterConfig: config.nlRouter,
+    getNlRouterBackend: () => nlRouterBackend,
+    getReposRegistry: () => reposRegistry,
     isControlTopic,
     voiceConfirmEnabled: () => voiceConfirmEnabled,
     voice: config.voice,

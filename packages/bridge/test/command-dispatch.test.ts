@@ -384,6 +384,54 @@ describe("dispatchInboundMessage - non-exact-syntax fallthrough", () => {
     expect(s.confirmSessionCommand.calls).toEqual([]);
   });
 
+  // Reply-to-retry follow-up: a retry phrase carrying a `replyToText` re-runs that text through
+  // this same function, fresh - distinct from (and taking priority over) retryStore's topic-keyed
+  // stash above.
+  test("replying 'retry' to an earlier message re-runs that message's text through dispatch", async () => {
+    const s = setup();
+    await s.commandDispatch.dispatchInboundMessage(1, "retry", 1, true, undefined, undefined, "op", undefined, "/new seowrite fix the bug");
+    expect(s.sessionLifecycle.calls.map((c) => c.fn)).toEqual(["handleNewCommand"]);
+  });
+
+  test("reply-to-retry takes priority over retryStore's own topic-keyed stash when both are present", async () => {
+    const s = setup();
+    s.retryStore.add({ id: "1", command: { kind: "restart" } as never, threadId: 1, currentSlug: undefined });
+    await s.commandDispatch.dispatchInboundMessage(1, "try again", 1, true, undefined, undefined, "op", undefined, "/new seowrite fix the bug");
+    expect(s.nlDispatch.postNlConfirmCalls.length).toBe(0);
+    expect(s.sessionLifecycle.calls.map((c) => c.fn)).toEqual(["handleNewCommand"]);
+  });
+
+  test("a reply that's itself the literal replied-to text of a retry phrase doesn't recurse forever", async () => {
+    const s = setup();
+    // The recursive dispatchInboundMessage call carries no replyToText of its own (Telegram's
+    // reply_to_message doesn't nest), so re-running "retry" text falls to retryStore, not another
+    // recursive replyToText hop.
+    await s.commandDispatch.dispatchInboundMessage(1, "retry", 1, true, undefined, undefined, "op", undefined, "retry");
+    expect(s.confirmSessionCommand.calls).toEqual([{ topicId: 1, text: "Nothing to retry - no expired confirmation is waiting here." }]);
+  });
+
+  test("reply-to-retry doesn't double the outer message's own contextPrefix onto the re-run text (code-review fix)", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ slug: "fix-bug", topicId: 5, state: "working" }));
+    const s = setup({ sessionStore });
+    const route = { slug: "fix-bug", topicId: 5, worktreePath: "c:\\does\\not\\exist", model: "sonnet" } as never;
+    // The outer message's own contextPrefix (as inbound-media.ts's buildContextPrefix would have
+    // built it from *this* message's reply_to_message) already quotes replyToText - it must not
+    // also be prepended to the recursively re-run text below.
+    await s.commandDispatch.dispatchInboundMessage(
+      1,
+      "retry",
+      5,
+      false,
+      route,
+      "fix-bug",
+      "op",
+      '[Replying to an earlier message: "just chatting"]\n\n',
+      "just chatting",
+    );
+    expect(s.ptyIo.channel).toEqual([{ slug: "fix-bug", topicId: 5, content: "just chatting", msgId: "1", from: "op" }]);
+  });
+
   test("no exact-syntax rule matches and there's no session: falls back to NL routing with hasSession false", async () => {
     const s = setup();
     s.nlDispatch.setNoMatchBehavior("call");

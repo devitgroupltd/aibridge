@@ -14,6 +14,13 @@ export interface PendingAttachment {
   kind: AttachmentKind;
   name: string;
   bytes: Uint8Array;
+  /** Set only when the caption wasn't literal `/new <repo> <prompt>` syntax and was instead routed
+   * through the NL router (inbound-media.ts's `handleControlTopicAttachment`) - the router's
+   * `prompt` field is an English paraphrase (right for the slug/topic title, wrong for what the
+   * announcement should show), so this carries the operator's actual raw caption text for
+   * `handleNewCommand` to use in `buildAttachmentAnnouncement` instead. Left unset for the literal-
+   * syntax path, where `cmd.prompt` is already verbatim and no override is needed. */
+  rawCaption?: string;
 }
 
 /**

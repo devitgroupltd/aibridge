@@ -40,7 +40,7 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
   const sessionStore = new SessionStore(":memory:");
   const staleConfirmRegistry = new StaleConfirmRegistry();
   const voiceConfirmRegistry = new VoiceConfirmRegistry();
-  const dispatched: Array<{ messageId: number; rawText: string; threadId: number | undefined }> = [];
+  const dispatched: Array<{ messageId: number; rawText: string; threadId: number | undefined; replyToText: string | undefined }> = [];
   const confirmed: Array<{ topicId: number | undefined; text: string }> = [];
   const createdFromAttachment: Array<{ cmd: unknown; controlTopicId: number | undefined }> = [];
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-inbound-media-test-"));
@@ -54,13 +54,18 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
     confirmSessionCommand: (topicId, text) => {
       confirmed.push({ topicId, text });
     },
-    dispatchInboundMessage: async (messageId, rawText, threadId) => {
-      dispatched.push({ messageId, rawText, threadId });
+    dispatchInboundMessage: async (messageId, rawText, threadId, _isControl, _route, _currentSlug, _from, _contextPrefix, replyToText) => {
+      dispatched.push({ messageId, rawText, threadId, replyToText });
     },
     createSessionFromAttachment: async (cmd, controlTopicId) => {
       createdFromAttachment.push({ cmd, controlTopicId });
     },
     disableCaptionNew: false,
+    // NL routing disabled by default in tests - `nlRouterConfig.enabled: false` short-circuits
+    // `routeCaptionToNewCommand` before it would ever call the real `routeText`/an LLM backend.
+    nlRouterConfig: { enabled: false, apiKey: undefined, model: "" },
+    getNlRouterBackend: () => "cli",
+    getReposRegistry: () => undefined,
     isControlTopic: (threadId) => threadId === undefined || threadId === 1,
     voiceConfirmEnabled: () => true,
     voice: { enabled: true, ffmpegPath: "ffmpeg", port: 8123 },
@@ -99,7 +104,7 @@ describe("createInboundMedia", () => {
       inboundMedia.routeInboundMessage(message({ message_thread_id: 5, text: "hello" }));
       await Promise.resolve();
 
-      expect(dispatched).toEqual([{ messageId: 1, rawText: "hello", threadId: 5 }]);
+      expect(dispatched).toEqual([{ messageId: 1, rawText: "hello", threadId: 5, replyToText: undefined }]);
     });
 
     test("a message in an unrouted, unknown topic with no known command is dropped", async () => {
@@ -118,7 +123,44 @@ describe("createInboundMedia", () => {
       inboundMedia.routeInboundMessage(message({ message_thread_id: 999, text: "/help" }));
       await Promise.resolve();
 
-      expect(dispatched).toEqual([{ messageId: 1, rawText: "/help", threadId: 999 }]);
+      expect(dispatched).toEqual([{ messageId: 1, rawText: "/help", threadId: 999, replyToText: undefined }]);
+    });
+
+    // Reply-to-retry follow-up: reply_to_message's text/caption is threaded through to
+    // dispatchInboundMessage's own replyToText param - the actual retry-vs-stash decision is
+    // command-dispatch.ts's job (see command-dispatch.test.ts), this only covers the plumbing.
+    describe("reply_to_message threading", () => {
+      test("a reply's text/caption is passed through as replyToText", async () => {
+        const { inboundMedia, routing, dispatched } = await setup();
+        routing.add(ROUTE);
+
+        inboundMedia.routeInboundMessage(
+          message({ message_thread_id: 5, text: "retry", reply_to_message: { message_id: 1, text: "Start a new session for demo-repo" } }),
+        );
+        await Promise.resolve();
+
+        expect(dispatched).toEqual([{ messageId: 1, rawText: "retry", threadId: 5, replyToText: "Start a new session for demo-repo" }]);
+      });
+
+      test("falls back to the reply target's caption when it has no text", async () => {
+        const { inboundMedia, routing, dispatched } = await setup();
+        routing.add(ROUTE);
+
+        inboundMedia.routeInboundMessage(message({ message_thread_id: 5, text: "try again", reply_to_message: { message_id: 1, caption: "fix the login bug" } }));
+        await Promise.resolve();
+
+        expect(dispatched[0]?.replyToText).toBe("fix the login bug");
+      });
+
+      test("an ordinary message with no reply_to_message carries no replyToText", async () => {
+        const { inboundMedia, routing, dispatched } = await setup();
+        routing.add(ROUTE);
+
+        inboundMedia.routeInboundMessage(message({ message_thread_id: 5, text: "hello" }));
+        await Promise.resolve();
+
+        expect(dispatched[0]?.replyToText).toBeUndefined();
+      });
     });
 
     test.each([
@@ -285,6 +327,135 @@ describe("createInboundMedia", () => {
 
         expect(createdFromAttachment).toEqual([]);
         expect(confirmed[0]?.text).toContain("Bot API caps");
+      });
+
+      // Feature A of the caption-triggered /new follow-up: NL-router fallback for a freeform
+      // caption. `routeText` is injected here (see InboundMediaOptions's own doc comment) so these
+      // tests never hit a real CLI/API backend.
+      describe("NL fallback for a freeform caption", () => {
+        test("a freeform caption that NL-matches kind:new creates a session, same as the literal syntax", async () => {
+          const routeTextCalls: Array<{ text: string; ctx: unknown }> = [];
+          const { inboundMedia, confirmed, createdFromAttachment } = await setup({
+            nlRouterConfig: { enabled: true, apiKey: undefined, model: "test-model" },
+            routeText: async (text, ctx) => {
+              routeTextCalls.push({ text, ctx });
+              return { matched: true, command: { kind: "new", repo: "demo-repo", prompt: "fix the login bug" }, destructive: false };
+            },
+          });
+
+          await inboundMedia.handleAttachmentMessage(
+            "image",
+            "i1",
+            undefined,
+            undefined,
+            undefined,
+            1,
+            undefined,
+            true,
+            1,
+            "create a session for demo-repo and fix the login bug",
+            "op",
+            message(),
+          );
+
+          expect(confirmed).toEqual([]);
+          expect(routeTextCalls.length).toBe(1);
+          expect(routeTextCalls[0]?.text).toBe("create a session for demo-repo and fix the login bug");
+          expect(routeTextCalls[0]?.ctx).toMatchObject({ isControl: true, hasSession: false });
+          expect(createdFromAttachment.length).toBe(1);
+          expect(createdFromAttachment[0]?.cmd).toMatchObject({
+            kind: "new",
+            repo: "demo-repo",
+            prompt: "fix the login bug",
+            pendingAttachment: {
+              kind: "image",
+              name: expect.any(String),
+              bytes: expect.any(Uint8Array),
+              rawCaption: "create a session for demo-repo and fix the login bug",
+            },
+          });
+        });
+
+        test("literal /new syntax never reaches the NL router at all", async () => {
+          let routeTextCalled = false;
+          const { inboundMedia, createdFromAttachment } = await setup({
+            nlRouterConfig: { enabled: true, apiKey: undefined, model: "test-model" },
+            routeText: async () => {
+              routeTextCalled = true;
+              return { matched: false };
+            },
+          });
+
+          await inboundMedia.handleAttachmentMessage("image", "i1", undefined, undefined, undefined, 1, undefined, true, 1, "/new demo-repo add a README", "op", message());
+
+          expect(routeTextCalled).toBe(false);
+          expect(createdFromAttachment.length).toBe(1);
+          expect(createdFromAttachment[0]?.cmd).toMatchObject({ pendingAttachment: { rawCaption: undefined } });
+        });
+
+        test("an NL match to a non-new kind still falls back to the plain rejection reply", async () => {
+          const { inboundMedia, confirmed, createdFromAttachment } = await setup({
+            nlRouterConfig: { enabled: true, apiKey: undefined, model: "test-model" },
+            routeText: async () => ({ matched: true, command: { kind: "ls" }, destructive: false }),
+          });
+
+          await inboundMedia.handleAttachmentMessage("image", "i1", undefined, undefined, undefined, 1, undefined, true, 1, "list my sessions", "op", message());
+
+          expect(createdFromAttachment).toEqual([]);
+          expect(confirmed[0]?.text).toContain("session topic");
+        });
+
+        test("nlRouterConfig.enabled: false never calls routeText and falls back to rejection", async () => {
+          let routeTextCalled = false;
+          const { inboundMedia, confirmed, createdFromAttachment } = await setup({
+            nlRouterConfig: { enabled: false, apiKey: undefined, model: "test-model" },
+            routeText: async () => {
+              routeTextCalled = true;
+              return { matched: false };
+            },
+          });
+
+          await inboundMedia.handleAttachmentMessage("image", "i1", undefined, undefined, undefined, 1, undefined, true, 1, "create a session for demo-repo", "op", message());
+
+          expect(routeTextCalled).toBe(false);
+          expect(createdFromAttachment).toEqual([]);
+          expect(confirmed[0]?.text).toContain("session topic");
+        });
+
+        test("a caption that's already a known but non-new fleet command skips the NL router entirely (code-review fix)", async () => {
+          let routeTextCalled = false;
+          const { inboundMedia, confirmed, createdFromAttachment } = await setup({
+            nlRouterConfig: { enabled: true, apiKey: undefined, model: "test-model" },
+            routeText: async () => {
+              routeTextCalled = true;
+              return { matched: false };
+            },
+          });
+
+          await inboundMedia.handleAttachmentMessage("image", "i1", undefined, undefined, undefined, 1, undefined, true, 1, "/ls", "op", message());
+
+          expect(routeTextCalled).toBe(false);
+          expect(createdFromAttachment).toEqual([]);
+          expect(confirmed[0]?.text).toContain("session topic");
+        });
+
+        test("the kill switch also suppresses the NL fallback", async () => {
+          let routeTextCalled = false;
+          const { inboundMedia, confirmed, createdFromAttachment } = await setup({
+            disableCaptionNew: true,
+            nlRouterConfig: { enabled: true, apiKey: undefined, model: "test-model" },
+            routeText: async () => {
+              routeTextCalled = true;
+              return { matched: true, command: { kind: "new", repo: "demo-repo", prompt: "fix it" }, destructive: false };
+            },
+          });
+
+          await inboundMedia.handleAttachmentMessage("image", "i1", undefined, undefined, undefined, 1, undefined, true, 1, "create a session for demo-repo", "op", message());
+
+          expect(routeTextCalled).toBe(false);
+          expect(createdFromAttachment).toEqual([]);
+          expect(confirmed[0]?.text).toContain("session topic");
+        });
       });
     });
   });
