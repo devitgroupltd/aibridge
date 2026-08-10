@@ -132,7 +132,26 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         "Read(~/**)",
         "Edit(~/**)",
       ],
-      ask: ["Bash(git commit *)", "Bash(git push *)", "Bash(gh pr *)", "Bash(npm publish *)", "Bash(dotnet nuget push *)"],
+      ask: [
+        "Bash(git commit *)",
+        "Bash(git push *)",
+        // `gh pr *` used to be one blanket ask rule covering every subcommand, including pure
+        // status reads. §6.2 (line ~2370 of the plan) is explicit that `ask` always wins over `allow`
+        // regardless of specificity, so a broad `Bash(gh pr *)` catch-all here would keep prompting
+        // for reads no matter how narrow an allow rule got added alongside it - the catch-all itself
+        // has to be narrowed to only the subcommands that actually mutate a PR. Live-observed
+        // 2026-08-10: a "Check PR status before merging" step (`gh pr checks`/`gh pr view`) prompted
+        // even though it's as read-only as `git status`/`git log` below, which are pre-approved.
+        "Bash(gh pr merge *)",
+        "Bash(gh pr close *)",
+        "Bash(gh pr create *)",
+        "Bash(gh pr edit *)",
+        "Bash(gh pr comment *)",
+        "Bash(gh pr ready *)",
+        "Bash(gh pr reopen *)",
+        "Bash(npm publish *)",
+        "Bash(dotnet nuget push *)",
+      ],
       allow: [
         "Read",
         "Grep",
@@ -152,6 +171,13 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         "Bash(git log *)",
         "Bash(git branch *)",
         "Bash(git show *)",
+        // The read-only half of `gh pr` (see the `ask` list's comment above for why the mutating
+        // half - merge/close/create/edit/comment/ready/reopen - stays gated there instead).
+        "Bash(gh pr view *)",
+        "Bash(gh pr checks *)",
+        "Bash(gh pr status *)",
+        "Bash(gh pr list *)",
+        "Bash(gh pr diff *)",
         "Bash(dotnet build *)",
         "Bash(dotnet test *)",
         "Bash(npm run *)",

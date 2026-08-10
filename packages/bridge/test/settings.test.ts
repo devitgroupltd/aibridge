@@ -138,6 +138,29 @@ describe("generateSettings", () => {
     expect(settings.permissions.ask).toContain("Bash(git push *)");
   });
 
+  // Live prompt 2026-08-10: a "Check PR status before merging" step (`gh pr checks`/`gh pr view`)
+  // prompted because `Bash(gh pr *)` was one blanket ask rule. §6.2 of the plan is explicit that
+  // `ask` always wins over `allow` regardless of specificity, so read-only `gh pr` subcommands can
+  // only be pre-approved by narrowing the `ask` catch-all itself, not by adding an allow rule
+  // alongside it.
+  test("splits gh pr: read-only subcommands allowed, mutating ones still ask", () => {
+    for (const rule of ["Bash(gh pr view *)", "Bash(gh pr checks *)", "Bash(gh pr status *)", "Bash(gh pr list *)", "Bash(gh pr diff *)"]) {
+      expect(settings.permissions.allow).toContain(rule);
+    }
+    for (const rule of [
+      "Bash(gh pr merge *)",
+      "Bash(gh pr close *)",
+      "Bash(gh pr create *)",
+      "Bash(gh pr edit *)",
+      "Bash(gh pr comment *)",
+      "Bash(gh pr ready *)",
+      "Bash(gh pr reopen *)",
+    ]) {
+      expect(settings.permissions.ask).toContain(rule);
+    }
+    expect(settings.permissions.ask).not.toContain("Bash(gh pr *)");
+  });
+
   test("omits the hooks block entirely when no hook client path is given", () => {
     expect(settings.hooks).toBeUndefined();
   });
