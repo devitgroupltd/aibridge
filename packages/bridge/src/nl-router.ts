@@ -239,6 +239,12 @@ const SYSTEM_INSTRUCTIONS_BASE =
   "A request to see what commands exist, what the bot can do, or how to use it (in any language) is " +
   "kind='help' (a plain command list) or kind='about' (a friendlier overview with examples) - prefer " +
   "'help' unless the message specifically sounds like someone new asking what this bot even is. " +
+  "But a question that already names one or more specific commands and asks something about them - " +
+  "how they differ, whether one duplicates another, what a specific one does, whether something is a " +
+  "bug - is NOT kind='help'/'about' even though it mentions commands: the operator already knows the " +
+  "commands exist and is asking something else, so respond with kind='forward' instead. Reserve " +
+  "'help'/'about' for a genuine request to see the list of available commands or a general intro to " +
+  "the bot, with no specific command already named as the subject of a question. " +
   "A request to list this project's own custom commands or skills is kind='commands'/'skills'. " +
   "A request to compact or clear the current conversation is kind='builtin'. " +
   "A request to see the folder structure, list files in a directory, or look inside a specific " +

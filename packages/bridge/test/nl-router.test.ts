@@ -395,6 +395,16 @@ describe("buildSystemInstructions", () => {
     expect(withRepos).toContain("kill yourself");
     expect(withRepos).toContain("aibridge");
   });
+
+  // Live-verified 2026-08-10 (plans/control-topic-nl-dialogue-plan.md "Known limitation"): a
+  // question that names real commands (e.g. "does /ship duplicate /deploy?") was read as
+  // kind='help' before it ever reached the control-topic Q&A no-match path. Narrowed the
+  // help/about trigger sentence to exclude questions that already name a specific command.
+  test("carves out questions naming a specific command from the help/about trigger", () => {
+    const text = buildSystemInstructions(CONTROL);
+    expect(text).toContain("already names one or more specific commands");
+    expect(text).toContain("NOT kind='help'/'about'");
+  });
 });
 
 describe("buildRouteViaCliArgs", () => {
