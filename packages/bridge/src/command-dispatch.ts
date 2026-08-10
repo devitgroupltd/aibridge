@@ -48,7 +48,16 @@ export interface CommandDispatchOptions {
   confirmSessionCommand: ConfirmSessionCommand;
   sessionLifecycle: Pick<
     SessionLifecycleCommands,
-    "handleNewCommand" | "handleLsCommand" | "handleKillCommand" | "handleRmCommand" | "handleAttachCommand" | "handleDetailCommand" | "handleVerboseCommand" | "handlePauseCommand" | "handleStopCommand"
+    | "handleNewCommand"
+    | "handleLsCommand"
+    | "handleKillCommand"
+    | "handleRmCommand"
+    | "handleAttachCommand"
+    | "handleDetailCommand"
+    | "handleVerboseCommand"
+    | "handlePauseCommand"
+    | "handleStopCommand"
+    | "handleResumeCommand"
   >;
   fleetReporting: FleetReportingCommands;
   fleetConfirmFlow: Pick<FleetConfirmFlow, "handleUsageCommand">;
@@ -263,6 +272,10 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     }
     if (fleetCmd.kind === "stop") {
       sessionLifecycle.handleStopCommand(fleetCmd, threadId, currentSlug);
+      return;
+    }
+    if (fleetCmd.kind === "resume") {
+      fireAndForget(sessionLifecycle.handleResumeCommand(fleetCmd, threadId, currentSlug), log, "command-dispatch handleResumeCommand");
       return;
     }
     sessionLifecycle.handlePauseCommand(fleetCmd, threadId, currentSlug);
