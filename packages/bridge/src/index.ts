@@ -516,6 +516,11 @@ async function main(): Promise<void> {
     resolveByToolMatch: (slug, toolName, toolInput) => pipeHandle.permissionRegistry.resolveByToolMatch(slug, toolName, toolInput),
     sendVerdict: (slug, requestId, behavior) => pipeHandle.sendVerdict(slug, requestId, behavior),
     finalizePermissionMessage: (messageId, text) => pipeHandle.finalizePermissionMessage(messageId, text),
+    typingIndicator,
+    // Same Bridge-generated convention as `sendResumeNudge` just above (fixed msgId/from) - `ptyIo`
+    // already exists by this point in construction order (line ~484), so this can be a plain
+    // closure rather than a `LateBound`; see `FeedWiringOptions.sendNoReplyNudge`'s own doc comment.
+    sendNoReplyNudge: (slug, topicId, content) => ptyIo.sendChannelText(slug, topicId, content, "no-reply-nudge", "aibridge"),
     log,
   });
 
@@ -540,6 +545,12 @@ async function main(): Promise<void> {
     onBeforeReply: (slug) => feedWiring.resetCoalescer(slug),
     onReplySent: (topicId) => {
       typingIndicator.stop(topicId);
+      // A reply landing is the ground truth for "this turn wasn't silent" - feed-wiring.ts's own
+      // `Stop`-hook nudge (added alongside this) can't see `reply()` calls itself (they're a
+      // channel-server MCP call, not a hook event), so it relies on this to mark the current turn
+      // as answered before that hook arrives.
+      const slug = routing.getByTopicId(Number(topicId))?.slug;
+      if (slug) feedWiring.markReplied(slug);
       // §4.4's rename-once (auto-upgrading the topic off its provisional `/new`-prompt title using
       // the session's first real reply text) was removed 2026-08-09 at operator request: a topic
       // name, once set - whether the provisional `/new`-derived one or a manual rename via

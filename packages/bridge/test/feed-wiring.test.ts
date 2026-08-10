@@ -68,6 +68,8 @@ function setup(overrides: Partial<Parameters<typeof createFeedWiring>[0]> = {}) 
   const quotaStoppedSlugs: string[] = [];
   const verdicts: Array<{ slug: string; requestId: string; behavior: string }> = [];
   const finalized: Array<{ messageId: number; text: string }> = [];
+  const typingStops: string[] = [];
+  const noReplyNudges: Array<{ slug: string; topicId: number; content: string }> = [];
   let permissionToResolve: PendingPermissionRequest | undefined;
 
   const feedWiring = createFeedWiring({
@@ -88,6 +90,11 @@ function setup(overrides: Partial<Parameters<typeof createFeedWiring>[0]> = {}) 
     finalizePermissionMessage: async (messageId, text) => {
       finalized.push({ messageId, text });
     },
+    typingIndicator: {
+      start: () => {},
+      stop: (topicId) => typingStops.push(topicId),
+    },
+    sendNoReplyNudge: (slug, topicId, content) => noReplyNudges.push({ slug, topicId, content }),
     ...overrides,
   });
 
@@ -101,6 +108,8 @@ function setup(overrides: Partial<Parameters<typeof createFeedWiring>[0]> = {}) 
     quotaStoppedSlugs,
     verdicts,
     finalized,
+    typingStops,
+    noReplyNudges,
     setPermissionToResolve: (p: PendingPermissionRequest | undefined) => {
       permissionToResolve = p;
     },
@@ -316,5 +325,77 @@ describe("createFeedWiring", () => {
     quiet = true;
     feedWiring.checkQuietMode(); // a later, separate storm notifies again
     expect(confirmCalls.length).toBe(2);
+  });
+
+  test("Stop stops the typing indicator even when the turn never replied", () => {
+    const { feedWiring, sessionStore, routing, typingStops } = setup();
+    sessionStore.insert(row());
+    routing.add({ slug: "fix-bug", topicId: 2, worktreePath: "c:\\data\\worktrees\\fix-bug" });
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit" }));
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "Stop" }));
+
+    expect(typingStops).toEqual(["2"]);
+  });
+
+  test("Stop sends the no-reply nudge exactly once when a turn never called reply()", () => {
+    const { feedWiring, sessionStore, routing, noReplyNudges, confirmCalls } = setup();
+    sessionStore.insert(row());
+    routing.add({ slug: "fix-bug", topicId: 2, worktreePath: "c:\\data\\worktrees\\fix-bug" });
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit" }));
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "Stop" }));
+
+    expect(noReplyNudges.length).toBe(1);
+    expect(noReplyNudges[0]).toEqual({ slug: "fix-bug", topicId: 2, content: expect.stringContaining("Reply now") });
+    expect(confirmCalls).toEqual([]);
+  });
+
+  test("Stop does not nudge when markReplied fired for the current turn", () => {
+    const { feedWiring, sessionStore, routing, noReplyNudges } = setup();
+    sessionStore.insert(row());
+    routing.add({ slug: "fix-bug", topicId: 2, worktreePath: "c:\\data\\worktrees\\fix-bug" });
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit" }));
+    feedWiring.markReplied("fix-bug");
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "Stop" }));
+
+    expect(noReplyNudges).toEqual([]);
+  });
+
+  test("a second consecutive silent Stop posts a give-up warning instead of nudging again", () => {
+    const { feedWiring, sessionStore, routing, noReplyNudges, confirmCalls } = setup();
+    sessionStore.insert(row());
+    routing.add({ slug: "fix-bug", topicId: 2, worktreePath: "c:\\data\\worktrees\\fix-bug" });
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit" }));
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "Stop" })); // 1st silent turn - nudged
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit" })); // the nudge's own turn
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "Stop" })); // also silent - give up instead
+
+    expect(noReplyNudges.length).toBe(1);
+    expect(confirmCalls.length).toBe(1);
+    expect(confirmCalls[0]?.text).toContain("2 times in a row");
+  });
+
+  test("markReplied resets the silent-stop streak so a later silent Stop nudges again", () => {
+    const { feedWiring, sessionStore, routing, noReplyNudges } = setup();
+    sessionStore.insert(row());
+    routing.add({ slug: "fix-bug", topicId: 2, worktreePath: "c:\\data\\worktrees\\fix-bug" });
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit" }));
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "Stop" })); // 1st silent turn - nudged
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit" }));
+    feedWiring.markReplied("fix-bug"); // this turn actually replied
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "Stop" }));
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit" }));
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "Stop" })); // silent again - streak restarted at 1
+
+    expect(noReplyNudges.length).toBe(2);
+  });
+
+  test("markReplied on a slug with no tracked feed state is a no-op, not a throw", () => {
+    const { feedWiring } = setup();
+    expect(() => feedWiring.markReplied("no-such-slug")).not.toThrow();
   });
 });

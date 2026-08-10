@@ -36,10 +36,16 @@ export interface FeedState {
    * `turn_start` alongside `lines` itself. `renderDetails`/`renderDetailsPlainText` ignore this -
    * the `details` button always shows the whole turn regardless of how many cards it spanned. */
   cardLineOffset: number;
+  /** Set by `feed-wiring.ts`'s `markReplied` the moment `pipe-server.ts`'s `onReplySent` fires for
+   * this slug - not derived from any hook event, since `reply()` is a channel-server MCP call, not
+   * a hook. Reset to false on `turn_start` alongside `lines`. Lets a `Stop`/`StopFailure` hook tell
+   * "this turn genuinely produced no operator-visible output" apart from "it did work but the
+   * operator already saw the reply" - see the no-reply-nudge in `feed-wiring.ts`. */
+  repliedThisTurn: boolean;
 }
 
 export function createFeedState(slug: string): FeedState {
-  return { slug, turnActive: false, turnStartedAtMs: null, lines: [], promptTimestampsMs: [], turnSeq: 0, cardLineOffset: 0 };
+  return { slug, turnActive: false, turnStartedAtMs: null, lines: [], promptTimestampsMs: [], turnSeq: 0, cardLineOffset: 0, repliedThisTurn: false };
 }
 
 /** A very long turn otherwise edits the same message forever, which loses any sense of *when*
@@ -92,6 +98,7 @@ export function applyEvent(state: FeedState, event: FeedEvent, nowMs: number): F
         promptTimestampsMs: pruneOldPrompts([...state.promptTimestampsMs, nowMs], nowMs),
         turnSeq: state.turnSeq + 1,
         cardLineOffset: 0,
+        repliedThisTurn: false,
       };
 
     case "tool_start":
