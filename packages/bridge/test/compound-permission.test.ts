@@ -129,6 +129,14 @@ describe("isCompoundCommandFullyAllowed", () => {
     expect(isCompoundCommandFullyAllowed(command, real, WIDENED_AUTO_APPROVE_PREFIXES)).toBe(true);
   });
 
+  // A second live prompt the same day, after the tail fix above: `head` and `echo` weren't
+  // allow-listed yet, so this chain still bailed out to a Telegram prompt post-restart.
+  test("the real generated settings now fully allow the live-prompted ls | head; echo; ls chain", () => {
+    const real = generateSettings();
+    const command = `cd /c/data/worktrees/analyze-the-design-of-stop/packages/bridge && ls node_modules/.bin/ 2>&1 | head -5; echo "---"; ls ../../node_modules/.bin/tsc* 2>&1`;
+    expect(isCompoundCommandFullyAllowed(command, real, WIDENED_AUTO_APPROVE_PREFIXES)).toBe(true);
+  });
+
   // Regression: a first version's rule matcher only recognised a wildcard when it sat at the very
   // end of the pattern (` *`), so real settings.ts deny entries with the `*` mid-string -
   // `Bash(rm -rf /*)`, `Bash(curl * | sh)` - were silently parsed as literal strings requiring an

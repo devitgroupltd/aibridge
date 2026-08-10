@@ -182,6 +182,14 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         // decomposition, not a standalone whole-string rule, so this alone doesn't approve the `cd
         // && ... | tail` chain - see WIDENED_AUTO_APPROVE_PREFIXES's doc comment for why that's fine.
         "Bash(tail *)",
+        // Same 2026-08-10 live prompt (`ls node_modules/.bin/ 2>&1 | head -5; echo "---"; ls ...`)
+        // also hit `head` and `echo`, neither previously allow-listed. `head` is read-only, same
+        // trust tier as `tail *` above. `echo` carries the same "any of these binaries can write
+        // via a shell `>`/`>>` redirect this whole-string glob can't see" risk `cat *`/`ls *` above
+        // already accept (§8.3's accepted no-OS-sandbox gap) - not a new risk category, just the
+        // same one for a new binary.
+        "Bash(head *)",
+        "Bash(echo *)",
       ],
     },
   };
