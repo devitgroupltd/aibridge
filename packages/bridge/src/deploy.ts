@@ -7,7 +7,7 @@ import { canonicalizeWindowsPath } from "./claude-config.ts";
 const execFileAsync = promisify(execFile);
 
 /**
- * §5.9 "Fixing the Bridge itself from Telegram": `/deploy <slug>` merges a session's own branch
+ * §5.9 "Fixing the Bridge itself from Telegram": `/merge <slug>` merges a session's own branch
  * into its repo's main checkout and runs the same gate an operator would run by hand, so a fix
  * written by a Claude session (including one against aibridge's own repo, registered like any
  * other project - see repos-registry.ts/§7.5) can land without a desk. Every git/test invocation
@@ -16,8 +16,9 @@ const execFileAsync = promisify(execFile);
  * or a real `bun test` run.
  *
  * Live-verified 2026-08-05: a trivial commit on this exact test-session branch was merged into
- * the real running dev Bridge's own checkout via a real `/deploy test-session` from Telegram,
- * the gate ran for real, and the self-respawn brought the Bridge back up with this comment live.
+ * the real running dev Bridge's own checkout via a real `/deploy test-session` from Telegram (the
+ * command was later renamed to `/merge`), the gate ran for real, and the self-respawn brought the
+ * Bridge back up with this comment live.
  */
 export interface CommandResult {
   status: number;
@@ -133,7 +134,7 @@ export function truncateForTelegram(text: string, maxLen = 3500): string {
  * moved on since the branch was cut) and `worktreePath` is given (the session's own worktree,
  * where `branch` is actually checked out), this auto-rebases `branch` onto `repoRoot`'s current
  * HEAD there and retries the merge once - the same `git rebase main` an operator would run by
- * hand, just done automatically so `/ship`/`/deploy` don't dead-end on "main moved on" alone. A
+ * hand, just done automatically so `/ship`/`/merge` don't dead-end on "main moved on" alone. A
  * rebase that hits real conflicts is aborted (never left half-done) and reported as a failure to
  * resolve by hand. Any other failure (a dirty tree, a missing branch, a failing test or
  * typecheck) leaves `repoRoot` exactly as it was: nothing merges at all, and a gate failure after

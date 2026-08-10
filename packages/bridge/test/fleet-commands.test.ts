@@ -292,10 +292,10 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/restart")).toEqual({ kind: "restart" });
   });
 
-  test("/deploy requires a slug", () => {
-    expect(parseFleetCommand("/deploy fix-the-thing")).toEqual({ kind: "deploy", slug: "fix-the-thing" });
-    expect(parseFleetCommand("/deploy")).toBeNull();
-    expect(parseFleetCommand("/deploy   ")).toBeNull();
+  test("/merge requires a slug", () => {
+    expect(parseFleetCommand("/merge fix-the-thing")).toEqual({ kind: "merge", slug: "fix-the-thing" });
+    expect(parseFleetCommand("/merge")).toBeNull();
+    expect(parseFleetCommand("/merge   ")).toBeNull();
   });
 
   test("/ship takes an optional slug - bare resolves later against currentSlug, not left to fall through as chat text", () => {
@@ -532,7 +532,7 @@ describe("renderHelp", () => {
       "/usage",
       "/budget",
       "/restart",
-      "/deploy",
+      "/merge",
       "/ship",
       "/detail",
       "/verbose",

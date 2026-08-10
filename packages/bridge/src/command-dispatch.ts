@@ -52,7 +52,7 @@ export interface CommandDispatchOptions {
   >;
   fleetReporting: FleetReportingCommands;
   fleetConfirmFlow: Pick<FleetConfirmFlow, "handleUsageCommand">;
-  deployLifecycle: Pick<DeployLifecycleCommands, "handleRestartCommand" | "handleDeployCommand" | "handleShipCommand" | "handleAutostartCommand">;
+  deployLifecycle: Pick<DeployLifecycleCommands, "handleRestartCommand" | "handleMergeCommand" | "handleShipCommand" | "handleAutostartCommand">;
   osPowerCommands: Pick<OsPowerCommands, "handleOsCommand">;
   voiceModeCommands: Pick<
     VoiceModeCommands,
@@ -203,8 +203,8 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
       fireAndForget(osPowerCommands.handleOsCommand(fleetCmd, threadId), log, "command-dispatch handleOsCommand");
       return;
     }
-    if (fleetCmd.kind === "deploy") {
-      fireAndForget(deployLifecycle.handleDeployCommand(threadId, fleetCmd.slug), log, "command-dispatch handleDeployCommand");
+    if (fleetCmd.kind === "merge") {
+      fireAndForget(deployLifecycle.handleMergeCommand(threadId, fleetCmd.slug), log, "command-dispatch handleMergeCommand");
       return;
     }
     if (fleetCmd.kind === "ship") {
@@ -461,7 +461,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
       return;
     }
 
-    // A recognised fleet-command name (`/new`, `/deploy`, `/repos`, ...) whose argument didn't
+    // A recognised fleet-command name (`/new`, `/merge`, `/repos`, ...) whose argument didn't
     // parse (missing/malformed required arg) - `parseFleetCommand` returns null for this exact same
     // as for "not a fleet command at all", so without this check the message falls through to NL
     // routing or (inside a session topic) gets forwarded to Claude as literal chat text. Surface the

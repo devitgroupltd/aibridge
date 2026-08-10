@@ -97,11 +97,11 @@ describe("createDeployLifecycleCommands", () => {
     });
   });
 
-  describe("handleDeployCommand", () => {
+  describe("handleMergeCommand", () => {
     test("outside the control topic, refuses without touching the session store", async () => {
       const { deployLifecycle, confirmed } = await setup();
 
-      await deployLifecycle.handleDeployCommand(5, "fix-bug");
+      await deployLifecycle.handleMergeCommand(5, "fix-bug");
 
       expect(confirmed[0]?.text).toContain("only works from the control topic");
     });
@@ -109,7 +109,7 @@ describe("createDeployLifecycleCommands", () => {
     test("an unknown slug reports it's missing", async () => {
       const { deployLifecycle, confirmed } = await setup();
 
-      await deployLifecycle.handleDeployCommand(undefined, "no-such-session");
+      await deployLifecycle.handleMergeCommand(undefined, "no-such-session");
 
       expect(confirmed[0]?.text).toContain('No session "no-such-session"');
     });
@@ -121,7 +121,7 @@ describe("createDeployLifecycleCommands", () => {
       });
       sessionStore.insert(row());
 
-      await deployLifecycle.handleDeployCommand(undefined, "fix-bug");
+      await deployLifecycle.handleMergeCommand(undefined, "fix-bug");
 
       expect(controlBot.sent.some((m) => m.text.includes("typecheck failed"))).toBe(true);
       expect(respawnCalls).toEqual([]);
@@ -136,7 +136,7 @@ describe("createDeployLifecycleCommands", () => {
       });
       sessionStore.insert(row({ repoPath: "c:\\some-other-project\\repo" }));
 
-      await deployLifecycle.handleDeployCommand(undefined, "fix-bug");
+      await deployLifecycle.handleMergeCommand(undefined, "fix-bug");
 
       expect(controlBot.sent.some((m) => m.text.includes("merged cleanly"))).toBe(true);
       expect(controlBot.sent.some((m) => m.text.includes("restarting now"))).toBe(false);
@@ -152,7 +152,7 @@ describe("createDeployLifecycleCommands", () => {
       });
       sessionStore.insert(row({ repoPath: "c:\\bridge-repo" }));
 
-      await deployLifecycle.handleDeployCommand(undefined, "fix-bug");
+      await deployLifecycle.handleMergeCommand(undefined, "fix-bug");
 
       expect(controlBot.sent.some((m) => m.text.includes("restarting now"))).toBe(true);
       expect(respawnCalls).toEqual([1]);

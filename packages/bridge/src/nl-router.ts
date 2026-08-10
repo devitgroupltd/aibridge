@@ -67,7 +67,7 @@ export type RouterAction =
 
 export type RouterResult = { matched: false } | { matched: true; command: FleetCommand | SessionCommand | RouterAction; destructive: boolean };
 
-/** Single-slug/bulk `/kill`/`/rm`, `/restart`, `/deploy`, `/repos rm` - broader than the CLI's own
+/** Single-slug/bulk `/kill`/`/rm`, `/restart`, `/merge`, `/repos rm` - broader than the CLI's own
  * confirm-gated set (only `kill --all`/`rm --all`, `fleet-confirm.ts`) because an NL match is
  * inherently less certain than an operator typing the exact command. `kill --all`/`rm --all`
  * themselves are the deliberate exception - they already funnel into that existing fleet-confirm
@@ -77,7 +77,7 @@ export type RouterResult = { matched: false } | { matched: true; command: FleetC
 function isDestructive(command: FleetCommand | SessionCommand | RouterAction): boolean {
   if (command.kind === "kill") return !command.all;
   if (command.kind === "rm") return command.bulk?.mode !== "all";
-  if (command.kind === "restart" || command.kind === "deploy" || command.kind === "ship") return true;
+  if (command.kind === "restart" || command.kind === "merge" || command.kind === "ship") return true;
   if (command.kind === "repos" && command.action === "rm") return true;
   // Turning a guard *off* is at least as destructive as the actions it guards, and these are the
   // easiest of all commands to trigger by accident from natural language: "stop asking me for
@@ -118,7 +118,7 @@ export const ROUTER_KINDS = [
   "usage",
   "budget",
   "restart",
-  "deploy",
+  "merge",
   "ship",
   "detail",
   "verbose",
@@ -225,7 +225,7 @@ function buildSchema(ctx: RouterContext): Record<string, unknown> {
  * out over it since most of the message's words were really the *task*, not the request to create
  * a session. Same class of gap as the `help`/`browse`/`find` fixes noted on `RouterAction` above.
  *
- * `restart`/`deploy`/`kill`/`rm` got the same treatment the same day, for the same class of gap
+ * `restart`/`merge`/`kill`/`rm` got the same treatment the same day, for the same class of gap
  * caught by re-checking every other command for it after the `new` fix: a bare one-word voice
  * transcript ("Restart.") also fell through to "Unrecognised", this time because the *only* mention
  * these four destructive kinds got was the closing "never guess a destructive command ... from a
@@ -264,9 +264,11 @@ const SYSTEM_INSTRUCTIONS_BASE =
   "- do not confuse the two. " +
   "A clear, direct instruction to restart the Bridge itself (even just the single word 'restart') is " +
   "kind='restart' - a short command is not the same thing as a vague one, so don't withhold it just " +
-  "for being brief. The same goes for a clear instruction to redeploy (kind='deploy', with 'slug' if a " +
-  "session was named), or to kill/remove a specific named session or explicitly 'all' sessions " +
-  "(kind='kill'/'rm', with 'slug' or 'all' set accordingly). " +
+  "for being brief. The same goes for a clear instruction to merge a session's own branch into its repo " +
+  "(kind='merge', with 'slug' if a session was named) - this is about landing that session's git branch, " +
+  "not a request to deploy something to a live server/staging/production, which is addressed to the " +
+  "coding assistant itself and is kind='forward' instead - or to kill/remove a specific named session " +
+  "or explicitly 'all' sessions (kind='kill'/'rm', with 'slug' or 'all' set accordingly). " +
   "A request to stop, interrupt, cancel, or halt what a session is currently doing - without asking to " +
   "kill/remove the session itself - is kind='stop' (with 'slug' if named); this is a short, non-" +
   "destructive interrupt that leaves the session alive, so a brief one-word message ('stop', 'cancel " +
@@ -280,7 +282,7 @@ const SYSTEM_INSTRUCTIONS_BASE =
   "kind='forward'. " +
   "If it's ambiguous, conversational, or addressed to a coding assistant rather than the fleet itself, " +
   "respond with kind='forward' - the caution against guessing a destructive command (kill/rm/restart/" +
-  "deploy/repos-rm) means don't infer one from a joke or unrelated chatter, not that an unambiguous " +
+  "merge/repos-rm) means don't infer one from a joke or unrelated chatter, not that an unambiguous " +
   "short command naming the action should be refused.";
 
 /** Live-observed gap (2026-08-07): the base instructions above only ever describe kill/rm as
@@ -400,8 +402,8 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
         return { kind: "budget" };
       case "restart":
         return { kind: "restart" };
-      case "deploy":
-        return raw.slug ? { kind: "deploy", slug: raw.slug } : null;
+      case "merge":
+        return raw.slug ? { kind: "merge", slug: raw.slug } : null;
       case "detail":
         return { kind: "detail", slug: raw.slug, level: raw.level === "compact" || raw.level === "full" ? raw.level : undefined };
       case "verbose":

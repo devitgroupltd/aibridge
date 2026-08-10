@@ -27,7 +27,7 @@ export interface PendingAttachment {
  * §4.2's fleet-scoped commands. `/new`/`/ls`/`/budget` are control-topic only (no target to act on
  * besides the fleet itself); `/kill`/`/rm`/`/attach`/`/pause`/`/usage`/`/ship` take an optional
  * `<slug>` so they can be sent from the control topic *or* bare from inside the session's own topic
- * (§4.2: "`/kill` with no argument inside a session topic kills that session"). `/deploy` stays the
+ * (§4.2: "`/kill` with no argument inside a session topic kills that session"). `/merge` stays the
  * one exception requiring an explicit `<slug>` from the control topic only (§5.9) - `/ship` runs the
  * identical merge+gate, so a bare invocation is exactly as deliberate an action from inside that
  * session's own topic, but an *explicit* slug naming a different session still needs the control
@@ -55,7 +55,7 @@ export type FleetCommand =
   | { kind: "stop"; slug?: string }
   | { kind: "budget" }
   | { kind: "restart" }
-  | { kind: "deploy"; slug: string }
+  | { kind: "merge"; slug: string }
   | { kind: "ship"; slug?: string }
   | { kind: "detail"; slug?: string; level?: "compact" | "full" }
   | { kind: "verbose"; slug?: string; on?: boolean }
@@ -436,14 +436,14 @@ export function parseSkillsQuery(text: string): { term: string } | null {
 
 /** Shared between `parseFleetCommand` and `matchFleetCommandName` below - the list of command
  * *names* this module recognises, independent of whether the rest of the message parses. */
-const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|rm|remove|attach|pause|stop|usage|budget|restart|deploy|ship|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b/;
+const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|rm|remove|attach|pause|stop|usage|budget|restart|merge|ship|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b/;
 
 /**
  * Same command-name match as `parseFleetCommand`, but returns the bare word even when the rest of
- * the message doesn't parse (missing/malformed required argument, e.g. `/new` with no repo, `/deploy`
+ * the message doesn't parse (missing/malformed required argument, e.g. `/new` with no repo, `/merge`
  * with no slug, `/repos add` with no name). Lets `command-dispatch.ts` tell "not a fleet command at
  * all" (fall through to NL routing/forwarding as plain chat) apart from "recognised command, invalid
- * argument" (surface help/usage instead) - operator-reported: a mistyped `/new` or `/deploy` was
+ * argument" (surface help/usage instead) - operator-reported: a mistyped `/new` or `/merge` was
  * otherwise silently swallowed into the NL router or forwarded into the session as literal chat text.
  */
 export function matchFleetCommandName(text: string): string | null {
@@ -470,12 +470,12 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return { kind: "budget" };
     case "restart":
       return { kind: "restart" };
-    case "deploy": {
+    case "merge": {
       const slug = rest.trim();
-      return slug.length > 0 ? { kind: "deploy", slug } : null;
+      return slug.length > 0 ? { kind: "merge", slug } : null;
     }
     case "ship": {
-      // Unlike `/deploy`, a bare slug is allowed here - resolved against `currentSlug` (the
+      // Unlike `/merge`, a bare slug is allowed here - resolved against `currentSlug` (the
       // dispatch layer, per §4.2's existing convention for `/kill`/`/rm`/`/pause`/`/usage`) when
       // sent from inside a session's own topic, so "ship" typed there is never left to fall through
       // as plain chat text to the session's own Claude process (which - lacking any real command by
@@ -739,10 +739,10 @@ export function renderHelp(): string {
     "  /restart - restart the Bridge daemon",
     "  /os shutdown|reboot|cancel - ⚠️ shut down or restart the WHOLE HOST MACHINE (not just the",
     "    Bridge), confirm-gated with a 60s window to /os cancel",
-    "  /deploy <slug> - merge that session's branch into its repo, run tests, and (if the repo is",
+    "  /merge <slug> - merge that session's branch into its repo, run tests, and (if the repo is",
     "    aibridge's own) restart the Bridge to pick up the fix (§5.9)",
     "  /ship [<slug>] - one-shot land to main: auto-commits uncommitted work in that session's",
-    "    worktree, does /deploy's merge+gate, then pushes origin (bare, from inside that session's",
+    "    worktree, does /merge's merge+gate, then pushes origin (bare, from inside that session's",
     "    own topic, targets that session - no permission buttons, this runs as trusted Bridge code)",
 
     "  /detail [<slug>] [compact|full] - how much of each tool call the feed card shows (default",
@@ -756,7 +756,7 @@ export function renderHelp(): string {
     "  /voiceconfirm [on|off] - whether a transcribed voice note shows a Send/Re-record/Type-instead",
     "    card first before it's dispatched (default on)",
     "  /assist [on|off] - whether a natural-language-matched destructive command (kill/remove/",
-    "    restart/deploy/ship/repos rm) shows a confirm card first (default on)",
+    "    restart/merge/ship/repos rm) shows a confirm card first (default on)",
     "  /router [api|cli] - natural-language routing backend: 'cli' uses your Claude Code",
     "    subscription (slower, no extra cost), 'api' uses a funded ANTHROPIC_API_KEY (faster, real",
     "    but small per-message cost). Defaults to 'cli' even if a key is configured - switch on",
@@ -822,8 +822,8 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "budget", description: "Fleet spend (5h/7d)" },
     { command: "restart", description: "Restart the Bridge daemon" },
     { command: "os", description: "Shut down or reboot the HOST MACHINE (not just the Bridge): /os shutdown|reboot|cancel - confirm-gated" },
-    { command: "deploy", description: "Merge a session's branch and run tests: /deploy <slug> (restarts if it's aibridge's own repo)" },
-    { command: "ship", description: "One-shot land to main: /ship [<slug>] - auto-commits uncommitted work, /deploy's merge+gate, then pushes origin (bare, inside a session's own topic, targets that session)" },
+    { command: "merge", description: "Merge a session's branch and run tests: /merge <slug> (restarts if it's aibridge's own repo)" },
+    { command: "ship", description: "One-shot land to main: /ship [<slug>] - auto-commits uncommitted work, /merge's merge+gate, then pushes origin (bare, inside a session's own topic, targets that session)" },
     { command: "detail", description: "Feed card detail level: /detail [<slug>] [compact|full]" },
     { command: "verbose", description: "Show real tool output on the feed card: /verbose [<slug>] [on|off]" },
     { command: "settings", description: "Registered repos + concurrency budget" },

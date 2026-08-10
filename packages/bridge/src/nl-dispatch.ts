@@ -104,8 +104,8 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
         return `/remove${command.slug ? ` ${command.slug}` : ""}`;
       case "restart":
         return "/restart";
-      case "deploy":
-        return `/deploy ${command.slug}`;
+      case "merge":
+        return `/merge ${command.slug}`;
       case "repos":
         return command.action === "rm" ? `/repos rm ${command.name}` : "/repos";
       default:

@@ -9,7 +9,7 @@
  * unconditionally - correct on a normal crash-to-restart gap of minutes, not on a few hundred ms.
  *
  * Rather than guess at Claude Code's own settle time, this just keeps a self-triggered restart
- * (`/restart`, `/deploy`'s self-repo restart, the stale-deploy rollback) from re-entering
+ * (`/restart`, `/merge`'s self-repo restart, the stale-deploy rollback) from re-entering
  * reconciliation before this process's *own* boot reconciliation has had a chance to breathe -
  * pure decision function, unit-testable against a fake clock rather than only exercisable live.
  */

@@ -5,7 +5,7 @@ import { createRequire } from "node:module";
  * (`slug`, `turnSeq`) button, so a later tap can *edit that message in place* (full log + button
  * removed) instead of always posting a brand-new message alongside it. Persisted (not just an
  * in-memory map) on the operator's own explicit request: an in-memory-only map would lose every
- * pending anchor on a `/restart`/`/deploy`, silently reverting to "send a new message" for every
+ * pending anchor on a `/restart`/`/merge`, silently reverting to "send a new message" for every
  * button posted before that restart - correct as a *fallback*, but not as the normal case for a
  * Bridge that restarts far more often than an operator taps a two-day-old button. Same runtime
  * SQLite binding and same `aibridge.db` file as `session-store.ts`/`settings-store.ts`/

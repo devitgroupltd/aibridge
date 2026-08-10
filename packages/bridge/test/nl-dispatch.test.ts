@@ -128,7 +128,7 @@ describe("createNlDispatch", () => {
       [{ kind: "rm", bulk: { mode: "prefix", prefix: "old-" } }, "/remove --prefix old-"],
       [{ kind: "rm", slug: "fix-bug" }, "/remove fix-bug"],
       [{ kind: "restart" }, "/restart"],
-      [{ kind: "deploy", slug: "fix-bug" }, "/deploy fix-bug"],
+      [{ kind: "merge", slug: "fix-bug" }, "/merge fix-bug"],
       [{ kind: "repos", action: "rm", name: "foo" }, "/repos rm foo"],
       [{ kind: "repos", action: "list" }, "/repos"],
       [{ kind: "budget" }, "/budget"],

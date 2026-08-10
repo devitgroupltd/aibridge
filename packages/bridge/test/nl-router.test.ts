@@ -23,7 +23,7 @@ const ALL_FLEET_COMMAND_KINDS = [
   "usage",
   "budget",
   "restart",
-  "deploy",
+  "merge",
   "detail",
   "verbose",
   "settings",
@@ -179,15 +179,15 @@ describe("mapRouterOutput - one case per kind", () => {
     expect(mapRouterOutput({ kind: "budget" }, SESSION)).toEqual({ matched: false });
   });
 
-  test("restart and deploy are destructive", () => {
+  test("restart and merge are destructive", () => {
     expect(mapRouterOutput({ kind: "restart" }, CONTROL)).toEqual({ matched: true, command: { kind: "restart" }, destructive: true });
-    expect(mapRouterOutput({ kind: "deploy", slug: "fix-bug" }, CONTROL)).toEqual({
+    expect(mapRouterOutput({ kind: "merge", slug: "fix-bug" }, CONTROL)).toEqual({
       matched: true,
-      command: { kind: "deploy", slug: "fix-bug" },
+      command: { kind: "merge", slug: "fix-bug" },
       destructive: true,
     });
-    // deploy requires a slug - there's nothing sensible to deploy without one.
-    expect(mapRouterOutput({ kind: "deploy" }, CONTROL)).toEqual({ matched: false });
+    // merge requires a slug - there's nothing sensible to merge without one.
+    expect(mapRouterOutput({ kind: "merge" }, CONTROL)).toEqual({ matched: false });
   });
 
   test("detail and verbose: not destructive, validate their enum fields", () => {

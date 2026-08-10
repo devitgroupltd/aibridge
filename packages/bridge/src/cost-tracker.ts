@@ -8,7 +8,7 @@
  * Pure and dependency-free by default - the optional `CostStorePort` (backed live by
  * `cost-store.ts`'s SQLite table) is injected, not imported, so this stays unit-testable without a
  * database. Found during the `/deep-check` sweep: without persistence, `/budget`'s rolling 5-hour
- * spend and the burn-rate alarm silently reset to $0 on every `/restart`/`/deploy` - a laptop-class
+ * spend and the burn-rate alarm silently reset to $0 on every `/restart`/`/merge` - a laptop-class
  * bug that's easy to never notice (nothing crashes, the number is just quietly wrong).
  */
 

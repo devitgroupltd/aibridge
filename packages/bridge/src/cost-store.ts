@@ -2,7 +2,7 @@ import { createRequire } from "node:module";
 
 /**
  * Persists `cost-tracker.ts`'s spend events so `/budget`'s rolling 5-hour figure and burn-rate
- * alarm survive a `/restart`/`/deploy` - found during the `/deep-check` sweep: `CostTracker` was
+ * alarm survive a `/restart`/`/merge` - found during the `/deep-check` sweep: `CostTracker` was
  * in-memory only, so a routine restart silently reset the fleet's spend to $0 and could re-arm the
  * burn-rate alarm's cooldown for no real reason. Lives in the same `aibridge.db` file (not a
  * second database) - one more `CREATE TABLE IF NOT EXISTS`, same runtime SQLite binding as

@@ -105,7 +105,7 @@ async function main(): Promise<void> {
   await validateTokens(controlBot, feedBot);
   log("INFO", "both bot tokens validated via getMe");
 
-  // §5.9's crash-loop safety net for `/deploy`'s self-restart path: a marker written just before
+  // §5.9's crash-loop safety net for `/merge`'s self-restart path: a marker written just before
   // the *previous* boot attempt's self-respawn that is still here, and old enough that this boot
   // clearly isn't that same attempt continuing (§7's Task Scheduler restart cadence), means the
   // deployed commit never reached "started cleanly" (see the marker-clearing call near the end of
@@ -114,7 +114,7 @@ async function main(): Promise<void> {
   {
     const marker = readDeployMarker(STATE_DIR);
     if (marker && isDeployMarkerStale(marker, Date.now())) {
-      log("WARN", `deploy marker for "${marker.branch}" is stale - Bridge never started cleanly after that deploy, rolling back to ${marker.previousHeadSha.slice(0, 8)}`);
+      log("WARN", `deploy marker for "${marker.branch}" is stale - Bridge never started cleanly after that merge, rolling back to ${marker.previousHeadSha.slice(0, 8)}`);
       const reset = await rollbackStaleDeploy(marker);
       clearDeployMarker(STATE_DIR);
       if (reset.status === 0) {
@@ -122,7 +122,7 @@ async function main(): Promise<void> {
           await controlBot.sendMessage(
             marker.chatId,
             marker.topicId,
-            `⚠️ Deploy of "${marker.branch}" didn't come back up cleanly - rolled back to ${marker.previousHeadSha.slice(0, 8)} and restarting again.`,
+            `⚠️ Merge of "${marker.branch}" didn't come back up cleanly - rolled back to ${marker.previousHeadSha.slice(0, 8)} and restarting again.`,
           );
         } catch (err) {
           log("WARN", `failed to send deploy-rollback notice: ${(err as Error).message}`);
@@ -857,9 +857,9 @@ async function main(): Promise<void> {
    * rather than a doomed child of this one. Falls back to the direct spawn otherwise, which is
    * correct for a manually-started dev Bridge where there is no job to escape.
    *
-   * Shared by all three self-respawn sites (`/restart`, `/deploy`'s self-repo restart, and the
+   * Shared by all three self-respawn sites (`/restart`, `/merge`'s self-repo restart, and the
    * stale-deploy rollback at boot). The latter two used the raw spawn directly, so on an
-   * autostart-installed host a successful `/deploy` took the Bridge down permanently - and the
+   * autostart-installed host a successful `/merge` took the Bridge down permanently - and the
    * rollback path then did it again on the next manual start, immediately after rolling back.
    *
    * restart-settle.ts: found live 2026-08-06 that firing this within ~1s of `bootReadyAt` kills a
@@ -867,7 +867,7 @@ async function main(): Promise<void> {
    * same `session_id` again in the successor - Claude Code's own resume bookkeeping doesn't
    * tolerate two resumes that close together and the second one comes up dead. `bootReadyAt` is
    * still `undefined` for the stale-deploy rollback (it fires before reconciliation ever runs, so
-   * there is nothing of this boot's own to protect yet) - only `/restart` and `/deploy` can ever
+   * there is nothing of this boot's own to protect yet) - only `/restart` and `/merge` can ever
    * see a defined, non-zero delay here.
    */
   async function respawnSelfAndExit(): Promise<never> {
@@ -884,7 +884,7 @@ async function main(): Promise<void> {
       // that blindly re-launches with whatever binary happened to start *this* process, so a
       // Bridge that was ever started via `bun run` even once - manually, or via the autostart
       // Task Scheduler entry's own past mis-registration - kept perpetuating that lineage forever,
-      // across every `/restart` and `/deploy`. Bun is the confirmed, reproduced trigger for
+      // across every `/restart` and `/merge`. Bun is the confirmed, reproduced trigger for
       // node-pty's unhandled "Socket is closed" ConPTY write crash (0.21.0), which wedges nearly
       // every session within ~1s of spawn - live-observed 2026-08-08, see
       // `resolveNodeExecutable`'s own doc comment (session-launcher.ts) for the full chain. Always
@@ -1007,7 +1007,7 @@ async function main(): Promise<void> {
         await controlBot.sendMessage(
           marker.chatId,
           marker.topicId,
-          `✅ Deploy succeeded - Bridge is back up on ${marker.newHeadSha.slice(0, 8)} ("${marker.branch}").`,
+          `✅ Merge succeeded - Bridge is back up on ${marker.newHeadSha.slice(0, 8)} ("${marker.branch}").`,
         );
       } catch (err) {
         log("WARN", `failed to send deploy-success notice: ${(err as Error).message}`);

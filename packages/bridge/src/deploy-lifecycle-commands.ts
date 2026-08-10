@@ -100,7 +100,7 @@ export interface DeployLifecycleCommandsOptions {
   entryScriptDir: string;
   log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
   /** Defaults to the real `deploy.ts` merge-and-gate implementation - injectable so
-   * `handleDeployCommand`'s own control flow (topic gating, ack/failure/success messaging,
+   * `handleMergeCommand`'s own control flow (topic gating, ack/failure/success messaging,
    * self-repo restart + deploy-marker sequencing) is unit-testable without a real git repo or a
    * real `bun test`/`tsc` gate run. */
   deployBranch?: typeof realDeployBranch;
@@ -112,7 +112,7 @@ export interface DeployLifecycleCommandsOptions {
 
 export interface DeployLifecycleCommands {
   handleRestartCommand(topicId: number | undefined): Promise<void>;
-  handleDeployCommand(topicId: number | undefined, slug: string): Promise<void>;
+  handleMergeCommand(topicId: number | undefined, slug: string): Promise<void>;
   handleShipCommand(topicId: number | undefined, explicitSlug: string | undefined, currentSlug: string | undefined): Promise<void>;
   handleAutostartCommand(cmd: Extract<FleetCommand, { kind: "autostart" }>, topicId: number | undefined): Promise<void>;
 }
@@ -124,13 +124,13 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
   const pushCurrentBranch = opts.pushCurrentBranch ?? realPushCurrentBranch;
 
   /**
-   * The self-repo-restart tail shared by `/deploy` and `/ship`: once a merge into `repoPath` has
+   * The self-repo-restart tail shared by `/merge` and `/ship`: once a merge into `repoPath` has
    * already succeeded, only if that repo is this Bridge's own checkout (`isSelfRepo`) does landing
    * the fix also mean respawning to run it - any other project's branch is just a merge+test, there
    * is no "Bridge" to restart for it. Writes `deployMarker` first so a boot that never comes up
    * cleanly gets rolled back automatically (see the startup check near the end of `main()`) rather
    * than crash-looping on a bad commit with no way to say so. Extracted so `/ship` gets the exact
-   * same self-repo behaviour as `/deploy` without duplicating it.
+   * same self-repo behaviour as `/merge` without duplicating it.
    */
   async function restartIfSelfRepo(commandLabel: string, repoPath: string, branch: string, outcome: { previousHeadSha?: string; newHeadSha?: string }, topicId: number | undefined): Promise<void> {
     const bridgeRepoRoot = resolveBridgeRepoRoot(entryScriptDir);
@@ -186,7 +186,7 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
   }
 
   /**
-   * §5.9's `/deploy <slug>`: lets a fix written by a Claude session - including one against
+   * §5.9's `/merge <slug>`: lets a fix written by a Claude session - including one against
    * aibridge's own repo, registered like any other project (§7.5) - land without a desk. Merges
    * that session's own branch into its repo's main checkout via `deployBranch` (fast-forward only,
    * rolled back automatically on a gate failure; if main has moved on since the branch was cut,
@@ -198,9 +198,9 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
    * (see the startup check near the end of `main()`) rather than crash-looping on a bad commit
    * with no way to say so.
    */
-  async function handleDeployCommand(topicId: number | undefined, slug: string): Promise<void> {
+  async function handleMergeCommand(topicId: number | undefined, slug: string): Promise<void> {
     if (!isControlTopic(topicId)) {
-      confirmSessionCommand(topicId, "/deploy only works from the control topic.");
+      confirmSessionCommand(topicId, "/merge only works from the control topic.");
       return;
     }
     const row = sessionStore.get(slug);
@@ -210,36 +210,36 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     }
     const { repoPath, branch, worktreePath } = row;
     try {
-      await controlBot.sendMessage(supergroupChatId, topicId, `Deploying "${branch}" (session "${slug}") into ${repoPath}…`);
+      await controlBot.sendMessage(supergroupChatId, topicId, `Merging "${branch}" (session "${slug}") into ${repoPath}…`);
     } catch (err) {
-      log("WARN", `failed to send /deploy ack: ${(err as Error).message}`);
+      log("WARN", `failed to send /merge ack: ${(err as Error).message}`);
     }
-    log("INFO", `/deploy requested for slug "${slug}" -> merging "${branch}" into ${repoPath}`);
+    log("INFO", `/merge requested for slug "${slug}" -> merging "${branch}" into ${repoPath}`);
     const packageDirs = discoverTypecheckedPackages(repoPath);
     const outcome = await deployBranch(repoPath, branch, packageDirs, undefined, worktreePath);
     if (!outcome.ok) {
-      log("WARN", `/deploy failed for "${branch}": ${outcome.message}`);
+      log("WARN", `/merge failed for "${branch}": ${outcome.message}`);
       try {
         await controlBot.sendMessage(supergroupChatId, topicId, truncateForTelegram(outcome.message));
       } catch (err) {
-        log("WARN", `failed to send /deploy failure message: ${(err as Error).message}`);
+        log("WARN", `failed to send /merge failure message: ${(err as Error).message}`);
       }
       return;
     }
     try {
       await controlBot.sendMessage(supergroupChatId, topicId, truncateForTelegram(outcome.message));
     } catch (err) {
-      log("WARN", `failed to send /deploy success message: ${(err as Error).message}`);
+      log("WARN", `failed to send /merge success message: ${(err as Error).message}`);
     }
 
-    await restartIfSelfRepo("/deploy", repoPath, branch, outcome, topicId);
+    await restartIfSelfRepo("/merge", repoPath, branch, outcome, topicId);
   }
 
   /**
    * `/ship <slug>` (control topic) or bare `/ship` (a session's own topic, §4.2's existing
    * `/kill`/`/rm`/`/pause`/`/usage` convention): the one-shot "land it, I'm done" command, reachable
    * without opening a control-topic round-trip *or* going through the session's own Claude process
-   * at all - this runs as trusted Bridge code via a direct `CommandRunner`, the same way `/deploy`
+   * at all - this runs as trusted Bridge code via a direct `CommandRunner`, the same way `/merge`
    * always has, so it never touches (and never needs a Telegram button from) the session's own
    * `permissions.ask` gate the way an equivalent in-session `git commit`/`git push` would. An
    * explicit slug naming a *different* session still requires the control topic - only a bare
@@ -249,7 +249,7 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
    *
    * Three steps chained together, each already its own tested piece: auto-commit the session's
    * worktree if it's dirty (`commitIfDirty` - a session may still have uncommitted work sitting
-   * there), then exactly what `/deploy` does (merge+gate, rolled back automatically on failure,
+   * there), then exactly what `/merge` does (merge+gate, rolled back automatically on failure,
    * self-repo restart), then - only on a successful merge - `git push origin <branch>` from
    * `repoPath` so the fast-forward actually reaches the remote instead of staying local to this
    * machine's checkout (`deployBranch` alone never pushes). A push failure is reported on its own:
@@ -349,5 +349,5 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     }
   }
 
-  return { handleRestartCommand, handleDeployCommand, handleShipCommand, handleAutostartCommand };
+  return { handleRestartCommand, handleMergeCommand, handleShipCommand, handleAutostartCommand };
 }
