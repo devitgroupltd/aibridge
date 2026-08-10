@@ -25,7 +25,11 @@ import type { PermissionSettings } from "./settings.ts";
 const UNSAFE_SUBSTRINGS = ["$(", "`"];
 // A lone `&` (background) - not part of `&&` - is unsafe to decompose; checked separately from
 // UNSAFE_SUBSTRINGS above since a plain `.includes("&")` would also (wrongly) flag every `&&`.
-const BARE_AMPERSAND_RE = /(?<!&)&(?!&)/;
+// Also excludes `&` immediately adjacent to `>` - `2>&1`, `>&2`, `&>file` are fd-duplication/
+// redirect syntax, not job control, and are extremely common in exactly the trusted
+// `cmd 2>&1 | tail -N` shape this module exists to unblock (found live 2026-08-10: that shape was
+// being rejected outright because this regex flagged the `&` in `2>&1` as a bare background `&`).
+const BARE_AMPERSAND_RE = /(?<![&>])&(?![&>])/;
 
 /** File-path substrings that make a command sensitive regardless of which sub-command carries
  * them - mirrors the `Read`/`Edit` deny globs in settings.ts (`.env`, `*.pem`, `*.key`, `*.pfx`,

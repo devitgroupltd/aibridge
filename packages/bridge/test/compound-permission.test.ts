@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { containsSensitivePath, isCompoundCommandFullyAllowed, splitTopLevelCommands, WIDENED_AUTO_APPROVE_PREFIXES } from "../src/compound-permission.ts";
-import type { PermissionSettings } from "../src/settings.ts";
+import { generateSettings, type PermissionSettings } from "../src/settings.ts";
 
 const settings: PermissionSettings = {
   permissions: {
@@ -24,6 +24,21 @@ describe("splitTopLevelCommands", () => {
     expect(splitTopLevelCommands("echo $(whoami)")).toBeNull();
     expect(splitTopLevelCommands("echo `whoami`")).toBeNull();
     expect(splitTopLevelCommands("sleep 5 &")).toBeNull();
+  });
+
+  // Regression: a first version of the bare-& guard flagged *any* lone `&`, including the `&` in
+  // fd-duplication/redirect syntax (`2>&1`, `>&2`, `&>file`) - not job control at all, and exactly
+  // the shape a trusted `cmd 2>&1 | tail -N` chain uses. That silently blocked decomposition of an
+  // otherwise fully-allowed chain like `cd <dir> && bun run typecheck 2>&1 | tail -80`.
+  test("does not mistake a redirect's fd-duplication & for a background &", () => {
+    expect(splitTopLevelCommands("bun run typecheck 2>&1 | tail -80")).toEqual(["bun run typecheck 2>&1", "tail -80"]);
+    expect(splitTopLevelCommands("cmd >&2")).toEqual(["cmd >&2"]);
+    expect(splitTopLevelCommands("cmd &>file")).toEqual(["cmd &>file"]);
+  });
+
+  test("still bails out on a genuine trailing background & even next to other text", () => {
+    expect(splitTopLevelCommands("cmd 2>&1 &")).toBeNull();
+    expect(splitTopLevelCommands("sleep 5 & sleep 6")).toBeNull();
   });
 
   test("bails out on an unterminated quote rather than guessing", () => {
@@ -92,6 +107,26 @@ describe("isCompoundCommandFullyAllowed", () => {
 
   test("an exact (non-wildcard) allow rule like Bash(npm ci) still matches as a sub-command", () => {
     expect(isCompoundCommandFullyAllowed("npm ci && cat README.md", settings)).toBe(true);
+  });
+
+  // The live-observed case that motivated widening BARE_AMPERSAND_RE: a `cd ... && bun run
+  // typecheck 2>&1 | tail -N` chain, piped through tail for a shorter log - every piece already
+  // trusted on its own, but the `2>&1` redirect used to be misread as a background `&` and bail
+  // the whole chain out to "can't decide" before decomposition ever got a chance.
+  test("a cd && trusted-cmd 2>&1 | tail -N chain is fully allowed", () => {
+    const withBunRun: PermissionSettings = {
+      permissions: { ...settings.permissions, allow: [...settings.permissions.allow, "Bash(bun run *)", "Bash(tail *)"] },
+    };
+    const command = `cd "C:\\data\\worktrees\\x\\packages\\bridge" && bun run typecheck 2>&1 | tail -80`;
+    expect(isCompoundCommandFullyAllowed(command, withBunRun)).toBe(true);
+  });
+
+  // End-to-end regression against the real generated settings (not the trimmed local fixture
+  // above) for the exact command a live Telegram prompt showed on 2026-08-10.
+  test("the real generated settings now fully allow the live-prompted cd && bun run typecheck 2>&1 | tail chain", () => {
+    const real = generateSettings();
+    const command = `cd /c/data/worktrees/analyze-the-design-of-stop/packages/bridge && bun run typecheck 2>&1 | tail -80`;
+    expect(isCompoundCommandFullyAllowed(command, real, WIDENED_AUTO_APPROVE_PREFIXES)).toBe(true);
   });
 
   // Regression: a first version's rule matcher only recognised a wildcard when it sat at the very

@@ -175,6 +175,13 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         // even though each half is exactly as safe as the `rg *` entry already pre-approved.
         "Bash(grep -c *)",
         "Bash(grep -n *)",
+        // Read-only, truncates stdin/a file to N lines - added 2026-08-10 after a live prompt for
+        // `cd <pkg> && bun run typecheck 2>&1 | tail -80` (a `bun run *`-allowed command piped
+        // through tail for a shorter log), the exact case the tsc.cmd/tail entry above was left out
+        // for until a real prompt demonstrated the gap. Combines with compound-permission.ts's
+        // decomposition, not a standalone whole-string rule, so this alone doesn't approve the `cd
+        // && ... | tail` chain - see WIDENED_AUTO_APPROVE_PREFIXES's doc comment for why that's fine.
+        "Bash(tail *)",
       ],
     },
   };
