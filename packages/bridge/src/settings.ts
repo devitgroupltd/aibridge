@@ -138,6 +138,11 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         "Grep",
         "TodoWrite",
         "NotebookRead",
+        // Starting a skill (`/commit`, `/push`, `/ship`, ...) is just loading its instructions into
+        // context - not itself a sensitive action. Added 2026-08-10 after a live prompt for
+        // `{"skill": "commit"}` on top of the git commit/push prompt the skill's own actions still
+        // correctly raise a moment later (those stay in `ask` above, unaffected by this).
+        "Skill",
         "mcp__aibridge__reply",
         "mcp__aibridge__send_file",
         "mcp__plugin_aibridge-telegram_aibridge__reply",

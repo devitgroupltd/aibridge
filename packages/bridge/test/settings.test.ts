@@ -15,6 +15,7 @@ const CANONICAL_TOOL_NAMES = new Set([
   "Write",
   "Glob",
   "NotebookEdit",
+  "Skill",
 ]);
 
 function ruleToolName(rule: string): string {
@@ -125,6 +126,16 @@ describe("generateSettings", () => {
   test("pre-allows the plugin-scoped reply/send_file tool names actually presented post-0.55.0", () => {
     expect(settings.permissions.allow).toContain("mcp__plugin_aibridge-telegram_aibridge__reply");
     expect(settings.permissions.allow).toContain("mcp__plugin_aibridge-telegram_aibridge__send_file");
+  });
+
+  // Live prompt 2026-08-10: starting `/commit` raised its own permission card before the git
+  // commit/push prompt its actions correctly still raise a moment later. Starting a skill is just
+  // loading instructions into context, not itself sensitive - the "ask git commit/push, not allow"
+  // rules above are what actually keeps a skill's real actions gated.
+  test("pre-approves starting any skill, without weakening the git commit/push ask rules", () => {
+    expect(settings.permissions.allow).toContain("Skill");
+    expect(settings.permissions.ask).toContain("Bash(git commit *)");
+    expect(settings.permissions.ask).toContain("Bash(git push *)");
   });
 
   test("omits the hooks block entirely when no hook client path is given", () => {
