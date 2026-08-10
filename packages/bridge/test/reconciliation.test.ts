@@ -40,12 +40,9 @@ describe("reconcile (§9 scenario 24, §4.5's reconciliation table)", () => {
     expect(reconcile([row({ state: "dead" })], () => false)).toEqual([]);
   });
 
-  test("an awaiting_input row also emits a lost_prompt notice, on top of its resume/readopt action", () => {
+  test("an awaiting_input row still just resumes here - the lost-prompt notice/nudge is session-supervisor.ts's resumeSession's job, not reconcile's (resume-nudge-on-lost-permission-plan.md §3)", () => {
     const actions = reconcile([row({ state: "awaiting_input" })], () => false);
-    expect(actions).toEqual([
-      { kind: "lost_prompt", slug: "fix-bug" },
-      { kind: "resume", slug: "fix-bug", sessionId: "sess-123" },
-    ]);
+    expect(actions).toEqual([{ kind: "resume", slug: "fix-bug", sessionId: "sess-123" }]);
   });
 
   test("a resume with no persisted session_id yet (killed before SessionStart) carries sessionId: null", () => {

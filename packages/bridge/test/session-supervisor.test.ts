@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createSessionSupervisor, MAX_CONSECUTIVE_RESUME_ATTEMPTS, RESUME_BACKOFF_MS } from "../src/session-supervisor.ts";
+import { LateBound } from "../src/late-bound.ts";
 import { Routing } from "../src/routing.ts";
 import { SessionStore, type SessionRow } from "../src/session-store.ts";
 import type { LaunchedSession } from "../src/session-launcher.ts";
@@ -72,6 +73,18 @@ function fakeConfirm() {
     },
     calls,
   };
+}
+
+/** A pre-set `LateBound` recording every `sendResumeNudge` call - resume-nudge-on-lost-permission-
+ * plan.md §1/§2. Set up front (unlike the real composition root's post-`createPtyIo` `.set()`)
+ * since these tests never exercise the construction-order gap `LateBound` itself guards against. */
+function fakeResumeNudge() {
+  const calls: Array<{ slug: string; topicId: number; content: string }> = [];
+  const late = new LateBound<(slug: string, topicId: number, content: string) => void>();
+  late.set((slug, topicId, content) => {
+    calls.push({ slug, topicId, content });
+  });
+  return { late, calls };
 }
 
 describe("createSessionSupervisor", () => {
@@ -451,6 +464,291 @@ describe("createSessionSupervisor", () => {
     expect(resumedPty.wasKilled()).toBe(true);
     expect(sessionStore.get("fix-bug")?.state).toBe("dead");
     expect(confirm.calls.some((c) => c.text.includes("couldn't resume its prior conversation"))).toBe(true);
+  });
+
+  // resume-nudge-on-lost-permission-plan.md §2/Testing: resumeSession sends a nudge into a
+  // successfully-resumed session, but only when its pending permission prompt was actually lost -
+  // this is the first real coverage of that branch (previously only reconciliation.ts's now-deleted
+  // `lost_prompt` action stood in for it, and nothing ever consumed that).
+  test("resumeSession nudges a resumed session whose pending permission prompt was lost", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "awaiting_input" }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const nudge = fakeResumeNudge();
+    const resumedPty = fakePty();
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      sendResumeNudge: nudge.late,
+      launchSession: () => ({
+        worktreePath: "c:\\data\\worktrees\\fix-bug",
+        branch: "claude/fix-bug-1",
+        ptyProcess: resumedPty as unknown as LaunchedSession["ptyProcess"],
+        ready: Promise.resolve({ resumeFailed: false }),
+      }),
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!);
+
+    expect(nudge.calls).toEqual([{ slug: "fix-bug", topicId: 2, content: expect.stringContaining("Check what you were in the middle of") }]);
+    expect(confirm.calls.some((c) => c.text.includes("pending question was lost"))).toBe(true);
+    expect(confirm.calls.some((c) => c.text === 'Session "fix-bug" resumed.')).toBe(true);
+  });
+
+  // resume-nudge-on-lost-permission-plan.md §7: three live trials (2026-08-10) confirmed the
+  // single nudge above does not reliably land as the very first turn after a resume - the session
+  // settles back to `idle` with nothing retried. This follow-up nudge is the one thing that
+  // reliably worked in every trial (an ordinary second message), sent automatically after
+  // RESUME_NUDGE_FOLLOWUP_DELAY_MS instead of requiring the operator to notice and type it.
+  test("resumeSession sends a second follow-up nudge if the session is still idle after the first one - the one thing that reliably worked live", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "awaiting_input" }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const nudge = fakeResumeNudge();
+    const resumedPty = fakePty();
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      sendResumeNudge: nudge.late,
+      // Simulates the confirmed-live failure mode: the nudged turn completes and the Stop hook
+      // (session-state-transitions.ts) settles the row back to idle, with nothing else changed.
+      delay: async () => {
+        sessionStore.setState("fix-bug", "idle", "2026-08-10T00:00:00.000Z");
+      },
+      launchSession: () => ({
+        worktreePath: "c:\\data\\worktrees\\fix-bug",
+        branch: "claude/fix-bug-1",
+        ptyProcess: resumedPty as unknown as LaunchedSession["ptyProcess"],
+        ready: Promise.resolve({ resumeFailed: false }),
+      }),
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!);
+    // Flushes the fire-and-forgotten follow-up's `await delay(...)` continuation (same idiom used
+    // elsewhere in this file for handleUnexpectedExit's own fire-and-forget resume).
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(nudge.calls.length).toBe(2);
+    expect(nudge.calls[1]).toEqual({ slug: "fix-bug", topicId: 2, content: expect.stringContaining("Nothing happened after my last message") });
+  });
+
+  test("resumeSession does NOT send a follow-up nudge if the first one worked - a fresh permission ask is already up (awaiting_input)", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "awaiting_input" }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const nudge = fakeResumeNudge();
+    const resumedPty = fakePty();
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      sendResumeNudge: nudge.late,
+      delay: async () => {
+        sessionStore.setState("fix-bug", "awaiting_input", "2026-08-10T00:00:00.000Z");
+      },
+      launchSession: () => ({
+        worktreePath: "c:\\data\\worktrees\\fix-bug",
+        branch: "claude/fix-bug-1",
+        ptyProcess: resumedPty as unknown as LaunchedSession["ptyProcess"],
+        ready: Promise.resolve({ resumeFailed: false }),
+      }),
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(nudge.calls.length).toBe(1);
+  });
+
+  test("resumeSession does NOT send a follow-up nudge if a turn is still genuinely in flight (state stayed working)", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "awaiting_input" }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const nudge = fakeResumeNudge();
+    const resumedPty = fakePty();
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      sendResumeNudge: nudge.late,
+      // No-op delay - the row stays "working" (this module's own awaiting_input -> working flip),
+      // i.e. still mid-turn at the deadline.
+      delay: async () => {},
+      launchSession: () => ({
+        worktreePath: "c:\\data\\worktrees\\fix-bug",
+        branch: "claude/fix-bug-1",
+        ptyProcess: resumedPty as unknown as LaunchedSession["ptyProcess"],
+        ready: Promise.resolve({ resumeFailed: false }),
+      }),
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(nudge.calls.length).toBe(1);
+  });
+
+  test("resumeSession does NOT send a follow-up nudge if the row was removed or killed during the follow-up wait", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "awaiting_input" }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const nudge = fakeResumeNudge();
+    const resumedPty = fakePty();
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      sendResumeNudge: nudge.late,
+      delay: async () => {
+        sessionStore.remove("fix-bug");
+      },
+      launchSession: () => ({
+        worktreePath: "c:\\data\\worktrees\\fix-bug",
+        branch: "claude/fix-bug-1",
+        ptyProcess: resumedPty as unknown as LaunchedSession["ptyProcess"],
+        ready: Promise.resolve({ resumeFailed: false }),
+      }),
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!);
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+
+    expect(nudge.calls.length).toBe(1);
+  });
+
+  test("resumeSession does not nudge a normal (non-awaiting_input) resume - it wasn't blocked on anything to retry", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "working" }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const nudge = fakeResumeNudge();
+    const resumedPty = fakePty();
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      sendResumeNudge: nudge.late,
+      launchSession: () => ({
+        worktreePath: "c:\\data\\worktrees\\fix-bug",
+        branch: "claude/fix-bug-1",
+        ptyProcess: resumedPty as unknown as LaunchedSession["ptyProcess"],
+        ready: Promise.resolve({ resumeFailed: false }),
+      }),
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!);
+
+    expect(nudge.calls).toEqual([]);
+  });
+
+  test("resumeSession does not nudge when claude --resume itself failed - there's no live conversation to retry into", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "awaiting_input" }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const nudge = fakeResumeNudge();
+    const resumedPty = fakePty();
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      sendResumeNudge: nudge.late,
+      launchSession: () => ({
+        worktreePath: "c:\\data\\worktrees\\fix-bug",
+        branch: "claude/fix-bug-1",
+        ptyProcess: resumedPty as unknown as LaunchedSession["ptyProcess"],
+        ready: Promise.resolve({ resumeFailed: true }),
+      }),
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!);
+
+    expect(nudge.calls).toEqual([]);
+  });
+
+  test("resumeSession does not nudge when there's no sessionId to resume from - no launch is even attempted", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "awaiting_input", sessionId: null }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const nudge = fakeResumeNudge();
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      sendResumeNudge: nudge.late,
+      launchSession: () => {
+        throw new Error("should not be called");
+      },
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!);
+
+    expect(nudge.calls).toEqual([]);
+  });
+
+  test("resumeSession does not nudge when launchSession itself throws", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "awaiting_input" }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const nudge = fakeResumeNudge();
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      sendResumeNudge: nudge.late,
+      launchSession: () => {
+        throw new Error("launch exploded");
+      },
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!);
+
+    expect(nudge.calls).toEqual([]);
+    expect(sessionStore.get("fix-bug")?.state).toBe("dead");
   });
 
   test("resumeSession with no recorded sessionId marks the row dead and reports it, rather than attempting a launch", async () => {

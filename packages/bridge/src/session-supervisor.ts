@@ -1,6 +1,7 @@
 import path from "node:path";
 import type * as pty from "node-pty";
 import { fireAndForget } from "./fire-and-forget.ts";
+import type { LateBound } from "./late-bound.ts";
 import { findOrphanProcesses } from "./orphan-scan.ts";
 import { listClaudeProcesses } from "./process-scan.ts";
 import { reconcile } from "./reconciliation.ts";
@@ -17,6 +18,15 @@ import type { InlineKeyboardMarkup } from "./telegram.ts";
  * `claude --resume` to fail instantly and relaunch in an unbounded, ever-flooding loop (§4.5). */
 export const RESUME_BACKOFF_MS = [1000, 15_000, 60_000] as const;
 export const MAX_CONSECUTIVE_RESUME_ATTEMPTS = 3;
+
+/** resume-nudge-on-lost-permission-plan.md §6/§7: how long to wait after the first resume nudge
+ * before checking whether it actually landed. Three live trials (2026-08-10, two different
+ * wordings plus `CLAUDE_CODE_RESUME_INTERRUPTED_TURN=0`) all showed the same shape - a resumed
+ * session's own turn in response to the nudge completes in a handful of seconds (a few dozen to
+ * ~100 thinking tokens, `Stop` hook firing shortly after) whether or not it actually retried
+ * anything - so 20s is generous headroom past that, not a guess at how long a real retry attempt
+ * takes to finish (that's unbounded and this check does not wait for it). */
+export const RESUME_NUDGE_FOLLOWUP_DELAY_MS = 20_000;
 
 type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
 
@@ -77,6 +87,18 @@ export interface SessionSupervisorOptions {
    * about to resume, not end). Optional so existing tests that never exercise this don't need to
    * supply one. */
   clearThinkingPlaceholder?: (topicId: number) => void;
+  /** Sends a nudge into a resumed session whose pending permission prompt was lost - see
+   * resume-nudge-on-lost-permission-plan.md §1/§2. Same shape as `PtyIo['sendChannelText']`
+   * deliberately (Interface Segregation: `resumeSession` needs exactly this one function, not the
+   * whole `PtyIo` surface). `LateBound`, not a plain closure over `pty-io.ts`'s `ptyIo`: the
+   * composition root constructs `session-supervisor.ts` *before* `pty-io.ts` (the latter needs this
+   * module's `lastActivityAt`/`getPtyProcess` accessors), so a bare closure captured at this call
+   * site would reference an unassigned `const`. `resumeSession` only calls `.get()` on this well
+   * after the composition root's `.set()` (a real resume can't happen before startup finishes), so
+   * the "read too early" guard is a safety net for a future refactor mistake, not a real runtime
+   * path. Optional so existing tests that never exercise the `awaiting_input` resume branch don't
+   * need to supply one. */
+  sendResumeNudge?: LateBound<(slug: string, topicId: number, content: string) => void>;
 }
 
 export interface SessionSupervisor {
@@ -123,6 +145,7 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
   const delay = opts.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const usageWaiters = opts.usageWaiters ?? new Map<string, { buffer: string; check: () => void }>();
   const launchSession = opts.launchSession ?? realLaunchSession;
+  const sendResumeNudge = opts.sendResumeNudge;
 
   const ptyProcessBySlug = new Map<string, pty.IPty>();
   /** Guards `handleUnexpectedExit`'s relaunch loop against a stale `session_id` causing an
@@ -374,7 +397,8 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
       log("INFO", `resumeSession("${slug}") skipped - it was already marked dead (most likely by /kill) during the resume wait`);
       return;
     }
-    if (current.state === "awaiting_input") {
+    const hadLostPrompt = current.state === "awaiting_input";
+    if (hadLostPrompt) {
       sessionStore.setState(slug, "working", now());
       confirmSessionCommand(topicId, "The pending question was lost - please re-ask.");
     }
@@ -432,11 +456,62 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
         );
       } else {
         confirmSessionCommand(topicId, `Session "${slug}" resumed.`);
+        // resume-nudge-on-lost-permission-plan.md §2: a resumed Claude comes back idle rather than
+        // retrying whatever tool call its lost permission prompt was blocking on (confirmed live
+        // 2026-08-10 - a pending `git commit` never happened after resume). Only for the row that
+        // actually lost a pending prompt on *this* resume - a normal working-state resume already
+        // has Claude mid-reply, and nudging that too would inject an unsolicited turn into work
+        // that was proceeding correctly on its own.
+        // Wording note (confirmed live 2026-08-10): a plain "please retry it" was NOT enough on its
+        // own - a live trial sat idle for minutes with no retry, and only started checking git
+        // state and re-attempting once explicitly asked "what were you in the middle of, check and
+        // retry." Folding that same check-first instruction into the nudge itself (rather than
+        // relying on the operator to send it by hand) is what makes this actually self-service.
+        if (hadLostPrompt) {
+          sendResumeNudge?.get()(
+            slug,
+            topicId,
+            "A Bridge restart interrupted you before your last action could complete or be approved - it never ran. Check what you were in the middle of (e.g. git status/log, or whatever else is relevant) and retry it.",
+          );
+          // §7: the nudge above is confirmed live (three trials, 2026-08-10) to NOT reliably land
+          // as the very first turn after a resume - the session's own turn completes in a handful
+          // of seconds and settles back to `idle` with nothing retried, no matter how the first
+          // nudge is worded. What did reliably work, in every trial: an *ordinary second* message
+          // reaching the session. This is that second message, sent automatically instead of
+          // requiring the operator to notice the silence and type it by hand - the one thing this
+          // plan's live investigation actually found working, not a new guess.
+          fireAndForget(sendFollowUpNudgeIfStillIdle(slug, topicId), log, `session-supervisor resume follow-up nudge(${slug})`);
+        }
       }
     } catch (err) {
       markDeadIfPresent(slug);
       confirmSessionCommand(topicId, `Failed to resume "${slug}": ${(err as Error).message}. Worktree preserved at ${row.worktreePath}.`);
     }
+  }
+
+  /**
+   * resume-nudge-on-lost-permission-plan.md §7: fires exactly once, `RESUME_NUDGE_FOLLOWUP_DELAY_MS`
+   * after the first resume nudge, only if the session settled at `idle` with nothing to show for
+   * it - the exact failure mode confirmed live. Skips (no second nudge) for every other outcome:
+   * - `awaiting_input` means the first nudge worked - a fresh permission card is already up.
+   * - `working` means a turn is still genuinely in flight (its own or a real retry) - nudging into
+   *   that would inject an unsolicited nested turn, same reasoning as `resumeSession` only ever
+   *   nudging a row that actually lost a pending prompt in the first place (§2).
+   * - `dead` or the row being gone entirely means `/kill`/`/rm` raced this wait - same defensive
+   *   re-read `resumeSession` itself already relies on, for the same reason.
+   * Not a loop: one follow-up only. Every live trial that got a reply needed exactly one second
+   * message, never more - looping further has no evidence behind it and risks nagging a session
+   * that's genuinely just idle for an unrelated reason.
+   */
+  async function sendFollowUpNudgeIfStillIdle(slug: string, topicId: number): Promise<void> {
+    await delay(RESUME_NUDGE_FOLLOWUP_DELAY_MS);
+    const current = sessionStore.get(slug);
+    if (!current || current.state !== "idle") return;
+    sendResumeNudge?.get()(
+      slug,
+      topicId,
+      "Nothing happened after my last message - you're still idle. Please actually run the check now (e.g. git status/log) and complete whatever action was interrupted by the restart, or reply explaining why you can't.",
+    );
   }
 
   function getPtyProcess(slug: string): pty.IPty | undefined {

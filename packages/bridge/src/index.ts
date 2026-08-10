@@ -442,6 +442,15 @@ async function main(): Promise<void> {
   // lastPtyActivityBySlug - everything else reaches them only through the accessors below.
   // `confirmSessionCommand` is a hoisted function declaration (defined further down in this same
   // scope) - referencing it here is safe, since JS hoists the whole declaration, not just the name.
+  // resume-nudge-on-lost-permission-plan.md §1: `sendResumeNudge` needs `pty-io.ts`'s real
+  // `sendChannelText`, but `createPtyIo` (below) isn't constructed until *after* this, since it in
+  // turn needs `sessionSupervisor`'s own `lastActivityAt`/`getPtyProcess` accessors - a plain
+  // closure captured here would reference `ptyIo` before it's assigned. `LateBound` makes that
+  // forward reference explicit and checked, same as `commandDispatch`/`fleetConfirmFlow` above:
+  // `resumeSession` only calls `.get()` from inside a real resume, well after `.set()` runs just
+  // below `createPtyIo`.
+  const sendResumeNudge = new LateBound<(slug: string, topicId: number, content: string) => void>();
+
   const sessionSupervisor = createSessionSupervisor({
     sessionStore,
     routing,
@@ -452,6 +461,7 @@ async function main(): Promise<void> {
     otlpPort,
     log,
     usageWaiters,
+    sendResumeNudge,
     // See `SessionSupervisorOptions.clearThinkingPlaceholder`'s own doc comment: a crash mid-turn
     // leaves that turn's placeholder stuck with nothing left to consume it - `handleUnexpectedExit`
     // calls this once it confirms a real crash, so the next inbound message after a resume gets its
@@ -481,6 +491,10 @@ async function main(): Promise<void> {
     submitConfirmWindowMs,
     echoSettleMs,
   });
+  // Fixed msgId/from pair identifies this as Bridge-generated, not a real Telegram message - same
+  // convention session-lifecycle-commands.ts's `/new` first-turn injection already uses
+  // ("new-1"/"telegram"). See sendResumeNudge's own doc comment above for why this is a LateBound.
+  sendResumeNudge.set((slug, topicId, content) => ptyIo.sendChannelText(slug, topicId, content, "resume-nudge", "aibridge"));
 
   // feed-wiring.ts: the hook-event -> feed-card rendering pipeline, the details-button anchor, and
   // the hook-driven half of the state table. Constructed *before* `pipeHandle` (needs
