@@ -20,6 +20,7 @@ const ALL_FLEET_COMMAND_KINDS = [
   "rm",
   "attach",
   "pause",
+  "resume",
   "usage",
   "budget",
   "restart",

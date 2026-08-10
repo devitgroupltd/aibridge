@@ -34,10 +34,12 @@ export const ABOUT_TOPICS: Record<string, { label: string; blurb: string; detail
       "  /new --opus seowrite refactor the export pipeline - same, but on Opus instead of the default model",
       "  /ls - table of every session: slug, state, model, branch, age, cost",
       "  /pause seowrite-1 - stop feed updates for that topic without stopping the session (replies/prompts still flow)",
+      "  /stop seowrite-1 - interrupt whatever it's doing right now; the session stays alive, just send it a message to carry on",
       "  /kill seowrite-1 - stop the session, keep the worktree",
       "  /remove seowrite-1 - stop the session AND remove its worktree/topic",
+      "  /resume seowrite-1 - relaunch a session that's ended/crashed/been killed, on its preserved worktree/conversation",
       "",
-      "Inside a session's own topic, /kill, /pause, /attach and /usage all work with no argument - they act on that session.",
+      "Inside a session's own topic, /kill, /pause, /stop, /resume, /attach and /usage all work with no argument - they act on that session.",
     ].join("\n"),
   },
   bulk_rm: {

@@ -77,7 +77,7 @@ export type RouterResult = { matched: false } | { matched: true; command: FleetC
 function isDestructive(command: FleetCommand | SessionCommand | RouterAction): boolean {
   if (command.kind === "kill") return !command.all;
   if (command.kind === "rm") return command.bulk?.mode !== "all";
-  if (command.kind === "restart" || command.kind === "merge" || command.kind === "ship") return true;
+  if (command.kind === "restart" || command.kind === "merge" || command.kind === "ship" || command.kind === "resume") return true;
   if (command.kind === "repos" && command.action === "rm") return true;
   // Turning a guard *off* is at least as destructive as the actions it guards, and these are the
   // easiest of all commands to trigger by accident from natural language: "stop asking me for
@@ -115,6 +115,7 @@ export const ROUTER_KINDS = [
   "attach",
   "pause",
   "stop",
+  "resume",
   "usage",
   "budget",
   "restart",
@@ -280,9 +281,15 @@ const SYSTEM_INSTRUCTIONS_BASE =
   "that's genuinely the message's point, not merely because it contains the word 'again' in passing " +
   "or is otherwise addressed to the coding assistant as a new instruction - those still go to " +
   "kind='forward'. " +
+  "A request to resume, restore, continue, or pick back up a session that has ended, crashed, or been " +
+  "killed - bringing its process back on the same worktree/conversation, not starting a new session for " +
+  "the same task - is kind='resume' (with 'slug' if named). This is different from asking to continue " +
+  "*this* conversation's own current task, addressed to the coding assistant itself (kind='forward'), " +
+  "and from restarting the Bridge daemon (kind='restart') - look for 'resume'/'continue' language " +
+  "specifically about a session that stopped working. " +
   "If it's ambiguous, conversational, or addressed to a coding assistant rather than the fleet itself, " +
   "respond with kind='forward' - the caution against guessing a destructive command (kill/rm/restart/" +
-  "merge/repos-rm) means don't infer one from a joke or unrelated chatter, not that an unambiguous " +
+  "merge/repos-rm/resume) means don't infer one from a joke or unrelated chatter, not that an unambiguous " +
   "short command naming the action should be refused.";
 
 /** Live-observed gap (2026-08-07): the base instructions above only ever describe kill/rm as
@@ -396,6 +403,8 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
         return { kind: "pause", slug: raw.slug };
       case "stop":
         return { kind: "stop", slug: raw.slug };
+      case "resume":
+        return { kind: "resume", slug: raw.slug };
       case "usage":
         return { kind: "usage", slug: raw.slug };
       case "budget":

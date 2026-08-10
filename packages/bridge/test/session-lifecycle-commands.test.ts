@@ -60,7 +60,7 @@ function fakeSessionSupervisor() {
     runStartupReconciliation: async () => {},
     wireSession: () => {},
     handleUnexpectedExit: async () => {},
-    resumeSession: async () => {},
+    resumeSession: async (_row: SessionRow) => {},
     getPtyProcess: () => undefined,
     killAndUntrack: (slug: string) => {
       calls.killAndUntrack.push(slug);
@@ -211,7 +211,7 @@ describe("createSessionLifecycleCommands", () => {
       sessionStore.insert(row({ paused: false }));
       sessionLifecycle.handlePauseCommand({ kind: "pause", slug: "fix-bug" }, 1, undefined);
       expect(sessionStore.get("fix-bug")?.paused).toBe(true);
-      expect(confirmed[0]?.text).toContain("Paused");
+      expect(confirmed[0]?.text).toContain("Feed paused");
     });
 
     test("handleStopCommand reports a clear failure for an unknown slug", () => {
@@ -322,6 +322,47 @@ describe("createSessionLifecycleCommands", () => {
       sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
 
       expect(permissionRegistry.get("req-1")).toBeDefined();
+    });
+
+    test("handleResumeCommand reports a clear failure for an unknown slug", async () => {
+      const { sessionLifecycle, confirmed } = setup();
+      await sessionLifecycle.handleResumeCommand({ kind: "resume", slug: "ghost" }, 1, undefined);
+      expect(confirmed[0]?.text).toContain('unknown slug "ghost"');
+    });
+
+    test("handleResumeCommand calls sessionSupervisor.resumeSession for a dead row", async () => {
+      const { sessionLifecycle, sessionStore, sessionSupervisor } = setup();
+      sessionStore.insert(row({ state: "dead" }));
+      const resumed: SessionRow[] = [];
+      sessionSupervisor.resumeSession = async (r: SessionRow) => {
+        resumed.push(r);
+      };
+      await sessionLifecycle.handleResumeCommand({ kind: "resume", slug: "fix-bug" }, 1, undefined);
+      expect(resumed.map((r) => r.slug)).toEqual(["fix-bug"]);
+    });
+
+    test("handleResumeCommand is a no-op with an explanatory note for a still-alive session (/stop leaves the process alive)", async () => {
+      const { sessionLifecycle, sessionStore, sessionSupervisor, confirmed } = setup();
+      sessionStore.insert(row({ state: "working" }));
+      const resumed: SessionRow[] = [];
+      sessionSupervisor.resumeSession = async (r: SessionRow) => {
+        resumed.push(r);
+      };
+      await sessionLifecycle.handleResumeCommand({ kind: "resume", slug: "fix-bug" }, 1, undefined);
+      expect(resumed).toEqual([]);
+      expect(confirmed[0]?.text).toContain("still running");
+    });
+
+    test("handleResumeCommand reports quota_stopped with its own wording rather than treating it like a dead row", async () => {
+      const { sessionLifecycle, sessionStore, sessionSupervisor, confirmed } = setup();
+      sessionStore.insert(row({ state: "quota_stopped" }));
+      const resumed: SessionRow[] = [];
+      sessionSupervisor.resumeSession = async (r: SessionRow) => {
+        resumed.push(r);
+      };
+      await sessionLifecycle.handleResumeCommand({ kind: "resume", slug: "fix-bug" }, 1, undefined);
+      expect(resumed).toEqual([]);
+      expect(confirmed[0]?.text).toContain("usage limit");
     });
 
     test("handleDetailCommand reports a clear failure for an unknown slug", () => {
