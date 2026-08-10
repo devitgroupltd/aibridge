@@ -456,9 +456,13 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
         inputPreview: msg.input_preview,
       });
       const sent = await p0(() =>
-        opts.controlBot.sendMessage(opts.chatId, route.topicId, text, {
-          inline_keyboard: buildPermissionKeyboard(msg.request_id),
-        }),
+        opts.controlBot.sendMessage(
+          opts.chatId,
+          route.topicId,
+          text,
+          { inline_keyboard: buildPermissionKeyboard(msg.request_id) },
+          "HTML",
+        ),
       );
       permissionRegistry.add({
         requestId: msg.request_id,
