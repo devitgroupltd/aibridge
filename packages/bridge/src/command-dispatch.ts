@@ -23,7 +23,7 @@ import {
   MODES,
   parseSessionCommand,
 } from "./session-commands.ts";
-import type { Model } from "./session-commands.ts";
+import type { Mode, Model } from "./session-commands.ts";
 import type { SessionStore } from "./session-store.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
 import type { Routing, SessionRoute } from "./routing.ts";
@@ -64,6 +64,11 @@ export interface CommandDispatchOptions {
   nlDispatch: Pick<NlDispatch, "postNlConfirm" | "routeOrFallback">;
   getReposRegistry: () => ReposRegistry | undefined;
   supergroupChatId: string;
+  /** Bare `/mode` typed in the control topic has no `currentSlug` to read a per-session mode off
+   * of - shows the fleet-wide `/default` value instead of a contextless blank picker (2026-08-10
+   * follow-up; `/effort` still has the same gap, left alone for now since only `/mode` was asked
+   * for). */
+  getDefaultSessionMode: () => Mode;
   log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
 }
 
@@ -147,6 +152,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     nlDispatch,
     getReposRegistry,
     supergroupChatId,
+    getDefaultSessionMode,
     log,
   } = opts;
 
@@ -354,8 +360,15 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
             keyboard: () => buildModelKeyboard((MODELS as readonly string[]).includes(currentModel ?? "") ? (currentModel as Model) : undefined),
           },
           "/mode": {
-            prompt: ctx.currentSlug ? `Choose a permission mode (current: ${routing.getMode(ctx.currentSlug)}):` : "Choose a permission mode:",
-            keyboard: () => buildModeKeyboard(ctx.currentSlug ? routing.getMode(ctx.currentSlug) : undefined),
+            // No `currentSlug` in the control topic - there's no one session to read a mode off
+            // of, so this falls back to the fleet-wide `/default` value instead of a contextless
+            // blank picker (2026-08-10: previously showed neither text nor a checkmark there,
+            // reported as a regression until traced back to this being the control topic, not a
+            // session's own).
+            prompt: ctx.currentSlug
+              ? `Choose a permission mode (current: ${routing.getMode(ctx.currentSlug)}):`
+              : `Choose a permission mode (fleet default: ${getDefaultSessionMode()}):`,
+            keyboard: () => buildModeKeyboard(ctx.currentSlug ? routing.getMode(ctx.currentSlug) : getDefaultSessionMode()),
           },
           "/effort": {
             prompt: ctx.currentSlug ? `Choose an effort level (current: ${routing.getEffort(ctx.currentSlug)}):` : "Choose an effort level:",

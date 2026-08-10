@@ -18,12 +18,15 @@ import type {
 } from "@aibridge/protocol";
 import { buildAskKeyboard, renderAskCard } from "./ask-callback.ts";
 import { AskRegistry, type PendingAsk } from "./ask-registry.ts";
+import { isCompoundCommandFullyAllowed, WIDENED_AUTO_APPROVE_PREFIXES } from "./compound-permission.ts";
 import { fireAndForget } from "./fire-and-forget.ts";
 import { isImagePath, resolveOutboxPath } from "./outbox.ts";
 import { buildPermissionKeyboard, renderPermissionCard } from "./permission-callback.ts";
 import { PermissionRegistry, type PendingPermissionRequest } from "./permission-registry.ts";
 import type { RateGovernor } from "./rate-governor.ts";
+import { extractBashCommand } from "./rule-derivation.ts";
 import { scrubSecrets } from "./secret-scrub.ts";
+import { readSettingsFile } from "./settings.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import type { Routing } from "./routing.ts";
 import type { SendMessageSource } from "./telegram.ts";
@@ -425,6 +428,25 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     if (!route) {
       log("WARN", `permission_request for unknown slug "${msg.slug}" - dropped`);
       return;
+    }
+    // compound-permission.ts: Claude Code's own settings evaluation matches a Bash call's entire
+    // raw command string against each glob rule, so a `&&`/`;`/`|` chain built entirely out of
+    // already-trusted pieces (e.g. `cd <worktree> && sed -i ... && grep -c ...; grep -c ...`)
+    // still reaches here unmatched. Decompose it ourselves and skip the Telegram round-trip
+    // entirely when every piece is exactly as safe as it would be running on its own - never
+    // touches Claude Code's own evaluation, and never fires for anything the decomposer can't
+    // fully account for (metacharacters it refuses to guess through, a sensitive path anywhere in
+    // the raw string, or a sub-command not already covered by this session's own allow list).
+    if (opts.stateDir && msg.tool_name === "Bash") {
+      const command = extractBashCommand(msg.input_preview);
+      if (command) {
+        const settings = readSettingsFile(opts.stateDir, msg.slug);
+        if (isCompoundCommandFullyAllowed(command, settings, WIDENED_AUTO_APPROVE_PREFIXES)) {
+          log("INFO", `auto-approved compound Bash for slug "${msg.slug}" - every sub-command already allowed: ${command}`);
+          sendVerdict(msg.slug, msg.request_id, "allow");
+          return;
+        }
+      }
     }
     try {
       const text = renderPermissionCard({

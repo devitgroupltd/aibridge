@@ -170,6 +170,11 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         "Bash(ls *)",
         "Bash(cat *)",
         "Bash(rg *)",
+        // Read-only grep forms (2026-08-10, same trust tier as `rg *`/`cat *` above) - added
+        // after a live session's `grep -c "/deploy" file; grep -c "/merge" file` kept prompting
+        // even though each half is exactly as safe as the `rg *` entry already pre-approved.
+        "Bash(grep -c *)",
+        "Bash(grep -n *)",
       ],
     },
   };

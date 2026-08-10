@@ -1,10 +1,27 @@
 import { describe, expect, test } from "bun:test";
-import { deriveAlwaysRule, ruleAlreadyCovered } from "../src/rule-derivation.ts";
+import { deriveAlwaysRule, extractBashCommand, ruleAlreadyCovered } from "../src/rule-derivation.ts";
 import type { PermissionSettings } from "../src/settings.ts";
 
 function bashPreview(command: string): string {
   return JSON.stringify({ command });
 }
+
+// extractBashCommand is the shared JSON-unwrap deriveAlwaysRule and compound-permission.ts's
+// pipe-server.ts caller both need - one place that decides how "not really JSON" fails.
+describe("extractBashCommand", () => {
+  test("unwraps a valid {command} preview", () => {
+    expect(extractBashCommand(bashPreview("git status"))).toBe("git status");
+  });
+
+  test("returns null for non-JSON input, rather than throwing", () => {
+    expect(extractBashCommand("git status")).toBeNull();
+  });
+
+  test("returns null when the parsed JSON has no string command field", () => {
+    expect(extractBashCommand(JSON.stringify({ command: 42 }))).toBeNull();
+    expect(extractBashCommand(JSON.stringify({}))).toBeNull();
+  });
+});
 
 // §9 scenario 8: rule derivation from Bash - table-driven, since a mis-derived rule is a
 // permanent, silent widening of the allowlist.

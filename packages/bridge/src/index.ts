@@ -921,6 +921,7 @@ async function main(): Promise<void> {
       nlDispatch,
       getReposRegistry: () => reposRegistry,
       supergroupChatId: config.supergroupChatId,
+      getDefaultSessionMode: () => defaultSessionMode,
       log,
     }),
   );

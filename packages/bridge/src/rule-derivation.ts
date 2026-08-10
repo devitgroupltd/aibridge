@@ -8,6 +8,22 @@ import type { PermissionSettings } from "./settings.ts";
 const METACHARACTERS = ["|", ";", "&", "$(", "`"];
 
 /**
+ * A permission message's `input_preview` is normally `{"command": "..."}` JSON, but this is the
+ * one boundary where that's an assumption rather than a guarantee (a hook/channel-server version
+ * mismatch, say) - shared by every caller that needs the real Bash command string rather than
+ * the raw preview field, so there's exactly one place that decides how to fail: returns `null`
+ * for anything that isn't valid JSON with a string `command` field, never throws.
+ */
+export function extractBashCommand(inputPreview: string): string | null {
+  try {
+    const parsed = JSON.parse(inputPreview) as { command?: unknown };
+    return typeof parsed.command === "string" ? parsed.command : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * §6.6's "Always allow" rule derivation: non-`Bash` tools generalise to the bare tool name;
  * `Bash` generalises to its first two tokens plus `*` (`git commit *`, `npm run *`) and no
  * further. Returns `null` (fall back to allow-once) for a metacharacter command or an empty one -
@@ -18,13 +34,10 @@ export function deriveAlwaysRule(toolName: string, inputPreview: string): string
     return toolName;
   }
 
-  let command: string;
-  try {
-    const parsed = JSON.parse(inputPreview) as { command?: unknown };
-    command = typeof parsed.command === "string" ? parsed.command : inputPreview;
-  } catch {
-    command = inputPreview;
-  }
+  // Unlike compound-permission.ts's caller, this one has no "safe to skip" fallback - an
+  // unparsed input_preview here still needs *some* command string to run the metacharacter/token
+  // check against, so it falls back to the raw preview itself rather than giving up outright.
+  const command = extractBashCommand(inputPreview) ?? inputPreview;
 
   if (METACHARACTERS.some((ch) => command.includes(ch))) {
     return null;

@@ -748,6 +748,166 @@ describe("startPipeServer", () => {
     });
   });
 
+  // compound-permission.ts (2026-08-10): a Bash `permission_request` built entirely out of pieces
+  // this session's own generated settings.json already allows individually gets auto-approved -
+  // a `verdict` sent straight back over the pipe - instead of ever posting a Telegram card.
+  describe("compound Bash auto-approval (compound-permission.ts)", () => {
+    async function setupWithSettings(stateDir: string, slug: string, extraAllow: string[] = []) {
+      const { writeSettingsFile, generateSettings } = await import("../src/settings.ts");
+      const settings = generateSettings();
+      writeSettingsFile(stateDir, slug, { ...settings, permissions: { ...settings.permissions, allow: [...settings.permissions.allow, ...extraAllow] } });
+    }
+
+    test("a chain of already-allowed pieces is auto-approved - no card posted, a verdict comes back instead", async () => {
+      const path_ = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const stateDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "aibridge-pipe-settings-"));
+      await setupWithSettings(stateDir, "test-session");
+      const sendMessageCalls: string[] = [];
+      const controlBot: SendMessageSource = {
+        sendMessage: async (_chatId, _threadId, text) => {
+          sendMessageCalls.push(text);
+          return { message_id: 1 };
+        },
+      };
+
+      const handle = startPipeServer({ pipePath: path_, routing, controlBot, chatId: "-1", stateDir });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket, received } = connectClient(path_);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "hello", role: "channel", slug: "test-session", pid: 1 } satisfies HelloFromChannel));
+      await waitFor(() => received.some((m) => m.type === "hello_ack"));
+
+      socket.write(
+        encodeMessage({
+          v: PROTOCOL_VERSION,
+          type: "permission_request",
+          slug: "test-session",
+          request_id: "req-compound",
+          tool_name: "Bash",
+          description: "run a command",
+          input_preview: JSON.stringify({ command: `git status && cat README.md; rg TODO` }),
+        } satisfies PermissionRequestMessage),
+      );
+
+      await waitFor(() => received.some((m) => m.type === "verdict"));
+      expect(received.find((m) => m.type === "verdict")).toMatchObject({ request_id: "req-compound", behavior: "allow" });
+      expect(sendMessageCalls.length).toBe(0);
+    });
+
+    test("sed -i chained with already-allowed pieces is auto-approved via the widened prefix, but a lone sed -i is not", async () => {
+      const path_ = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const stateDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "aibridge-pipe-settings-"));
+      await setupWithSettings(stateDir, "test-session");
+      const controlBot: SendMessageSource = { sendMessage: async () => ({ message_id: 1 }) };
+
+      const handle = startPipeServer({ pipePath: path_, routing, controlBot, chatId: "-1", stateDir });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket, received } = connectClient(path_);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "hello", role: "channel", slug: "test-session", pid: 1 } satisfies HelloFromChannel));
+      await waitFor(() => received.some((m) => m.type === "hello_ack"));
+
+      socket.write(
+        encodeMessage({
+          v: PROTOCOL_VERSION,
+          type: "permission_request",
+          slug: "test-session",
+          request_id: "req-sed-chain",
+          tool_name: "Bash",
+          description: "run a command",
+          input_preview: JSON.stringify({ command: `sed -i 's#/deploy#/merge#g' plan.md && grep -c "/deploy" plan.md; grep -c "/merge" plan.md` }),
+        } satisfies PermissionRequestMessage),
+      );
+
+      await waitFor(() => received.some((m) => m.type === "verdict"));
+      expect(received.find((m) => m.type === "verdict")).toMatchObject({ request_id: "req-sed-chain", behavior: "allow" });
+    });
+
+    test("a sensitive path anywhere in the chain still posts a normal card, never auto-approved", async () => {
+      const path_ = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const stateDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "aibridge-pipe-settings-"));
+      await setupWithSettings(stateDir, "test-session");
+      const sendMessageCalls: string[] = [];
+      const controlBot: SendMessageSource = {
+        sendMessage: async (_chatId, _threadId, text) => {
+          sendMessageCalls.push(text);
+          return { message_id: 1 };
+        },
+      };
+
+      const handle = startPipeServer({ pipePath: path_, routing, controlBot, chatId: "-1", stateDir });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket, received } = connectClient(path_);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "hello", role: "channel", slug: "test-session", pid: 1 } satisfies HelloFromChannel));
+      await waitFor(() => received.some((m) => m.type === "hello_ack"));
+
+      socket.write(
+        encodeMessage({
+          v: PROTOCOL_VERSION,
+          type: "permission_request",
+          slug: "test-session",
+          request_id: "req-secret",
+          tool_name: "Bash",
+          description: "run a command",
+          input_preview: JSON.stringify({ command: `cat README.md && sed -i 's#a#b#g' .env` }),
+        } satisfies PermissionRequestMessage),
+      );
+
+      await waitFor(() => sendMessageCalls.length >= 1);
+      expect(received.some((m) => m.type === "verdict")).toBe(false);
+    });
+
+    test("with no stateDir configured, compound requests fall through to a normal card unchanged", async () => {
+      const path_ = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const sendMessageCalls: string[] = [];
+      const controlBot: SendMessageSource = {
+        sendMessage: async (_chatId, _threadId, text) => {
+          sendMessageCalls.push(text);
+          return { message_id: 1 };
+        },
+      };
+
+      const handle = startPipeServer({ pipePath: path_, routing, controlBot, chatId: "-1" });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket, received } = connectClient(path_);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "hello", role: "channel", slug: "test-session", pid: 1 } satisfies HelloFromChannel));
+      await waitFor(() => received.some((m) => m.type === "hello_ack"));
+
+      socket.write(
+        encodeMessage({
+          v: PROTOCOL_VERSION,
+          type: "permission_request",
+          slug: "test-session",
+          request_id: "req-no-statedir",
+          tool_name: "Bash",
+          description: "run a command",
+          input_preview: JSON.stringify({ command: "git status && cat README.md" }),
+        } satisfies PermissionRequestMessage),
+      );
+
+      await waitFor(() => sendMessageCalls.length >= 1);
+      expect(received.some((m) => m.type === "verdict")).toBe(false);
+    });
+  });
+
   // §13 check 4, found live 2026-08-06: the §6.5 terminal-answer heuristic can call
   // finalizePermissionMessage under a second after the card's own sendMessage, and the real
   // Telegram Bot API intermittently 400s that fast an edit with "message to edit not found"

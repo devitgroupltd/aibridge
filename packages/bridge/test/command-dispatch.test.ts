@@ -3,6 +3,7 @@ import { createCommandDispatch } from "../src/command-dispatch.ts";
 import { Routing } from "../src/routing.ts";
 import { RetryStore } from "../src/retry-store.ts";
 import { SessionStore, type SessionRow } from "../src/session-store.ts";
+import type { Mode } from "../src/session-commands.ts";
 
 function row(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
@@ -188,7 +189,7 @@ function fakeNlDispatch() {
   };
 }
 
-function setup(overrides: Partial<{ sessionStore: SessionStore }> = {}) {
+function setup(overrides: Partial<{ sessionStore: SessionStore; defaultSessionMode: Mode }> = {}) {
   const controlBot = fakeControlBot();
   const ptyIo = fakePtyIo();
   const cardSenders = fakeCardSenders();
@@ -223,6 +224,7 @@ function setup(overrides: Partial<{ sessionStore: SessionStore }> = {}) {
     nlDispatch: nlDispatch as never,
     getReposRegistry: () => undefined,
     supergroupChatId: "-100",
+    getDefaultSessionMode: () => overrides.defaultSessionMode ?? "manual",
     log: () => {},
   });
 
@@ -350,6 +352,22 @@ describe("dispatchInboundMessage - exact-syntax rule dispatch order", () => {
     expect(s.controlBot.sent.length).toBe(1);
     expect(s.controlBot.sent[0]?.text).toContain("Choose a model");
     expect(s.nlDispatch.routeOrFallbackCalls).toEqual([]);
+  });
+
+  test("bare /mode in the control topic (no currentSlug) shows the fleet default, not a blank picker", async () => {
+    const s = setup({ defaultSessionMode: "auto" });
+    await s.commandDispatch.dispatchInboundMessage(1, "/mode", undefined, true, undefined, undefined, "op");
+    expect(s.controlBot.sent.length).toBe(1);
+    expect(s.controlBot.sent[0]?.text).toBe("Choose a permission mode (fleet default: auto):");
+    const keyboard = s.controlBot.sent[0]?.keyboard as { inline_keyboard: Array<Array<{ text: string }>> };
+    expect(keyboard.inline_keyboard.flat().find((b) => b.text === "✓ auto")).toBeDefined();
+  });
+
+  test("bare /mode inside a session topic shows that session's own current mode, not the fleet default", async () => {
+    const s = setup({ defaultSessionMode: "auto" });
+    const route = { slug: "fix-bug", topicId: 5, worktreePath: "c:\\does\\not\\exist", model: "sonnet" } as never;
+    await s.commandDispatch.dispatchInboundMessage(1, "/mode", 5, false, route, "fix-bug", "op");
+    expect(s.controlBot.sent[0]?.text).toBe("Choose a permission mode (current: manual):");
   });
 
   test("an unmatched /model argument is rejected with the recognised-value list, not forwarded", async () => {
