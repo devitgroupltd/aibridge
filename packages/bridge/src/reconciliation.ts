@@ -7,10 +7,7 @@ import type { SessionRow } from "./session-store.ts";
  * and "row exists, topic deleted in Telegram" both need a live-process/topic enumeration this pass
  * doesn't build - noted as a deferred gap, not silently skipped.
  */
-export type ReconciliationAction =
-  | { kind: "readopt"; slug: string }
-  | { kind: "resume"; slug: string; sessionId: string | null }
-  | { kind: "lost_prompt"; slug: string };
+export type ReconciliationAction = { kind: "readopt"; slug: string } | { kind: "resume"; slug: string; sessionId: string | null };
 
 /**
  * §4.5's 2026-08-03 measurement: on this Windows/ConPTY stack, a live session's process does not
@@ -23,9 +20,11 @@ export function reconcile(rows: readonly SessionRow[], isProcessAlive: (pid: num
   for (const row of rows) {
     if (row.state === "dead") continue;
 
-    if (row.state === "awaiting_input") {
-      actions.push({ kind: "lost_prompt", slug: row.slug });
-    }
+    // A row's own "was its pending prompt lost" fact belongs to session-supervisor.ts's
+    // resumeSession alone (resume-nudge-on-lost-permission-plan.md §3) - it re-reads the row fresh
+    // right before acting on it (a /rm or /kill can race the async gap between this pass and that
+    // read), so a second, staler copy of the same check here was never anything but dead code: no
+    // caller ever switched on a `lost_prompt` action.
 
     if (isProcessAlive(row.ptyPid)) {
       // The PTY handle belongs to the process that created it (§2.3) - a restarted Bridge can see
