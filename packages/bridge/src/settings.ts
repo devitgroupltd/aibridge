@@ -221,6 +221,18 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         // same one for a new binary.
         "Bash(head *)",
         "Bash(echo *)",
+        // Pure read, same trust tier as `cat *`/`ls *` above - added 2026-08-10 alongside the
+        // count-loc script below (`wc` alone can't write or execute anything, unlike `find`/`xargs`
+        // right next to it in that live prompt, which stay ungated for exactly that reason - see
+        // count-loc.sh's own doc comment).
+        "Bash(wc *)",
+        // A fixed, reviewed script rather than the ad-hoc `find | xargs wc -l | tail` (wrapped in a
+        // `for` loop) that prompted live 2026-08-10 and can't itself be auto-approved:
+        // compound-permission.ts never decomposes `for` loops, and `find`/`xargs` are too easily
+        // turned into `-exec`/arbitrary-command execution to blanket-allow standalone. This exact
+        // invocation has no open-ended shell left to hide anything in, so it's safe to pre-approve
+        // whole. See scripts/count-loc.sh.
+        "Bash(bash scripts/count-loc.sh)",
       ],
     },
   };

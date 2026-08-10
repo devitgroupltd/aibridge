@@ -38,6 +38,17 @@ describe("generateSettings", () => {
     expect(settings.permissions.ask).not.toContain("Bash(*)");
   });
 
+  // Live prompt 2026-08-10: a `for` loop wrapping `find | xargs wc -l | tail` couldn't
+  // auto-approve (compound-permission.ts never decomposes control-flow syntax, and `find`/`xargs`
+  // are too easily turned into `-exec`/arbitrary-command execution to blanket-allow standalone).
+  // `wc` alone is safe to allow; the loop itself is replaced by a fixed, reviewed script.
+  test("allows wc standalone and the fixed count-loc script, without widening find/xargs", () => {
+    expect(settings.permissions.allow).toContain("Bash(wc *)");
+    expect(settings.permissions.allow).toContain("Bash(bash scripts/count-loc.sh)");
+    expect(settings.permissions.allow).not.toContain("Bash(find *)");
+    expect(settings.permissions.allow).not.toContain("Bash(xargs *)");
+  });
+
   test("git commit/push never sit only in allow without also being in ask", () => {
     expect(settings.permissions.allow).not.toContain("Bash(git commit *)");
     expect(settings.permissions.allow).not.toContain("Bash(git push *)");
