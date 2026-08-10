@@ -7,6 +7,7 @@
  * overview itself longer. `/help` still owns the exhaustive syntax list; `/about` is the on-ramp.
  */
 import type { InlineKeyboardButton } from "./commands.ts";
+import { renderHelp } from "./fleet-commands.ts";
 
 /** `/about` (bare, no aliases - unlike `/help` there's no established `?`/`/h` shorthand to match,
  * and this is new enough not to need one). Works from either the control topic or a session's own
@@ -123,6 +124,23 @@ export function renderAbout(): string {
     "Tap a button below for examples on any of these, or send /help for the exact command syntax.",
   ];
   return lines.join("\n");
+}
+
+/** Grounding text for the control-topic free-form Q&A call (`nl-router.ts`'s
+ * `answerControlTopicQuestion`, `plans/control-topic-nl-dialogue-plan.md` §3.3) - concatenates the
+ * two existing renderers plus a short architecture note, so the model answers from the same facts
+ * `/help`/`/about` already show rather than a hand-duplicated copy that could drift from them. */
+export function buildDialogueGroundingText(): string {
+  return [
+    renderHelp(),
+    "",
+    renderAbout(),
+    "",
+    "Architecture: a Bridge daemon owns the Telegram bots and a PTY per session; a Channel server " +
+      "per session talks MCP over stdio; a Hook client reports tool activity. The control topic (no " +
+      "session attached) can only run fleet commands or answer questions like this one - unlike a " +
+      "session's own topic, it never forwards free text to a live Claude session.",
+  ].join("\n");
 }
 
 /** Builds `/about`'s "more info" keyboard: one button per topic, in the same order as

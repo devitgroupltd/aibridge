@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { botCommandList } from "../src/fleet-commands.ts";
-import { buildRouteViaCliArgs, buildSystemInstructions, mapRouterOutput, ROUTER_KINDS } from "../src/nl-router.ts";
+import { buildAnswerViaCliArgs, buildRouteViaCliArgs, buildSystemInstructions, mapRouterOutput, ROUTER_KINDS } from "../src/nl-router.ts";
 
 const CONTROL: { isControl: true; hasSession: false } = { isControl: true, hasSession: false };
 const SESSION: { isControl: false; hasSession: true } = { isControl: false, hasSession: true };
@@ -413,5 +413,29 @@ describe("buildRouteViaCliArgs", () => {
     expect(args).toContain("json");
     expect(args.some((a) => a.includes("delete this session"))).toBe(true);
     expect(args.some((a) => a.includes('"kind"'))).toBe(true);
+  });
+});
+
+// Control-topic free-form Q&A (plans/control-topic-nl-dialogue-plan.md) - the second, schema-less
+// call. Same "impure execFile call isn't unit-testable, the array it's handed should be" split as
+// buildRouteViaCliArgs's own tests above.
+describe("buildAnswerViaCliArgs", () => {
+  test("always includes --strict-mcp-config, and never --json-schema", () => {
+    const args = buildAnswerViaCliArgs("does /ship duplicate /deploy?", "grounding text", "", "claude-haiku-4-5-20251001");
+    expect(args).toContain("--strict-mcp-config");
+    expect(args).not.toContain("--json-schema");
+  });
+
+  test("carries the model, the grounding text, the history text, and the message", () => {
+    const args = buildAnswerViaCliArgs("does /ship duplicate /deploy?", "GROUNDING_MARKER", "Recent conversation:\nOperator: hi\n\n", "claude-haiku-4-5-20251001");
+    expect(args).toContain("claude-haiku-4-5-20251001");
+    expect(args.some((a) => a.includes("does /ship duplicate /deploy?"))).toBe(true);
+    expect(args.some((a) => a.includes("GROUNDING_MARKER"))).toBe(true);
+    expect(args.some((a) => a.includes("Recent conversation:"))).toBe(true);
+  });
+
+  test("omits the history block cleanly when historyText is empty", () => {
+    const args = buildAnswerViaCliArgs("hi", "grounding", "", "claude-haiku-4-5-20251001");
+    expect(args.some((a) => a.includes("Recent conversation:"))).toBe(false);
   });
 });

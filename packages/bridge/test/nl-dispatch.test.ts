@@ -91,6 +91,9 @@ async function setup(overrides: Partial<Parameters<typeof createNlDispatch>[0]> 
     getAssistEnabled: () => assistEnabled,
     supergroupChatId: "-100",
     log: () => {},
+    // Default no-op: existing no-match tests expect `onNoMatch` to still fire even with
+    // `ctx.isControl: true` - override explicitly in tests that exercise the Q&A path itself.
+    answerControlTopicQuestion: async () => null,
     ...overrides,
   });
   return {
@@ -345,6 +348,57 @@ describe("createNlDispatch", () => {
 
       expect(thinkingPlaceholder.started).toEqual(["5"]);
       expect(controlBot.deleted).toEqual([77]);
+    });
+
+    // plans/control-topic-nl-dialogue-plan.md's control-topic free-form Q&A - a second, isolated
+    // call made only on the existing no-match path, only in the control topic.
+    describe("control-topic Q&A", () => {
+      test("a control-topic no-match with an answer sends it and never calls onNoMatch", async () => {
+        const routeText = async () => ({ matched: false as const });
+        const answerControlTopicQuestion = async () => "It reuses /deploy's own merge logic - no duplication.";
+        const { nlDispatch, controlBot } = await setup({ routeText, answerControlTopicQuestion });
+        let noMatchCalled = false;
+
+        await nlDispatch.routeOrFallback("does /ship duplicate /deploy?", { isControl: true, hasSession: false }, 1, true, undefined, () => {
+          noMatchCalled = true;
+        }, () => {});
+
+        expect(noMatchCalled).toBe(false);
+        expect(controlBot.sent.at(-1)?.text).toBe("It reuses /deploy's own merge logic - no duplication.");
+      });
+
+      test("a control-topic no-match with no answer (null) falls back to onNoMatch", async () => {
+        const routeText = async () => ({ matched: false as const });
+        const answerControlTopicQuestion = async () => null;
+        const { nlDispatch, controlBot } = await setup({ routeText, answerControlTopicQuestion });
+        let noMatchCalled = false;
+
+        await nlDispatch.routeOrFallback("gibberish", { isControl: true, hasSession: false }, 1, true, undefined, () => {
+          noMatchCalled = true;
+        }, () => {});
+
+        expect(noMatchCalled).toBe(true);
+        expect(controlBot.sent).toEqual([]);
+      });
+
+      test("a session-topic no-match never calls the Q&A function, even when it's injected", async () => {
+        const routeText = async () => ({ matched: false as const });
+        let qaCalled = false;
+        const answerControlTopicQuestion = async () => {
+          qaCalled = true;
+          return "should never be reached";
+        };
+        const { nlDispatch, controlBot } = await setup({ routeText, answerControlTopicQuestion });
+        let noMatchCalled = false;
+
+        await nlDispatch.routeOrFallback("hi", { isControl: false, hasSession: true }, 5, false, "fix-bug", () => {
+          noMatchCalled = true;
+        }, () => {});
+
+        expect(qaCalled).toBe(false);
+        expect(noMatchCalled).toBe(true);
+        expect(controlBot.sent).toEqual([]);
+      });
     });
 
     // nl-router.ts's `kind='retry'` (added 2026-08-09, any-language natural phrasing that

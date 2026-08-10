@@ -17,6 +17,7 @@ import { StaleConfirmRegistry } from "./stale-confirm.ts";
 import { VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { startWhisperServer } from "./voice-transcribe.ts";
 import { NlConfirmRegistry } from "./nl-confirm.ts";
+import { createControlTopicHistory } from "./control-topic-history.ts";
 import { LateBound } from "./late-bound.ts";
 import { RetryStore } from "./retry-store.ts";
 import { ChannelConnectCoordinator } from "./channel-connect-coordinator.ts";
@@ -292,6 +293,11 @@ async function main(): Promise<void> {
   // nl-router.ts's destructive-command confirm gate (nl-confirm.ts) - own registry, same
   // add/resolve-pops-and-checks-TTL shape as fleetConfirmRegistry/voiceConfirmRegistry above.
   const nlConfirmRegistry = new NlConfirmRegistry();
+  // Control-topic free-form Q&A's bounded exchange-history buffer (control-topic-history.ts,
+  // plans/control-topic-nl-dialogue-plan.md) - one instance for the process's lifetime, since
+  // there's exactly one control topic per Bridge instance. Read by nl-dispatch.ts's routeOrFallback
+  // for both the classifier call and the new Q&A call.
+  const controlTopicHistory = createControlTopicHistory();
   // §4.2's `/retry` (retry-store.ts): the single most recently *expired* nl-confirm per topic, so
   // it can be re-armed without retyping/re-saying the original request. Populated only where an
   // nl-confirm entry actually expires (the sweep below, and the tap-loses-the-race path further
@@ -711,6 +717,7 @@ async function main(): Promise<void> {
     getAssistEnabled: () => assistEnabled,
     supergroupChatId: config.supergroupChatId,
     log,
+    history: controlTopicHistory,
   });
 
   // §6.5: strip the keyboard, mark "expired", and deny (see sweepExpiredPermissions) on any

@@ -559,3 +559,58 @@ export async function routeText(text: string, ctx: RouterContext, cfg: RouterCon
   const raw = await routeViaCli(text, ctx, cfg.model, log);
   return raw ? mapRouterOutput(raw, ctx) : { matched: false };
 }
+
+/**
+ * Control-topic free-form Q&A (`plans/control-topic-nl-dialogue-plan.md`) - a second, isolated
+ * `claude -p` call made only on `routeText`'s existing no-match path, and only in the control topic
+ * (`nl-dispatch.ts`'s `routeOrFallback` gates both). Deliberately never given the classifier's
+ * schema/tools - its only possible output is a string (the answer) or `null` (couldn't produce one,
+ * or the backend call itself failed), never a command; this call cannot execute anything.
+ *
+ * CLI/subscription-only, unconditionally - not offered on the API backend, and not gated by
+ * `RouterConfig.backend` the way the classifier is: this call always shells out to `claude -p`
+ * regardless of whatever the operator currently has `/router` set to for the classifier itself. The
+ * whole point (per the plan's own cost/tool-calling-fidelity tradeoff discussion) is staying off the
+ * separately-metered API backend for this specific call.
+ */
+const ANSWER_SYSTEM_INSTRUCTIONS =
+  "You answer a Telegram operator's question about a fleet-control bot for developer Claude Code " +
+  "sessions, using ONLY the reference text given below - never speculate about internals it doesn't " +
+  "cover. If the question is outside that reference, say plainly you don't know and suggest asking " +
+  "inside a session's own topic (which has real repo access to answer it properly). Be brief: answer " +
+  "only what's asked, no restating the question, no preamble, no repeating the full command list " +
+  "unless actually asked for it.";
+
+/** Pure prompt/arg assembly, same "impure call isn't unit-testable but the array it's handed should
+ * be" split `buildRouteViaCliArgs` already uses. Deliberately omits `--json-schema` - the one thing
+ * that distinguishes this call from the classifier's - so the model answers in free prose rather
+ * than being forced into a schema it has nothing meaningful to fill. */
+export function buildAnswerViaCliArgs(text: string, groundingText: string, historyText: string, model: string): string[] {
+  const prompt = `${ANSWER_SYSTEM_INSTRUCTIONS}\n\nReference:\n${groundingText}\n\n${historyText}Message: ${text}`;
+  return ["-p", prompt, "--output-format", "json", "--model", model, "--strict-mcp-config"];
+}
+
+/** Mirrors `routeViaCli`'s exact `execFile` shape (`cwd: os.tmpdir()`, the same `EXEC_TIMEOUT_MS`,
+ * `--strict-mcp-config`) for the same reasons documented on that function - this call has nothing
+ * registered to connect to either. Parses plain `{ result: string }` (no `structured_output` wrapper,
+ * since there's no `--json-schema` here) and returns `null` on any failure/empty/unparseable output -
+ * the caller's "fail open to today's fallthrough" contract, same as `routeText` itself. */
+export async function answerControlTopicQuestion(text: string, groundingText: string, historyText: string, model: string, log: RouterLog): Promise<string | null> {
+  return new Promise((resolve) => {
+    execFile("claude", buildAnswerViaCliArgs(text, groundingText, historyText, model), { cwd: os.tmpdir(), timeout: EXEC_TIMEOUT_MS }, (err, stdout) => {
+      if (err) {
+        log("WARN", `control-topic Q&A call failed: ${(err as Error).message}`);
+        resolve(null);
+        return;
+      }
+      try {
+        const parsed = JSON.parse(stdout) as { result?: string };
+        const result = parsed.result?.trim();
+        resolve(result && result.length > 0 ? result : null);
+      } catch {
+        log("WARN", "control-topic Q&A call: couldn't parse claude -p's stdout as JSON");
+        resolve(null);
+      }
+    });
+  });
+}

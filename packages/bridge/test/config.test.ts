@@ -136,4 +136,23 @@ describe("loadConfig - nlRouter", () => {
       expect(loadConfig(envPath).nlRouter.backend).toBe("cli");
     });
   });
+
+  // plans/control-topic-nl-dialogue-plan.md §7 - default 4, configurable, 0 disables the window.
+  test("historyTurns defaults to 4 with no override", async () => {
+    await withEnvFile(REQUIRED, (envPath) => {
+      expect(loadConfig(envPath).nlRouter.historyTurns).toBe(4);
+    });
+  });
+
+  test("NL_ROUTER_HISTORY_TURNS overrides the default", async () => {
+    await withEnvFile(`${REQUIRED}NL_ROUTER_HISTORY_TURNS=10\n`, (envPath) => {
+      expect(loadConfig(envPath).nlRouter.historyTurns).toBe(10);
+    });
+  });
+
+  test("NL_ROUTER_HISTORY_TURNS=0 disables the window explicitly", async () => {
+    await withEnvFile(`${REQUIRED}NL_ROUTER_HISTORY_TURNS=0\n`, (envPath) => {
+      expect(loadConfig(envPath).nlRouter.historyTurns).toBe(0);
+    });
+  });
 });

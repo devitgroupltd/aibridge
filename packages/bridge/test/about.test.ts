@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { ABOUT_TOPICS, buildAboutKeyboard, isAboutCommand, renderAbout, resolveAboutCallback } from "../src/about.ts";
+import { ABOUT_TOPICS, buildAboutKeyboard, buildDialogueGroundingText, isAboutCommand, renderAbout, resolveAboutCallback } from "../src/about.ts";
 
 describe("isAboutCommand", () => {
   test("matches a bare /about, with surrounding whitespace tolerated", () => {
@@ -22,6 +22,16 @@ describe("renderAbout", () => {
       expect(text).toContain(topic.blurb);
     }
     expect(text).toContain("/help");
+  });
+});
+
+// plans/control-topic-nl-dialogue-plan.md §3.3 - grounding text for the control-topic Q&A call.
+describe("buildDialogueGroundingText", () => {
+  test("includes both renderHelp's and renderAbout's content plus an architecture note", () => {
+    const text = buildDialogueGroundingText();
+    expect(text).toContain("Fleet commands");
+    expect(text).toContain("aibridge lets you run and manage");
+    expect(text).toContain("Architecture:");
   });
 });
 

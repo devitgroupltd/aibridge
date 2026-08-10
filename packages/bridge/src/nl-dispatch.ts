@@ -1,7 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { fireAndForget } from "./fire-and-forget.ts";
+import { buildDialogueGroundingText } from "./about.ts";
+import { formatHistoryForPrompt } from "./control-topic-history.ts";
+import type { ControlTopicHistory } from "./control-topic-history.ts";
 import { buildNlConfirmKeyboard, NlConfirmRegistry } from "./nl-confirm.ts";
-import { routeText as realRouteText } from "./nl-router.ts";
+import { answerControlTopicQuestion as realAnswerControlTopicQuestion, routeText as realRouteText } from "./nl-router.ts";
 import type { RouterAction } from "./nl-router.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import type { Effort, Mode, SessionCommand } from "./session-commands.ts";
@@ -30,7 +33,7 @@ export interface NlDispatchOptions {
   applyEffortSwitch: (slug: string, topicId: number, effort: Effort) => void;
   nlConfirmRegistry: NlConfirmRegistry;
   dispatchFleetCommand: (fleetCmd: FleetCommand, threadId: number | undefined, isControl: boolean, currentSlug: string | undefined) => void;
-  nlRouterConfig: { enabled: boolean; apiKey: string | undefined; model: string };
+  nlRouterConfig: { enabled: boolean; apiKey: string | undefined; model: string; historyTurns?: number };
   getNlRouterBackend: () => "api" | "cli";
   getAssistEnabled: () => boolean;
   supergroupChatId: string;
@@ -39,6 +42,14 @@ export interface NlDispatchOptions {
    * control flow (indicator start/stop, the destructive-confirm gate, dispatch to
    * `executeMatchedCommand`) is unit-testable without a real CLI/API backend call. */
   routeText?: typeof realRouteText;
+  /** Control-topic free-form Q&A (`plans/control-topic-nl-dialogue-plan.md`) - defaults to the real
+   * `nl-router.ts` implementation, injectable for the same testability reason as `routeText` above.
+   * Only ever called from `routeOrFallback`'s no-match branch, and only when `ctx.isControl`. */
+  answerControlTopicQuestion?: typeof realAnswerControlTopicQuestion;
+  /** The control topic's bounded exchange-history buffer (`control-topic-history.ts`) - optional so
+   * every existing caller/test that doesn't care about history continues to work unchanged; a
+   * missing `history` just means no context is recorded or read (equivalent to `historyTurns: 0`). */
+  history?: ControlTopicHistory;
 }
 
 export interface NlDispatch {
@@ -74,8 +85,10 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     getAssistEnabled,
     supergroupChatId,
     log,
+    history,
   } = opts;
   const routeText = opts.routeText ?? realRouteText;
+  const answerControlTopicQuestion = opts.answerControlTopicQuestion ?? realAnswerControlTopicQuestion;
 
   /** Short human-readable label for an NL-matched command's confirm card and its finalize message
    * - not exhaustive-per-field (e.g. `/new`'s prompt text isn't echoed back), just enough for the
@@ -159,9 +172,11 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
   async function postNlConfirm(command: FleetCommand | SessionCommand | RouterAction, threadId: number | undefined, currentSlug: string | undefined): Promise<void> {
     const id = randomUUID().slice(0, 8);
     try {
-      const sent = await controlBot.sendMessage(supergroupChatId, threadId, `🤖 I read that as ${describeNlCommand(command)} - run it?`, {
+      const confirmText = `🤖 I read that as ${describeNlCommand(command)} - run it?`;
+      const sent = await controlBot.sendMessage(supergroupChatId, threadId, confirmText, {
         inline_keyboard: buildNlConfirmKeyboard(id),
       });
+      history?.recordBot(confirmText);
       nlConfirmRegistry.add({ id, command, threadId, currentSlug, messageId: sent.message_id });
     } catch (err) {
       log("WARN", `failed to post NL-confirm card: ${(err as Error).message}`);
@@ -188,6 +203,10 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
       onNoMatch();
       return;
     }
+    // Recorded regardless of match outcome, but only in the control topic - the history buffer is a
+    // control-topic-only concept (plans/control-topic-nl-dialogue-plan.md §4); a session's own topic
+    // already has its own native conversation context and never reads this buffer.
+    if (ctx.isControl) history?.recordOperator(text);
     const topicIdStr = threadId !== undefined ? String(threadId) : undefined;
     // The router call itself is the latency gap with no existing "something is happening" signal
     // (unlike a forwarded turn, which sendChannelText already covers) - live-observed as a silent
@@ -230,6 +249,25 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     }
 
     if (!result.matched) {
+      // Control-topic free-form Q&A (plans/control-topic-nl-dialogue-plan.md) - only in the control
+      // topic (a session's own topic already forwards unmatched text to a live Claude turn with real
+      // repo access, which answers better - this path never fires there). A second, isolated
+      // `claude -p` call that can only ever produce a string or `null`, never a command - it cannot
+      // execute anything, so this never touches the destructive-confirm gate below.
+      if (ctx.isControl) {
+        const groundingText = buildDialogueGroundingText();
+        const historyText = formatHistoryForPrompt(history?.recent(nlRouterConfig.historyTurns ?? 0) ?? []);
+        const answer = await answerControlTopicQuestion(text, groundingText, historyText, nlRouterConfig.model, log);
+        if (answer) {
+          history?.recordBot(answer);
+          try {
+            await controlBot.sendMessage(supergroupChatId, threadId, answer);
+          } catch (err) {
+            log("WARN", `failed to send control-topic Q&A answer: ${(err as Error).message}`);
+          }
+          return;
+        }
+      }
       onNoMatch();
       return;
     }

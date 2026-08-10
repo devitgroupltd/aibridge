@@ -80,6 +80,12 @@ export interface BridgeConfig {
     apiKey: string | undefined;
     model: string;
     backend: "api" | "cli";
+    /** Control-topic free-form Q&A's history window (`plans/control-topic-nl-dialogue-plan.md`
+     * §6-7) - the number of recent operator/bot exchange pairs fed as context into both the
+     * classifier call and the new Q&A call. `0` disables the window entirely (no history sent).
+     * Always CLI-side regardless of `backend` above - see `nl-router.ts`'s
+     * `answerControlTopicQuestion` doc comment for why this feature never uses the API backend. */
+    historyTurns: number;
   };
 }
 
@@ -138,6 +144,10 @@ export function loadConfig(envPath = path.join(SECRETS_DIR, ".env")): BridgeConf
       // is the live, restart-free way to actually switch, backed by settings-store.ts; this is
       // only the one-time startup default before any live override has been set.
       backend: parsed.NL_ROUTER_BACKEND === "api" ? "api" : "cli",
+      // Default 4 - see plans/control-topic-nl-dialogue-plan.md §7 for the research behind this
+      // number (a "sweet spot" between chatbot-memory conventions and intent-classification-
+      // specific findings, which favor a short window over a long one). Set to 0 to disable.
+      historyTurns: Number(parsed.NL_ROUTER_HISTORY_TURNS ?? "4"),
     },
   };
 }
