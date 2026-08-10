@@ -96,6 +96,16 @@ describe("parseWhisperServerResponse", () => {
   test("throws on an empty string body rather than silently returning an empty transcript", () => {
     expect(() => parseWhisperServerResponse("   ")).toThrow(/empty transcript/);
   });
+
+  test("collapses a mid-word segment-boundary newline into a space, rather than leaving the word split", () => {
+    expect(parseWhisperServerResponse({ text: "можно улучш\nить и исправить" })).toEqual({
+      text: "можно улучшить и исправить",
+    });
+  });
+
+  test("collapses a newline surrounded by segment-boundary spaces to a single space", () => {
+    expect(parseWhisperServerResponse({ text: "hello \n world" })).toEqual({ text: "hello world" });
+  });
 });
 
 // The next two describe blocks are integration tests against the real ffmpeg binary on this
