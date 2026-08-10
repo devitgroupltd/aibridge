@@ -97,6 +97,7 @@ export interface SessionLifecycleCommands {
   handleAttachCommand(cmd: Extract<FleetCommand, { kind: "attach" }>, topicId: number | undefined, currentSlug: string | undefined): void;
   handlePauseCommand(cmd: Extract<FleetCommand, { kind: "pause" }>, topicId: number | undefined, currentSlug: string | undefined): void;
   handleStopCommand(cmd: Extract<FleetCommand, { kind: "stop" }>, topicId: number | undefined, currentSlug: string | undefined): void;
+  handleResumeCommand(cmd: Extract<FleetCommand, { kind: "resume" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void>;
   handleDetailCommand(cmd: Extract<FleetCommand, { kind: "detail" }>, topicId: number | undefined, currentSlug: string | undefined): void;
   handleVerboseCommand(cmd: Extract<FleetCommand, { kind: "verbose" }>, topicId: number | undefined, currentSlug: string | undefined): void;
 }
@@ -594,7 +595,10 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     if (!row) return;
     const next = !row.paused;
     sessionStore.setPaused(row.slug, next);
-    confirmSessionCommand(topicId, `${next ? "Paused" : "Resumed"} feed updates for "${row.slug}".`);
+    // "Feed paused/resumed" (not bare "Paused"/"Resumed") - deliberately worded to avoid colliding
+    // with `/resume`'s own "Session ... resumed." text below: this only mutes/unmutes Telegram feed
+    // updates for the topic, it never touches the session's process the way `/resume` does.
+    confirmSessionCommand(topicId, `Feed ${next ? "paused" : "resumed"} for "${row.slug}".`);
   }
 
   /**
@@ -659,6 +663,43 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
   }
 
   /**
+   * `/resume [<slug>]`: the manual counterpart to `/stop`'s "how do I continue after this" gap
+   * (2026-08-10 operator request - see the plan's changelog for the analysis this implements).
+   *
+   * `/stop` never kills the process - it only sends Escape (see `handleStopCommand`'s own doc
+   * comment), so a `/stop`ped session has nothing to "resume" at the process level at all; the next
+   * message sent into its topic is delivered to the still-live PTY exactly as it always would be.
+   * `/resume` therefore only ever does real work for a `dead` row - one that was `/kill`ed, crashed
+   * and exhausted its auto-resume attempts (`session-supervisor.ts`'s `MAX_CONSECUTIVE_RESUME_ATTEMPTS`),
+   * or otherwise ended - by manually invoking the exact same `sessionSupervisor.resumeSession` the
+   * crash-resume path (§4.5) already uses on a Bridge restart or an unexpected PTY exit: relaunches
+   * `claude --resume <session_id>` on the row's preserved worktree, rewires the PTY, and re-adds the
+   * routing entry. Every hazard that already applies there (a stale `session_id` failing outright, a
+   * `/rm` racing the relaunch) applies identically here - `resumeSession` re-reads the row from the
+   * store as its first step for exactly that reason, so this doesn't need its own copy of that guard.
+   *
+   * For anything short of `dead`, there is nothing to relaunch - reported as a no-op rather than
+   * silently doing nothing, so an operator who reaches for `/resume` out of habit right after `/stop`
+   * gets pointed at the actual fix (just send a message) instead of wondering whether the command
+   * did anything. `quota_stopped` gets its own wording: the process is alive and expected to recover
+   * on its own once the usage window resets (`quota-alarms.ts`'s `markQuotaStopped`), not something
+   * `/resume` needs to (or can usefully) intervene on.
+   */
+  async function handleResumeCommand(cmd: Extract<FleetCommand, { kind: "resume" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
+    const row = resolveSessionOrBail(cmd.slug, currentSlug, topicId);
+    if (!row) return;
+    if (row.state === "quota_stopped") {
+      confirmSessionCommand(topicId, `"${row.slug}" is still alive - it's paused on a usage limit and should resume on its own once the window resets, nothing to /resume.`);
+      return;
+    }
+    if (row.state !== "dead") {
+      confirmSessionCommand(topicId, `"${row.slug}" is still running - just send it a message to continue (a /stop interrupt leaves the process alive).`);
+      return;
+    }
+    await sessionSupervisor.resumeSession(row);
+  }
+
+  /**
    * §5.9's `/detail [<slug>] [compact|full]`: how much of each tool call the feed card shows for
    * this one session - "full" wraps each line's untruncated input in a `<blockquote expandable>`
    * instead of the 80-char one-liner; no argument reports the current setting rather than
@@ -708,6 +749,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     handleAttachCommand,
     handlePauseCommand,
     handleStopCommand,
+    handleResumeCommand,
     handleDetailCommand,
     handleVerboseCommand,
   };

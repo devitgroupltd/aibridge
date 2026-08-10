@@ -53,6 +53,7 @@ export type FleetCommand =
   | { kind: "pause"; slug?: string }
   | { kind: "usage"; slug?: string }
   | { kind: "stop"; slug?: string }
+  | { kind: "resume"; slug?: string }
   | { kind: "budget" }
   | { kind: "restart" }
   | { kind: "merge"; slug: string }
@@ -144,7 +145,7 @@ export function newSessionContent(cmd: { prompt: string; sourceText?: string }):
   return cmd.sourceText ?? cmd.prompt;
 }
 
-function parseSlugArg(kind: "attach" | "pause" | "usage" | "stop", rest: string): FleetCommand {
+function parseSlugArg(kind: "attach" | "pause" | "usage" | "stop" | "resume", rest: string): FleetCommand {
   const slug = rest.trim();
   return { kind, slug: slug.length > 0 ? slug : undefined };
 }
@@ -436,7 +437,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
 
 /** Shared between `parseFleetCommand` and `matchFleetCommandName` below - the list of command
  * *names* this module recognises, independent of whether the rest of the message parses. */
-const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|rm|remove|attach|pause|stop|usage|budget|restart|merge|ship|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b/;
+const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|rm|remove|attach|pause|stop|resume|usage|budget|restart|merge|ship|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b/;
 
 /**
  * Same command-name match as `parseFleetCommand`, but returns the bare word even when the rest of
@@ -517,6 +518,7 @@ export function parseFleetCommand(text: string): FleetCommand | null {
     case "pause":
     case "usage":
     case "stop":
+    case "resume":
       return parseSlugArg(cmd, rest);
     default:
       return null;
@@ -733,7 +735,10 @@ export function renderHelp(): string {
     "    confirm-gated unless --force; /rm is an alias)",
     "  /remove (bare, inside a topic with no tracked session) - offers to delete that orphaned Telegram topic itself, confirm-gated",
     "  /attach [<slug>] - show a session's PTY tail",
-    "  /pause [<slug>] - pause a session",
+    "  /pause [<slug>] - pause/resume this topic's feed updates (does not affect the session itself)",
+    "  /resume [<slug>] - relaunch a dead session's process (claude --resume) on its preserved",
+    "    worktree; a no-op note if the session is still alive (/stop leaves it alive - just send a",
+    "    message to continue)",
     "  /usage [<slug>] - token/cost usage",
     "  /budget - fleet spend (5h/7d)",
     "  /restart - restart the Bridge daemon",
@@ -816,8 +821,9 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "remove", description: "Remove a dead session row: /remove [<slug>|--dead|--prefix <text>|--all [--force]] (/rm is an alias)" },
     { command: "rm", description: "Alias for /remove" },
     { command: "attach", description: "Show a session's PTY tail" },
-    { command: "stop", description: "Interrupt the current turn (Escape) - session stays alive: /stop [<slug>]" },
-    { command: "pause", description: "Pause a session" },
+    { command: "stop", description: "Interrupt the current turn (Escape) - session stays alive, just send a message to continue: /stop [<slug>]" },
+    { command: "resume", description: "Relaunch a dead session's process on its preserved worktree: /resume [<slug>] (no-op note if it's still alive)" },
+    { command: "pause", description: "Pause/resume this topic's feed updates (not the session itself)" },
     { command: "usage", description: "Token/cost usage" },
     { command: "budget", description: "Fleet spend (5h/7d)" },
     { command: "restart", description: "Restart the Bridge daemon" },

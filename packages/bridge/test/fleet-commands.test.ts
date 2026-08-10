@@ -217,6 +217,11 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/stop")).toEqual({ kind: "stop", slug: undefined });
   });
 
+  test("/resume with and without a slug", () => {
+    expect(parseFleetCommand("/resume fix-bug")).toEqual({ kind: "resume", slug: "fix-bug" });
+    expect(parseFleetCommand("/resume")).toEqual({ kind: "resume", slug: undefined });
+  });
+
   test("/budget takes no argument", () => {
     expect(parseFleetCommand("/budget")).toEqual({ kind: "budget" });
   });
