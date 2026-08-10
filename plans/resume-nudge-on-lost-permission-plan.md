@@ -1,8 +1,9 @@
 ---
-version: 1.0.0
+version: 1.1.0
 status: solid
-last_modified_utc: 2026-08-10T11:19:00Z
+last_modified_utc: 2026-08-10T18:50:00Z
 changelog:
+  - "1.1.0 (2026-08-10): Generalized past resume specifically - live-observed the same silent-Stop failure on an *ordinary* second turn (no resume involved at all): 'Is everything committed?' ran a real Bash/subagent check via a Task subagent, then ended the turn (Stop hook) without ever calling reply(). Added §8: (1) feed-wiring.ts now stops the typing indicator on any turn_end/session_end, not just onReplySent - it was previously stuck ticking for up to 30 minutes whenever a turn ended without a reply, confirmed live via the sidebar still showing '...typing' minutes after the topic had gone silent; (2) a new no-reply nudge fires from the same Stop/StopFailure hook whenever a turn ends with feed-state's new repliedThisTurn flag still false, reusing sendChannelText exactly like sendResumeNudge but gated on 'did reply() fire this turn' rather than 'was the row awaiting_input' - bounded by the same 'one automatic follow-up, then give up' rule as §7's resume nudge (a silentStopStreak counter, reset by markReplied) so a session that ignores the nudge too doesn't nudge itself forever. 5 new unit tests (feed-wiring.test.ts) + updated feed-state.test.ts fixtures. bun test (1437/1437) and typecheck clean. Not yet live-verified against a real Telegram session - next step"
   - "1.0.0 (2026-08-10): Live-verified end-to-end: real pending permission -> real /restart -> zero operator input -> automatic follow-up nudge -> retried commit -> fresh permission card -> approved -> confirmed at the git level. This is the first of four live trials where the operator never had to type anything, closing the original gap this plan set out to fix. Marking solid - implementation, tests (1431/1431 + typecheck), and live behavior all confirmed"
   - "0.6.0 (2026-08-10): Implemented §7's follow-up nudge: resumeSession now schedules a single automatic second nudge (RESUME_NUDGE_FOLLOWUP_DELAY_MS = 20s) if the session is still idle after the first, reusing the same injected delay primitive handleUnexpectedExit's backoff already uses. Only fires for idle - skips awaiting_input (worked), working (still in flight), and dead/gone (kill or rm raced the wait). Added 4 new unit tests covering all four outcomes. bun test (1431/1431) and typecheck clean. Not yet live-verified with this specific change - next step"
   - "0.5.0 (2026-08-10): Live-tested the CLAUDE_CODE_RESUME_INTERRUPTED_TURN hypothesis (§6) and ruled it out - explicitly threading the flag past ptyEnv()'s CLAUDE_CODE_* strip and disabling it produced the identical idle-no-retry outcome as both prior trials (third fresh disposable session, same $0.09 token spend). Reverted the experimental env change (no benefit). This leaves 'send a second automatic nudge if still idle' as the only one of §6's three options with direct live evidence behind it - recorded as the recommended next implementation step, not yet built"
@@ -371,6 +372,50 @@ transcript without re-invoking the tool, that's consistent with (and would expla
 but-not-erroring behavior observed live, and is worth confirming isn't itself a cheaper knob than
 this nudge. Not blocking — this plan's nudge works regardless of that variable's state, since it acts
 one turn later, after Claude Code's own resume logic (whatever it does) has already settled.
+
+## §8 Generalizing Past Resume: Any Silent `Stop` (implemented)
+
+Live-observed 2026-08-10, on the very session this plan's own trials used, on an **ordinary** turn
+with no resume anywhere in its history for that turn: the operator asked "Is everything committed?",
+Claude delegated the check to a Task subagent (which ran `git status`/`git log` and finished
+successfully), and the turn ended (`Stop` hook) without ever calling `reply()`. The operator saw a
+feed card showing real tool activity and then... nothing. Two independent problems, both fixed here:
+
+1. **The typing indicator never stopped.** `typing-indicator.ts`'s only stop signal was
+   `onReplySent` (`index.ts:541`) - a turn that ends without a reply never fires it, so the indicator
+   kept ticking every 4s, confirmed live via the topic sidebar still showing "...typing" minutes
+   after the session had gone genuinely idle. Fixed by also stopping it from `feed-wiring.ts`'s
+   `handleHookEvent` whenever a `turn_end`/`session_end` event lands and the previous state had
+   `turnActive: true` - the hook-driven "this turn is over" signal, independent of whether a reply
+   ever happened. Both stop sites call the same idempotent `TypingIndicator.stop`, so wiring this
+   here doesn't risk double-stopping anything a real reply already stopped.
+2. **Nothing told Claude it had gone silent.** §2-§7 above only nudge a resumed session whose row was
+   `awaiting_input` - this failure has nothing to do with resume at all. Generalized: `feed-state.ts`
+   gained `repliedThisTurn` (reset false on `turn_start`, set true by a new `feedWiring.markReplied`
+   call wired into `pipe-server.ts`'s `onReplySent` via `index.ts`, since `reply()` is a
+   channel-server MCP call - hooks never see it directly). `handleHookEvent` now checks, on every
+   `turn_end`, whether the turn that just ended had `turnActive: true` and `repliedThisTurn: false` -
+   if so, it fires the identical `sendChannelText` nudge mechanism §1 already built
+   (`sendNoReplyNudge`, same fixed-`msgId`/`from` convention, `"no-reply-nudge"`/`"aibridge"`).
+
+**Why this didn't need a `LateBound`, unlike `sendResumeNudge`:** construction order in `index.ts`
+builds `feedWiring` (line ~506) *after* `ptyIo` (line ~484) and `typingIndicator` (line ~389) already
+exist as real values - unlike `sessionSupervisor`, which is built *before* `ptyIo`. Both are plain
+closures/values passed into `createFeedWiring`'s options.
+
+**Bounded the same way §7's follow-up nudge is bounded**, for the same reason: the nudge is itself a
+synthetic inbound turn, so a session that stays silent through the nudge too must not nudge itself
+forever. A `silentStopStreak` counter per slug increments on every silent `turn_end`; only streak `1`
+sends the nudge, any streak beyond that posts a plain `confirmSessionCommand` warning instead ("ended
+a turn without replying, N times in a row... may need a manual look, or /restart") and stops trying.
+`markReplied` resets the streak to 0, so a later silent turn (after a genuine reply in between) nudges
+again rather than staying permanently given-up.
+
+**Not yet live-verified** (unlike §7's resume nudge, which has a full live trial behind it) - this is
+implemented and unit-tested (`feed-wiring.test.ts`: typing-indicator-stops-on-silent-Stop,
+nudge-fires-once, no-nudge-after-markReplied, second-silent-Stop-gives-up-instead-of-nudging-again,
+streak-resets-after-a-real-reply) but the next live pass should confirm the nudge actually gets a
+resumed-free ordinary session to reply, the same way §7's live trial 4 confirmed the resume case.
 
 ## §5 Accepted Limitations (explicit, not silent)
 

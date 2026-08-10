@@ -13,6 +13,7 @@ import { stateForHookEvent } from "./session-state-transitions.ts";
 import { isPermanentEditFailure, type SendMessageSource } from "./telegram.ts";
 import type { PendingPermissionRequest } from "./permission-registry.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
+import type { TypingIndicator } from "./typing-indicator.ts";
 
 type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
 
@@ -43,6 +44,19 @@ export interface FeedWiringOptions {
   resolveByToolMatch: (slug: string, toolName: string, toolInput: unknown) => PendingPermissionRequest | undefined;
   sendVerdict: (slug: string, requestId: string, behavior: VerdictBehavior) => boolean;
   finalizePermissionMessage: (messageId: number, text: string) => Promise<void>;
+  /** Stopped the moment a turn ends (`Stop`/`StopFailure`/`SessionEnd`), not just on `onReplySent`
+   * (index.ts's other caller) - a turn that ends without ever calling `reply()` left this ticking
+   * every 4s for up to its 30-minute backstop with nothing actually happening, observed live
+   * 2026-08-10. Both stop sites are idempotent (`typing-indicator.ts`'s `stop` on an already-stopped
+   * topic is a no-op), so wiring this here doesn't risk double-stopping anything. */
+  typingIndicator: TypingIndicator;
+  /** Same shape/convention as `sessionSupervisor`'s `sendResumeNudge` (resume-nudge-on-lost-
+   * permission-plan.md §1) - a synthetic inbound turn via `pty-io.ts`'s real `sendChannelText`,
+   * fixed `msgId`/`from` identifying it as Bridge-generated. Fired from `handleHookEvent` itself
+   * (not a `LateBound`): by construction order (index.ts) `feedWiring` is built *after* `ptyIo`
+   * exists, unlike `sessionSupervisor`, which is built before it - so the forward-reference problem
+   * that motivated `LateBound` there doesn't exist here. */
+  sendNoReplyNudge: (slug: string, topicId: number, content: string) => void;
   log?: LogFn;
 }
 
@@ -58,6 +72,11 @@ export interface FeedWiring {
   /** Read-only lookup for the `"d:"` details-button callback (`callback-query-router.ts`, not yet
    * extracted) - checks the tapped turn is still the session's current one before rendering it. */
   getFeedState(slug: string): FeedState | undefined;
+  /** Called from `pipe-server.ts`'s `onReplySent` (via index.ts, alongside the existing
+   * `typingIndicator.stop`) the moment a reply actually lands for this slug - marks the *current*
+   * turn as having produced operator-visible output, so a `Stop` that follows doesn't get flagged
+   * as silent. A no-op if this slug has no tracked feed state yet (nothing to mark). */
+  markReplied(slug: string): void;
   /** Read-only view of every tracked feed state, for `/ls`'s `buildLsDetail` (`fleet-commands.ts`)
    * - it needs the whole set to render each row's "running: ..." detail line, not one lookup. */
   allFeedStates(): ReadonlyMap<string, FeedState>;
@@ -82,8 +101,15 @@ export interface FeedWiring {
  */
 export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
   const { sessionStore, routing, detailsAnchorStore, feedGovernor, controlBot, feedBot, supergroupChatId, confirmSessionCommand, markQuotaStopped } = opts;
-  const { resolveByToolMatch, sendVerdict, finalizePermissionMessage } = opts;
+  const { resolveByToolMatch, sendVerdict, finalizePermissionMessage, typingIndicator, sendNoReplyNudge } = opts;
   const log = opts.log ?? (() => {});
+
+  // How many *consecutive* turns have ended silently (no reply) for a slug - reset the moment
+  // `markReplied` fires. Bounded the same way `resumeSession`'s follow-up nudge is (resume-nudge-
+  // on-lost-permission-plan.md §7's "not a retry loop - exactly one follow-up"): nudging is itself a
+  // synthetic inbound turn, so a session that ignores the nudge too would otherwise nudge itself
+  // forever. One automatic nudge, then a plain warning notice instead of a second nudge.
+  const silentStopStreak = new Map<string, number>();
 
   // §5.1-§5.4: one turn-card state per session, sharing feedGovernor's P2 lane (droppable, unlike
   // P0/P1) with a coalescer that skips a render when the text hasn't actually changed.
@@ -228,6 +254,41 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
     feedStates.set(msg.slug, next);
     const feedSettings = row ? { detail: row.feedDetail, verbose: row.feedVerbose } : undefined;
 
+    // A turn ending (`turn_end`/`session_end`) is the real "Claude is done, for better or worse"
+    // signal - `onReplySent` (index.ts) covers the common case, but a turn that ends *without* ever
+    // calling `reply()` never fires it, and the typing indicator otherwise keeps ticking every 4s
+    // for up to its 30-minute backstop with nothing actually happening (live-observed 2026-08-10).
+    // Both stop sites are idempotent, so stopping it again here on a turn that did reply is harmless.
+    if ((event.kind === "turn_end" || event.kind === "session_end") && previous.turnActive) {
+      const route = routing.get(msg.slug);
+      if (route) typingIndicator.stop(String(route.topicId));
+    }
+
+    // The no-reply nudge: only for a genuine `turn_end` (not `session_end` - a session that just
+    // exited has no live PTY left to nudge), only if a turn had actually started, and only if that
+    // turn never called `reply()`. Mirrors resume-nudge-on-lost-permission-plan.md's own nudge
+    // mechanism and its "exactly one automatic follow-up, then give up" bound (§7) - a nudge is
+    // itself a synthetic inbound turn, so a session that stays silent through the nudge too must not
+    // nudge itself forever.
+    if (event.kind === "turn_end" && previous.turnActive && !previous.repliedThisTurn) {
+      const route = routing.get(msg.slug);
+      const streak = (silentStopStreak.get(msg.slug) ?? 0) + 1;
+      silentStopStreak.set(msg.slug, streak);
+      if (route && streak === 1) {
+        sendNoReplyNudge(
+          msg.slug,
+          route.topicId,
+          "Your last turn ended without sending a reply - the operator saw nothing happen. Reply now with what you found/did, or say why there's nothing to report.",
+        );
+      } else if (route) {
+        log("WARN", `session "${msg.slug}" ended a turn without replying ${streak} times in a row - not nudging again`);
+        confirmSessionCommand(
+          route.topicId,
+          `⚠️ Session "${msg.slug}" ended a turn without replying, ${streak} times in a row - the automatic nudge didn't help. It may need a manual look, or /restart.`,
+        );
+      }
+    }
+
     if (event.kind === "turn_start") {
       // §5.3/§5.4 are explicit that the card is *one message per turn*, edited in place - so a new
       // turn must start a new message. Without this the id set on the session's very first flush
@@ -274,6 +335,12 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
     return feedStates.get(slug);
   }
 
+  function markReplied(slug: string): void {
+    silentStopStreak.delete(slug);
+    const state = feedStates.get(slug);
+    if (state) feedStates.set(slug, { ...state, repliedThisTurn: true });
+  }
+
   function allFeedStates(): ReadonlyMap<string, FeedState> {
     return feedStates;
   }
@@ -308,6 +375,7 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
     maybeSetState,
     markInterjected,
     getFeedState,
+    markReplied,
     allFeedStates,
     forgetSession,
     resetCoalescer,
