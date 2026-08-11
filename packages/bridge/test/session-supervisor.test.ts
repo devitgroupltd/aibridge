@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createSessionSupervisor, MAX_CONSECUTIVE_RESUME_ATTEMPTS, RESUME_BACKOFF_MS } from "../src/session-supervisor.ts";
+import { createSessionSupervisor, MAX_CONSECUTIVE_RESUME_ATTEMPTS, RESUME_BACKOFF_MS, RESUME_NUDGE_FOLLOWUP_DELAY_MS } from "../src/session-supervisor.ts";
 import { LateBound } from "../src/late-bound.ts";
 import { Routing } from "../src/routing.ts";
 import { SessionStore, type SessionRow } from "../src/session-store.ts";
@@ -244,7 +244,10 @@ describe("createSessionSupervisor", () => {
     await Promise.resolve();
     await Promise.resolve();
     await Promise.resolve();
-    expect(delays).toEqual([RESUME_BACKOFF_MS[0]]);
+    // The backoff delay, then (since the resume succeeded) finishResumeSuccess's own unconditional
+    // follow-up-nudge delay - see that function's doc comment for why it no longer only fires for
+    // an awaiting_input row.
+    expect(delays).toEqual([RESUME_BACKOFF_MS[0], RESUME_NUDGE_FOLLOWUP_DELAY_MS]);
 
     // Simulate /kill (or /rm) tearing the slug down entirely - a later /new reusing this exact slug
     // (slug.ts derives slugs from a prompt's own first words, so a repeat is entirely possible) must
@@ -259,7 +262,7 @@ describe("createSessionSupervisor", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(delays).toEqual([RESUME_BACKOFF_MS[0]]);
+    expect(delays).toEqual([RESUME_BACKOFF_MS[0], RESUME_NUDGE_FOLLOWUP_DELAY_MS]);
   });
 
   test("handleUnexpectedExit is a no-op when ptyProcessBySlug no longer points at this pty (a deliberate /kill raced the exit event)", async () => {
@@ -325,7 +328,7 @@ describe("createSessionSupervisor", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(delays).toEqual([RESUME_BACKOFF_MS[0]]);
+    expect(delays).toEqual([RESUME_BACKOFF_MS[0], RESUME_NUDGE_FOLLOWUP_DELAY_MS]);
     expect(launchCount).toBe(1);
     expect(sessionStore.get("fix-bug")?.state).not.toBe("dead");
     expect(confirm.calls.some((c) => c.text.includes("resumed"))).toBe(true);
@@ -686,7 +689,14 @@ describe("createSessionSupervisor", () => {
     expect(nudge.calls.length).toBe(1);
   });
 
-  test("resumeSession does not nudge a normal (non-awaiting_input) resume - it wasn't blocked on anything to retry", async () => {
+  // Reversed 2026-08-11 (was "does not nudge a normal (non-awaiting_input) resume"): live-confirmed
+  // via /resume --all that a `working`-state resume does NOT continue on its own either - two
+  // sessions that had been `working` (not `awaiting_input`) at crash time sat silently idle after
+  // "Session ... resumed." with no nudge, since the old gate only fired for `awaiting_input`. See
+  // `finishResumeSuccess`'s own doc comment for why that plan-era assumption doesn't hold on this
+  // stack: `claude --resume` always comes back to a cold, idle process regardless of what state the
+  // row was in before it died.
+  test("resumeSession nudges a working-state resume too - claude --resume comes back cold either way, not mid-reply", async () => {
     const sessionStore = new SessionStore(":memory:");
     sessionStore.insert(row({ state: "working" }));
     const routing = new Routing();
@@ -711,7 +721,9 @@ describe("createSessionSupervisor", () => {
 
     await supervisor.resumeSession(sessionStore.get("fix-bug")!);
 
-    expect(nudge.calls).toEqual([]);
+    expect(nudge.calls).toEqual([{ slug: "fix-bug", topicId: 2, content: expect.stringContaining("Check what you were in the middle of") }]);
+    expect(confirm.calls.some((c) => c.text.includes("pending question was lost"))).toBe(false);
+    expect(confirm.calls.some((c) => c.text === 'Session "fix-bug" resumed.')).toBe(true);
   });
 
   test("resumeSession does not nudge when claude --resume itself failed - there's no live conversation to retry into", async () => {
@@ -1021,6 +1033,6 @@ describe("createSessionSupervisor", () => {
     await Promise.resolve();
 
     // Started over at attempt 1's delay, not attempt 2's - proof the counter was actually reset.
-    expect(delays).toEqual([RESUME_BACKOFF_MS[0]]);
+    expect(delays).toEqual([RESUME_BACKOFF_MS[0], RESUME_NUDGE_FOLLOWUP_DELAY_MS]);
   });
 });

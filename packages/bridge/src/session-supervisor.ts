@@ -463,23 +463,34 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
 
   /**
    * resume-nudge-on-lost-permission-plan.md §2: a resumed Claude comes back idle rather than
-   * retrying whatever tool call its lost permission prompt was blocking on (confirmed live
-   * 2026-08-10 - a pending `git commit` never happened after resume). Only for the row that
-   * actually lost a pending prompt on *this* resume - a normal working-state resume already has
-   * Claude mid-reply, and nudging that too would inject an unsolicited turn into work that was
-   * proceeding correctly on its own. Wording note (confirmed live 2026-08-10): a plain "please
-   * retry it" was NOT enough on its own - a live trial sat idle for minutes with no retry, and only
-   * started checking git state and re-attempting once explicitly asked "what were you in the middle
-   * of, check and retry." Folding that same check-first instruction into the nudge itself (rather
-   * than relying on the operator to send it by hand) is what makes this actually self-service.
+   * retrying whatever it was doing when the crash/restart hit (confirmed live 2026-08-10 - a
+   * pending `git commit` never happened after resume). Originally gated on `hadLostPrompt`
+   * (`current.state === "awaiting_input"`) on the theory that a `working`-state resume "already has
+   * Claude mid-reply" and continues on its own - **contradicted live 2026-08-11**: `/resume --all`
+   * on two sessions that had been `working` (not `awaiting_input`) mid-crash produced the identical
+   * silent-forever symptom the `awaiting_input` case was fixed for, with nothing else happening after
+   * "Session ... resumed." That plan's own assumption doesn't hold on this stack: `claude --resume`
+   * reloads a transcript into a *fresh* process, it does not resurrect an in-flight turn, so there is
+   * no meaningful difference between "was waiting on a permission prompt" and "was mid-tool-call"
+   * from the successor process's point of view - both come back cold, sitting idle, with nothing to
+   * make them continue unless told to. Nudging unconditionally (not gated on the pre-crash state at
+   * all) closes that gap for every resume path, not just the one state reconciliation happened to be
+   * able to prove was broken first; the one-shot follow-up nudge below already tolerates a session
+   * that continues correctly on its own (skips if it's no longer idle by then), so nudging a resume
+   * that didn't actually need it costs at most one harmless extra check.
+   *
+   * Wording note (confirmed live 2026-08-10): a plain "please retry it" was NOT enough on its own -
+   * a live trial sat idle for minutes with no retry, and only started checking git state and
+   * re-attempting once explicitly asked "what were you in the middle of, check and retry." Folding
+   * that same check-first instruction into the nudge itself (rather than relying on the operator to
+   * send it by hand) is what makes this actually self-service.
    */
-  function finishResumeSuccess(slug: string, topicId: number, hadLostPrompt: boolean): void {
+  function finishResumeSuccess(slug: string, topicId: number): void {
     confirmSessionCommand(topicId, `Session "${slug}" resumed.`);
-    if (!hadLostPrompt) return;
     sendResumeNudge?.get()(
       slug,
       topicId,
-      "A Bridge restart interrupted you before your last action could complete or be approved - it never ran. Check what you were in the middle of (e.g. git status/log, or whatever else is relevant) and retry it.",
+      "A Bridge restart interrupted this session before its last action finished - a tool call, a reply, or something awaiting your approval - it never completed. Check what you were in the middle of (e.g. git status/log, or whatever else is relevant) and continue or retry it.",
     );
     // §7: the nudge above is confirmed live (three trials, 2026-08-10) to NOT reliably land as the
     // very first turn after a resume - the session's own turn completes in a handful of seconds and
@@ -572,7 +583,7 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
       if (resumeFailed) {
         finishResumeFailure(row, session, current.sessionId);
       } else {
-        finishResumeSuccess(slug, topicId, hadLostPrompt);
+        finishResumeSuccess(slug, topicId);
       }
     } catch (err) {
       markDeadIfPresent(slug);
