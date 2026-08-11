@@ -61,8 +61,20 @@ export class Routing {
   /** Optional - tests and the self-check route construct a `Routing` with no persistence at all,
    * getting the pre-2026-08-11 in-memory-only behavior (mode, auto-permission and auto-answer all
    * reset to their defaults on every restart). The live Bridge always passes `session-store.ts`'s
-   * `SessionStore`. */
-  constructor(private readonly persistence?: RoutingPersistence) {}
+   * `SessionStore`.
+   *
+   * A plain field + body assignment, not a TS parameter property - found live 2026-08-11: the
+   * Bridge runs under `node --experimental-strip-types` (§9, autostart.ts's `buildCreateArgs`),
+   * which only erases type annotations and rejects parameter properties outright
+   * (`ERR_UNSUPPORTED_TYPESCRIPT_SYNTAX` - they need a real transform, synthesizing the field
+   * assignment, not mere erasure). That crash happens at module-parse time, before `index.ts`'s
+   * own `initFileLogging` call ever runs, so a scheduled-task `/restart` died silently: no log
+   * line, no live Bridge, nothing but `schtasks`' own `Last Result: 1`. */
+  private readonly persistence?: RoutingPersistence;
+
+  constructor(persistence?: RoutingPersistence) {
+    this.persistence = persistence;
+  }
 
   add(route: SessionRoute): void {
     this.bySlug.set(route.slug, route);
