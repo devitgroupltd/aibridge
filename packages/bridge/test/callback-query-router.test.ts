@@ -157,6 +157,10 @@ function fakeVoiceModeCommands() {
     applyEffortSwitch: record("applyEffortSwitch"),
     applyDefaultMode: (mode: string) => `default mode is now ${mode}`,
     applyDefaultEffort: (effort: string) => `default effort is now ${effort}`,
+    applyDefaultAutoToggle: (category: string, value: boolean) => {
+      calls.push({ fn: "applyDefaultAutoToggle", args: [category, value] });
+      return `default ${category} is now ${value ? "on" : "off"}`;
+    },
     calls,
   };
 }
@@ -399,6 +403,22 @@ describe("createCallbackQueryRouter - every documented namespace resolves to its
     const s = setup();
     s.router.routeCallbackQuery(cq("defmode:plan"));
     expect(s.controlBot.edited).toEqual([{ messageId: 1, text: "default mode is now plan" }]);
+  });
+
+  // A resolver-only test can't catch a dead button: without a fifth `match` branch these strings
+  // resolve to nothing, the "default" rule declines, and the tap falls through to the catch-all -
+  // a live-looking button that silently does nothing.
+  test('"default:permission:on" is claimed by the default rule and applies the toggle', () => {
+    const s = setup();
+    s.router.routeCallbackQuery(cq("default:permission:on"));
+    expect(s.voiceModeCommands.calls).toEqual([{ fn: "applyDefaultAutoToggle", args: ["permission", true] }]);
+    expect(s.controlBot.edited).toEqual([{ messageId: 1, text: "default permission is now on" }]);
+  });
+
+  test('"default:answer:off" carries its own category and value, not the permission arm\'s', () => {
+    const s = setup();
+    s.router.routeCallbackQuery(cq("default:answer:off"));
+    expect(s.voiceModeCommands.calls).toEqual([{ fn: "applyDefaultAutoToggle", args: ["answer", false] }]);
   });
 
   test('"about:<id>" sends the topic detail text', () => {

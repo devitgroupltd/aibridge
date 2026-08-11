@@ -30,6 +30,12 @@ export class Routing {
   // consumer, so drift here is cosmetic, not something any command's actual effect relies on.
   private readonly effortBySlug = new Map<string, Effort>();
   private readonly ringBufferBySlug = new Map<string, string>();
+  // `/auto permission` / `/auto answer` (bypass-and-autoanswer-plan.md §0.2). In-memory only and
+  // deliberately so: a fresh `Routing` on every Bridge restart means both toggles come back OFF,
+  // fail-closed, mirroring permission-registry.ts's "a restart declares a pending prompt lost,
+  // never silently reconstructed" one level up. Not a gap to be "fixed" into a persisted column.
+  private readonly bypassBySlug = new Map<string, boolean>();
+  private readonly autoAnswerBySlug = new Map<string, boolean>();
 
   add(route: SessionRoute): void {
     this.bySlug.set(route.slug, route);
@@ -59,6 +65,11 @@ export class Routing {
     this.modeBySlug.delete(slug);
     this.effortBySlug.delete(slug);
     this.ringBufferBySlug.delete(slug);
+    // Safety-relevant, not bookkeeping: `uniqueSlug` (slug.ts) de-duplicates only against *live*
+    // slugs, so `/rm fix-bug` frees that name for reuse. Leaving these set would have the next
+    // session to claim it start fully auto-permitted, with nothing announcing that.
+    this.bypassBySlug.delete(slug);
+    this.autoAnswerBySlug.delete(slug);
   }
 
   setPtyWrite(slug: string, write: (text: string) => void): void {
@@ -92,6 +103,26 @@ export class Routing {
 
   setEffort(slug: string, effort: Effort): void {
     this.effortBySlug.set(slug, effort);
+  }
+
+  /** `/auto permission` - whether this session's permission requests are auto-allowed by the Bridge
+   * before any card is posted (pipe-server.ts's `handlePermissionRequest`). Defaults to off. */
+  getBypass(slug: string): boolean {
+    return this.bypassBySlug.get(slug) ?? false;
+  }
+
+  setBypass(slug: string, on: boolean): void {
+    this.bypassBySlug.set(slug, on);
+  }
+
+  /** `/auto answer` - whether this session's `AskUserQuestion` calls are auto-answered when Claude
+   * marked exactly one option as recommended (pipe-server.ts's `handleAsk`). Defaults to off. */
+  getAutoAnswer(slug: string): boolean {
+    return this.autoAnswerBySlug.get(slug) ?? false;
+  }
+
+  setAutoAnswer(slug: string, on: boolean): void {
+    this.autoAnswerBySlug.set(slug, on);
   }
 
   /** Appends raw PTY output to `/attach`'s ring buffer, trimmed to the last

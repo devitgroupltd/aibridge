@@ -475,6 +475,12 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
         repoPath: current.repoPath,
         worktreesRoot: path.dirname(current.worktreePath),
         model: current.model,
+        // A resumed PTY re-spawns `claude` from scratch (§4.5), so without this the session comes
+        // back at the CLI's own `manual` default however it was set before the crash - silently, and
+        // while `routing.getMode` still reports the old value, so a later `/mode` switch would cycle
+        // from a starting point the session isn't actually at. Cheap to carry now that it's a launch
+        // flag rather than a keystroke burst.
+        permissionMode: routing.getMode(slug),
         resumeSessionId: current.sessionId,
         otlpPort,
         log,

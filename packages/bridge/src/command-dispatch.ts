@@ -55,6 +55,7 @@ export interface CommandDispatchOptions {
     | "handleAttachCommand"
     | "handleDetailCommand"
     | "handleVerboseCommand"
+    | "handleAutoCommand"
     | "handlePauseCommand"
     | "handleStopCommand"
     | "handleResumeCommand"
@@ -236,6 +237,13 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     }
     if (fleetCmd.kind === "verbose") {
       sessionLifecycle.handleVerboseCommand(fleetCmd, threadId, currentSlug);
+      return;
+    }
+    if (fleetCmd.kind === "auto") {
+      // `fireAndForget`, like kill/rm and unlike the neighbouring `verbose` - `handleAutoCommand`'s
+      // `--all` scope posts a confirm card, so it's `Promise<void>`, and a bare call would drop a
+      // rejected post silently.
+      fireAndForget(sessionLifecycle.handleAutoCommand(fleetCmd, threadId, currentSlug), log, "command-dispatch handleAutoCommand");
       return;
     }
     if (fleetCmd.kind === "settings") {

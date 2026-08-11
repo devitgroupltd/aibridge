@@ -127,6 +127,72 @@ describe("mapRouterOutput - one case per kind", () => {
     });
   });
 
+  // "stop asking me for permission on this one" is the sentence isDestructive's own comment names as
+  // `mode auto`'s most plausible fuzzy match - it describes this command even more exactly.
+  test("auto <category> on is destructive - one gate covers both categories", () => {
+    for (const category of ["permission", "answer"] as const) {
+      expect(mapRouterOutput({ kind: "auto", autoCategory: category, slug: "fix-bug", on: true }, SESSION)).toEqual({
+        matched: true,
+        command: { kind: "auto", category, slug: "fix-bug", all: false, on: true },
+        destructive: true,
+      });
+    }
+  });
+
+  test("auto <category> off and the bare status form are not destructive - only turning a guard off is", () => {
+    expect(mapRouterOutput({ kind: "auto", autoCategory: "permission", slug: "fix-bug", on: false }, SESSION)).toMatchObject({ matched: true, destructive: false });
+    expect(mapRouterOutput({ kind: "auto", autoCategory: "permission", slug: "fix-bug" }, SESSION)).toMatchObject({ matched: true, destructive: false });
+  });
+
+  test("auto --all on is NOT destructive here - it posts its own confirm card, same as kill --all", () => {
+    expect(mapRouterOutput({ kind: "auto", autoCategory: "permission", all: true, on: true }, CONTROL)).toMatchObject({ matched: true, destructive: false });
+  });
+
+  test("auto with a missing or unknown category does not fall through to either one", () => {
+    expect(mapRouterOutput({ kind: "auto", on: true }, SESSION).matched).toBe(false);
+    expect(mapRouterOutput({ kind: "auto", autoCategory: "ship", on: true }, SESSION).matched).toBe(false);
+  });
+
+  test("default permission|answer take their value from `on`, and a missing one is the status form", () => {
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "permission", on: true }, CONTROL)).toMatchObject({
+      matched: true,
+      command: { kind: "default", category: "permission", value: true },
+    });
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "answer", on: false }, CONTROL)).toMatchObject({
+      matched: true,
+      command: { kind: "default", category: "answer", value: false },
+    });
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "permission" }, CONTROL)).toMatchObject({
+      matched: true,
+      command: { kind: "default", category: "permission", value: undefined },
+    });
+  });
+
+  // Wider than `/auto <category> on`, not narrower: it applies to every session created from that
+  // point on, and unlike `--all` it posts no confirm card of its own.
+  test("default permission|answer ON is destructive; off and the bare form are not", () => {
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "permission", on: true }, CONTROL)).toMatchObject({ matched: true, destructive: true });
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "answer", on: true }, CONTROL)).toMatchObject({ matched: true, destructive: true });
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "permission", on: false }, CONTROL)).toMatchObject({ matched: true, destructive: false });
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "permission" }, CONTROL)).toMatchObject({ matched: true, destructive: false });
+    // The pre-existing categories keep their own (non-destructive) treatment.
+    expect(mapRouterOutput({ kind: "default", defaultCategory: "mode", mode: "auto" }, CONTROL)).toMatchObject({ matched: true, destructive: false });
+  });
+
+  test("the schema the model actually sees offers all four defaultCategory values", () => {
+    // Asserted through the CLI arg builder because that's the only exported surface the schema
+    // reaches - a value the mapper handles but the schema never offers is one the model can't emit.
+    const args = buildRouteViaCliArgs("make new sessions auto-approve", CONTROL, "claude-haiku-4-5-20251001").join(" ");
+    expect(args).toContain('"mode","effort","permission","answer"');
+  });
+
+  // The regression test for "auto reads like default, so group it with default": doing that filters
+  // it out of every session topic, killing the feature's most likely natural-language invocation.
+  test("auto is offered in a session topic as well as the control topic", () => {
+    expect(mapRouterOutput({ kind: "auto", autoCategory: "permission", on: true }, SESSION).matched).toBe(true);
+    expect(mapRouterOutput({ kind: "auto", autoCategory: "permission", slug: "fix-bug", on: true }, CONTROL).matched).toBe(true);
+  });
+
   test("kill: bare (no slug) inside a session topic - relies on dispatch's own currentSlug fallback", () => {
     expect(mapRouterOutput({ kind: "kill" }, SESSION)).toEqual({
       matched: true,

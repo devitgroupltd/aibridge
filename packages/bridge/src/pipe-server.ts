@@ -147,6 +147,40 @@ const MAX_SEND_FILE_BYTES = 50 * 1024 * 1024;
 /** See `PipeServerOptions.onBeforeReplyTimeoutMs`'s own doc comment. */
 const DEFAULT_ONBEFOREREPLY_TIMEOUT_MS = 1500;
 
+/** How much of a tool call's input preview an auto-approval notice shows. These are one-line
+ * status notes in a topic that may get one per tool call, not the permission card's full detail -
+ * the card is what got skipped. */
+const AUTO_NOTE_PREVIEW_MAX = 120;
+
+/** Claude Code's own marker for a preferred `AskUserQuestion` option - see `findAutoAnswer`. */
+const RECOMMENDED_SUFFIX = " (Recommended)";
+
+/**
+ * Vocabulary suggesting an option defers or investigates rather than commits - "Verify against a
+ * real session first", "Hold off, review the plan changes first", "Not yet".
+ *
+ * **This is a veto, never a selection, and the distinction is the whole design.** The operator's
+ * standing preference is to investigate before committing, so the obvious feature is "auto-pick the
+ * investigate option instead of the recommended one". That was measured against 715 real
+ * `AskUserQuestion` calls from this machine's own Claude Code transcripts and rejected: option
+ * semantics are not expressible in the schema (`AskQuestionOption` is `{label, description?}`, and
+ * only `(Recommended)` is a convention Claude is actually instructed to emit), so any detector is
+ * keyword-matching free prose. A generous one ran at roughly 13% precision, and its failures
+ * inverted the operator's intent rather than merely missing - it would have answered *"Auto-send
+ * immediately, no confirmation"* over *"Always show a confirm card first (Recommended)"*, having
+ * matched "confirm" inside "no confirmation", i.e. silently disabling a safety confirmation the
+ * question existed to enable.
+ *
+ * Used as a veto the same imprecision is harmless and the risk profile inverts: a false positive
+ * costs one button tap (the real card is posted, which is also the only way the operator can pick
+ * the investigate option at all), and a false negative just auto-answers as before. It fires on
+ * ~11% of otherwise-auto-answerable questions in that corpus.
+ *
+ * Labels only, deliberately - `description` is explanatory prose that routinely contains "before"
+ * and "first" while describing an option that commits to something.
+ */
+const DEFER_OPTION_RE = /\b(first|before|investigat\w*|research\w*|clarif\w*|explain\w*|hold off|hold on|wait|not yet|verify|double-check|look into)\b/i;
+
 /** Splits at line boundaries where it can, mid-line only when a single line is itself too long.
  * Returns `[]` for text that is empty or whitespace-only - Telegram 400s on that too. */
 export function splitForTelegram(text: string, limit = TELEGRAM_TEXT_LIMIT): string[] {
@@ -427,6 +461,91 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
   }
 
   /**
+   * `/auto answer`'s whole rule: auto-resolve a call only when *every* question carries exactly one
+   * option whose label ends in " (Recommended)", and pick those. If any question lacks exactly one,
+   * return null and post the real card for the whole call - never a partial auto-answer.
+   *
+   * The suffix is Claude Code's own convention for marking a preferred option (its `AskUserQuestion`
+   * tool description instructs the model to append it to the recommended option). That makes it an
+   * instructed convention rather than a documented schema field - `AskQuestionOption` is `{ label,
+   * description? }` with nothing structured to read - so a model that doesn't follow it, or follows
+   * it twice, simply falls through to the real card. Hence "exactly one, or bail" rather than
+   * "the first one found".
+   */
+  function findAutoAnswer(questions: HookAskMessage["questions"]): string[] | null {
+    // Load-bearing, not defensive decoration: without it the loop below never runs and this returns
+    // `[]`, which is non-null, so the caller would take the auto-answer path for a call with nothing
+    // to answer and write an empty `answers` map to a hook client that then unblocks having
+    // answered nothing.
+    if (questions.length === 0) return null;
+    const answers: string[] = [];
+    for (const q of questions) {
+      const recommended = q.options.filter((o) => o.label.endsWith(RECOMMENDED_SUFFIX));
+      if (recommended.length !== 1) return null;
+      // Operator-requested 2026-08-11: when there is *also* an option to investigate/defer, the
+      // operator wants that one - and the only reliable way to give it to them is to show the real
+      // buttons, since which option that is cannot be determined from the schema. See
+      // DEFER_OPTION_RE for the measurement behind "veto, never select".
+      const deferrable = q.options.find((o) => o !== recommended[0] && DEFER_OPTION_RE.test(o.label));
+      if (deferrable) {
+        log("INFO", `auto-answer declined for "${q.question}": "${deferrable.label}" looks like an investigate-first option, posting the real card`);
+        return null;
+      }
+      answers.push(recommended[0]!.label);
+    }
+    return answers;
+  }
+
+  /** The answer sent back keeps the full label - a real button tap sends `option.label` verbatim, so
+   * anything else would be a different answer than the operator could have given. Only the notice
+   * strips it, for readability. */
+  function stripRecommendedSuffix(label: string): string {
+    return label.endsWith(RECOMMENDED_SUFFIX) ? label.slice(0, -RECOMMENDED_SUFFIX.length) : label;
+  }
+
+  /** One-line plain-text summary of a tool call, e.g. `Bash(git push origin main)`. Deliberately not
+   * built from `renderPermissionCard`/`renderInputPreview`: those produce Telegram HTML (`<b>`,
+   * `<code>`, escaped body) for a `parse_mode: "HTML"` send, and `postAutoApprovedNote` sends with no
+   * parse mode - reusing them would print literal tags in every notice. Plain text is also immune to
+   * a command containing `<` or `&`, which is not a rare shape in a shell one-liner. */
+  function describeCall(toolName: string, inputPreview: string): string {
+    // A Bash `input_preview` is the tool's JSON input, so the raw string renders as
+    // `Bash({ "command": "cd ... && bash scripts/typecheck.sh",…)` - the envelope crowding out the
+    // one thing the operator is reading the line for (live-observed 2026-08-11). Unwrap it to the
+    // command itself, reusing the same parser the compound-Bash shortcut in this file already
+    // depends on. Non-Bash tools, and anything that doesn't parse, fall back to the raw preview.
+    const unwrapped = (toolName === "Bash" ? extractBashCommand(inputPreview) : null) ?? inputPreview;
+    const preview = unwrapped.replace(/\s+/g, " ").trim();
+    if (!preview) return toolName;
+    const truncated = preview.length > AUTO_NOTE_PREVIEW_MAX ? `${preview.slice(0, AUTO_NOTE_PREVIEW_MAX - 1)}…` : preview;
+    return `${toolName}(${truncated})`;
+  }
+
+  /**
+   * The operator-visible trace for anything the Bridge resolved on their behalf - a plain message
+   * into the session's own topic, not a feed-card line (there is no Bridge-side primitive for
+   * appending to a feed card, and `pipe-server.ts` holds no `feedWiring` reference at all).
+   *
+   * P1, not P0 and not P2. The permission card this replaces sends on P0, reserved for traffic a
+   * human is actively blocked on; a burst of auto-approvals must not compete there with other
+   * sessions' real permission cards. P2 is wrong the other way - droppable under pressure, and a
+   * "what did the Bridge do on my behalf" audit trail must not silently vanish when the feed is busy.
+   *
+   * **Enqueued, never awaited by callers, and never throws.** P0 and P1 share one control-bot bucket
+   * refilling at roughly one token every 3 seconds (rate-governor.ts). Awaiting this before sending
+   * the verdict would gate every auto-approved tool call on a rate-limiter token - a 20-call turn
+   * would freeze for about a minute, with Claude blocked on a verdict the Bridge decided instantly
+   * and locally, and the feature meant to remove a Telegram round-trip would have replaced it with a
+   * governor one. The ordering the operator's timeline needs ("🔓 auto-approved: X" before X's
+   * effects) comes from enqueue order, since the lanes are FIFO - not from awaiting the send.
+   */
+  function postAutoApprovedNote(topicId: number, text: string): void {
+    void p1(() => opts.controlBot.sendMessage(opts.chatId, topicId, text)).catch((err) =>
+      log("WARN", `failed to post auto-approval notice: ${(err as Error).message}`),
+    );
+  }
+
+  /**
    * §6.3's relay: post an inline-keyboard card and register it as pending. The card renders from
    * this notification's own fields alone (§6.5 - no join against a hook payload), and a post
    * failure (e.g. Telegram briefly unreachable) leaves nothing registered rather than a pending
@@ -436,6 +555,20 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     const route = opts.routing.get(msg.slug);
     if (!route) {
       log("WARN", `permission_request for unknown slug "${msg.slug}" - dropped`);
+      return;
+    }
+    // `/auto permission on` for this session: the operator-controlled generalization of the
+    // compound-Bash shortcut below. Checked first because it's the coarser gate - if everything is
+    // being auto-allowed anyway there's no point decomposing the command to find out whether this
+    // one could have been. Note this can only ever see calls Claude Code already decided to escalate:
+    // a `permissions.deny` match never reaches the relay at all (its precedence chain refuses the
+    // call outright), so the deny list stays a hard floor regardless of this toggle. What it *does*
+    // auto-allow is the `permissions.ask` list - git commit/push, PR merge, npm publish - which is
+    // the deliberate, headline behavior change, not an oversight.
+    if (opts.routing.getBypass(msg.slug)) {
+      log("INFO", `auto-permission: auto-allowed ${msg.tool_name} for slug "${msg.slug}": ${msg.input_preview}`);
+      postAutoApprovedNote(route.topicId, `🔓 auto-approved (auto permission): ${describeCall(msg.tool_name, msg.input_preview)}`);
+      sendVerdict(msg.slug, msg.request_id, "allow");
       return;
     }
     // compound-permission.ts: Claude Code's own settings evaluation matches a Bash call's entire
@@ -452,6 +585,10 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
         const settings = readSettingsFile(opts.stateDir, msg.slug);
         if (isCompoundCommandFullyAllowed(command, settings, WIDENED_AUTO_APPROVE_PREFIXES)) {
           log("INFO", `auto-approved compound Bash for slug "${msg.slug}" - every sub-command already allowed: ${command}`);
+          // Brought up to the same observability standard as the toggle above while in this
+          // function: this shortcut has always been server-log-only, with no Telegram-visible trace
+          // of what the Bridge approved on the operator's behalf.
+          postAutoApprovedNote(route.topicId, `🔓 auto-approved (every sub-command already allowed): ${describeCall(msg.tool_name, msg.input_preview)}`);
           sendVerdict(msg.slug, msg.request_id, "allow");
           return;
         }
@@ -506,6 +643,29 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     if (!route) {
       log("WARN", `ask for unknown slug "${msg.slug}" - dropped`);
       return;
+    }
+
+    // `/auto answer on` for this session. Placed after *both* guards above, deliberately: after the
+    // reconnect-rebind branch, so a re-sent `ask` for an entry still pending from before the toggle
+    // went on keeps rebinding its socket rather than being answered out from under a card the
+    // operator is already looking at; and after the route lookup, since the notice needs a topicId
+    // and an unknown slug must keep falling through to the WARN-and-drop above.
+    if (opts.routing.getAutoAnswer(msg.slug)) {
+      const picked = findAutoAnswer(msg.questions);
+      if (picked) {
+        const answers: Record<string, string> = {};
+        msg.questions.forEach((q, i) => {
+          answers[q.question] = picked[i]!;
+        });
+        for (const [question, label] of Object.entries(answers)) {
+          postAutoApprovedNote(route.topicId, `🔓 auto-answered (auto answer): "${question}" → "${stripRecommendedSuffix(label)}"`);
+        }
+        // Never registers with `askRegistry` and never posts a card - there is nothing for the
+        // operator to answer, so an entry here would exist only to be deleted a microtask later,
+        // racing the expiry sweep and `removeForSlug` for no benefit.
+        writeAnswer(socket, msg.slug, { answers });
+        return;
+      }
     }
 
     try {
@@ -699,6 +859,19 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
   /** Shared by `completeAsk`/`cancelAsk` below - both pop the registry entry, forget its socket,
    * and (if one was still live) send a `type: "answer"` message back to the blocked hook, differing
    * only in the payload (`{ answers }` vs `{ cancel: true }`). */
+  /** Writes the `type: "answer"` frame the blocked hook client is waiting on.
+   *
+   * **Takes the socket as a parameter; it must not look one up.** `finishAsk` resolves its socket
+   * from `askSocketsById`, a map only ever populated on the same line as an `askRegistry.add` - so
+   * the auto-answer path, which deliberately never registers an entry, has nothing to find there.
+   * Folding the lookup in here would make that path silently write nothing: the operator would see
+   * "🔓 auto-answered" while the hook client stayed blocked forever, with no registry entry left for
+   * any expiry sweep to reach. The auto-answer path passes `handleAsk`'s own `socket` argument,
+   * which is the very connection the blocked client is waiting on. */
+  function writeAnswer(socket: net.Socket, slug: string, payload: Pick<HookAnswerMessage, "answers" | "cancel">): void {
+    socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "answer", slug, ...payload }));
+  }
+
   function finishAsk(id: string, buildPayload: (entry: PendingAsk) => Pick<HookAnswerMessage, "answers" | "cancel">): boolean {
     const entry = askRegistry.get(id);
     if (!entry) return false;
@@ -707,7 +880,7 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     askRegistry.remove(id);
     askSocketsById.delete(id);
     if (!socket) return false;
-    socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "answer", slug: entry.slug, ...payload }));
+    writeAnswer(socket, entry.slug, payload);
     return true;
   }
 

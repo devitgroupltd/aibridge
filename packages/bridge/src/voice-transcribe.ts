@@ -136,16 +136,27 @@ export interface TranscribeResult {
   text: string;
 }
 
+/** whisper.cpp decodes in short timestamped segments and joins their text with `\n` - segment
+ * cuts are driven by audio timing, not word boundaries, so a cut landing mid-word produces a
+ * literal newline inside a word (e.g. "улучш\nить"). Whisper's own segment text carries a leading
+ * space at real word boundaries but not mid-word, so that's the signal used here: a newline with
+ * no adjacent space on either side is a mid-word split and is deleted outright (rejoining the
+ * word); a newline with an adjacent space is a real segment/word boundary and collapses to one
+ * space, same as any other run of whitespace. */
+function collapseSegmentBreaks(text: string): string {
+  return text.replace(/([^\S\n]*)\n([^\S\n]*)/g, (_match, before: string, after: string) => (before || after ? " " : ""));
+}
+
 /** Parses whisper-server's `/inference` response body. See the module doc comment for why this
  * is deliberately permissive rather than asserting one exact shape. */
 export function parseWhisperServerResponse(body: unknown): TranscribeResult {
   if (typeof body === "string") {
-    const text = body.trim();
+    const text = collapseSegmentBreaks(body.trim());
     if (text.length === 0) throw new Error("whisper-server returned an empty transcript body");
     return { text };
   }
   if (body && typeof body === "object" && "text" in body && typeof (body as { text: unknown }).text === "string") {
-    return { text: (body as { text: string }).text.trim() };
+    return { text: collapseSegmentBreaks((body as { text: string }).text.trim()) };
   }
   throw new Error(`unrecognised whisper-server response shape: ${JSON.stringify(body)}`);
 }

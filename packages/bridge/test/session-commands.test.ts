@@ -5,7 +5,7 @@ import {
   buildDefaultModeKeyboard,
   buildEffortKeyboard,
   buildModeKeyboard,
-  buildModeKeystrokes,
+  buildModeKeystrokeSteps,
   buildModelKeyboard,
   EFFORTS,
   isDefaultCategoryCancelCallback,
@@ -19,6 +19,7 @@ import {
   MODES,
   parseSessionCommand,
   resolveDefaultCategoryCallback,
+  resolveDefaultToggleCallback,
   resolveDefaultEffortCallback,
   resolveDefaultModeCallback,
   resolveEffortCallback,
@@ -76,20 +77,20 @@ describe("isSessionCommandAttempt", () => {
   });
 });
 
-describe("buildModeKeystrokes", () => {
+describe("buildModeKeystrokeSteps", () => {
   test("zero presses when already at the target", () => {
-    expect(buildModeKeystrokes("manual", "manual")).toBe("");
+    expect(buildModeKeystrokeSteps("manual", "manual")).toEqual([]);
   });
 
   test("one press to the immediate next mode in the cycle", () => {
-    expect(buildModeKeystrokes("manual", "acceptEdits")).toBe(SHIFT_TAB);
+    expect(buildModeKeystrokeSteps("manual", "acceptEdits")).toEqual([SHIFT_TAB]);
   });
 
   test("counts forward across the whole cycle for every (current, target) pair", () => {
     for (const from of MODES) {
       for (const to of MODES) {
         const expectedSteps = (MODES.indexOf(to) - MODES.indexOf(from) + MODES.length) % MODES.length;
-        expect(buildModeKeystrokes(from, to)).toBe(SHIFT_TAB.repeat(expectedSteps));
+        expect(buildModeKeystrokeSteps(from, to)).toHaveLength(expectedSteps);
       }
     }
   });
@@ -97,7 +98,17 @@ describe("buildModeKeystrokes", () => {
   test("wraps forward past the end of the cycle rather than going backward", () => {
     // auto -> acceptEdits is "backward" by index, but the picker only cycles forward: auto -> manual
     // -> acceptEdits is 2 presses, not -2.
-    expect(buildModeKeystrokes("auto", "acceptEdits")).toBe(SHIFT_TAB.repeat(2));
+    expect(buildModeKeystrokeSteps("auto", "acceptEdits")).toEqual([SHIFT_TAB, SHIFT_TAB]);
+  });
+
+  // The shape is the point: one entry per press, never a single pre-concatenated string, so a caller
+  // physically cannot write the burst that the 2026-08-10 defect was.
+  test("never returns a multi-press entry", () => {
+    for (const from of MODES) {
+      for (const to of MODES) {
+        for (const step of buildModeKeystrokeSteps(from, to)) expect(step).toBe(SHIFT_TAB);
+      }
+    }
   });
 });
 
@@ -201,10 +212,12 @@ describe("buildDefaultModeKeyboard / buildDefaultEffortKeyboard - distinct names
 
 describe("buildDefaultCategoryKeyboard / resolveDefaultCategoryCallback", () => {
   test("one row per category, each labelled with its current value, plus a cancel row", () => {
-    const keyboard = buildDefaultCategoryKeyboard("manual", "medium");
+    const keyboard = buildDefaultCategoryKeyboard("manual", "medium", false, false);
     expect(keyboard).toEqual([
       [{ text: "Mode (manual)", callback_data: "default:mode" }],
       [{ text: "Effort (medium)", callback_data: "default:effort" }],
+      [{ text: "Auto-permission: OFF (tap to turn ON)", callback_data: "default:permission:on" }],
+      [{ text: "Auto-answer: OFF (tap to turn ON)", callback_data: "default:answer:on" }],
       [{ text: "✖️ Cancel", callback_data: "default:cancel" }],
     ]);
   });
@@ -216,5 +229,48 @@ describe("buildDefaultCategoryKeyboard / resolveDefaultCategoryCallback", () => 
     expect(resolveDefaultCategoryCallback("defmode:manual")).toBeNull();
     expect(isDefaultCategoryCancelCallback("default:cancel")).toBe(true);
     expect(isDefaultCategoryCancelCallback("default:mode")).toBe(false);
+  });
+
+  // A toggle row's `callback_data` carries the *inverse* of the current value, so a hardcoded
+  // "default:permission:on" would pass any single-direction test while producing a button that can
+  // turn the default on and then never off - under a label claiming the opposite. Both directions.
+  test("the toggle rows flip both their label and their callback_data with the current value", () => {
+    const keyboard = buildDefaultCategoryKeyboard("manual", "medium", true, true);
+    expect(keyboard[2]).toEqual([{ text: "Auto-permission: ON (tap to turn OFF)", callback_data: "default:permission:off" }]);
+    expect(keyboard[3]).toEqual([{ text: "Auto-answer: ON (tap to turn OFF)", callback_data: "default:answer:off" }]);
+  });
+
+  test("the two toggles are independent rows, not one shared value", () => {
+    const keyboard = buildDefaultCategoryKeyboard("manual", "medium", true, false);
+    expect(keyboard[2]?.[0]?.callback_data).toBe("default:permission:off");
+    expect(keyboard[3]?.[0]?.callback_data).toBe("default:answer:on");
+  });
+
+  test("resolveDefaultCategoryCallback stays narrow - a toggle string is not a drill-down category", () => {
+    // Widening it would hand a boolean category to the drill-down handler, which has no picker to
+    // show for one.
+    expect(resolveDefaultCategoryCallback("default:permission:on")).toBeNull();
+    expect(resolveDefaultCategoryCallback("default:answer:off")).toBeNull();
+  });
+});
+
+describe("resolveDefaultToggleCallback", () => {
+  test("round-trips every button buildDefaultCategoryKeyboard actually emits", () => {
+    for (const [bypass, autoAnswer] of [
+      [false, false],
+      [true, true],
+    ] as const) {
+      const rows = buildDefaultCategoryKeyboard("manual", "medium", bypass, autoAnswer);
+      expect(resolveDefaultToggleCallback(rows[2]![0]!.callback_data)).toEqual({ category: "permission", value: !bypass });
+      expect(resolveDefaultToggleCallback(rows[3]![0]!.callback_data)).toEqual({ category: "answer", value: !autoAnswer });
+    }
+  });
+
+  test("rejects an unknown category, an unknown value, and a different namespace", () => {
+    expect(resolveDefaultToggleCallback("default:mode:on")).toBeNull();
+    expect(resolveDefaultToggleCallback("default:permission:maybe")).toBeNull();
+    expect(resolveDefaultToggleCallback("default:permission")).toBeNull();
+    expect(resolveDefaultToggleCallback("defmode:permission:on")).toBeNull();
+    expect(resolveDefaultToggleCallback("garbage")).toBeNull();
   });
 });

@@ -1,9 +1,11 @@
 import { describe, expect, test } from "bun:test";
+import { splitForTelegram } from "../src/pipe-server.ts";
 import {
   botCommandList,
   buildLsDetail,
   isKnownCommandText,
   isHelpCommand,
+  matchFleetCommandName,
   newSessionContent,
   normalizeDashFlags,
   parseCommandsQuery,
@@ -339,6 +341,44 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/verbose fix-bug bogus")).toBeNull();
   });
 
+  test("/auto <category> follows /verbose's slug+on|off shape, per category", () => {
+    expect(parseFleetCommand("/auto permission")).toEqual({ kind: "auto", category: "permission", slug: undefined, on: undefined });
+    expect(parseFleetCommand("/auto permission on")).toEqual({ kind: "auto", category: "permission", slug: undefined, on: true });
+    expect(parseFleetCommand("/auto answer off")).toEqual({ kind: "auto", category: "answer", slug: undefined, on: false });
+    expect(parseFleetCommand("/auto permission fix-bug")).toEqual({ kind: "auto", category: "permission", slug: "fix-bug", on: undefined });
+    expect(parseFleetCommand("/auto answer fix-bug on")).toEqual({ kind: "auto", category: "answer", slug: "fix-bug", on: true });
+    expect(parseFleetCommand("/auto permission fix-bug bogus")).toBeNull();
+  });
+
+  test("/auto with no category, or an unknown one, is a parse error rather than defaulting to either", () => {
+    expect(parseFleetCommand("/auto")).toBeNull();
+    expect(parseFleetCommand("/auto ship on")).toBeNull();
+    expect(parseFleetCommand("/auto on")).toBeNull();
+  });
+
+  // v0.3.0's finding: without stripping --all first, parseSlugAndValue reads it as a slug and the
+  // command silently targets a session literally named "--all".
+  test("/auto <category> --all parses as a fleet flag, never as a slug", () => {
+    expect(parseFleetCommand("/auto permission --all on")).toEqual({ kind: "auto", category: "permission", all: true, on: true });
+    expect(parseFleetCommand("/auto permission -all on")).toEqual({ kind: "auto", category: "permission", all: true, on: true });
+    expect(parseFleetCommand("/auto answer --all off")).toEqual({ kind: "auto", category: "answer", all: true, on: false });
+    expect(parseFleetCommand("/auto permission --all extra on")).toBeNull();
+  });
+
+  // v0.10.0's finding: a confirm card built from `on: undefined` says ON and does OFF on tap.
+  test("/auto <category> --all with no value is the status form, carrying no on value at all", () => {
+    expect(parseFleetCommand("/auto permission --all")).toEqual({ kind: "auto", category: "permission", all: true });
+  });
+
+  // The one that breaks a shipped command if the alternation is written carelessly: `auto` is only
+  // safe next to `autostart` because of the group's shared trailing \b.
+  test("registering /auto does not hijack /autostart", () => {
+    expect(matchFleetCommandName("/auto")).toBe("auto");
+    expect(matchFleetCommandName("/autostart")).toBe("autostart");
+    expect(parseFleetCommand("/autostart status")).toEqual({ kind: "autostart", action: "status" });
+    expect(parseFleetCommand("/autostart install")).toEqual({ kind: "autostart", action: "install" });
+  });
+
   test("/settings takes no argument", () => {
     expect(parseFleetCommand("/settings")).toEqual({ kind: "settings" });
   });
@@ -425,10 +465,24 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/default effort max")).toEqual({ kind: "default", category: "effort", value: "max" });
   });
 
+  test("/default permission|answer parse to booleans, bare to the reports-status form", () => {
+    expect(parseFleetCommand("/default permission on")).toEqual({ kind: "default", category: "permission", value: true });
+    expect(parseFleetCommand("/default permission off")).toEqual({ kind: "default", category: "permission", value: false });
+    expect(parseFleetCommand("/default answer on")).toEqual({ kind: "default", category: "answer", value: true });
+    expect(parseFleetCommand("/default answer off")).toEqual({ kind: "default", category: "answer", value: false });
+    // Bare = report. Unlike mode/effort, `value: undefined` here means "tell me", not "show a picker"
+    // - there is nothing to pick between for a boolean.
+    expect(parseFleetCommand("/default permission")).toEqual({ kind: "default", category: "permission" });
+    expect(parseFleetCommand("/default answer")).toEqual({ kind: "default", category: "answer" });
+  });
+
   test("/default with an unrecognised category or value is invalid, not a different command", () => {
     expect(parseFleetCommand("/default bogus")).toBeNull();
     expect(parseFleetCommand("/default mode bogus")).toBeNull();
     expect(parseFleetCommand("/default effort bogus")).toBeNull();
+    // Not silently coerced to `false` - a mistyped value must not read as "turn it off".
+    expect(parseFleetCommand("/default permission yes")).toBeNull();
+    expect(parseFleetCommand("/default answer bogus")).toBeNull();
   });
 
   test("/repos with no argument, or 'list', means list", () => {
@@ -525,6 +579,21 @@ describe("parseFleetCommand", () => {
 });
 
 describe("renderHelp", () => {
+  // renderHelp() crossed Telegram's 4096-char cap unnoticed and `/help` silently stopped sending -
+  // live-observed 2026-08-11 as `Bad Request: message is too long` at 4132 chars, taking every
+  // malformed-fleet-command usage card down with it (command-dispatch.ts routes those here too).
+  // `sendHelpCard` now chunks via `splitForTelegram`, so this asserts the property that actually
+  // matters - every chunk fits - rather than capping the help text itself, which would just make the
+  // next person's new command silently truncate the list instead.
+  test("splits into chunks that each fit inside a single Telegram message", () => {
+    const chunks = splitForTelegram(renderHelp());
+    expect(chunks.length).toBeGreaterThan(0);
+    for (const chunk of chunks) expect(chunk.length).toBeLessThanOrEqual(4096);
+    // Nothing dropped by the split.
+    expect(chunks.join("\n")).toContain("/auto permission");
+    expect(chunks.join("\n")).toContain("/new");
+  });
+
   test("lists every fleet-scoped and session-scoped command", () => {
     const text = renderHelp();
     for (const cmd of [
@@ -547,9 +616,17 @@ describe("renderHelp", () => {
       "/assist",
       "/router",
       "/default",
+      "/auto",
     ]) {
       expect(text).toContain(cmd);
     }
+    // Both categories by name - a bullet mentioning only "/auto" would leave the operator with no
+    // way to discover that "permission" and "answer" are the two things it takes.
+    expect(text).toContain("/auto permission");
+    expect(text).toContain("/auto answer");
+    // The two wider scopes are separate commands to discover, not variations a reader infers.
+    expect(text).toContain("--all");
+    expect(text).toContain("/default [mode|effort|permission|answer]");
     expect(text).toContain("/model <");
     expect(text).toContain("/mode <");
     expect(text).toContain("/effort <");
@@ -825,6 +902,16 @@ describe("isKnownCommandText", () => {
       expect(isKnownCommandText(`/${command}`)).toBe(true);
       expect(isKnownCommandText(`/${command} with args`)).toBe(true);
     }
+  });
+
+  // The nl-router completeness test only checks that everything advertised maps to a router kind -
+  // it passes just as happily if a command is missing from the list entirely. This is what actually
+  // pins /auto into Telegram's native "/" autocomplete.
+  test("advertises /auto, describing both categories", () => {
+    const auto = botCommandList().find((c) => c.command === "auto");
+    expect(auto).toBeDefined();
+    expect(auto!.description).toContain("permission");
+    expect(auto!.description).toContain("answer");
   });
 
   test("tolerates Telegram's @botname suffix and a phone keyboard's capitalisation", () => {

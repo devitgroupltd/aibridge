@@ -56,18 +56,45 @@ describe("Routing multi-session lookups (Phase 5)", () => {
     expect(routing.all().map((r) => r.slug).sort()).toEqual(["a", "b"]);
   });
 
-  test("remove forgets the slug, its topic mapping, pty write function, mode and effort", () => {
+  test("remove forgets the slug, its topic mapping, pty write function, mode, effort and both auto toggles", () => {
     const routing = new Routing();
     routing.add({ slug: "a", topicId: 2, worktreePath: "c:\\wt\\a" });
     routing.setPtyWrite("a", () => {});
     routing.setMode("a", "auto");
     routing.setEffort("a", "high");
+    routing.setBypass("a", true);
+    routing.setAutoAnswer("a", true);
     routing.remove("a");
     expect(routing.get("a")).toBeUndefined();
     expect(routing.getByTopicId(2)).toBeUndefined();
     expect(routing.getPtyWrite("a")).toBeUndefined();
     expect(routing.getMode("a")).toBe("manual");
     expect(routing.getEffort("a")).toBe("medium");
+    // Safety-relevant, not tidiness: `uniqueSlug` de-duplicates only against live slugs, so after
+    // `/rm a` the name is free again. A leaked `true` here would have the next session to claim it
+    // start fully auto-permitted, with no confirmation announcing that.
+    expect(routing.getBypass("a")).toBe(false);
+    expect(routing.getAutoAnswer("a")).toBe(false);
+  });
+
+  test("both auto toggles default to off, round-trip, and stay independent per slug and per category", () => {
+    const routing = new Routing();
+    expect(routing.getBypass("a")).toBe(false);
+    expect(routing.getAutoAnswer("a")).toBe(false);
+
+    routing.setBypass("a", true);
+    expect(routing.getBypass("a")).toBe(true);
+    expect(routing.getAutoAnswer("a")).toBe(false);
+    expect(routing.getBypass("b")).toBe(false);
+
+    routing.setBypass("a", false);
+    expect(routing.getBypass("a")).toBe(false);
+  });
+
+  test("a fresh Routing starts both toggles off - the fail-closed Bridge-restart behavior", () => {
+    const before = new Routing();
+    before.setBypass("a", true);
+    expect(new Routing().getBypass("a")).toBe(false);
   });
 
   test("clearPtyWrite drops the write function but keeps the route (§4.2's /kill: worktree/topic mapping survive)", () => {

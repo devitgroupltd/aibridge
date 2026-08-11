@@ -4,6 +4,7 @@ import { renderHelp } from "./fleet-commands.ts";
 import { buildDiffReview, renderFilesChangedSummary } from "./diff-review.ts";
 import { buildDirKeyboard, buildHitsKeyboard, BrowseRegistry, renderDirText, renderHitsText } from "./browse-nav.ts";
 import { listDirectory, searchWorktree } from "./worktree-fs.ts";
+import { splitForTelegram } from "./pipe-server.ts";
 import type { SessionRoute } from "./routing.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
 import type { SendMessageSource } from "./telegram.ts";
@@ -42,12 +43,30 @@ export function createCardSenders(opts: CardSendersOptions): CardSenders {
       .catch((err) => log("WARN", `sendMessage (/about) failed: ${(err as Error).message}`));
   }
 
-  /** `/help`'s exact-syntax and NL-matched (`kind: "help"`, nl-router.ts) paths both call this. */
+  /**
+   * `/help`'s exact-syntax and NL-matched (`kind: "help"`, nl-router.ts) paths both call this.
+   *
+   * Chunked, because `renderHelp()` outgrew Telegram's 4096-char message cap: live-observed
+   * 2026-08-11 failing with `Bad Request: message is too long` at 4132 chars, i.e. it had already
+   * crossed the limit before `/auto`'s own entry pushed it further. The failure is silent from the
+   * operator's side - the `.catch` logs a WARN server-side and nothing is posted - and it takes down
+   * more than `/help` itself: `command-dispatch.ts` calls this for *any* recognised fleet command
+   * with a malformed argument, so `/verbose bogus`, `/auto` with no category, and every other usage
+   * error looked like the Bridge ignoring the message entirely. The keyboard rides the final chunk so
+   * the buttons still sit under the end of the text.
+   */
   function sendHelpCard(threadId: number | undefined, route: SessionRoute | undefined): void {
     const repoCommands = route ? listRepoCommands(route.worktreePath) : [];
     const repoSkills = route ? listRepoSkills(route.worktreePath) : [];
-    controlBot
-      .sendMessage(supergroupChatId, threadId, renderHelp(), { inline_keyboard: buildCommandKeyboard(repoCommands, repoSkills) })
+    const chunks = splitForTelegram(renderHelp());
+    void chunks
+      .reduce<Promise<unknown>>(
+        (chain, chunk, i) =>
+          chain.then(() =>
+            controlBot.sendMessage(supergroupChatId, threadId, chunk, i === chunks.length - 1 ? { inline_keyboard: buildCommandKeyboard(repoCommands, repoSkills) } : undefined),
+          ),
+        Promise.resolve(),
+      )
       .catch((err) => log("WARN", `sendMessage (command list) failed: ${(err as Error).message}`));
   }
 
