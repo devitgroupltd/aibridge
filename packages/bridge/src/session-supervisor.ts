@@ -108,7 +108,7 @@ export interface SessionSupervisor {
   runStartupReconciliation(): Promise<void>;
   wireSession(slug: string, ptyProcess: pty.IPty, topicId: number, ready: Promise<{ resumeFailed: boolean }>): void;
   handleUnexpectedExit(slug: string, ptyProcess: pty.IPty, topicId: number, exitCode: number): Promise<void>;
-  resumeSession(row: SessionRow): Promise<void>;
+  resumeSession(row: SessionRow, opts?: { manuallyRequested?: boolean }): Promise<void>;
   /** Read accessor for consumers that need to reach a tracked PTY without owning the map
    * themselves - the dev-control debug HTTP server (composition root) in particular. */
   getPtyProcess(slug: string): pty.IPty | undefined;
@@ -447,14 +447,26 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
     fireAndForget(sendFollowUpNudgeIfStillIdle(slug, topicId), log, `session-supervisor resume follow-up nudge(${slug})`);
   }
 
-  async function resumeSession(row: SessionRow): Promise<void> {
+  async function resumeSession(row: SessionRow, opts: { manuallyRequested?: boolean } = {}): Promise<void> {
     const { slug, topicId } = row;
     const current = sessionStore.get(slug);
     if (!current) {
       log("INFO", `resumeSession("${slug}") skipped - its row no longer exists (removed, most likely by /rm, during the resume wait)`);
       return;
     }
-    if (current.state === "dead") {
+    // This guard exists to catch a genuine race: `handleUnexpectedExit`'s backoff wait and
+    // `runStartupReconciliation` both capture a row that was NOT dead, then do real async work
+    // (a delay, a topic-deletion probe) before reaching here - if a manual /kill lands during that
+    // window, `current` (re-read fresh, unlike the stale `row` param) reflects it and this backs off
+    // instead of resurrecting something the operator just killed on purpose.
+    //
+    // `handleResumeCommand`'s manual `/resume <slug>` (§ its own doc comment) is different in kind,
+    // not degree: it only ever calls this once `row.state === "dead"` has already been confirmed -
+    // that's the *precondition* for calling it at all, not a race to detect. Without this
+    // `manuallyRequested` opt-out, `current.state === "dead"` was true 100% of the time for that
+    // caller, silently no-op'ing every manual `/resume` on a dead session (live-confirmed
+    // 2026-08-11: `bridge.log` showed the skip line, no confirm message, `/ls` still `dead`).
+    if (!opts.manuallyRequested && current.state === "dead") {
       log("INFO", `resumeSession("${slug}") skipped - it was already marked dead (most likely by /kill) during the resume wait`);
       return;
     }

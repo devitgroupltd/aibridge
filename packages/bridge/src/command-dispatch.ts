@@ -595,6 +595,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
           if (isControl) confirmSessionCommand(threadId, "Unrecognised control-topic command. Try /new, /ls or /help.");
         },
         handleRetry,
+        contextPrefix,
       );
       return;
     }
@@ -655,6 +656,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
         ptyIo.sendChannelText(currentSlug, threadId, contextPrefix + rawText, String(messageId), from);
       },
       handleRetry,
+      contextPrefix,
     );
   }
 
