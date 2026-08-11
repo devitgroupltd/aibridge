@@ -285,7 +285,12 @@ const SYSTEM_INSTRUCTIONS_BASE =
   "bug - is NOT kind='help'/'about' even though it mentions commands: the operator already knows the " +
   "commands exist and is asking something else, so respond with kind='forward' instead. Reserve " +
   "'help'/'about' for a genuine request to see the list of available commands or a general intro to " +
-  "the bot, with no specific command already named as the subject of a question. " +
+  "the bot, with no specific command already named as the subject of a question. The same carve-out " +
+  "applies with no exact command name mentioned at all: a hypothetical or meta question about how " +
+  "*you* (the bot) would interpret different wording - e.g. asking whether a synonym or alternate " +
+  "phrasing ('what if I say branch instead of session') would still be understood and acted on - is " +
+  "a question about your own behaviour, not a request to see the command list, so it is kind='forward' " +
+  "too, never 'help'/'about'. " +
   "A request to list this project's own custom commands or skills is kind='commands'/'skills'. " +
   "A request to compact or clear the current conversation is kind='builtin'. " +
   "A request to see the folder structure, list files in a directory, or look inside a specific " +

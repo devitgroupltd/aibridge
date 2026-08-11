@@ -493,6 +493,18 @@ describe("buildSystemInstructions", () => {
     expect(text).toContain("already names one or more specific commands");
     expect(text).toContain("NOT kind='help'/'about'");
   });
+
+  // Live-observed 2026-08-11: "If i will use word 'branch' instead of session will you understand
+  // that need to create new session with new command?" - a meta question about the router's own
+  // synonym tolerance, naming no exact slash command - was read as kind='help' and answered with the
+  // full command list instead of reaching the control-topic Q&A path. The 2026-08-10 carve-out above
+  // only excludes messages naming a specific *command*; this one names generic words ('session',
+  // 'new command') that appear in the schema's own vocabulary without naming an actual command.
+  test("carves out hypothetical/meta questions about the router's own interpretation, even without naming a command", () => {
+    const text = buildSystemInstructions(CONTROL);
+    expect(text).toContain("hypothetical or meta question about how");
+    expect(text).toContain("no exact command name mentioned at all");
+  });
 });
 
 describe("buildRouteViaCliArgs", () => {

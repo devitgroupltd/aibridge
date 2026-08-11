@@ -1,12 +1,13 @@
 ---
-version: 0.2.2
+version: 0.2.3
 status: solid
-last_modified_utc: 2026-08-10T06:05:42Z
+last_modified_utc: 2026-08-11T20:05:00Z
 changelog:
   - "0.1.0 (2026-08-10): Frontmatter added — plan previously lacked valid frontmatter"
   - "0.2.0 (2026-08-10): plan-craft pass 1 — fixed file-attribution error (card-senders.ts, not fleet-commands.ts), reconciled cost framing with §10.5's non-interactive credit pool, resolved both open questions (answer-path shape, grounding-text builder location) with concrete decisions, added explicit nlRouterConfig wiring gap and routeOrFallback insertion point, pinned the new CLI call's operational details (cwd/timeout/--strict-mcp-config/log level), added dedicated Testing and Verification sections, reworded two imprecise claims (kind='forward' framing, misattributed CLAUDE.md quote)"
   - "0.2.1 (2026-08-10): Implemented per §3/§8/§9 and live-verified against the real Telegram client - added a Known Limitation section documenting a real gap the live check surfaced: the unchanged classifier sometimes reads a question that names real commands (e.g. \"does /ship duplicate /deploy?\") as kind='help', so it never reaches this plan's Q&A path for that exact message"
   - "0.2.2 (2026-08-10): Resolved the Known Limitation's deferred follow-up - narrowed SYSTEM_INSTRUCTIONS_BASE's kind='help'/'about' trigger so a question naming a specific command is excluded and falls through to kind='forward' instead"
+  - "0.2.3 (2026-08-11): Resolved a second, narrower instance of the same gap, live-observed on a control-topic message naming no exact command ('branch' vs 'session' synonym question) - widened SYSTEM_INSTRUCTIONS_BASE's carve-out to also exclude hypothetical/meta questions about the classifier's own interpretation of alternate wording"
 v020_touched_sections:
   - section: "§1 Problem"
     type: modified
@@ -366,3 +367,19 @@ no specific command already named as the question's subject. Covered by a new
 (that would require a real Anthropic API round-trip or `claude -p` invocation per case) — the fix is
 a prompt-wording change to an existing, separately-tested classifier path, not new code, so unit-level
 coverage of the prompt text was judged sufficient here.
+
+**A second, narrower instance of the same gap (live-observed 2026-08-11):** the 2026-08-10 carve-out
+above only excludes a question that names a specific *slash command*. A control-topic message reading
+"If i will use word 'branch' instead of session will you understand that need to create new session
+with new command?" names no exact command at all — it's a hypothetical/meta question about the
+classifier's own synonym tolerance, using generic words ("session", "new session", "new command")
+that happen to overlap the schema's own vocabulary for `kind='new'` — and was still classified
+`kind='help'`, producing the same "got the static command list instead of a real answer" failure mode
+on a message the 2026-08-10 fix doesn't reach. **Resolved (2026-08-11):**
+`SYSTEM_INSTRUCTIONS_BASE` now carves this out too: a hypothetical/meta question about how the bot
+itself would interpret different wording (a synonym or alternate phrasing) is excluded from
+`kind='help'`/`'about'` even when it names no exact command, and falls through to `kind='forward'`
+the same way. Covered by a new `buildSystemInstructions` prompt-text assertion in `nl-router.test.ts`;
+`bun test` (1543 pass) and `bun run typecheck` both clean. Same "prompt-wording change to an existing,
+separately-tested path" reasoning as the first fix — not re-verified live against a real classifier
+call for the same reason.
