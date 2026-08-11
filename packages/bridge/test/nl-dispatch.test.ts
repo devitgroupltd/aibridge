@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { createNlDispatch } from "../src/nl-dispatch.ts";
 import { NlConfirmRegistry } from "../src/nl-confirm.ts";
+import { RepoPickRegistry } from "../src/repo-picker.ts";
 import { Routing } from "../src/routing.ts";
 
 function fakeControlBot() {
@@ -71,6 +72,7 @@ async function setup(overrides: Partial<Parameters<typeof createNlDispatch>[0]> 
   const modeSwitchCalls: unknown[] = [];
   const effortSwitchCalls: unknown[] = [];
   const nlConfirmRegistry = new NlConfirmRegistry();
+  const repoPickRegistry = new RepoPickRegistry();
   const dispatchFleetCommandCalls: unknown[] = [];
   let assistEnabled = true;
   let nlRouterBackend: "api" | "cli" = "cli";
@@ -85,6 +87,7 @@ async function setup(overrides: Partial<Parameters<typeof createNlDispatch>[0]> 
     applyModeSwitch: (...args) => modeSwitchCalls.push(args),
     applyEffortSwitch: (...args) => effortSwitchCalls.push(args),
     nlConfirmRegistry,
+    repoPickRegistry,
     dispatchFleetCommand: (...args) => dispatchFleetCommandCalls.push(args),
     nlRouterConfig: { enabled: true, apiKey: undefined, model: "test-model" },
     getNlRouterBackend: () => nlRouterBackend,
@@ -109,6 +112,7 @@ async function setup(overrides: Partial<Parameters<typeof createNlDispatch>[0]> 
     modeSwitchCalls,
     effortSwitchCalls,
     nlConfirmRegistry,
+    repoPickRegistry,
     dispatchFleetCommandCalls,
     getAssistEnabled: () => assistEnabled,
     setAssistEnabled: (v: boolean) => {
@@ -170,6 +174,18 @@ describe("createNlDispatch", () => {
       const { nlDispatch, dispatchFleetCommandCalls, cardSenders } = await setup();
 
       nlDispatch.executeMatchedCommand({ kind: "retry" } as never, 1, true, undefined);
+
+      expect(dispatchFleetCommandCalls).toEqual([]);
+      expect(cardSenders.calls).toEqual([]);
+    });
+
+    // Same "dead code in real dispatch, still worth pinning" reasoning as "retry" above -
+    // `routeOrFallback` intercepts `kind === "new_pick_repo"` itself (see its own describe block
+    // below) before this function ever sees it.
+    test("new_pick_repo is a silent no-op, not a fall-through to dispatchFleetCommand", async () => {
+      const { nlDispatch, dispatchFleetCommandCalls, cardSenders } = await setup();
+
+      nlDispatch.executeMatchedCommand({ kind: "new_pick_repo", prompt: "analyze this alarm" } as never, 1, true, undefined);
 
       expect(dispatchFleetCommandCalls).toEqual([]);
       expect(cardSenders.calls).toEqual([]);
@@ -452,6 +468,46 @@ describe("createNlDispatch", () => {
         );
 
         expect(settled).toBe(true);
+      });
+    });
+
+    // nl-router.ts's `kind='new_pick_repo'` (added 2026-08-11, a control-topic "create a session for
+    // X" that never named which of 2+ registered repos to use) - posts the ask-which-repo keyboard
+    // and registers the pick, without touching `executeMatchedCommand`'s machinery (there's no real
+    // `FleetCommand` yet, only once a repo is actually tapped).
+    describe("a matched 'new_pick_repo' kind", () => {
+      test("posts a repo-pick keyboard and registers the pending pick, instead of calling onNoMatch", async () => {
+        const routeText = async () => ({ matched: true as const, command: { kind: "new_pick_repo" as const, prompt: "analyze this alarm" }, destructive: false });
+        const { nlDispatch, controlBot, cardSenders, dispatchFleetCommandCalls, repoPickRegistry } = await setup({ routeText });
+        let noMatchCalled = false;
+
+        await nlDispatch.routeOrFallback(
+          "create a session for analyze this alarm",
+          { isControl: true, hasSession: false, repoNames: ["aibridge", "seowrite"] },
+          1,
+          true,
+          undefined,
+          () => {
+            noMatchCalled = true;
+          },
+          () => {},
+        );
+
+        expect(noMatchCalled).toBe(false);
+        expect(cardSenders.calls).toEqual([]);
+        expect(dispatchFleetCommandCalls).toEqual([]);
+        expect(controlBot.sent).toHaveLength(1);
+        const [sent] = controlBot.sent;
+        expect(sent?.text).toContain("analyze this alarm");
+        const keyboard = sent?.keyboard as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+        const buttons = keyboard.inline_keyboard.flat();
+        expect(buttons.map((b) => b.text)).toEqual(["aibridge", "seowrite", "❌ Cancel"]);
+
+        const id = buttons[0]!.callback_data.split(":")[1]!;
+        const pending = repoPickRegistry.resolve(id);
+        expect(pending?.prompt).toBe("analyze this alarm");
+        expect(pending?.sourceText).toBe("create a session for analyze this alarm");
+        expect(pending?.threadId).toBe(1);
       });
     });
   });

@@ -24,6 +24,7 @@ import { resolveStaleConfirmCallback, StaleConfirmRegistry } from "./stale-confi
 import { resolveVoiceConfirmCallback, VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { NlConfirmRegistry, resolveNlConfirmCallback } from "./nl-confirm.ts";
 import { resolvePermCallback } from "./permission-callback.ts";
+import { RepoPickRegistry, resolveRepoPickCallback } from "./repo-picker.ts";
 import { deriveAlwaysRule, ruleAlreadyCovered } from "./rule-derivation.ts";
 import { addAlwaysRule, readSettingsFile, writeSettingsFile } from "./settings.ts";
 import {
@@ -87,6 +88,7 @@ export interface CallbackQueryRouterOptions {
   staleConfirmRegistry: StaleConfirmRegistry;
   voiceConfirmRegistry: VoiceConfirmRegistry;
   nlConfirmRegistry: NlConfirmRegistry;
+  repoPickRegistry: RepoPickRegistry;
   osConfirmRegistry: OsConfirmRegistry;
   fleetConfirmFlow: Pick<FleetConfirmFlow, "executeFleetConfirm">;
   osPowerCommands: Pick<OsPowerCommands, "executeOsConfirm">;
@@ -141,7 +143,7 @@ function rule<M>(name: string, match: (data: string | undefined, ctx: CallbackCt
 /**
  * §5-§6/§10's callback-query side of every inline keyboard the Bridge posts - one namespace per
  * `callback_data` prefix (`"ask:"`, `"perm:"`, `"fc:"`, `"br:"`/`"bf:"`/`"bv:"`/`"bs:"`, `"nc:"`,
- * `"sc:"`, `"vc:"`, `"vm:"`, the bare model/mode/effort cancel+value callbacks, `"default:"`/
+ * `"rp:"`, `"sc:"`, `"vc:"`, `"vm:"`, the bare model/mode/effort cancel+value callbacks, `"default:"`/
  * `"defmode:"`/`"defeffort:"`, `"about:"`, and the catch-all `resolveCommandAction`). Reshaped from
  * the ~450-line sequential if-chain that used to sit inline inside `onUpdate` into an ordered
  * `NAMESPACE_RULES` table, same "order is data, not buried in control flow" treatment
@@ -166,6 +168,7 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
     staleConfirmRegistry,
     voiceConfirmRegistry,
     nlConfirmRegistry,
+    repoPickRegistry,
     osConfirmRegistry,
     fleetConfirmFlow,
     osPowerCommands,
@@ -452,6 +455,34 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
         );
         const pendingIsControl = isControlTopic(pending.threadId);
         nlDispatch.executeMatchedCommand(pending.command, pending.threadId, pendingIsControl, pending.currentSlug);
+      },
+    ),
+
+    // nl-router.ts's ask-which-repo keyboard (repo-picker.ts) - "rp:", a fresh namespace alongside
+    // "nc:"/"fc:"/"vc:"/"sc:"/"d:". Only ever posted for a `kind='new'` NL match whose message never
+    // named one of 2+ registered repos (`mapRouterOutput`'s "new" case) - a tap here is the operator
+    // resolving that ambiguity, so it's turned into the exact same `kind='new'` `executeMatchedCommand`
+    // call a directly-matched `/new` (typed or NL) would have gotten.
+    rule(
+      "repoPick",
+      (data) => (data ? resolveRepoPickCallback(data) : null),
+      (repoPickAction, ctx) => {
+        const pending = confirmCards.takeOrNotifyGone(repoPickRegistry, repoPickAction.id, ctx.callbackQuery.message?.message_id, (entry) =>
+          fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "callback-query-router markConfirmCardExpired(repoPick)"),
+        );
+        if (!pending) return;
+        if ("cancel" in repoPickAction) {
+          fireAndForget(confirmCards.finalizeCard(pending.messageId, "❌ Cancelled - no session was created."), log, "callback-query-router finalizeCard(repoPick cancel)");
+          return;
+        }
+        fireAndForget(confirmCards.finalizeCard(pending.messageId, `✅ Starting a session against "${repoPickAction.repo}"...`), log, "callback-query-router finalizeCard(repoPick run)");
+        const pendingIsControl = isControlTopic(pending.threadId);
+        nlDispatch.executeMatchedCommand(
+          { kind: "new", repo: repoPickAction.repo, prompt: pending.prompt, model: pending.model, sourceText: pending.sourceText },
+          pending.threadId,
+          pendingIsControl,
+          undefined,
+        );
       },
     ),
 

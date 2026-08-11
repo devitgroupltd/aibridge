@@ -17,6 +17,7 @@ import { StaleConfirmRegistry } from "./stale-confirm.ts";
 import { VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { startWhisperServer } from "./voice-transcribe.ts";
 import { NlConfirmRegistry } from "./nl-confirm.ts";
+import { RepoPickRegistry } from "./repo-picker.ts";
 import { createControlTopicHistory } from "./control-topic-history.ts";
 import { LateBound } from "./late-bound.ts";
 import { RetryStore } from "./retry-store.ts";
@@ -311,6 +312,9 @@ async function main(): Promise<void> {
   // nl-router.ts's destructive-command confirm gate (nl-confirm.ts) - own registry, same
   // add/resolve-pops-and-checks-TTL shape as fleetConfirmRegistry/voiceConfirmRegistry above.
   const nlConfirmRegistry = new NlConfirmRegistry();
+  // nl-router.ts's ask-which-repo gate (repo-picker.ts) - own registry, same
+  // add/resolve-pops-and-checks-TTL shape as nlConfirmRegistry above.
+  const repoPickRegistry = new RepoPickRegistry();
   // Control-topic free-form Q&A's bounded exchange-history buffer (control-topic-history.ts,
   // plans/control-topic-nl-dialogue-plan.md) - one instance for the process's lifetime, since
   // there's exactly one control topic per Bridge instance. Read by nl-dispatch.ts's routeOrFallback
@@ -765,6 +769,7 @@ async function main(): Promise<void> {
     applyModeSwitch: voiceModeCommands.applyModeSwitch,
     applyEffortSwitch: voiceModeCommands.applyEffortSwitch,
     nlConfirmRegistry,
+    repoPickRegistry,
     dispatchFleetCommand: (fleetCmd, threadId, isControl, currentSlug) => commandDispatch.get().dispatchFleetCommand(fleetCmd, threadId, isControl, currentSlug),
     nlRouterConfig: config.nlRouter,
     getNlRouterBackend: () => nlRouterBackend,
@@ -796,6 +801,7 @@ async function main(): Promise<void> {
     // sweep these four never had - entries used to be dropped only by a tap, so an untapped card
     // (and its whole replay payload) leaked for the lifetime of the daemon.
     for (const entry of nlConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markNlConfirmCardExpired(entry), log, "index sweep markNlConfirmCardExpired");
+    for (const entry of repoPickRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "index sweep markConfirmCardExpired(repoPick)");
     for (const entry of fleetConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "index sweep markConfirmCardExpired(fleet)");
     for (const entry of osConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "index sweep markConfirmCardExpired(os)");
     for (const entry of staleConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.confirmCardMessageId), log, "index sweep markConfirmCardExpired(stale)");
@@ -1014,6 +1020,7 @@ async function main(): Promise<void> {
     staleConfirmRegistry,
     voiceConfirmRegistry,
     nlConfirmRegistry,
+    repoPickRegistry,
     osConfirmRegistry,
     fleetConfirmFlow: fleetConfirmFlow.get(),
     osPowerCommands,

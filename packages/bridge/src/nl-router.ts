@@ -53,7 +53,16 @@ export type RouterContext = {
  * here rather than as a fifth alternative in `RETRY_PHRASE` because natural language, in any
  * language, is exactly what this classifier - not a regex - exists for; `command-dispatch.ts` still
  * owns the actual retry mechanics (replying-to-the-earlier-message vs. the topic-keyed `retryStore`),
- * this just widens what triggers them. None of `RouterAction`'s kinds are ever destructive. */
+ * this just widens what triggers them. `new_pick_repo` was added the same class of gap again
+ * (2026-08-11): a control-topic message that's unambiguously "create a session for X" but never
+ * names *which* registered repo used to be silently dropped to `matched: false` by `mapRouterOutput`'s
+ * "new" case (it requires both `repo` and `prompt`) - since a session's own topic never gets this
+ * classifier at all, that fell all the way through to the control-topic free-form Q&A fallback and
+ * came back as a conversational explanation instead of a session. `mapRouterOutput` now only takes
+ * that path when the repo is genuinely ambiguous (2+ repos registered); with exactly one repo, it
+ * fills `repo` itself, the same "no other repo could possibly have been meant" reasoning
+ * `resolveRepoNameFuzzy` (repos-registry.ts) already applies to a mangled name. None of
+ * `RouterAction`'s kinds are ever destructive. */
 export type RouterAction =
   | { kind: "help" }
   | { kind: "about" }
@@ -63,7 +72,8 @@ export type RouterAction =
   | { kind: "browse"; path: string }
   | { kind: "find"; query: string }
   | { kind: "diff" }
-  | { kind: "retry" };
+  | { kind: "retry" }
+  | { kind: "new_pick_repo"; prompt: string; model?: Model };
 
 export type RouterResult = { matched: false } | { matched: true; command: FleetCommand | SessionCommand | RouterAction; destructive: boolean };
 
@@ -411,8 +421,22 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
         return { kind: "help" };
       case "about":
         return { kind: "about" };
-      case "new":
-        return raw.repo && raw.prompt ? { kind: "new", repo: raw.repo, prompt: raw.prompt, model: isModel(raw.model) ? raw.model : undefined } : null;
+      case "new": {
+        if (!raw.prompt) return null;
+        const model = isModel(raw.model) ? raw.model : undefined;
+        if (raw.repo) return { kind: "new", repo: raw.repo, prompt: raw.prompt, model };
+        // No repo named. Exactly one repo registered is unambiguous regardless - the same "no other
+        // repo could possibly have been meant" case `resolveRepoNameFuzzy` already covers for a
+        // mangled *name*, extended to a name that's missing outright. Two or more is a real
+        // ambiguity a guess would risk silently applying to the wrong repo, so that's `new_pick_repo`
+        // instead - `nl-dispatch.ts`'s `routeOrFallback` turns it into an inline repo-choice keyboard
+        // rather than a no-match. Zero registered repos has nothing to default to or choose between,
+        // so it stays a no-match, same as today (falls through to `handleNewCommand`'s own "no
+        // repos.toml registered yet" message the next time a real `/new`/NL-new is tried).
+        if (ctx.repoNames?.length === 1) return { kind: "new", repo: ctx.repoNames[0]!, prompt: raw.prompt, model };
+        if (ctx.repoNames && ctx.repoNames.length > 1) return { kind: "new_pick_repo", prompt: raw.prompt, model };
+        return null;
+      }
       case "ls":
         return { kind: "ls" };
       case "kill":

@@ -10,6 +10,7 @@ import { OsConfirmRegistry } from "../src/os-power-commands.ts";
 import { StaleConfirmRegistry } from "../src/stale-confirm.ts";
 import { VoiceConfirmRegistry } from "../src/voice-confirm.ts";
 import { NlConfirmRegistry } from "../src/nl-confirm.ts";
+import { RepoPickRegistry } from "../src/repo-picker.ts";
 import { BrowseRegistry } from "../src/browse-nav.ts";
 import { DetailsAnchorStore } from "../src/details-anchor-store.ts";
 import { readSettingsFile } from "../src/settings.ts";
@@ -87,11 +88,15 @@ function fakeConfirmCards() {
   const finalizedNl: Array<{ text: string }> = [];
   const finalizedStale: Array<{ text: string }> = [];
   const finalizedVoice: Array<{ text: string }> = [];
+  const finalizedCard: Array<{ messageId: number; text: string }> = [];
   return {
     takeOrNotifyGone: (registry: { take(id: string): { entry: unknown; expired: boolean } | undefined; wasRecentlyAnswered(id: string): boolean }, id: string) => {
       const taken = registry.take(id);
       if (!taken) return undefined;
       return taken.entry;
+    },
+    finalizeCard: async (messageId: number, text: string) => {
+      finalizedCard.push({ messageId, text });
     },
     markConfirmCardExpired: async () => {},
     markNlConfirmCardExpired: async () => {},
@@ -111,6 +116,7 @@ function fakeConfirmCards() {
     finalizedNl,
     finalizedStale,
     finalizedVoice,
+    finalizedCard,
   };
 }
 
@@ -184,6 +190,7 @@ function setup() {
   const staleConfirmRegistry = new StaleConfirmRegistry();
   const voiceConfirmRegistry = new VoiceConfirmRegistry();
   const nlConfirmRegistry = new NlConfirmRegistry();
+  const repoPickRegistry = new RepoPickRegistry();
   const osConfirmRegistry = new OsConfirmRegistry();
   const fleetConfirmFlow = fakeFleetConfirmFlow();
   const osPowerCommands = fakeOsPowerCommands();
@@ -211,6 +218,7 @@ function setup() {
     staleConfirmRegistry,
     voiceConfirmRegistry,
     nlConfirmRegistry,
+    repoPickRegistry,
     osConfirmRegistry,
     fleetConfirmFlow: fleetConfirmFlow as never,
     osPowerCommands: osPowerCommands as never,
@@ -246,6 +254,7 @@ function setup() {
     staleConfirmRegistry,
     voiceConfirmRegistry,
     nlConfirmRegistry,
+    repoPickRegistry,
     osConfirmRegistry,
     fleetConfirmFlow,
     osPowerCommands,
@@ -327,6 +336,31 @@ describe("createCallbackQueryRouter - every documented namespace resolves to its
     s.router.routeCallbackQuery(cq("nc:n2:s"));
     expect(s.getAssistEnabled()).toBe(false);
     expect(s.settingsStoreCalls).toContainEqual({ key: "assist_enabled", value: "false" });
+  });
+
+  test('"rp:" a repo tap executes a real kind=\'new\' via nlDispatch, with the operator\'s own words as sourceText', () => {
+    const s = setup();
+    // `new`/`new_pick_repo` only ever originate from the control topic (nl-router.ts's
+    // `allowedKinds`) - `undefined` is that convention's own encoding for it, same as every other
+    // pending-confirm shape in this codebase (repo-picker.ts's own doc comment on `threadId`).
+    s.repoPickRegistry.add({ id: "r1", prompt: "analyze this alarm", sourceText: "create a session for analyze this alarm", model: undefined, threadId: undefined, messageId: 11 });
+    s.router.routeCallbackQuery(cq("rp:r1:aibridge", 1, undefined));
+    expect(s.nlDispatch.executed).toEqual([[{ kind: "new", repo: "aibridge", prompt: "analyze this alarm", model: undefined, sourceText: "create a session for analyze this alarm" }, undefined, true, undefined]]);
+    expect(s.confirmCards.finalizedCard).toEqual([{ messageId: 11, text: '✅ Starting a session against "aibridge"...' }]);
+  });
+
+  test('"rp:" cancel finalizes without ever calling nlDispatch', () => {
+    const s = setup();
+    s.repoPickRegistry.add({ id: "r2", prompt: "analyze this alarm", sourceText: "create a session for analyze this alarm", model: undefined, threadId: undefined, messageId: 12 });
+    s.router.routeCallbackQuery(cq("rp:r2:_cancel", 1, undefined));
+    expect(s.nlDispatch.executed).toEqual([]);
+    expect(s.confirmCards.finalizedCard).toEqual([{ messageId: 12, text: "❌ Cancelled - no session was created." }]);
+  });
+
+  test('"rp:" an unknown/expired id is a silent no-op, not a crash', () => {
+    const s = setup();
+    expect(() => s.router.routeCallbackQuery(cq("rp:doesnotexist:aibridge"))).not.toThrow();
+    expect(s.nlDispatch.executed).toEqual([]);
   });
 
   test('"sc:" confirmed replays via commandDispatch.dispatchInboundMessage', () => {

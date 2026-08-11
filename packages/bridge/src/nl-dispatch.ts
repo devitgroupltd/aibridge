@@ -6,8 +6,9 @@ import type { ControlTopicHistory } from "./control-topic-history.ts";
 import { buildNlConfirmKeyboard, NlConfirmRegistry } from "./nl-confirm.ts";
 import { answerControlTopicQuestion as realAnswerControlTopicQuestion, routeText as realRouteText } from "./nl-router.ts";
 import type { RouterAction } from "./nl-router.ts";
+import { buildRepoPickKeyboard, RepoPickRegistry } from "./repo-picker.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
-import type { Effort, Mode, SessionCommand } from "./session-commands.ts";
+import type { Effort, Mode, Model, SessionCommand } from "./session-commands.ts";
 import type { CardSenders } from "./card-senders.ts";
 import type { PtyIo } from "./pty-io.ts";
 import type { Routing } from "./routing.ts";
@@ -32,6 +33,9 @@ export interface NlDispatchOptions {
   applyModeSwitch: (slug: string, topicId: number, mode: Mode) => void;
   applyEffortSwitch: (slug: string, topicId: number, effort: Effort) => void;
   nlConfirmRegistry: NlConfirmRegistry;
+  /** Backs `RouterAction`'s `new_pick_repo` outcome (`nl-router.ts`) - an ask-which-repo keyboard for
+   * an NL-matched `kind='new'` whose message never named one of 2+ registered repos. */
+  repoPickRegistry: RepoPickRegistry;
   dispatchFleetCommand: (fleetCmd: FleetCommand, threadId: number | undefined, isControl: boolean, currentSlug: string | undefined) => void;
   nlRouterConfig: { enabled: boolean; apiKey: string | undefined; model: string; historyTurns?: number };
   getNlRouterBackend: () => "api" | "cli";
@@ -79,6 +83,7 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     applyModeSwitch,
     applyEffortSwitch,
     nlConfirmRegistry,
+    repoPickRegistry,
     dispatchFleetCommand,
     nlRouterConfig,
     getNlRouterBackend,
@@ -152,11 +157,12 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
       cardSenders.sendDiffCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined);
       return;
     }
-    // Never actually reached - `routeOrFallback` intercepts `kind === "retry"` itself before calling
-    // here (see its own comment) - kept only so this function's `FleetCommand | SessionCommand |
-    // RouterAction` parameter type still narrows the fall-through `dispatchFleetCommand(command, ...)`
-    // call below to `FleetCommand`, which `retry` (a `RouterAction`) isn't.
-    if (command.kind === "retry") return;
+    // Never actually reached - `routeOrFallback` intercepts `kind === "retry"`/`"new_pick_repo"`
+    // themselves before calling here (see their own comments there) - kept only so this function's
+    // `FleetCommand | SessionCommand | RouterAction` parameter type still narrows the fall-through
+    // `dispatchFleetCommand(command, ...)` call below to `FleetCommand`, which neither `retry` nor
+    // `new_pick_repo` (both `RouterAction`) is.
+    if (command.kind === "retry" || command.kind === "new_pick_repo") return;
     if (command.kind === "model" || command.kind === "mode" || command.kind === "effort") {
       if (!currentSlug || threadId === undefined) return;
       if (command.kind === "model") applyModelSwitch(currentSlug, threadId, command.model);
@@ -180,6 +186,26 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
       nlConfirmRegistry.add({ id, command, threadId, currentSlug, messageId: sent.message_id });
     } catch (err) {
       log("WARN", `failed to post NL-confirm card: ${(err as Error).message}`);
+    }
+  }
+
+  /** Posts the ask-which-repo keyboard for a `new_pick_repo` match (`nl-router.ts`) - the "new"
+   * equivalent of `postNlConfirm` above, minus the destructive-confirm framing: this isn't confirming
+   * a guess, it's resolving a genuine ambiguity `mapRouterOutput` refused to guess past. `sourceText`
+   * is the operator's own raw message, carried through so the eventual `handleNewCommand` call gets
+   * the same "operator's own words, not the classifier's paraphrase" treatment a direct `kind='new'`
+   * match already gets a few lines below in `routeOrFallback`. */
+  async function postRepoPick(prompt: string, model: Model | undefined, sourceText: string, repoNames: readonly string[], threadId: number | undefined): Promise<void> {
+    const id = randomUUID().slice(0, 8);
+    try {
+      const pickText = `🤖 Which repo should I start "${prompt}" against?`;
+      const sent = await controlBot.sendMessage(supergroupChatId, threadId, pickText, {
+        inline_keyboard: buildRepoPickKeyboard(id, repoNames),
+      });
+      history?.recordBot(pickText);
+      repoPickRegistry.add({ id, prompt, sourceText, model, threadId, messageId: sent.message_id });
+    } catch (err) {
+      log("WARN", `failed to post repo-pick card: ${(err as Error).message}`);
     }
   }
 
@@ -279,6 +305,15 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     // (which has no branch for it and would silently drop it into `dispatchFleetCommand`).
     if (result.command.kind === "retry") {
       await onRetryMatch();
+      return;
+    }
+    // Same "no dedicated card/handler" shape as `retry` above, for the ambiguous-repo case
+    // `mapRouterOutput`'s "new" case defers here rather than guessing: post the ask-which-repo
+    // keyboard and stop - there is no `FleetCommand`/`SessionCommand` yet to hand to
+    // `executeMatchedCommand`, only once a repo is actually tapped (callback-query-router.ts's `rp:`
+    // rule turns that tap into a real `kind='new'` call).
+    if (result.command.kind === "new_pick_repo") {
+      await postRepoPick(result.command.prompt, result.command.model, text, ctx.repoNames ?? [], threadId);
       return;
     }
     // The router's own `prompt` field is an emergent English paraphrase (its classification prompt
