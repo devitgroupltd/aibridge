@@ -35,8 +35,20 @@ export async function defaultRunner(cmd: string, args: string[], cwd: string): P
     const { stdout, stderr } = await execFileAsync(cmd, args, { cwd, maxBuffer: 20 * 1024 * 1024 });
     return { status: 0, stdout, stderr };
   } catch (err) {
-    const e = err as { code?: number; stdout?: string; stderr?: string };
-    return { status: typeof e.code === "number" ? e.code : 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+    const e = err as { code?: number | string; stdout?: string; stderr?: string; message?: string };
+    const stdout = e.stdout ?? "";
+    const stderr = e.stderr ?? "";
+    // A real git exit (nonzero `code`, plus whatever it wrote to stdout/stderr) is handled above as
+    // intended. But a *spawn-level* failure - `cwd` doesn't exist, `cmd` isn't resolvable, a
+    // permission/lock error - never actually runs the child process, so `e.code` is an errno string
+    // (e.g. "ENOENT") rather than a numeric exit code, and stdout/stderr are both empty. Without a
+    // fallback, that leaves callers (deployBranch's `git status failed.`, etc.) with an empty
+    // `detail` and no way to tell "git said no" apart from "git never ran at all" - found live,
+    // 2026-08-11: a `/ship` failure surfaced as a bare "git status failed." with nothing else to go
+    // on. Fall back to `e.message` (Node's own "spawn git ENOENT" / "ENOENT: ... chdir '...'" text)
+    // only when the process truly produced nothing else.
+    const status = typeof e.code === "number" ? e.code : 1;
+    return { status, stdout, stderr: stdout || stderr ? stderr : e.message ?? "" };
   }
 }
 

@@ -6,6 +6,7 @@ import type { CommandResult, CommandRunner, DeployMarker } from "../src/deploy.t
 import {
   clearDeployMarker,
   commitIfDirty,
+  defaultRunner,
   deployBranch,
   deployMarkerPath,
   discoverTypecheckedPackages,
@@ -453,4 +454,25 @@ describe("truncateForTelegram", () => {
     expect(result).toContain("truncated");
     expect(result.length).toBeLessThan(long.length);
   });
+});
+
+describe("defaultRunner", () => {
+  test("reports a real command's nonzero exit via status/stdout/stderr as before", async () => {
+    const result = await defaultRunner("git", ["rev-parse", "--verify", "definitely-not-a-real-branch"], process.cwd());
+
+    expect(result.status).not.toBe(0);
+  });
+
+  test(
+    "falls back to the spawn error's message when a spawn-level failure (bad cwd) leaves stdout/stderr empty - " +
+      "found live 2026-08-11: this used to surface as a bare 'git status failed.' with no diagnostic at all",
+    async () => {
+      const result = await defaultRunner("git", ["status", "--porcelain"], "C:\\this\\path\\does\\not\\exist\\at\\all");
+
+      expect(result.status).not.toBe(0);
+      expect(result.stdout).toBe("");
+      expect(result.stderr.length).toBeGreaterThan(0);
+      expect(result.stderr).toMatch(/ENOENT|no such file/i);
+    },
+  );
 });
