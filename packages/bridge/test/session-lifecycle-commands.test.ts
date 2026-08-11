@@ -398,6 +398,36 @@ describe("createSessionLifecycleCommands", () => {
       expect(confirmed[0]?.text).toContain("usage limit");
     });
 
+    test("/resume --all resumes every dead session, excluding the self-check slug, and skips anything still alive", async () => {
+      const { sessionLifecycle, sessionStore, sessionSupervisor, confirmed } = setup();
+      sessionStore.insert(row({ slug: "dead-one", state: "dead", topicId: 6, sessionId: "sess-dead-1" }));
+      sessionStore.insert(row({ slug: "dead-two", state: "dead", topicId: 7, sessionId: "sess-dead-2" }));
+      sessionStore.insert(row({ slug: "alive-one", state: "working", topicId: 8, sessionId: "sess-alive" }));
+      sessionStore.insert(row({ slug: "self-check", state: "dead", topicId: 9, sessionId: "sess-self" }));
+      const calls: Array<{ slug: string; opts: unknown }> = [];
+      sessionSupervisor.resumeSession = async (r: SessionRow, opts?: unknown) => {
+        calls.push({ slug: r.slug, opts });
+      };
+      await sessionLifecycle.handleResumeCommand({ kind: "resume", all: true }, 1, undefined);
+      expect(calls).toEqual([
+        { slug: "dead-one", opts: { manuallyRequested: true } },
+        { slug: "dead-two", opts: { manuallyRequested: true } },
+      ]);
+      expect(confirmed[0]?.text).toContain("Resumed 2 dead sessions: dead-one, dead-two");
+    });
+
+    test("/resume --all reports a clear no-op when nothing is dead", async () => {
+      const { sessionLifecycle, sessionStore, sessionSupervisor, confirmed } = setup();
+      sessionStore.insert(row({ state: "working" }));
+      const resumed: SessionRow[] = [];
+      sessionSupervisor.resumeSession = async (r: SessionRow) => {
+        resumed.push(r);
+      };
+      await sessionLifecycle.handleResumeCommand({ kind: "resume", all: true }, 1, undefined);
+      expect(resumed).toEqual([]);
+      expect(confirmed[0]?.text).toBe("No dead sessions to resume.");
+    });
+
     test("handleDetailCommand reports a clear failure for an unknown slug", () => {
       const { sessionLifecycle, confirmed } = setup();
       sessionLifecycle.handleDetailCommand({ kind: "detail", slug: "ghost" }, 1, undefined);

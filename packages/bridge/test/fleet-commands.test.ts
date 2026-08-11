@@ -224,6 +224,11 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/resume")).toEqual({ kind: "resume", slug: undefined });
   });
 
+  test("/resume --all, including a single-dash typo (normalizeDashFlags)", () => {
+    expect(parseFleetCommand("/resume --all")).toEqual({ kind: "resume", all: true });
+    expect(parseFleetCommand("/resume -all")).toEqual({ kind: "resume", all: true });
+  });
+
   test("/budget takes no argument", () => {
     expect(parseFleetCommand("/budget")).toEqual({ kind: "budget" });
   });

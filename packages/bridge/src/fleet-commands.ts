@@ -67,7 +67,7 @@ export type FleetCommand =
   | { kind: "pause"; slug?: string }
   | { kind: "usage"; slug?: string }
   | { kind: "stop"; slug?: string }
-  | { kind: "resume"; slug?: string }
+  | { kind: "resume"; slug?: string; all?: boolean }
   | { kind: "budget" }
   | { kind: "restart" }
   | { kind: "merge"; slug: string }
@@ -164,9 +164,22 @@ export function newSessionContent(cmd: { prompt: string; sourceText?: string }):
   return cmd.sourceText ?? cmd.prompt;
 }
 
-function parseSlugArg(kind: "attach" | "pause" | "usage" | "stop" | "resume", rest: string): FleetCommand {
+function parseSlugArg(kind: "attach" | "pause" | "usage" | "stop", rest: string): FleetCommand {
   const slug = rest.trim();
   return { kind, slug: slug.length > 0 ? slug : undefined };
+}
+
+/** `/resume --all` (2026-08-12 operator request, after a Bridge restart left multiple sessions
+ * dead in one go - no bulk form existed, only `/resume <slug>` one at a time). Unlike `/kill --all`/
+ * `/remove --all`, this needs no confirm card and no `--force` escape hatch for one: `/resume` (see
+ * `handleResumeCommand`'s own doc comment) only ever does real work for a `dead` row regardless of
+ * what's asked for, so there is no live session a mistyped bulk resume could touch - the same reason
+ * `/remove --dead`/`--prefix` already execute immediately rather than going through
+ * `postFleetConfirm`. Anything else falls through to the ordinary single-slug form. */
+function parseResume(rest: string): FleetCommand {
+  const trimmed = rest.trim();
+  if (trimmed === "--all") return { kind: "resume", all: true };
+  return { kind: "resume", slug: trimmed.length > 0 ? trimmed : undefined };
 }
 
 /**
@@ -605,8 +618,9 @@ export function parseFleetCommand(text: string): FleetCommand | null {
     case "pause":
     case "usage":
     case "stop":
-    case "resume":
       return parseSlugArg(cmd, rest);
+    case "resume":
+      return parseResume(rest);
     default:
       return null;
   }
@@ -829,9 +843,9 @@ export function renderHelp(): string {
     "  /stop [<slug>] - interrupt the current turn (Escape); the session stays alive, just send a",
     "    message to continue",
     "  /pause [<slug>] - pause/resume this topic's feed updates (does not affect the session itself)",
-    "  /resume [<slug>] - relaunch a dead session's process (claude --resume) on its preserved",
+    "  /resume [<slug>|--all] - relaunch a dead session's process (claude --resume) on its preserved",
     "    worktree; a no-op note if the session is still alive (/stop leaves it alive - just send a",
-    "    message to continue)",
+    "    message to continue); --all resumes every dead session at once, no confirm needed",
     "  /usage [<slug>] - token/cost usage",
     "  /budget - fleet spend (5h/7d)",
     "  /restart - restart the Bridge daemon",
@@ -926,7 +940,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "rm", description: "Alias for /remove" },
     { command: "attach", description: "Show a session's PTY tail" },
     { command: "stop", description: "Interrupt the current turn (Escape) - session stays alive, just send a message to continue: /stop [<slug>]" },
-    { command: "resume", description: "Relaunch a dead session's process on its preserved worktree: /resume [<slug>] (no-op note if it's still alive)" },
+    { command: "resume", description: "Relaunch a dead session's process on its preserved worktree: /resume [<slug>|--all] (no-op note if it's still alive)" },
     { command: "pause", description: "Pause/resume this topic's feed updates (not the session itself)" },
     { command: "usage", description: "Token/cost usage" },
     { command: "budget", description: "Fleet spend (5h/7d)" },
