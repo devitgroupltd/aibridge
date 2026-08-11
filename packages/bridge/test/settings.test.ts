@@ -78,6 +78,15 @@ describe("generateSettings", () => {
     expect(settings.permissions.allow).toContain("Bash(cat *)");
   });
 
+  // Live prompt 2026-08-11: git fetch only updates remote-tracking refs, never the working tree or
+  // an index - same read-only trust tier as git status/diff/log/branch/show right beside it, unlike
+  // git pull/merge (still ungated, deliberately - those do touch the working tree).
+  test("pre-approves git fetch alongside the other read-only git subcommands", () => {
+    expect(settings.permissions.allow).toContain("Bash(git fetch *)");
+    expect(settings.permissions.allow).not.toContain("Bash(git pull *)");
+    expect(settings.permissions.allow).not.toContain("Bash(git merge *)");
+  });
+
   // Bun is the runtime this very repo's CLAUDE.md standardises on (`bun test`, `bun run typecheck`),
   // same trust level as the dotnet/npm build-and-test entries above - all read-only against a
   // committed lockfile. Missing this meant every session hit an avoidable prompt for a command it

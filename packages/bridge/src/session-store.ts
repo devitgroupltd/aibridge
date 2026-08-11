@@ -69,6 +69,24 @@ export interface SessionRow {
    * Defaults off - real tool output can contain arbitrary file content (the same §8.2 concern
    * that already governs `feedDetail`'s truncation), so showing it is opt-in, not the default. */
   feedVerbose: boolean;
+  /** `/auto permission` (bypass-and-autoanswer-plan.md §0.2, revised 2026-08-11): mirrors
+   * `routing.ts`'s in-memory `bypassBySlug` so the toggle survives a Bridge restart instead of
+   * silently resetting to off. `routing.ts` remains the single read path during a live process -
+   * this column only exists to re-hydrate that map on `resumeSession` (session-supervisor.ts). */
+  bypassPermission: boolean;
+  /** `/auto answer` - same restart-survival column as `bypassPermission` above, mirroring
+   * `routing.ts`'s `autoAnswerBySlug`. */
+  autoAnswer: boolean;
+  /** `/mode` (revised 2026-08-11, same restart-survival motive as the two toggles above, found by
+   * the same audit): mirrors `routing.ts`'s in-memory `modeBySlug`. Unlike `feedVerbose`/the two
+   * toggles above, this one isn't cosmetic - `session-supervisor.ts`'s `resumeSession` reads
+   * `routing.getMode(slug)` to build the real `--permission-mode` relaunch flag, so losing it on a
+   * Bridge restart silently relaunched every non-`manual` session back in `manual` mode. Stored as
+   * a plain string, not `Mode`, so this file doesn't need to import `session-commands.ts`'s type -
+   * `routing.ts`'s `hydrateFromRow` re-validates against `MODES` the same way `index.ts`'s own
+   * settingsStore-backed defaults do, in case a value was written by a build that later removed a
+   * mode. */
+  mode: string;
   createdUtc: string;
   lastEventUtc: string;
 }
@@ -88,6 +106,9 @@ interface SessionRowSql {
   renamed: number;
   feed_detail: string;
   feed_verbose: number;
+  bypass_permission: number;
+  auto_answer: number;
+  mode: string;
   created_utc: string;
   last_event_utc: string;
 }
@@ -108,6 +129,9 @@ function fromSql(row: SessionRowSql): SessionRow {
     renamed: row.renamed !== 0,
     feedDetail: row.feed_detail === "full" ? "full" : "compact",
     feedVerbose: row.feed_verbose !== 0,
+    bypassPermission: row.bypass_permission !== 0,
+    autoAnswer: row.auto_answer !== 0,
+    mode: row.mode,
     createdUtc: row.created_utc,
     lastEventUtc: row.last_event_utc,
   };
@@ -142,6 +166,15 @@ const COLUMN_MIGRATIONS: readonly { column: string; ddl: string }[] = [
   { column: "renamed", ddl: "ALTER TABLE sessions ADD COLUMN renamed INTEGER NOT NULL DEFAULT 0;" },
   { column: "feed_detail", ddl: "ALTER TABLE sessions ADD COLUMN feed_detail TEXT NOT NULL DEFAULT 'compact';" },
   { column: "feed_verbose", ddl: "ALTER TABLE sessions ADD COLUMN feed_verbose INTEGER NOT NULL DEFAULT 0;" },
+  // Both default 0/off on an existing pre-2026-08-11 row, same fail-closed default the toggles
+  // themselves have always had - an upgrade never silently grants a session either toggle it didn't
+  // already have live in routing.ts's in-memory maps at the moment of the upgrade.
+  { column: "bypass_permission", ddl: "ALTER TABLE sessions ADD COLUMN bypass_permission INTEGER NOT NULL DEFAULT 0;" },
+  { column: "auto_answer", ddl: "ALTER TABLE sessions ADD COLUMN auto_answer INTEGER NOT NULL DEFAULT 0;" },
+  // Defaults to the CLI's own real spawn default (session-commands.ts's DEFAULT_MODE) - an existing
+  // pre-2026-08-11 row predates per-session mode tracking entirely, so "manual" is the only value
+  // that was ever actually true for it.
+  { column: "mode", ddl: "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'manual';" },
 ];
 
 export class SessionStore {
@@ -174,6 +207,9 @@ export class SessionStore {
         renamed        INTEGER NOT NULL DEFAULT 0,
         feed_detail    TEXT NOT NULL DEFAULT 'compact',
         feed_verbose   INTEGER NOT NULL DEFAULT 0,
+        bypass_permission INTEGER NOT NULL DEFAULT 0,
+        auto_answer    INTEGER NOT NULL DEFAULT 0,
+        mode           TEXT NOT NULL DEFAULT 'manual',
         created_utc    TEXT NOT NULL,
         last_event_utc TEXT NOT NULL
       );
@@ -210,8 +246,8 @@ export class SessionStore {
   insert(row: SessionRow): void {
     this.prepare(
       `INSERT INTO sessions
-       (slug, topic_id, session_id, worktree_path, branch, repo_path, model, pty_pid, state, turn_card_msg, paused, renamed, feed_detail, feed_verbose, created_utc, last_event_utc)
-       VALUES ($slug, $topic_id, $session_id, $worktree_path, $branch, $repo_path, $model, $pty_pid, $state, $turn_card_msg, $paused, $renamed, $feed_detail, $feed_verbose, $created_utc, $last_event_utc)`,
+       (slug, topic_id, session_id, worktree_path, branch, repo_path, model, pty_pid, state, turn_card_msg, paused, renamed, feed_detail, feed_verbose, bypass_permission, auto_answer, mode, created_utc, last_event_utc)
+       VALUES ($slug, $topic_id, $session_id, $worktree_path, $branch, $repo_path, $model, $pty_pid, $state, $turn_card_msg, $paused, $renamed, $feed_detail, $feed_verbose, $bypass_permission, $auto_answer, $mode, $created_utc, $last_event_utc)`,
     ).run({
         $slug: row.slug,
         $topic_id: row.topicId,
@@ -227,6 +263,9 @@ export class SessionStore {
         $renamed: row.renamed ? 1 : 0,
         $feed_detail: row.feedDetail,
         $feed_verbose: row.feedVerbose ? 1 : 0,
+        $bypass_permission: row.bypassPermission ? 1 : 0,
+        $auto_answer: row.autoAnswer ? 1 : 0,
+        $mode: row.mode,
         $created_utc: row.createdUtc,
         $last_event_utc: row.lastEventUtc,
       });
@@ -301,6 +340,24 @@ export class SessionStore {
 
   setFeedVerbose(slug: string, verbose: boolean): void {
     this.prepare("UPDATE sessions SET feed_verbose = $verbose WHERE slug = $slug").run({ $verbose: verbose ? 1 : 0, $slug: slug });
+  }
+
+  /** `routing.ts`'s `setBypass` write-through target - see that method's own doc comment for why
+   * this is a mirror of the in-memory map, not the source of truth during a live process. */
+  setBypassPermission(slug: string, on: boolean): void {
+    this.prepare("UPDATE sessions SET bypass_permission = $on WHERE slug = $slug").run({ $on: on ? 1 : 0, $slug: slug });
+  }
+
+  /** `routing.ts`'s `setAutoAnswer` write-through target - same mirror relationship as
+   * `setBypassPermission` above. */
+  setAutoAnswer(slug: string, on: boolean): void {
+    this.prepare("UPDATE sessions SET auto_answer = $on WHERE slug = $slug").run({ $on: on ? 1 : 0, $slug: slug });
+  }
+
+  /** `routing.ts`'s `setMode` write-through target - same mirror relationship as the two above,
+   * except this one backs a value `resumeSession` actually relaunches with, not just a display. */
+  setMode(slug: string, mode: string): void {
+    this.prepare("UPDATE sessions SET mode = $mode WHERE slug = $slug").run({ $mode: mode, $slug: slug });
   }
 
   setPtyPid(slug: string, ptyPid: number): void {

@@ -17,6 +17,9 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     renamed: false,
     feedDetail: "compact",
     feedVerbose: false,
+    bypassPermission: false,
+    autoAnswer: false,
+    mode: "manual",
     createdUtc: "2026-08-03T00:00:00.000Z",
     lastEventUtc: "2026-08-03T00:00:00.000Z",
     ...overrides,
@@ -163,5 +166,30 @@ describe("SessionStore", () => {
     expect(store.get("fix-bug")).toMatchObject({ feedDetail: "full", feedVerbose: true });
     store.setFeedDetail("fix-bug", "compact");
     expect(store.get("fix-bug")).toMatchObject({ feedDetail: "compact", feedVerbose: true });
+  });
+
+  // bypass-and-autoanswer-plan.md v0.24.0: these two columns are what lets `/auto permission`/
+  // `/auto answer` survive a Bridge restart instead of silently resetting to off - `routing.ts`'s
+  // `setBypass`/`setAutoAnswer` write through to exactly these two setters.
+  test("v0.24.0: setBypassPermission/setAutoAnswer each update only their own field, defaulting off", () => {
+    const store = new SessionStore(":memory:");
+    store.insert(row());
+    expect(store.get("fix-bug")).toMatchObject({ bypassPermission: false, autoAnswer: false });
+    store.setBypassPermission("fix-bug", true);
+    expect(store.get("fix-bug")).toMatchObject({ bypassPermission: true, autoAnswer: false });
+    store.setAutoAnswer("fix-bug", true);
+    expect(store.get("fix-bug")).toMatchObject({ bypassPermission: true, autoAnswer: true });
+    store.setBypassPermission("fix-bug", false);
+    expect(store.get("fix-bug")).toMatchObject({ bypassPermission: false, autoAnswer: true });
+  });
+
+  // Same audit, found in the same pass: `mode` isn't cosmetic like `feedVerbose` - resumeSession
+  // uses it to build a real `--permission-mode` relaunch flag.
+  test("v0.24.0: setMode updates only that field, defaulting to manual", () => {
+    const store = new SessionStore(":memory:");
+    store.insert(row());
+    expect(store.get("fix-bug")).toMatchObject({ mode: "manual" });
+    store.setMode("fix-bug", "acceptEdits");
+    expect(store.get("fix-bug")).toMatchObject({ mode: "acceptEdits", feedVerbose: false });
   });
 });

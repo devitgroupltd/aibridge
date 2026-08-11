@@ -152,13 +152,17 @@ async function main(): Promise<void> {
   const selfCheckWorktreePath = path.join(selfCheckWorktreesRoot, config.selfCheck.slug);
   const fleetWorktreesRoot = process.env.AIBRIDGE_WORKTREES_ROOT;
 
-  const routing = new Routing();
+  // Constructed before `Routing` (moved 2026-08-11) so `Routing` can take it as its persistence
+  // sink for `/auto permission`/`/auto answer` - see routing.ts's own doc comment on why those two
+  // toggles now survive a Bridge restart instead of resetting to off.
+  const dbPath = process.env.AIBRIDGE_DB_PATH ?? path.join(STATE_DIR, "aibridge.db");
+  const sessionStore = new SessionStore(dbPath);
+
+  const routing = new Routing(sessionStore);
   routing.add({ slug: config.selfCheck.slug, topicId: config.selfCheck.topicId, worktreePath: selfCheckWorktreePath });
 
   const nowIso = () => new Date().toISOString();
 
-  const dbPath = process.env.AIBRIDGE_DB_PATH ?? path.join(STATE_DIR, "aibridge.db");
-  const sessionStore = new SessionStore(dbPath);
   // nl-router.ts's confirm gate (nl-confirm.ts) - a fleet-wide preference, not per-session, same
   // reasoning `/budget`/`/settings` staying control-topic-only already established. Lives in the
   // same aibridge.db file, not a second database (settings-store.ts).
@@ -195,9 +199,9 @@ async function main(): Promise<void> {
   // default for `/auto`'s two toggles, same in-memory-for-reads, persisted-on-write shape as the two
   // above. Both fall back to "false" - fail-closed, deliberately unlike `voice_confirm_enabled`'s
   // "true" fallback, which defaults a confirmation *on*; these default a confirmation *away*.
-  // Note the asymmetry with the per-session flags (`routing.ts`'s `bypassBySlug`/`autoAnswerBySlug`),
-  // which are in-memory only and reset on every restart: this is standing configuration for sessions
-  // that don't exist yet, not a live session's own state.
+  // This is standing configuration for sessions that don't exist yet, distinct from a *live*
+  // session's own per-slug toggle (`routing.ts`'s `bypassBySlug`/`autoAnswerBySlug`, revised
+  // 2026-08-11 to survive a restart via `session-store.ts` instead of resetting to off).
   let defaultBypassEnabled = settingsStore.get("default_bypass_enabled", "false") === "true";
   let defaultAutoAnswerEnabled = settingsStore.get("default_autoanswer_enabled", "false") === "true";
   if (!sessionStore.get(config.selfCheck.slug)) {
@@ -216,6 +220,11 @@ async function main(): Promise<void> {
       renamed: false,
       feedDetail: "compact",
       feedVerbose: false,
+      bypassPermission: false,
+      autoAnswer: false,
+      // No `permissionMode` is passed to the self-check session's own `launchSession` call, so it
+      // spawns at the CLI's own real default - same value `DEFAULT_MODE` names.
+      mode: DEFAULT_MODE,
       createdUtc: nowIso(),
       lastEventUtc: nowIso(),
     });
@@ -813,12 +822,29 @@ async function main(): Promise<void> {
   }, 60_000);
 
   if (process.env.AIBRIDGE_SKIP_LAUNCH !== "1") {
+    // The self-check slug is deliberately excluded from `runStartupReconciliation`
+    // (`session-supervisor.ts`'s own row filter: it launches fresh here rather than resuming), so it
+    // is the one live session that never reaches `resumeSession`'s `routing.hydrateFromRow` call.
+    // Without this it silently kept the pre-v0.24.0 behavior that the whole persistence change exists
+    // to remove: `/auto permission on` in this topic, then any Bridge restart, and the Allow/Deny
+    // card is back with nothing announcing why. `/mode` was worse - `setMode` persisted the operator's
+    // choice, but with no hydration and no `permissionMode` flag below, the session relaunched in
+    // `manual` while its row went on asserting the mode it was no longer in. Its row is inserted far
+    // above (guarded on `!sessionStore.get(...)`), so this always finds one; the `if` is a type
+    // narrowing, not a real branch.
+    const selfCheckRow = sessionStore.get(config.selfCheck.slug);
+    if (selfCheckRow) routing.hydrateFromRow(config.selfCheck.slug, selfCheckRow);
     const session = launchSession({
       slug: config.selfCheck.slug,
       topicId: config.selfCheck.topicId,
       repoPath: config.selfCheck.repoPath,
       worktreesRoot: selfCheckWorktreesRoot,
       mirrorPtyToConsole: process.env.AIBRIDGE_DEV_MIRROR_PTY === "1",
+      // Same launch-flag-not-keystrokes reasoning as the other two `launchSession` call sites
+      // (`buildClaudeSpawnArgs`' own note on why the Shift+Tab burst was replaced). `manual` is a
+      // real, documented value for this flag, so a fresh row's default passes it explicitly rather
+      // than omitting the flag - exactly what `resumeSession` already does for a manual fleet session.
+      permissionMode: routing.getMode(config.selfCheck.slug),
       otlpPort,
       log,
     });

@@ -137,6 +137,16 @@ describe("isCompoundCommandFullyAllowed", () => {
     expect(isCompoundCommandFullyAllowed(command, real, WIDENED_AUTO_APPROVE_PREFIXES)).toBe(true);
   });
 
+  // A third live prompt, 2026-08-11: every other piece of this chain (`tail`/`echo`/`git log`/
+  // `git status`) was already allow-listed, but `git fetch` alone was not, and the decomposer's
+  // all-or-nothing check (§ this module's own doc comment) means one missing sub-command defeats
+  // the whole chain regardless of how trusted the rest is.
+  test("the real generated settings now fully allow the live-prompted git fetch && git log/status chain", () => {
+    const real = generateSettings();
+    const command = `cd C:/data/worktrees/analyze-the-codebase-for-improvements && git fetch origin 2>&1 | tail -5 && echo --- && git log --oneline HEAD..origin/main && echo "---ahead---" && git status --short && git log --oneline -3`;
+    expect(isCompoundCommandFullyAllowed(command, real, WIDENED_AUTO_APPROVE_PREFIXES)).toBe(true);
+  });
+
   // Regression: a first version's rule matcher only recognised a wildcard when it sat at the very
   // end of the pattern (` *`), so real settings.ts deny entries with the `*` mid-string -
   // `Bash(rm -rf /*)`, `Bash(curl * | sh)` - were silently parsed as literal strings requiring an
