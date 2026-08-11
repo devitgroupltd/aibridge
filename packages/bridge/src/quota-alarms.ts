@@ -9,7 +9,7 @@ type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
 /** §10.5 point 2's burn-rate alarm - this project's own choice of threshold, not a number the plan
  * specifies (same convention as §10.4.1's prompts-per-hour warning), overridable for a laptop that
  * wants a tighter or looser guardrail. */
-export const DEFAULT_BURN_RATE_THRESHOLD_USD = 10;
+export const DEFAULT_BURN_RATE_THRESHOLD_USD = 20;
 /** Keeps a session that's genuinely burning through quota from posting on every single API call
  * once it crosses the line - "an alarm that fires constantly is an alarm nobody reads" (§10.5). */
 export const DEFAULT_BURN_RATE_ALARM_COOLDOWN_MS = 60 * 60 * 1000;

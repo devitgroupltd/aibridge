@@ -153,7 +153,7 @@ describe("createQuotaAlarms", () => {
   });
 
   test("defaults match the documented constants when not overridden", () => {
-    expect(DEFAULT_BURN_RATE_THRESHOLD_USD).toBe(10);
+    expect(DEFAULT_BURN_RATE_THRESHOLD_USD).toBe(20);
     expect(DEFAULT_BURN_RATE_ALARM_COOLDOWN_MS).toBe(60 * 60 * 1000);
   });
 });
