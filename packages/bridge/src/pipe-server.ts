@@ -691,7 +691,10 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       // §5.1: the hook client's hello carries no session_id (only pid + which event it's for),
       // so there is nothing to register here - the event message on the same connection, handled
       // below, is the one that actually carries anything routable.
-      log("INFO", `hook client connected for event "${msg.event}" (pid ${msg.pid})`);
+      // slug is on every hook hello (EnvelopeBase) despite the above note about session_id - added
+      // 2026-08-11 so this line is correlatable to a session by slug, not just a pid that meant
+      // nothing without cross-referencing OS process listings (live debugging pain point).
+      log("INFO", `hook client connected for event "${msg.event}" (pid ${msg.pid}, slug "${msg.slug}")`);
       return;
     }
     connectionsBySlug.set(msg.slug, socket);
