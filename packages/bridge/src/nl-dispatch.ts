@@ -120,8 +120,11 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
    * arrives without `currentSlug`/`threadId` set (`allowedKinds`'s `hasSession` gate), so the guard
    * here is defense in depth, not load-bearing. */
   function executeMatchedCommand(command: FleetCommand | SessionCommand | RouterAction, threadId: number | undefined, isControl: boolean, currentSlug: string | undefined): void {
+    // Hoisted once - help/commands/skills/browse/find each independently recomputed this same
+    // conditional lookup inline.
+    const route = threadId !== undefined ? routing.getByTopicId(threadId) : undefined;
     if (command.kind === "help") {
-      cardSenders.sendHelpCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined);
+      cardSenders.sendHelpCard(threadId, route);
       return;
     }
     if (command.kind === "about") {
@@ -129,11 +132,11 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
       return;
     }
     if (command.kind === "commands") {
-      cardSenders.sendCommandsListCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.term);
+      cardSenders.sendCommandsListCard(threadId, route, command.term);
       return;
     }
     if (command.kind === "skills") {
-      cardSenders.sendSkillsListCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.term);
+      cardSenders.sendSkillsListCard(threadId, route, command.term);
       return;
     }
     if (command.kind === "builtin") {
@@ -141,15 +144,15 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
       return;
     }
     if (command.kind === "browse") {
-      cardSenders.sendBrowseCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.path);
+      cardSenders.sendBrowseCard(threadId, route, command.path);
       return;
     }
     if (command.kind === "find") {
-      cardSenders.sendFindCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined, command.query);
+      cardSenders.sendFindCard(threadId, route, command.query);
       return;
     }
     if (command.kind === "diff") {
-      cardSenders.sendDiffCard(threadId, threadId !== undefined ? routing.getByTopicId(threadId) : undefined);
+      cardSenders.sendDiffCard(threadId, route);
       return;
     }
     // Never actually reached - `routeOrFallback` intercepts `kind === "retry"` itself before calling

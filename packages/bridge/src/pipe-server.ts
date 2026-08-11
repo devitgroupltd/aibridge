@@ -259,6 +259,24 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
   }
 
   /**
+   * Pops this topic's thinking placeholder (if any) and best-effort deletes it - shared by
+   * `handleReply`'s empty-chunks and successful-send branches, which used to each hand-write this
+   * consume-then-delete sequence separately. The empty-chunks path used to bypass the `p1` rate-
+   * governor lane every other Telegram send in this file goes through; a session producing many
+   * scrubbed-to-empty replies in a burst could hit Telegram's rate limit on `deleteMessage` calls
+   * nothing else here was protected from. Always resolves - callers that need the delete to have
+   * settled before continuing should `await` it; the successful-send path fires it without awaiting
+   * (via `fireAndForget`) so a slow/failing delete never delays the reply's own remaining chunks.
+   */
+  async function deletePlaceholder(routedTopic: string, slug: string): Promise<void> {
+    const placeholderId = await opts.thinkingPlaceholder?.consume(routedTopic);
+    if (placeholderId === undefined || !opts.controlBot.deleteMessage) return;
+    await p1(() => opts.controlBot.deleteMessage!(opts.chatId, placeholderId)).catch((err) =>
+      log("WARN", `failed to delete the thinking placeholder for slug "${slug}": ${(err as Error).message}`),
+    );
+  }
+
+  /**
    * The destination topic is derived from the *slug*, never taken from the message. `topic_id` is
    * an argument the model fills in ("pass back the topic_id from the tag"), so a session that read
    * a file containing a channel-tag-shaped string - or just a confused model reusing a stale tag -
@@ -337,12 +355,7 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
         // land finally consumed it. A turn that resolves to "nothing to say" still resolves - the
         // placeholder has to clear here too, not just on the path that sends real text.
         log("WARN", `reply for slug "${msg.slug}" was empty after scrubbing - nothing to send`);
-        const placeholderId = await opts.thinkingPlaceholder?.consume(routedTopic);
-        if (placeholderId !== undefined && opts.controlBot.deleteMessage) {
-          await opts.controlBot.deleteMessage(opts.chatId, placeholderId).catch((err) =>
-            log("WARN", `failed to delete the thinking placeholder for slug "${msg.slug}": ${(err as Error).message}`),
-          );
-        }
+        await deletePlaceholder(routedTopic, msg.slug);
         return;
       }
       // 0.104.0: this used to *edit* the placeholder into the reply's own text instead of sending a
@@ -366,15 +379,11 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       // later reply to self-heal. Consuming after a successful send means a failed one instead
       // leaves the placeholder right where the empty-chunks case leaves it too: still pending, so
       // whatever reply eventually does get through still clears it.
-      const placeholderId = await opts.thinkingPlaceholder?.consume(routedTopic);
-      if (placeholderId !== undefined && opts.controlBot.deleteMessage) {
-        // Best-effort: a delete failing (already gone, past Telegram's edit/delete window, etc.)
-        // must never take the reply down with it - the reply above has already landed either way,
-        // and a stray leftover "🤔 Thinking..." bubble is a cosmetic wart, not a lost message.
-        p1(() => opts.controlBot.deleteMessage!(opts.chatId, placeholderId)).catch((err) =>
-          log("WARN", `failed to delete the thinking placeholder for slug "${msg.slug}": ${(err as Error).message}`),
-        );
-      }
+      // Best-effort, not awaited: a delete failing (already gone, past Telegram's edit/delete
+      // window, etc.) must never take the reply down with it - the reply above has already landed
+      // either way, and a stray leftover "🤔 Thinking..." bubble is a cosmetic wart, not a lost
+      // message.
+      fireAndForget(deletePlaceholder(routedTopic, msg.slug), log, `pipe-server deletePlaceholder(${msg.slug})`);
       for (const chunk of chunks.slice(1)) {
         await p1(() => opts.controlBot.sendMessage(opts.chatId, topicId, chunk));
       }

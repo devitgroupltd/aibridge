@@ -1,11 +1,20 @@
 import type { PermissionSettings } from "./settings.ts";
+import { containsUnsafeSubshellOrBackground } from "./shell-metacharacters.ts";
 
 /**
  * §6.6: never generalise a command containing a shell metacharacter, since the "first two tokens"
  * heuristic below would otherwise scope a rule to only the first of several chained commands
- * while silently allow-listing whatever runs after the `|`/`;`/`&`/`$(`/backtick.
+ * while silently allow-listing whatever runs after the `|`/`;`/a background `&`/`$(`/backtick.
+ * Pipe, semicolon, and `&&` are always unsafe to generalise past (checked directly below, since
+ * unlike compound-permission.ts this module never splits on them - it only ever wants "is there a
+ * chain at all"); `$(`/backtick/a genuine background `&` are shared with compound-permission.ts's
+ * own metacharacter check so a fix to one (e.g. excluding `2>&1`-style fd-duplication from "bare
+ * `&`") can't silently fail to apply to the other - that exact drift shipped live 2026-08-10 before
+ * this was shared.
  */
-const METACHARACTERS = ["|", ";", "&", "$(", "`"];
+function containsUngeneralisableMetacharacter(command: string): boolean {
+  return command.includes("|") || command.includes(";") || command.includes("&&") || containsUnsafeSubshellOrBackground(command);
+}
 
 /**
  * A permission message's `input_preview` is normally `{"command": "..."}` JSON, but this is the
@@ -39,7 +48,7 @@ export function deriveAlwaysRule(toolName: string, inputPreview: string): string
   // check against, so it falls back to the raw preview itself rather than giving up outright.
   const command = extractBashCommand(inputPreview) ?? inputPreview;
 
-  if (METACHARACTERS.some((ch) => command.includes(ch))) {
+  if (containsUngeneralisableMetacharacter(command)) {
     return null;
   }
 

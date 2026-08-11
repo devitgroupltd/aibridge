@@ -679,6 +679,19 @@ describe("renderHelp", () => {
     expect(text).toContain("/mode <");
     expect(text).toContain("/effort <");
   });
+
+  // `isKnownCommandText` is explicitly keyed off `botCommandList()` "so it can't drift" (its own
+  // doc comment), but `renderHelp()`'s prose is a wholly separate hand-written block with nothing
+  // enforcing the two stay consistent - a command added to one and forgotten in the other used to
+  // ship silently wrong (found live: /stop and /retry were both in `botCommandList()` but missing
+  // from `renderHelp()`'s text entirely). "/help" and "/rm" pass via the header line and the
+  // /remove line's "/rm is an alias" mention respectively - neither needs its own bullet.
+  test("every botCommandList() command is mentioned somewhere in renderHelp()'s text", () => {
+    const text = renderHelp();
+    for (const { command } of botCommandList()) {
+      expect(text).toContain(`/${command}`);
+    }
+  });
 });
 
 describe("renderSettings", () => {

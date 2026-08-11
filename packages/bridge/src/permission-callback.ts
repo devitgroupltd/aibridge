@@ -1,4 +1,5 @@
 import type { InlineKeyboardButton } from "./telegram.ts";
+import { escapeForFeed } from "./feed-escape.ts";
 
 export type PermVerdictAction = "allow" | "deny" | "always";
 
@@ -43,10 +44,6 @@ export interface PermissionCardFields {
   inputPreview: string;
 }
 
-function escapeHtml(text: string): string {
-  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
-}
-
 /**
  * `inputPreview` is Claude Code's own `JSON.stringify` of the tool's raw input (§6.3) - dumping it
  * straight into the card meant a real command showed up as one escaped blob (`\"...\"`, literal
@@ -67,16 +64,16 @@ function renderInputPreview(toolName: string, description: string, inputPreview:
   } catch {
     parsed = null;
   }
-  if (!parsed) return `<pre>${escapeHtml(inputPreview)}</pre>`;
+  if (!parsed) return `<pre>${escapeForFeed(inputPreview)}</pre>`;
 
   if (toolName === "Bash" && typeof parsed.command === "string") {
-    return `<pre>${escapeHtml(parsed.command)}</pre>`;
+    return `<pre>${escapeForFeed(parsed.command)}</pre>`;
   }
 
   const lines = Object.entries(parsed)
     .filter(([key, value]) => !(key === "description" && value === description))
-    .map(([key, value]) => `<b>${escapeHtml(key)}</b>: ${escapeHtml(typeof value === "string" ? value : JSON.stringify(value))}`);
-  return lines.length > 0 ? lines.join("\n") : `<pre>${escapeHtml(inputPreview)}</pre>`;
+    .map(([key, value]) => `<b>${escapeForFeed(key)}</b>: ${escapeForFeed(typeof value === "string" ? value : JSON.stringify(value))}`);
+  return lines.length > 0 ? lines.join("\n") : `<pre>${escapeForFeed(inputPreview)}</pre>`;
 }
 
 /** §6.3's card shape - a permission request rendered from the channel notification alone (§6.5).
@@ -84,5 +81,5 @@ function renderInputPreview(toolName: string, description: string, inputPreview:
  * the monospace command block below actually render, rather than showing their raw tags. */
 export function renderPermissionCard(fields: PermissionCardFields): string {
   const body = renderInputPreview(fields.toolName, fields.description, fields.inputPreview);
-  return `🔐 <b>${escapeHtml(fields.slug)}</b> wants to run <b>${escapeHtml(fields.toolName)}</b>\n\n${escapeHtml(fields.description)}\n\n${body}`;
+  return `🔐 <b>${escapeForFeed(fields.slug)}</b> wants to run <b>${escapeForFeed(fields.toolName)}</b>\n\n${escapeForFeed(fields.description)}\n\n${body}`;
 }

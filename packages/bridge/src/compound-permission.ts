@@ -1,4 +1,5 @@
 import type { PermissionSettings } from "./settings.ts";
+import { containsUnsafeSubshellOrBackground } from "./shell-metacharacters.ts";
 
 /**
  * 2026-08-10 follow-up to the "too many Bash prompts" investigation (see CLAUDE.md's permission
@@ -22,15 +23,6 @@ import type { PermissionSettings } from "./settings.ts";
  * split on - only *unquoted*, top-level occurrences count as real separators.
  */
 
-const UNSAFE_SUBSTRINGS = ["$(", "`"];
-// A lone `&` (background) - not part of `&&` - is unsafe to decompose; checked separately from
-// UNSAFE_SUBSTRINGS above since a plain `.includes("&")` would also (wrongly) flag every `&&`.
-// Also excludes `&` immediately adjacent to `>` - `2>&1`, `>&2`, `&>file` are fd-duplication/
-// redirect syntax, not job control, and are extremely common in exactly the trusted
-// `cmd 2>&1 | tail -N` shape this module exists to unblock (found live 2026-08-10: that shape was
-// being rejected outright because this regex flagged the `&` in `2>&1` as a bare background `&`).
-const BARE_AMPERSAND_RE = /(?<![&>])&(?![&>])/;
-
 /** File-path substrings that make a command sensitive regardless of which sub-command carries
  * them - mirrors the `Read`/`Edit` deny globs in settings.ts (`.env`, `*.pem`, `*.key`, `*.pfx`,
  * `id_rsa*`, `~/**`), which only bind Claude's `Read`/`Edit` tools and so don't cover the same
@@ -49,7 +41,7 @@ export function containsSensitivePath(command: string): boolean {
  * unterminated quote (malformed/unparseable input; never guess toward "safe" on those).
  */
 export function splitTopLevelCommands(command: string): string[] | null {
-  if (UNSAFE_SUBSTRINGS.some((ch) => command.includes(ch)) || BARE_AMPERSAND_RE.test(command)) return null;
+  if (containsUnsafeSubshellOrBackground(command)) return null;
 
   const parts: string[] = [];
   let current = "";

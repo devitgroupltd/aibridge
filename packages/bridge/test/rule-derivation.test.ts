@@ -51,6 +51,21 @@ describe("deriveAlwaysRule", () => {
     expect(deriveAlwaysRule("Bash", inputPreview)).toBeNull();
   });
 
+  // Regression: `2>&1`/`>&2`/`&>file` are fd-duplication/redirect syntax, not a bare background
+  // `&` - must not be treated as an ungeneralisable metacharacter (mirrors
+  // compound-permission.test.ts's own case for the same bug, found live 2026-08-10).
+  test.each([
+    [bashPreview("bun run typecheck 2>&1 | tail -80")],
+  ])("still bails on a real chain, not on the redirect syntax inside it: %p", (inputPreview) => {
+    // The pipe in this example is a real chain - correctly null - but exercised via a command
+    // shaped like the ones the bare-`&` bug used to false-positive on before the pipe was reached.
+    expect(deriveAlwaysRule("Bash", inputPreview)).toBeNull();
+  });
+
+  test("2>&1 alone (no other metacharacter) is not treated as a bare background &", () => {
+    expect(deriveAlwaysRule("Bash", bashPreview("bun run typecheck 2>&1"))).toBe("Bash(bun run *)");
+  });
+
   test("an empty command derives no rule", () => {
     expect(deriveAlwaysRule("Bash", bashPreview(""))).toBeNull();
     expect(deriveAlwaysRule("Bash", bashPreview("   "))).toBeNull();
