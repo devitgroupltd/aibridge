@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { buildFleetConfirmKeyboard, FleetConfirmRegistry, resolveFleetConfirmCallback } from "../src/fleet-confirm.ts";
+import { autoConfirmKind, buildFleetConfirmKeyboard, FleetConfirmRegistry, parseAutoConfirmKind, resolveFleetConfirmCallback } from "../src/fleet-confirm.ts";
 
 function entry(overrides: Partial<Parameters<FleetConfirmRegistry["add"]>[0]> = {}) {
   return {
@@ -73,6 +73,13 @@ describe("resolveFleetConfirmCallback", () => {
     expect(resolveFleetConfirmCallback("fc:rm-topic:abcde123:n")).toEqual({ id: "abcde123", kind: "rm-topic", confirmed: false });
   });
 
+  test("resolves all four /auto --all kinds - a card that posts but never resolves is a dead button", () => {
+    for (const kind of ["permission-on", "permission-off", "answer-on", "answer-off"] as const) {
+      expect(resolveFleetConfirmCallback(`fc:${kind}:abcde123:y`)).toEqual({ id: "abcde123", kind, confirmed: true });
+      expect(resolveFleetConfirmCallback(`fc:${kind}:abcde123:n`)).toEqual({ id: "abcde123", kind, confirmed: false });
+    }
+  });
+
   test("rejects an unknown kind or malformed confirmation code (tampered callback_data)", () => {
     expect(resolveFleetConfirmCallback("fc:restart:abcde123:y")).toBeNull();
     expect(resolveFleetConfirmCallback("fc:kill:abcde123:x")).toBeNull();
@@ -82,6 +89,24 @@ describe("resolveFleetConfirmCallback", () => {
     expect(resolveFleetConfirmCallback("perm:abcde:a")).toBeNull();
     expect(resolveFleetConfirmCallback("fc:kill:abcde123")).toBeNull();
     expect(resolveFleetConfirmCallback("garbage")).toBeNull();
+  });
+});
+
+describe("autoConfirmKind / parseAutoConfirmKind", () => {
+  test("round-trips both categories in both directions", () => {
+    for (const category of ["permission", "answer"] as const) {
+      for (const on of [true, false]) {
+        expect(parseAutoConfirmKind(autoConfirmKind(category, on))).toEqual({ category, on });
+      }
+    }
+  });
+
+  test('returns null for every non-auto kind - "rm-topic" especially', () => {
+    // The reason this isn't a generic `kind.split("-")`: that reads "rm-topic" as category "rm",
+    // value "topic", turning an /rm --all tap into an auto-toggle on a category that doesn't exist.
+    expect(parseAutoConfirmKind("rm-topic")).toBeNull();
+    expect(parseAutoConfirmKind("kill")).toBeNull();
+    expect(parseAutoConfirmKind("rm")).toBeNull();
   });
 });
 

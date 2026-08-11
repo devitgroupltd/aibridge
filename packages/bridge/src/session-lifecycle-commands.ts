@@ -4,9 +4,9 @@ import { AskRegistry } from "./ask-registry.ts";
 import { buildAttachmentAnnouncement, forgetInboxGitignoreCache, writeAttachmentToInbox } from "./attachment-inbox.ts";
 import { CostTracker } from "./cost-tracker.ts";
 import { cleanupDiffRefs } from "./diff-review.ts";
-import { buildFleetConfirmKeyboard, FleetConfirmRegistry } from "./fleet-confirm.ts";
-import type { FleetCommand } from "./fleet-commands.ts";
-import { buildLsDetail, newSessionContent, renderAttach, renderLsTable } from "./fleet-commands.ts";
+import { autoConfirmKind, buildFleetConfirmKeyboard, FleetConfirmRegistry, type FleetBulkKind } from "./fleet-confirm.ts";
+import type { AutoCategory, FleetCommand } from "./fleet-commands.ts";
+import { AUTO_CATEGORIES, buildLsDetail, newSessionContent, renderAttach, renderLsTable } from "./fleet-commands.ts";
 import { checkConcurrencyCap, WEIGHTED_CAP } from "./concurrency-cap.ts";
 import { monotonicNowMs } from "./monotonic-clock.ts";
 import { PermissionRegistry } from "./permission-registry.ts";
@@ -14,7 +14,7 @@ import type { ReposRegistry } from "./repos-registry.ts";
 import { resolveRepoNameFuzzy } from "./repos-registry.ts";
 import type { Routing } from "./routing.ts";
 import { launchSession } from "./session-launcher.ts";
-import { DEFAULT_EFFORT, DEFAULT_MODE, ESCAPE, type Effort, type Mode } from "./session-commands.ts";
+import { DEFAULT_EFFORT, ESCAPE, type Effort, type Mode } from "./session-commands.ts";
 import type { PtyIo } from "./pty-io.ts";
 import type { SessionSupervisor } from "./session-supervisor.ts";
 import { SessionStore, type SessionRow } from "./session-store.ts";
@@ -22,6 +22,7 @@ import { slugFromPrompt, uniqueSlug } from "./slug.ts";
 import { buildTopicDeepLink, type ForumTopicSource, type InlineKeyboardMarkup, type SendMessageSource } from "./telegram.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import { removeWorktree } from "./worktree.ts";
+import type { VerdictBehavior } from "@aibridge/protocol";
 
 type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
 
@@ -48,6 +49,12 @@ export interface SessionLifecycleCommandsOptions {
    * in place and strips its keyboard. Already used for two other stale-card cases (the TTL sweep's
    * "expired", an ask's own "cancelled" ceiling); `/stop` (`handleStopCommand`) is a third. */
   finalizePermissionMessage: (messageId: number, text: string) => Promise<void>;
+  /** `pipeHandle.sendVerdict` - genuinely new for `/auto permission`'s drain, and deliberately not
+   * shared with `handleStopCommand`, the only other consumer of the two options above: that command
+   * sends no verdict at all (see its doc comment). Returns false when the slug has no live channel
+   * server, which the drain must check - a verdict delivered to nothing, with the card already
+   * edited to claim approval, is the one outcome worse than not draining. */
+  sendVerdict: (slug: string, requestId: string, behavior: VerdictBehavior) => boolean;
   /** Injected rather than imported, same "not yet extracted, avoid a forward reference into a
    * sibling module's own future file" treatment as `dispatchInboundMessage` in inbound-media.ts -
    * `stopIndicatorsForTopic`/`postFleetConfirm`/`executeFleetActionDirect` are fleet-confirm-flow.ts
@@ -59,10 +66,8 @@ export interface SessionLifecycleCommandsOptions {
    * comment. A typed `/new` never started one, so `consume` resolving `undefined` there is the
    * normal, harmless case. */
   thinkingPlaceholder: ThinkingPlaceholder;
-  postFleetConfirm: (kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[], promptText: string) => Promise<void>;
+  postFleetConfirm: (kind: FleetBulkKind, topicId: number | undefined, targets: readonly SessionRow[], promptText: string) => Promise<void>;
   executeFleetActionDirect: (kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[]) => Promise<void>;
-  /** voice-mode-commands.ts (item 10)'s own function - injected for the same reason. */
-  writeModeKeystrokes: (slug: string, mode: Mode) => void;
   /** Composition-root function today (channelConnectCoordinator isn't owned by any extracted
    * module) - injected rather than imported to avoid reaching back into index.ts. */
   waitForChannelConnected: (slug: string, timeoutMs?: number) => Promise<void>;
@@ -76,6 +81,12 @@ export interface SessionLifecycleCommandsOptions {
    * reassign these `let`s at runtime - `handleNewCommand` must see the current value on every call. */
   getDefaultSessionMode: () => Mode;
   getDefaultSessionEffort: () => Effort;
+  /** Live getters for the same reason as the two above - `/default permission|answer`
+   * (voice-mode-commands.ts) reassigns these `let`s at runtime. A construction-time `boolean` here
+   * would compile, persist and confirm, and then every session for the rest of that Bridge's
+   * lifetime would still start without the setting, looking correct again after the next restart. */
+  getDefaultBypassEnabled: () => boolean;
+  getDefaultAutoAnswerEnabled: () => boolean;
   supergroupChatId: string;
   selfCheckSlug: string;
   fleetWorktreesRoot: string | undefined;
@@ -100,6 +111,10 @@ export interface SessionLifecycleCommands {
   handleResumeCommand(cmd: Extract<FleetCommand, { kind: "resume" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void>;
   handleDetailCommand(cmd: Extract<FleetCommand, { kind: "detail" }>, topicId: number | undefined, currentSlug: string | undefined): void;
   handleVerboseCommand(cmd: Extract<FleetCommand, { kind: "verbose" }>, topicId: number | undefined, currentSlug: string | undefined): void;
+  handleAutoCommand(cmd: Extract<FleetCommand, { kind: "auto" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void>;
+  /** Called by `fleet-confirm-flow.ts`'s `--all` branch: that path must go through this, not
+   * `routing.setBypass`, or the fleet-bulk form silently skips the drain. */
+  applyAutoToggle(slug: string, category: AutoCategory, on: boolean): void;
 }
 
 /** §4.5.2's note appended to an `/rm` confirmation whenever `deleteForumTopic` failed above -
@@ -151,16 +166,18 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     fleetConfirmRegistry,
     confirmSessionCommand,
     finalizePermissionMessage,
+    sendVerdict,
     stopIndicatorsForTopic,
     thinkingPlaceholder,
     postFleetConfirm,
     executeFleetActionDirect,
-    writeModeKeystrokes,
     waitForChannelConnected,
     isControlTopic,
     getReposRegistry,
     getDefaultSessionMode,
     getDefaultSessionEffort,
+    getDefaultBypassEnabled,
+    getDefaultAutoAnswerEnabled,
     supergroupChatId,
     selfCheckSlug,
     fleetWorktreesRoot,
@@ -373,6 +390,11 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         repoPath: repo.path,
         worktreesRoot: fleetWorktreesRoot,
         model,
+        // `/default mode`, applied as a launch flag instead of the post-launch Shift+Tab burst that
+        // never actually landed (see `buildClaudeSpawnArgs`). Read here rather than further down so
+        // it's part of the spawn itself; `routing.setMode` below keeps the tracked value in step, so
+        // a later live `/mode` switch still cycles from the right starting point.
+        permissionMode: getDefaultSessionMode(),
         otlpPort,
         log,
       });
@@ -470,19 +492,27 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // lost even with the dialog long since confirmed, also confirmed live 2026-08-04).
     await session.ready;
     await waitForChannelConnected(slug);
-    // `/defaultmode`/`/defaulteffort`: applied before the initial prompt, not after, so the very
-    // first turn already runs under the configured defaults rather than starting under the CLI's
-    // own "manual"/"medium" spawn default and switching mid-turn. Silent (no confirmSessionCommand)
-    // - see writeModeKeystrokes's own doc comment for why a second "Switched..." message here would
-    // just be noise on top of the "Created ..." confirmation already sent above. Skipped entirely
-    // when a default is still at the CLI's own spawn default, rather than relying on either write
-    // being a harmless no-op at that value - unverified for `/effort`, and `routing.getMode`'s
-    // default already assumes "manual" until the first real switch, so a same-value keystroke send
-    // isn't even a true no-op, just zero `buildModeKeystrokes` steps.
-    const defaultSessionMode = getDefaultSessionMode();
+    // `/default effort`: applied before the initial prompt, not after, so the very first turn
+    // already runs under the configured default rather than starting at the CLI's own "medium" and
+    // switching mid-turn. Silent (no confirmSessionCommand) - a second "Switched..." message here
+    // would just be noise on top of the "Created ..." confirmation already sent above. Skipped when
+    // it's still at the CLI's own spawn default rather than relying on the write being a harmless
+    // no-op at that value, which is unverified for `/effort`.
+    //
+    // `/default mode` is NOT applied here any more - it's a `--permission-mode` launch flag now (see
+    // the `launchSession` call above). Only the Bridge's own tracked value is set, so a later live
+    // `/mode` switch cycles from where the session actually is; no keystroke is sent, because the
+    // session already started in that mode.
     const defaultSessionEffort = getDefaultSessionEffort();
-    if (defaultSessionMode !== DEFAULT_MODE) writeModeKeystrokes(slug, defaultSessionMode);
+    routing.setMode(slug, getDefaultSessionMode());
     if (defaultSessionEffort !== DEFAULT_EFFORT) ptyIo.sendEffortCommand(slug, defaultSessionEffort);
+    // `/default permission`/`/default answer`: deliberately *not* the keystroke/typed-command
+    // machinery its two neighbours above need. This state lives in `routing.ts`, on the Bridge side
+    // of the relay - there is no CLI setting to drive and nothing to type into the PTY. `spec.set`
+    // rather than `applyAutoToggle` for the same reason the plan gives: a session created seconds ago
+    // has no already-posted permission card to drain.
+    if (getDefaultBypassEnabled()) autoCategorySpec("permission").set(slug, true);
+    if (getDefaultAutoAnswerEnabled()) autoCategorySpec("answer").set(slug, true);
     ptyIo.sendChannelText(slug, topic.message_thread_id, newSessionContent(cmd), "new-1", "telegram");
   }
 
@@ -737,6 +767,156 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     confirmSessionCommand(topicId, `"${row.slug}" verbose tool output set to ${cmd.on ? "on" : "off"}.${noEffectNote}`);
   }
 
+  /**
+   * `/auto <category>`'s per-category differences, resolved once (bypass-and-autoanswer-plan.md
+   * §0.2). The *only* place the categories are enumerated: `handleAutoCommand`'s scope tree and
+   * `applyAutoToggle` both read this descriptor rather than switching again, so a future third
+   * category fails to compile at one `never` arm instead of silently landing in someone's `else`.
+   *
+   * That indirection is not decoration. Four review passes over this feature's plan found nine
+   * instances of the same defect - a two-way branch quietly absorbing a third case - and twice the
+   * proposed fix was "add another exhaustive switch", after which the next pass found a site the
+   * enumeration had missed. A guarantee spread over N sites is only as good as remembering all N.
+   */
+  interface AutoCategorySpec {
+    readonly label: string;
+    readonly get: (slug: string) => boolean;
+    readonly set: (slug: string, on: boolean) => void;
+    /** Whether turning this category ON drains that session's already-pending escalations.
+     * `permission` does; `answer` deliberately does not - draining a pending question would answer
+     * it on the operator's behalf with an option they never saw, which (unlike a permission verdict)
+     * is not obviously the one they'd have picked. */
+    readonly drainsOnEnable: boolean;
+    readonly confirmation: (slug: string, on: boolean) => string;
+    /** The `--all` confirm card's own prompt (§0.3). The slug list is appended by
+     * `postFleetConfirm`, same as `/kill --all`'s. Only ever reached with an explicit on/off - a
+     * bare `--all` reports fleet status and never posts a card. */
+    readonly bulkPrompt: (on: boolean) => string;
+  }
+
+  function autoCategorySpec(category: AutoCategory): AutoCategorySpec {
+    switch (category) {
+      case "permission":
+        return {
+          label: "Auto-permission",
+          get: (slug) => routing.getBypass(slug),
+          set: (slug, on) => routing.setBypass(slug, on),
+          drainsOnEnable: true,
+          confirmation: (slug, on) =>
+            on
+              ? `🔓 Auto-permission is now ON for "${slug}" - every permission prompt this session would raise, including git commit/push, PR merge/create, and npm publish, is auto-allowed with no Telegram prompt. The deny list (force-push, secret reads, rm -rf /) still hard-blocks regardless - this cannot bypass that. /auto permission off to revert; it also resets to off on every Bridge restart.`
+              : `Auto-permission is now off for "${slug}" - permission prompts resume as normal.`,
+          bulkPrompt: (on) =>
+            on
+              ? "⚠️ Turn auto-permission ON for every live session? This auto-allows ALL permission prompts (including git commit/push) with no further Telegram confirmation, for:"
+              : "Turn auto-permission OFF for every live session? Permission prompts resume as normal for:",
+        };
+      case "answer":
+        return {
+          label: "Auto-answer",
+          get: (slug) => routing.getAutoAnswer(slug),
+          set: (slug, on) => routing.setAutoAnswer(slug, on),
+          drainsOnEnable: false,
+          confirmation: (slug, on) =>
+            on
+              ? `🔓 Auto-answer is now ON for "${slug}" - when Claude marks exactly one option as its recommendation, that question is answered automatically with no card posted. You still get the real buttons whenever there's no clear recommendation, or whenever one of the other options looks like "investigate/verify/hold off first" - those are yours to choose, never auto-picked. /auto answer off to revert.`
+              : `Auto-answer is now off for "${slug}" - questions show you the real buttons again.`,
+          bulkPrompt: (on) =>
+            on
+              ? "⚠️ Turn auto-answer ON for every live session? Questions where Claude marked exactly one option as recommended are answered automatically, with no card posted, for:"
+              : "Turn auto-answer OFF for every live session? Questions show you the real buttons again for:",
+        };
+      default: {
+        const _exhaustive: never = category;
+        throw new Error(`unhandled /auto category: ${_exhaustive}`);
+      }
+    }
+  }
+
+  /**
+   * The common way to discover you want auto-permission is to be looking at a card you don't want to
+   * tap - so turning it on drains what's already pending rather than only affecting future requests.
+   *
+   * Unlike `handleStopCommand`'s superficially similar loop, this **must** send a verdict:
+   * `/stop` writes an ESCAPE first, so Claude's own interrupt handling has already unblocked the
+   * waiting hook client and there is nothing left for a verdict to reach. Nothing is interrupted
+   * here. Popping the entry and editing its card without sending one would leave no recovery path at
+   * all - `sweepExpiredPermissions` iterates the registry this just emptied, so the session would
+   * hang forever on a card claiming it was approved.
+   */
+  function drainPendingPermissions(slug: string): void {
+    for (const entry of permissionRegistry.removeForSlug(slug)) {
+      // Verdict first, then finalize - the reverse of the auto-approve notice's ordering in
+      // pipe-server.ts, and for the opposite reason: this card edit is a terminal marker whose text
+      // depends on whether the verdict actually reached anything, so it can't be written first
+      // without guessing.
+      const delivered = sendVerdict(slug, entry.requestId, "allow");
+      if (!delivered) log("WARN", `auto-permission drain: no live channel for "${slug}", ${entry.toolName} left unapproved`);
+      const text = delivered
+        ? `🔓 auto-approved: ${entry.toolName} (auto-permission was turned on)`
+        : `⚠️ auto-permission is on, but this request couldn't be auto-approved: the session's channel is disconnected. Re-send the tool call once it's back.`;
+      finalizePermissionMessage(entry.messageId, text).catch((err) => log("WARN", `failed to finalize auto-approved permission for "${slug}": ${(err as Error).message}`));
+    }
+  }
+
+  /** Set + drain, in that order - the only supported way to change either toggle for a live session.
+   * A bare `spec.set` call skips the drain and leaves already-posted cards wedged forever. */
+  function applyAutoToggle(slug: string, category: AutoCategory, on: boolean): void {
+    const spec = autoCategorySpec(category);
+    spec.set(slug, on);
+    if (on && spec.drainsOnEnable) drainPendingPermissions(slug);
+  }
+
+  /**
+   * `/auto <category> --all` with no on/off value: one line per live session showing *both*
+   * categories, not just the one asked about. This is the reports-status form (§0.3) - a bare `--all`
+   * must never reach the confirm card, whose kind carries the value and whose prompt is a fixed
+   * string saying ON; a card built from `undefined` would say one thing and, via a falsy coercion at
+   * the Yes button, do the opposite fleet-wide.
+   *
+   * It also closes the only real observability gap this deliberately in-memory design otherwise has:
+   * there is no `/ls` column for either flag and no other way to ask "which sessions have this on?".
+   */
+  function renderAutoFleetStatus(rows: readonly SessionRow[]): string {
+    if (rows.length === 0) return "No live sessions.";
+    const lines = rows.map((row) => `${row.slug}: ${AUTO_CATEGORIES.map((category) => `${category} ${autoCategorySpec(category).get(row.slug) ? "on" : "off"}`).join(", ")}`);
+    return [`Auto-resolve settings for ${rows.length} live session${rows.length === 1 ? "" : "s"}:`, ...lines].join("\n");
+  }
+
+  /**
+   * `/auto <permission|answer> [<slug>|--all] [on|off]` - dispatches on *scope*, with the category
+   * resolved once through `autoCategorySpec`. All three scopes are category-agnostic, so splitting
+   * by category first would mean writing the whole tree twice.
+   */
+  async function handleAutoCommand(cmd: Extract<FleetCommand, { kind: "auto" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
+    const spec = autoCategorySpec(cmd.category);
+
+    if (cmd.all) {
+      // Same `selfCheckSlug` exclusion `/kill --all`/`/rm --all` already apply, and the same
+      // live-only filter: the Bridge's own hardcoded dev/self-check session isn't an
+      // operator-created one, and a dead session has no escalations left to auto-resolve.
+      const targets = sessionStore.all().filter((r) => r.state !== "dead" && r.slug !== selfCheckSlug);
+      if (cmd.on === undefined) {
+        confirmSessionCommand(topicId, renderAutoFleetStatus(targets));
+        return;
+      }
+      await postFleetConfirm(autoConfirmKind(cmd.category, cmd.on), topicId, targets, spec.bulkPrompt(cmd.on));
+      return;
+    }
+
+    const row = resolveSessionOrBail(cmd.slug, currentSlug, topicId);
+    if (!row) return;
+
+    // Bare = reports status, never toggles. A status read must not flip a safety gate.
+    if (cmd.on === undefined) {
+      confirmSessionCommand(topicId, `"${row.slug}" ${spec.label.toLowerCase()}: ${spec.get(row.slug) ? "on" : "off"}.`);
+      return;
+    }
+
+    applyAutoToggle(row.slug, cmd.category, cmd.on);
+    confirmSessionCommand(topicId, spec.confirmation(row.slug, cmd.on));
+  }
+
   return {
     resolveTargetSlug,
     killSessionRow,
@@ -752,5 +932,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     handleResumeCommand,
     handleDetailCommand,
     handleVerboseCommand,
+    handleAutoCommand,
+    applyAutoToggle,
   };
 }

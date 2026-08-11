@@ -86,13 +86,23 @@ export function isSessionCommandAttempt(text: string): boolean {
   return /^\/(model|mode|effort)\s+/.test(text.trim());
 }
 
-/** §4.2.2: how many Shift+Tab presses separate `current` from `target` in the cycle, wrapping
- * forward only (the picker has no "previous" direction). Zero if already there. */
-export function buildModeKeystrokes(current: Mode, target: Mode): string {
+/**
+ * §4.2.2: the Shift+Tab presses separating `current` from `target` in the cycle, wrapping forward
+ * only (the picker has no "previous" direction) - **one array entry per press**, empty if already
+ * there. The caller must write them to the PTY spaced apart.
+ *
+ * There used to be a `buildModeKeystrokes` beside this returning `SHIFT_TAB.repeat(steps)`, one
+ * concatenated string. That is exactly the 2026-08-10 defect: written in a single go, a three-press
+ * manual->auto switch advanced the picker once (`manual` -> `accept edits on`), because the TUI
+ * consumes one key per render frame and discards the rest of the buffer. It was deleted rather than
+ * kept for its distance tests - a correct-looking function whose only remaining consumer was its own
+ * test, sitting next to the one that replaced it, is how the same burst gets reintroduced.
+ */
+export function buildModeKeystrokeSteps(current: Mode, target: Mode): string[] {
   const from = MODES.indexOf(current);
   const to = MODES.indexOf(target);
   const steps = (to - from + MODES.length) % MODES.length;
-  return SHIFT_TAB.repeat(steps);
+  return Array.from({ length: steps }, () => SHIFT_TAB);
 }
 
 export interface InlineKeyboardButton {
@@ -158,27 +168,61 @@ export const resolveDefaultEffortCallback = (data: string): Effort | null => res
 export const isDefaultModeCancelCallback = (data: string): boolean => isLevelCancelCallback("defmode", data);
 export const isDefaultEffortCancelCallback = (data: string): boolean => isLevelCancelCallback("defeffort", data);
 
-export type DefaultCategory = "mode" | "effort";
+/** The N-valued `/default` categories: the ones with a drill-down value picker behind them. */
+export type DefaultPickerCategory = "mode" | "effort";
+/** The boolean `/default` categories (bypass-and-autoanswer-plan.md §0.4) - `/auto`'s two toggles,
+ * as a new-session default. Deliberately a *different shape* from the two above rather than being
+ * forced through the N-valued picker: a boolean has nothing to drill into. */
+export type DefaultToggleCategory = "permission" | "answer";
+export type DefaultCategory = DefaultPickerCategory | DefaultToggleCategory;
 
 /** `/default`'s top-level picker (bare `/default`, or a tapped "back" from either value picker in
  * a future pass) - one row per category, each button's own label carrying that category's current
  * value so the whole picker doubles as a status readout, plus the same trailing Cancel row every
- * other picker here has. */
-export function buildDefaultCategoryKeyboard(currentMode: Mode, currentEffort: Effort): InlineKeyboardButton[][] {
+ * other picker here has.
+ *
+ * The two boolean rows are direct toggles: tapping applies immediately, no intermediate screen. That
+ * makes them value-dependent in *two* places at once - the label AND the `callback_data`, which
+ * carries the inverse of the current value - which is why the two new current-value parameters are
+ * not optional. An implementer with no current value to hand would have to hardcode
+ * `default:permission:on`, producing a button that turns the default on and can then never turn it
+ * off, under a label claiming it will. */
+export function buildDefaultCategoryKeyboard(currentMode: Mode, currentEffort: Effort, currentBypass: boolean, currentAutoAnswer: boolean): InlineKeyboardButton[][] {
+  const toggleRow = (label: string, category: DefaultToggleCategory, current: boolean) => [
+    { text: `${label}: ${current ? "ON" : "OFF"} (tap to turn ${current ? "OFF" : "ON"})`, callback_data: `default:${category}:${current ? "off" : "on"}` },
+  ];
   return [
     [{ text: `Mode (${currentMode})`, callback_data: "default:mode" }],
     [{ text: `Effort (${currentEffort})`, callback_data: "default:effort" }],
+    toggleRow("Auto-permission", "permission", currentBypass),
+    toggleRow("Auto-answer", "answer", currentAutoAnswer),
     [{ text: "✖️ Cancel", callback_data: "default:cancel" }],
   ];
 }
 
 /** `default:mode`/`default:effort` - not `resolveLevelCallback`-shaped (there's no enum of valid
  * category *values* to re-validate against, just two fixed literal strings), so this is its own
- * small parser rather than a third `buildLevelKeyboard` instantiation. */
-export function resolveDefaultCategoryCallback(data: string): DefaultCategory | null {
+ * small parser rather than a third `buildLevelKeyboard` instantiation.
+ *
+ * Stays narrow at `DefaultPickerCategory` deliberately, and must not be widened "for consistency"
+ * when `DefaultCategory` grows: it resolves the two-segment category-drill-down taps only. The
+ * boolean categories have no drill-down screen at all - their three-segment strings are
+ * `resolveDefaultToggleCallback`'s below. Widening this would hand a boolean category straight to
+ * the drill-down handler, which has no picker to show for it. */
+export function resolveDefaultCategoryCallback(data: string): DefaultPickerCategory | null {
   if (data === "default:mode") return "mode";
   if (data === "default:effort") return "effort";
   return null;
+}
+
+/** `default:permission:on|off` / `default:answer:on|off` - the direct-toggle rows above. Its own
+ * resolver rather than an extension of `resolveDefaultCategoryCallback` (see that function's note),
+ * re-validating both segments against fixed literals with the same defensive discipline as every
+ * sibling resolver here, since `callback_data` is attacker-shaped input in principle. */
+export function resolveDefaultToggleCallback(data: string): { category: DefaultToggleCategory; value: boolean } | null {
+  const match = data.match(/^default:(permission|answer):(on|off)$/);
+  if (!match) return null;
+  return { category: match[1] as DefaultToggleCategory, value: match[2] === "on" };
 }
 
 export function isDefaultCategoryCancelCallback(data: string): boolean {

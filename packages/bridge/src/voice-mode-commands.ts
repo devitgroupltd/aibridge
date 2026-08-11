@@ -6,9 +6,10 @@ import {
   buildDefaultCategoryKeyboard,
   buildDefaultEffortKeyboard,
   buildDefaultModeKeyboard,
-  buildModeKeystrokes,
+  buildModeKeystrokeSteps,
 } from "./session-commands.ts";
-import type { DefaultCategory, Effort, Mode } from "./session-commands.ts";
+import type { InlineKeyboardButton } from "./session-commands.ts";
+import type { DefaultPickerCategory, DefaultToggleCategory, Effort, Mode } from "./session-commands.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import type { PtyIo } from "./pty-io.ts";
 import type { Routing } from "./routing.ts";
@@ -46,12 +47,27 @@ export interface VoiceModeCommandsOptions {
   setDefaultSessionMode: (mode: Mode) => void;
   getDefaultSessionEffort: () => Effort;
   setDefaultSessionEffort: (effort: Effort) => void;
+  /** `/default permission|answer` (bypass-and-autoanswer-plan.md §0.4). Both halves, like mode/effort
+   * above: this module writes them, and `sendDefaultStatusCard` needs to *read* them live to render
+   * each toggle row's label and its inverse-valued `callback_data`. */
+  getDefaultBypassEnabled: () => boolean;
+  setDefaultBypassEnabled: (value: boolean) => void;
+  getDefaultAutoAnswerEnabled: () => boolean;
+  setDefaultAutoAnswerEnabled: (value: boolean) => void;
   getNlRouterBackend: () => "api" | "cli";
   setNlRouterBackend: (backend: "api" | "cli") => void;
   nlRouterApiKeyConfigured: boolean;
   supergroupChatId: string;
   log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  /** Injectable in place of the real `setTimeout`, same convention as `pty-io.ts` - lets
+   * `writeModeKeystrokes`' spaced presses be asserted without real waits. */
+  setTimeoutFn?: (fn: () => void, ms: number) => unknown;
 }
+
+/** Gap between consecutive Shift+Tab presses. Comfortably longer than a TUI render frame without
+ * making a three-step switch feel laggy; `sendEffortCommand`'s own 200ms inter-write delay for the
+ * same class of problem is the precedent. */
+export const MODE_KEYSTROKE_GAP_MS = 150;
 
 export interface VoiceModeCommands {
   applyModelSwitch(slug: string, topicId: number, model: string): void;
@@ -64,9 +80,10 @@ export interface VoiceModeCommands {
   handleVoiceConfirmCommand(cmd: Extract<FleetCommand, { kind: "voiceconfirm" }>, topicId: number | undefined): void;
   renderDefaultModeConfirmation(mode: Mode): string;
   sendDefaultStatusCard(topicId: number | undefined): void;
-  sendDefaultCategoryPicker(topicId: number | undefined, category: DefaultCategory): void;
+  sendDefaultCategoryPicker(topicId: number | undefined, category: DefaultPickerCategory): void;
   applyDefaultMode(mode: Mode): string;
   applyDefaultEffort(effort: Effort): string;
+  applyDefaultAutoToggle(category: DefaultToggleCategory, value: boolean): string;
   handleDefaultCommand(cmd: Extract<FleetCommand, { kind: "default" }>, topicId: number | undefined): void;
   handleRouterBackendCommand(cmd: Extract<FleetCommand, { kind: "router" }>, topicId: number | undefined): void;
 }
@@ -89,12 +106,17 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
     setDefaultSessionMode,
     getDefaultSessionEffort,
     setDefaultSessionEffort,
+    getDefaultBypassEnabled,
+    setDefaultBypassEnabled,
+    getDefaultAutoAnswerEnabled,
+    setDefaultAutoAnswerEnabled,
     getNlRouterBackend,
     setNlRouterBackend,
     nlRouterApiKeyConfigured,
     supergroupChatId,
     log,
   } = opts;
+  const setTimeoutFn = opts.setTimeoutFn ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
 
   // Shared by the typed `/model foo` / `/mode bar` / `/effort baz` path and the button-tap path
   // (bare /model, /mode or /effort followed by a keyboard selection) - same switch, two triggers.
@@ -110,11 +132,22 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
   // noise for something the operator already configured, not something they just asked for here).
   function writeModeKeystrokes(slug: string, mode: Mode): void {
     const current = routing.getMode(slug);
-    const keystrokes = buildModeKeystrokes(current, mode);
-    // Already at the target mode: no keystroke to send, and ptyIo.sendRaw("") would still submit a
-    // spurious blank Enter at the prompt.
-    if (keystrokes.length > 0) {
-      routing.getPtyWrite(slug)?.(keystrokes);
+    const steps = buildModeKeystrokeSteps(current, mode);
+    // Already at the target mode: nothing to send, and a zero-length write would still be a
+    // spurious keystroke at the prompt.
+    const write = routing.getPtyWrite(slug);
+    if (write) {
+      // One press per tick, not `SHIFT_TAB.repeat(n)` in a single write. Live-reproduced 2026-08-10:
+      // a three-press burst for manual->auto advanced the picker exactly once (`manual` -> `accept
+      // edits on`), because the TUI consumes one key per render frame and drops the rest of the
+      // buffer - the same class of PTY-timing hazard as `sendEffortCommand`'s confirming `\r`
+      // arriving before its dialog has rendered, and fixed the same way. New sessions no longer
+      // depend on this at all (they get `--permission-mode` at launch); this path is the live
+      // `/mode` switch, which has no CLI equivalent mid-session.
+      steps.forEach((keystroke, i) => {
+        if (i === 0) write(keystroke);
+        else setTimeoutFn(() => write(keystroke), MODE_KEYSTROKE_GAP_MS * i);
+      });
     }
     routing.setMode(slug, mode);
   }
@@ -220,8 +253,16 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
    * kept as one function so the two spots that need "what are the defaults right now" (the status
    * card and the mode-change confirmation) can't drift apart. */
   function renderDefaultModeConfirmation(mode: Mode): string {
+    // The old text claimed auto mode meant "no permission prompts at all for any tool call,
+    // including git commit/push". That is false, per Claude Code's own current docs: auto mode still
+    // forces a prompt for every `permissions.ask` rule match - and `settings.ts` deliberately puts
+    // git commit/push there (CLAUDE.md decision 3) - and it falls back to full manual prompting
+    // after 3 consecutive or 20 total classifier blocks. Overstating this is worse than saying
+    // nothing: an operator who believes it stops expecting the cards that will still arrive, and
+    // reaches for the wrong control when they do. `/auto permission` is the one that actually makes
+    // that promise, so it's named here rather than left to be discovered.
     return mode === "auto"
-      ? "New sessions will now start in auto mode - no permission prompts at all for any tool call, including git commit/push, until this is changed back. /default mode manual to revert."
+      ? "New sessions will now start in auto mode - most tool calls run without a prompt, but anything on the ask list (git commit/push, PR merge, npm publish) still asks, and Claude Code falls back to prompting for everything after repeated classifier blocks. /default mode manual to revert. For genuinely no prompts at all, use /default permission on instead - that's a Bridge-level auto-allow and isn't subject to either limit."
       : `New sessions will now start in ${mode} mode.`;
   }
 
@@ -233,12 +274,15 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
   function sendDefaultStatusCard(topicId: number | undefined): void {
     const defaultSessionMode = getDefaultSessionMode();
     const defaultSessionEffort = getDefaultSessionEffort();
+    const defaultBypass = getDefaultBypassEnabled();
+    const defaultAutoAnswer = getDefaultAutoAnswerEnabled();
+    const autoNote = defaultBypass || defaultAutoAnswer ? ` Auto-permission ${defaultBypass ? "on" : "off"}, auto-answer ${defaultAutoAnswer ? "on" : "off"}.` : "";
     controlBot
       .sendMessage(
         supergroupChatId,
         topicId,
-        `New sessions currently start in ${defaultSessionMode} mode at ${defaultSessionEffort} effort. Tap one to change it:`,
-        { inline_keyboard: buildDefaultCategoryKeyboard(defaultSessionMode, defaultSessionEffort) },
+        `New sessions currently start in ${defaultSessionMode} mode at ${defaultSessionEffort} effort.${autoNote} Tap one to change it:`,
+        { inline_keyboard: buildDefaultCategoryKeyboard(defaultSessionMode, defaultSessionEffort, defaultBypass, defaultAutoAnswer) },
       )
       .catch((err) => log("WARN", `sendMessage (/default status) failed: ${(err as Error).message}`));
   }
@@ -247,11 +291,22 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
    * button from `sendDefaultStatusCard`'s keyboard): shows that category's own value picker, current
    * value marked, under the `defmode:`/`defeffort:` namespace (`session-commands.ts` - deliberately
    * not `mode:`/`effort:`, which resolve against `currentSlug` and would silently no-op here). */
-  function sendDefaultCategoryPicker(topicId: number | undefined, category: DefaultCategory): void {
-    const [prompt, keyboard] =
-      category === "mode"
-        ? [`Choose the default permission mode for new sessions (current: ${getDefaultSessionMode()}):`, buildDefaultModeKeyboard(getDefaultSessionMode())]
-        : [`Choose the default effort level for new sessions (current: ${getDefaultSessionEffort()}):`, buildDefaultEffortKeyboard(getDefaultSessionEffort())];
+  function sendDefaultCategoryPicker(topicId: number | undefined, category: DefaultPickerCategory): void {
+    // Exhaustive, and typed to the picker categories only: `permission`/`answer` are booleans with
+    // no picker to show, so they can't reach here at all rather than being silently handed the
+    // effort screen the way a two-way ternary over a widened union would have done.
+    const [prompt, keyboard] = ((): [string, InlineKeyboardButton[][]] => {
+      switch (category) {
+        case "mode":
+          return [`Choose the default permission mode for new sessions (current: ${getDefaultSessionMode()}):`, buildDefaultModeKeyboard(getDefaultSessionMode())];
+        case "effort":
+          return [`Choose the default effort level for new sessions (current: ${getDefaultSessionEffort()}):`, buildDefaultEffortKeyboard(getDefaultSessionEffort())];
+        default: {
+          const _exhaustive: never = category;
+          throw new Error(`unhandled /default picker category: ${_exhaustive}`);
+        }
+      }
+    })();
     controlBot
       .sendMessage(supergroupChatId, topicId, prompt, { inline_keyboard: keyboard })
       .catch((err) => log("WARN", `sendMessage (/default ${category}) failed: ${(err as Error).message}`));
@@ -279,24 +334,91 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
     return `New sessions will now start at ${effort} effort.`;
   }
 
-  function handleDefaultCommand(cmd: Extract<FleetCommand, { kind: "default" }>, topicId: number | undefined): void {
-    if (cmd.category === "status") {
-      sendDefaultStatusCard(topicId);
-      return;
+  /** The two boolean categories' per-category differences, resolved once behind a single `never`
+   * arm - same descriptor discipline as `session-lifecycle-commands.ts`'s `autoCategorySpec`, and
+   * for the same reason: every consumer here (`handleDefaultCommand`'s status form, its set form,
+   * and the callback router's tap) reads this rather than switching again. */
+  function defaultToggleSpec(category: DefaultToggleCategory): { label: string; get: () => boolean; set: (value: boolean) => void; settingsKey: string; confirmation: (value: boolean) => string } {
+    switch (category) {
+      case "permission":
+        return {
+          label: "auto-permission",
+          get: getDefaultBypassEnabled,
+          set: setDefaultBypassEnabled,
+          settingsKey: "default_bypass_enabled",
+          confirmation: (value) =>
+            value
+              ? "New sessions will now start with auto-permission ON - every permission prompt they'd otherwise raise, including git commit/push, is auto-allowed from their very first turn. /default permission off to revert (only affects sessions created after that point - see /auto permission --all off to also flip already-running ones)."
+              : "New sessions will now start with auto-permission off - they'll ask before anything outside the allowlist. Already-running sessions keep whatever they're set to (/auto permission --all off to flip those too).",
+        };
+      case "answer":
+        return {
+          label: "auto-answer",
+          get: getDefaultAutoAnswerEnabled,
+          set: setDefaultAutoAnswerEnabled,
+          settingsKey: "default_autoanswer_enabled",
+          confirmation: (value) =>
+            value
+              ? "New sessions will now start with auto-answer ON - from their first turn, a question where Claude marked exactly one option as recommended is answered automatically, with no card posted. Anything less clear still shows you the real buttons. /default answer off to revert (only affects sessions created after that point)."
+              : "New sessions will now start with auto-answer off - questions show you the real buttons. Already-running sessions keep whatever they're set to (/auto answer --all off to flip those too).",
+        };
+      default: {
+        const _exhaustive: never = category;
+        throw new Error(`unhandled /default toggle category: ${_exhaustive}`);
+      }
     }
-    if (cmd.category === "mode") {
-      if (cmd.value === undefined) {
-        sendDefaultCategoryPicker(topicId, "mode");
+  }
+
+  /** Shared by the typed `/default permission on` path and the status card's own toggle-row taps,
+   * so the two can't drift - and doing the three-part write-through the persisted fleet defaults all
+   * need: the in-memory `let` (via the injected setter, which is what `handleNewCommand` reads) *and*
+   * the settings row that rehydrates it on the next Bridge start. */
+  function applyDefaultAutoToggle(category: DefaultToggleCategory, value: boolean): string {
+    const spec = defaultToggleSpec(category);
+    spec.set(value);
+    settingsStore.set(spec.settingsKey, String(value));
+    return spec.confirmation(value);
+  }
+
+  /**
+   * An exhaustive `switch`, not the `if`/`if`/implicit-tail shape this replaced. That tail treated
+   * "anything that isn't status or mode" as effort, so `/default permission on` used to reach
+   * `applyDefaultEffort(true)` - writing a boolean into `default_session_effort`, reporting "New
+   * sessions will now start at true effort", leaving `permission` untouched, and corrupting a
+   * persisted setting the operator never asked to change (one `index.ts` reads back at every
+   * startup). With four categories the root fix is exhaustiveness: a fifth fails to compile here
+   * instead of silently landing in someone else's branch.
+   */
+  function handleDefaultCommand(cmd: Extract<FleetCommand, { kind: "default" }>, topicId: number | undefined): void {
+    switch (cmd.category) {
+      case "status":
+        sendDefaultStatusCard(topicId);
+        return;
+      case "mode":
+        if (cmd.value === undefined) sendDefaultCategoryPicker(topicId, "mode");
+        else confirmSessionCommand(topicId, applyDefaultMode(cmd.value));
+        return;
+      case "effort":
+        if (cmd.value === undefined) sendDefaultCategoryPicker(topicId, "effort");
+        else confirmSessionCommand(topicId, applyDefaultEffort(cmd.value));
+        return;
+      case "permission":
+      case "answer": {
+        // Bare = reports, never toggles (same rule as `/auto`'s own bare form): a status read must
+        // not flip a safety gate. No value picker either - there's nothing to pick between.
+        const spec = defaultToggleSpec(cmd.category);
+        if (cmd.value === undefined) {
+          confirmSessionCommand(topicId, `New sessions currently start with ${spec.label} ${spec.get() ? "on" : "off"}. /default ${cmd.category} ${spec.get() ? "off" : "on"} to change it.`);
+          return;
+        }
+        confirmSessionCommand(topicId, applyDefaultAutoToggle(cmd.category, cmd.value));
         return;
       }
-      confirmSessionCommand(topicId, applyDefaultMode(cmd.value));
-      return;
+      default: {
+        const _exhaustive: never = cmd;
+        throw new Error(`unhandled /default category: ${JSON.stringify(_exhaustive)}`);
+      }
     }
-    if (cmd.value === undefined) {
-      sendDefaultCategoryPicker(topicId, "effort");
-      return;
-    }
-    confirmSessionCommand(topicId, applyDefaultEffort(cmd.value));
   }
 
   /** `/router [api|cli]` - live switch for the NL-router backend, no restart needed either
@@ -340,6 +462,7 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
     sendDefaultCategoryPicker,
     applyDefaultMode,
     applyDefaultEffort,
+    applyDefaultAutoToggle,
     handleDefaultCommand,
     handleRouterBackendCommand,
   };

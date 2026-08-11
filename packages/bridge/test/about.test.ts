@@ -35,6 +35,35 @@ describe("buildDialogueGroundingText", () => {
   });
 });
 
+// /auto removes the operator's own approval step, so its two non-obvious properties have to be
+// discoverable from /about rather than only from the confirmation text you see after enabling it:
+// that it auto-allows the ask list (git commit/push), and that the deny list still hard-blocks.
+describe("ABOUT_TOPICS documents /auto", () => {
+  test("covers both categories, what permission gives away, and the floor it cannot cross", () => {
+    const details = Object.values(ABOUT_TOPICS)
+      .flatMap((t) => t.details)
+      .join("\n");
+    expect(details).toContain("/auto permission|answer");
+    expect(details).toContain("git commit/push");
+    expect(details).toContain("deny list");
+    // The veto - the operator asked for investigate-first options to stay theirs to choose.
+    expect(details).toContain("investigate/verify/hold off first");
+  });
+
+  // The two wider scopes are where an operator can most easily do more than they meant to, so the
+  // two properties that actually distinguish them have to be discoverable: `--all` is confirm-gated
+  // and momentary, `/default` is silent and persistent.
+  test("covers the --all and /default scopes, including which one survives a restart", () => {
+    const details = Object.values(ABOUT_TOPICS)
+      .flatMap((t) => t.details)
+      .join("\n");
+    expect(details).toContain("/auto permission|answer --all");
+    expect(details).toContain("/default permission|answer");
+    expect(details).toContain("confirm card");
+    expect(details).toContain("survive a");
+  });
+});
+
 describe("buildAboutKeyboard", () => {
   test("one button per topic, each resolving back to that same topic id", () => {
     const keyboard = buildAboutKeyboard();

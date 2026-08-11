@@ -89,6 +89,17 @@ function isDestructive(command: FleetCommand | SessionCommand | RouterAction): b
   // self-propagating.
   if (command.kind === "mode" && command.mode === "auto") return true;
   if ((command.kind === "assist" || command.kind === "voiceconfirm") && command.action === "off") return true;
+  // `/auto <category> on` is that same "stop asking me for permission" sentence, only more so - the
+  // comment above names it as `mode auto`'s most plausible fuzzy match, and it describes this command
+  // more exactly than the one it was written about. Gated on the `on` transition only (turning a
+  // guard back on needs no guard) and excluded for `--all`, which posts its own confirm card and
+  // would otherwise show two in a row. One line covers both categories: neither the condition nor
+  // its rationale differs between them.
+  if (command.kind === "auto" && command.on === true) return !command.all;
+  // `/default permission|answer on` is the same guard-off transition one level up again, and wider:
+  // it applies to every session created from that point on, not just the live ones. Unlike `--all`
+  // it posts no confirm card of its own, so this is the only gate there is.
+  if (command.kind === "default" && (command.category === "permission" || command.category === "answer") && command.value === true) return true;
   return false;
 }
 
@@ -123,6 +134,12 @@ export const ROUTER_KINDS = [
   "ship",
   "detail",
   "verbose",
+  // Deliberately absent from `allowedKinds`' two exclusion predicates below: `/auto` takes an
+  // optional slug and works from a session's own topic *and* the control topic, exactly like
+  // kill/rm/verbose. Grouping it with `default` (which it resembles in shape, and only in shape)
+  // would filter it out of every session topic - i.e. out of "stop asking me for permission on this
+  // one", the single most likely way this command is ever reached by natural language.
+  "auto",
   "settings",
   "autostart",
   "repos",
@@ -188,11 +205,18 @@ function buildSchema(ctx: RouterContext): Record<string, unknown> {
       repo: { type: "string", description: "For 'new': the short repo name from repos.toml." },
       prompt: { type: "string", description: "For 'new': the task to hand the new session." },
       model: { type: "string", enum: [...MODELS], description: "For 'new' or 'session_model'." },
-      all: { type: "boolean", description: "For 'kill'/'rm': act on every session." },
+      all: { type: "boolean", description: "For 'kill'/'rm'/'auto': act on every session." },
       bulkMode: { type: "string", enum: ["dead", "prefix"], description: "For 'rm': bulk-remove dead rows, optionally by prefix." },
       bulkPrefix: { type: "string", description: "For 'rm' with bulkMode 'prefix'." },
       level: { type: "string", enum: ["compact", "full"], description: "For 'detail'." },
-      on: { type: "boolean", description: "For 'verbose'." },
+      // These two fields are shared across kinds, and the description is the only thing telling the
+      // model a field applies at all - a field documented as "for kill/rm" is one the model will not
+      // set for an 'auto' command, so "turn off auto-approve on all my sessions" would arrive with
+      // `all` unset, get applied to one session, and be reported as a fleet-wide change.
+      on: {
+        type: "boolean",
+        description: "For 'verbose'/'auto', and for 'default' with defaultCategory='permission'/'answer': the on/off value. Omit to report current status without changing anything.",
+      },
       reposAction: { type: "string", enum: ["list", "add", "rm"], description: "For 'repos'." },
       reposName: { type: "string", description: "For 'repos add'/'repos rm'." },
       reposPath: { type: "string", description: "For 'repos add', optional." },
@@ -201,10 +225,16 @@ function buildSchema(ctx: RouterContext): Record<string, unknown> {
       voiceModel: { type: "string", description: "For 'voice', optional model name to switch to." },
       mode: { type: "string", enum: [...MODES], description: "For 'session_mode' (the current session) or 'default' with defaultCategory='mode' (all future new sessions)." },
       effort: { type: "string", enum: [...EFFORTS], description: "For 'session_effort' (the current session) or 'default' with defaultCategory='effort' (all future new sessions)." },
+      autoCategory: {
+        type: "string",
+        enum: ["permission", "answer"],
+        description: "For 'auto': which auto-resolve toggle to check or change - 'permission' auto-allows tool permission prompts, 'answer' auto-picks Claude's own recommended option on questions.",
+      },
       defaultCategory: {
         type: "string",
-        enum: ["mode", "effort"],
-        description: "For 'default': which new-session default to show/change - 'mode' or 'effort'. Omit for a bare status report of both.",
+        enum: ["mode", "effort", "permission", "answer"],
+        description:
+          "For 'default': which new-session default to show/change - 'mode', 'effort', or the two /auto toggles 'permission'/'answer' (whose value goes in 'on', not 'mode'/'effort'). Omit for a bare status report.",
       },
       assistAction: { type: "string", enum: ["status", "on", "off"], description: "For 'assist': confirm-before-destructive-NL-command toggle." },
       voiceConfirmAction: { type: "string", enum: ["status", "on", "off"], description: "For 'voiceconfirm': confirm-before-sending-a-transcribed-voice-note toggle." },
@@ -344,6 +374,7 @@ interface RawRouterOutput {
   voiceModel?: string;
   mode?: string;
   effort?: string;
+  autoCategory?: string;
   defaultCategory?: string;
   assistAction?: string;
   voiceConfirmAction?: string;
@@ -417,6 +448,10 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
         return { kind: "detail", slug: raw.slug, level: raw.level === "compact" || raw.level === "full" ? raw.level : undefined };
       case "verbose":
         return { kind: "verbose", slug: raw.slug, on: raw.on };
+      case "auto":
+        return raw.autoCategory === "permission" || raw.autoCategory === "answer"
+          ? { kind: "auto", category: raw.autoCategory, slug: raw.slug, all: raw.all === true, on: raw.on }
+          : null;
       case "settings":
         return { kind: "settings" };
       case "autostart":
@@ -441,6 +476,11 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
       case "default":
         if (raw.defaultCategory === "mode") return { kind: "default", category: "mode", value: isMode(raw.mode) ? raw.mode : undefined };
         if (raw.defaultCategory === "effort") return { kind: "default", category: "effort", value: isEffort(raw.effort) ? raw.effort : undefined };
+        // The boolean categories take their value from `on`, not `mode`/`effort` - an omitted `on`
+        // is the reports-status form, same as every other bare toggle here.
+        if (raw.defaultCategory === "permission" || raw.defaultCategory === "answer") {
+          return { kind: "default", category: raw.defaultCategory, value: typeof raw.on === "boolean" ? raw.on : undefined };
+        }
         return { kind: "default", category: "status" };
       case "commands":
         return { kind: "commands", term: raw.term ?? "" };

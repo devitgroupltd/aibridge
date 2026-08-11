@@ -170,6 +170,11 @@ export interface SessionLaunchOptions {
    * `claude --resume <id>` on a fresh PTY instead of starting a new one. The worktree is reused
    * as-is (`ensureWorktree` is a no-op when the directory already exists). */
   resumeSessionId?: string;
+  /** The permission mode to *start* in (`/default mode`, and a resume preserving whatever the
+   * session was last switched to). Omitted means "whatever the CLI's own default is" - which is
+   * `manual`, the same value `DEFAULT_MODE` tracks. See `buildClaudeSpawnArgs` for why this is a
+   * launch flag rather than post-launch keystrokes. */
+  permissionMode?: string;
   /** §5.7: where this session's OTLP export should point - defaults to `settings.ts`'s own `4318`
    * default. Overridable so integration tests can point a launched session at a throwaway listener
    * instead of the Bridge's real one. */
@@ -265,7 +270,7 @@ const LANGUAGE_MIRROR_SYSTEM_PROMPT =
 /** Extracted from `launchSession`'s `pty.spawn` call so it's unit-testable without touching
  * `pty.spawn` itself - mirrors this file's existing pattern of pulling pure logic (`stripAnsi`,
  * `waitForStartupPrompt`) out into its own exported piece. */
-export function buildClaudeSpawnArgs(opts: { model: string; settingsPath: string; resumeSessionId?: string }): string[] {
+export function buildClaudeSpawnArgs(opts: { model: string; settingsPath: string; resumeSessionId?: string; permissionMode?: string }): string[] {
   return [
     "--channels",
     "plugin:aibridge-telegram@devitgroup-plugins",
@@ -275,6 +280,16 @@ export function buildClaudeSpawnArgs(opts: { model: string; settingsPath: string
     opts.settingsPath,
     "--append-system-prompt",
     LANGUAGE_MIRROR_SYSTEM_PROMPT,
+    // `--permission-mode <manual|acceptEdits|plan|auto|…>` - a real, `--help`-documented flag
+    // (verified against the pinned client 2026-08-11). This replaces the Shift+Tab keystroke burst
+    // `/default mode` used to send *after* launch, which never worked: live-reproduced 2026-08-10,
+    // every freshly-spawned session went `manual` -> `accept edits on` and stopped, i.e. exactly one
+    // of the three presses `buildModeKeystrokeSteps` computes for manual->auto landed. Setting the mode
+    // before the process starts removes the race outright rather than tuning it - there is no
+    // picker to cycle, nothing to redraw between presses, and nothing to lose if the operator's
+    // first turn arrives quickly. `buildModeKeystrokeSteps` still owns the *live* `/mode` switch, which
+    // has no CLI equivalent mid-session.
+    ...(opts.permissionMode ? ["--permission-mode", opts.permissionMode] : []),
     ...(opts.resumeSessionId ? ["--resume", opts.resumeSessionId] : []),
   ];
 }
@@ -370,7 +385,7 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   // carry a per-session `AIBRIDGE_SLUG` the way a per-worktree `.mcp.json` env block used to.
   const ptyProcess = pty.spawn(
     resolveClaudeExecutable(),
-    buildClaudeSpawnArgs({ model: opts.model ?? "sonnet", settingsPath, resumeSessionId: opts.resumeSessionId }),
+    buildClaudeSpawnArgs({ model: opts.model ?? "sonnet", settingsPath, resumeSessionId: opts.resumeSessionId, permissionMode: opts.permissionMode }),
     {
       name: "xterm-256color",
       cols: 120,
