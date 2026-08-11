@@ -748,6 +748,32 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
    * `/resume` needs to (or can usefully) intervene on.
    */
   async function handleResumeCommand(cmd: Extract<FleetCommand, { kind: "resume" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void> {
+    // `--all` (2026-08-12 operator request, after a Bridge restart left multiple sessions dead at
+    // once with no bulk recovery path - `/resume <slug>` one at a time was the only option). Scoped
+    // to `dead` rows only, same exclusion as `/kill --all`/`/rm --all`'s own selfCheckSlug note -
+    // unlike those, there is nothing *live* a bulk resume could touch by mistake (the single-slug
+    // branch below already no-ops on anything that isn't `dead`), so this executes immediately with
+    // no confirm card, the same reasoning `/remove --dead`/`--prefix` already use.
+    if (cmd.all) {
+      const targets = sessionStore.all().filter((r) => r.state === "dead" && r.slug !== selfCheckSlug);
+      if (targets.length === 0) {
+        confirmSessionCommand(topicId, "No dead sessions to resume.");
+        return;
+      }
+      for (const target of targets) {
+        // Sequential, not parallel - same precedent as `/rm --dead`'s bulk loop just above. Each
+        // call re-reads its own row fresh (`resumeSession`'s first step) and `manuallyRequested`
+        // bypasses its dead-guard the same way the single-slug branch below does - see that branch's
+        // own comment for why that guard doesn't apply here.
+        await sessionSupervisor.resumeSession(target, { manuallyRequested: true });
+      }
+      confirmSessionCommand(
+        topicId,
+        `Resumed ${targets.length} dead session${targets.length === 1 ? "" : "s"}: ${targets.map((r) => r.slug).join(", ")}. Watch each one's own topic for a "couldn't resume" notice if its conversation transcript wasn't recoverable.`,
+      );
+      return;
+    }
+
     const row = resolveSessionOrBail(cmd.slug, currentSlug, topicId);
     if (!row) return;
     if (row.state === "quota_stopped") {
