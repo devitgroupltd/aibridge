@@ -1,8 +1,10 @@
 ---
-version: 0.23.0
+version: 0.25.0
 status: implemented
-last_modified_utc: 2026-08-11T22:00:00Z
+last_modified_utc: 2026-08-11T23:45:00Z
 changelog:
+  - "0.25.0 (2026-08-11): Follow-up audit ('check for similar issues, maybe something is not persisted but should be') found one sibling gap in the same restart-survival shape v0.24.0 just fixed, in a value this plan's own `RoutingPersistence` interface (née `AutoTogglePersistence`, renamed for this) now also covers: `routing.ts`'s `modeBySlug` (`/mode`). Unlike `effortBySlug` (audited and confirmed cosmetic - display-only, no fix needed), `modeBySlug` is read by `session-supervisor.ts`'s `resumeSession` to build the real `--permission-mode` relaunch flag - a Bridge restart silently relaunched every non-`manual` session back in `manual` mode, with no operator-visible signal, exactly the same failure shape as v0.24.0's toggles minus the safety angle (falling back to `manual` isn't dangerous the way falling back to bypass-on would be, so there was never a 'deliberate fail-closed' argument protecting this one - it was a plain oversight, confirmed by the absence of any plan-doc rationale for it). Fixed identically: a `mode` TEXT column (`session-store.ts`, `DEFAULT 'manual'`), `routing.ts`'s `setMode` writes through to it, and `hydrateAutoToggles` was generalized into `hydrateFromRow(slug, {mode, bypassPermission, autoAnswer})` - one call instead of two, since `mode` has a placement constraint the two toggles don't: it must run *before* `resumeSession`'s `launchSession` call (right after `current` is fetched), not after `routing.add()` like the toggles, or the relaunch reads the still-empty map. `hydrateFromRow` re-validates the stored string against `MODES`, falling back to `DEFAULT_MODE`, the same defensive re-validation `index.ts`'s own settingsStore-backed defaults already apply. A live regression test asserts `launchSession` receives the persisted mode against a deliberately fresh, empty `Routing()` (i.e. what a real restart looks like), not just that `routing.ts`'s own map round-trips in isolation."
+  - "0.24.0 (2026-08-11): Operator-requested reversal of the fail-closed-on-restart design (§0.2's 'State' bullet, live-verified as working-as-specified in 0.23.0). Live incident: an operator who believed `/auto permission` was on for a session got the Allow/Deny card anyway (`analyze-the-codebase-for-improvements`) — root cause was exactly the documented behavior, a Bridge restart between turning the toggle on and this permission request silently put `bypassBySlug`/`autoAnswerBySlug` back to their construction-time default with no signal that had happened. The 'fail-closed, mirroring permission-registry.ts' argument doesn't actually transfer: a *lost pending prompt* (permission-registry.ts's case) has no safe default to fall back to and must be re-asked, but a *standing toggle* silently reverting to a more-prompting state is pure friction with no operator-visible cause, not a safety backstop — the operator's actual intent was 'stay on', and the old design guaranteed drift from it on every restart. Now persisted: two new `sessions` columns (`bypass_permission`, `auto_answer`, session-store.ts, both `DEFAULT 0` — an upgrade never grants a pre-2026-08-11 row a toggle it didn't already have live), `routing.ts`'s `setBypass`/`setAutoAnswer` write through to them via a new optional `AutoTogglePersistence` constructor param (`SessionStore` in production; omitted in every test and the self-check route, which keeps the pre-existing in-memory-only behavior there), and `session-supervisor.ts`'s `resumeSession` calls a new `hydrateAutoToggles(slug, bypass, autoAnswer)` — deliberately not `setBypass`/`setAutoAnswer` themselves, since a restore isn't an operator action and shouldn't re-fire a write-through of the value it just read. `routing.remove` is unchanged: `/rm` already deletes the whole `sessions` row, taking both columns with it, so the existing `bypassBySlug.delete`/`autoAnswerBySlug.delete` calls (§0.2 above) still fully cover slug reuse. Net effect: the toggle now means what the confirmation text always told the operator it meant, rather than quietly expiring at a time the operator has no way to predict."
   - "0.23.0 (2026-08-11): Steps 2 and 3 implemented — fleet-bulk `--all` and `/default permission|answer`. The whole feature (§0-§6) is now in the tree and live-verified; `status` moves draft → implemented. Both open MEDIUMs resolved *against* the plan's own suggestion, and the resolution is the same in both cases — narrow the type instead of widening it and adding a runtime arm. (1) `executeFleetActionDirect` is NOT widened past `\"kill\" | \"rm\"`: §0.3 argued its three unreachable ternaries should widen anyway because 'unreachable because of a parser two files away' isn't visible to a reader of the function. But a narrow signature makes it visible *and* compiler-enforced, where widening trades that for a WARN default arm nobody reads; the note there now says what to do if `--force` is ever added to `/auto` (widen it *and* give it the same `parseAutoConfirmKind` early return, since its loop carries the identical bare-else hazard). (2) `sendDefaultCategoryPicker` and `resolveDefaultCategoryCallback` take/return the new `DefaultPickerCategory` (`mode | effort`), not the widened `DefaultCategory` — so the two boolean categories cannot reach the drill-down path at all, rather than reaching it and hitting a `never` arm at runtime. Both keep an exhaustive switch on top for the next category. One §5 item is not unit-testable and was live-verified instead: `handleNewCommand`'s application point can't be reached in a test without a real `launchSession` (git worktree + PTY spawn), so 'a new session inherits the default' was checked end-to-end against the real Telegram client. Live-verified in full: bare `--all` fleet status, the `--all on` confirm card, the tap (fleet intact, card finalized 'Auto-permission ON for 1 session', status flipped for that category only), `--all off`, `/default`'s two toggle rows in both label/callback directions, the toggle tap, persistence across a Bridge restart, per-session flags still resetting on that same restart (the deliberate asymmetry), and a new session inheriting the default."
   - "0.22.0 (2026-08-11): Operator-requested investigate-first handling for `auto answer`, resolved against real data rather than intuition. The request was 'when there's a recommended option AND an option to investigate first, always pick investigate'. Extracting all 715 real AskUserQuestion calls from this machine's own Claude Code transcripts (44 sessions) showed why that specific shape can't ship: 212 carry exactly one '(Recommended)' and 0 carry more than one (independently confirming §2.2's rule; 207/212 also put it first, per the tool description), but option semantics live nowhere in the schema - `{label, description?}`, with '(Recommended)' the only instructed convention - so an investigate-detector is keyword-matching prose written without one. Measured ~13% precision, failing toward LESS rigor: it would have answered 'Auto-send immediately, no confirmation' over 'Always show a confirm card first (Recommended)' by matching `confirm` inside `no confirmation`, and 'Extract only, tests later' over 'add tests as each module is extracted (Recommended)'. Shipped as a veto instead - same detection, opposite role: a defer-shaped option among the non-recommended ones suppresses the auto-answer and posts the real card, which is also the only way the operator can pick investigate at all. False positive costs one tap; false negative behaves as before. Fires on ~11% of otherwise-answerable questions. Free-text answering ('investigate first' via the tool's own Other path) was also rejected: Claude asked because it needs a decision, so it would investigate, ask again, be auto-answered identically, and loop until the hook client's 59-minute timeout."
   - "0.21.0 (2026-08-11): Fills §0.2's hole — `handleAutoPermission`/`handleAutoAnswer` were dispatched to but never defined, from v0.13.0 through v0.20.0. Written out, but with the dispatch inverted: on *scope*, not category. All three scopes (bare-status, on/off, --all) are category-agnostic, so splitting by category first forces the whole scope tree to be written twice — contradicting §0.2's own 'described once instead of twice'. What actually differs between the categories is four values, so they resolve through one `autoCategorySpec(category)` descriptor {label, get, set, drainsOnEnable, confirmation} behind a single `never` arm. This supersedes v0.18.0's 'give `applyAutoToggle` its own exhaustive switch': that function now reads `spec.drainsOnEnable` and has no category dispatch left. Rationale recorded in the Overview, since it reverses a prior pass's fix on purpose — four runs found nine instances of the bare-else defect, and twice the fix was 'add another exhaustive switch', after which the next run found a site the enumeration had missed (v0.16.0's `DefaultCategory` ternary, v0.18.0's `applyAutoToggle`). A guarantee spread over N sites is only as strong as remembering all N; one site cannot be forgotten. Also closes §0.3's decomposition gap with `autoConfirmKind`/`parseAutoConfirmKind` in fleet-confirm.ts — a generic `split('-')` reads the existing `rm-topic` kind as category 'rm', so a `/rm --all` tap would enter the auto-toggle branch."
@@ -458,19 +460,29 @@ added — the exact failure class this feature has demonstrated six times, close
 instead of by author discipline. `handleDefaultCommand` (§0.4) and `sendDefaultCategoryPicker`'s
 dispatch (§0.4) both get the identical treatment for the identical reason.
 
-Bare-reports-status, `--all`-stripping, and the fail-closed in-memory state convention are unchanged
-from every prior revision, just described once instead of twice:
+Bare-reports-status and `--all`-stripping are unchanged from every prior revision, just described once
+instead of twice. The in-memory-only state convention below was reversed in v0.24.0 — kept here with
+that history noted rather than silently rewritten, since the "why" of the reversal matters as much as
+the "what":
 - **Bare `/auto <category>` (no value) reports status, never toggles** — same precedent as
   `handleVerboseCommand`'s `if (cmd.on === undefined)` branch (`session-lifecycle-commands.ts:728-731`).
   A status read must never flip a safety gate; `FleetCommand.on` being optional (not a required
   boolean) is what makes this representable at all.
-- **State**: `bypassBySlug: Map<string, boolean>` / `autoAnswerBySlug: Map<string, boolean>` in
-  `routing.ts`, alongside the existing `modeBySlug`/`effortBySlug` maps — `getBypass`/`setBypass`,
-  `getAutoAnswer`/`setAutoAnswer`, defaulting to `false`. In-memory only, cleared on every **Bridge**
-  process restart (a fresh `Routing` instance) — a deliberate fail-closed choice, mirroring
-  `permission-registry.ts`'s own "a restart declares a pending prompt lost, never silently
-  reconstructed" stance one level up. A session-level `claude --resume` (crash-resume, §12 Phase 5)
-  leaves this state untouched — see §4's note on what that means for the resume-nudge plan.
+- **State** (revised v0.24.0): `bypassBySlug: Map<string, boolean>` / `autoAnswerBySlug: Map<string,
+  boolean>` in `routing.ts`, alongside the existing `modeBySlug`/`effortBySlug` maps —
+  `getBypass`/`setBypass`, `getAutoAnswer`/`setAutoAnswer`, defaulting to `false`. Through v0.23.0
+  these were in-memory only, cleared on every **Bridge** process restart (a fresh `Routing` instance) —
+  argued as a deliberate fail-closed choice mirroring `permission-registry.ts`'s "a restart declares a
+  pending prompt lost, never silently reconstructed" stance one level up. v0.24.0's changelog entry
+  explains why that argument doesn't actually hold for a *standing toggle* the way it holds for a
+  *pending prompt*, and reverses it: `setBypass`/`setAutoAnswer` now write through to
+  `session-store.ts`'s `bypass_permission`/`auto_answer` columns (via an injected
+  `AutoTogglePersistence`, optional so tests and the self-check route keep the old in-memory-only
+  shape), and `session-supervisor.ts`'s `resumeSession` restores both from the persisted row on every
+  crash-resume via `hydrateAutoToggles` — a value-restore, deliberately not routed through
+  `setBypass`/`setAutoAnswer` themselves. A session-level `claude --resume` (crash-resume, §12 Phase 5)
+  already left this state untouched even before v0.24.0 (it only ever cleared on a full **Bridge**
+  process restart) — see §4's note on what that means for the resume-nudge plan.
 - **`routing.remove(slug)` must delete both maps too.** `remove` (`routing.ts:52-62`) already deletes
   `bySlug`, `slugByTopicId`, `ptyWriteBySlug`, `modeBySlug`, `effortBySlug`, `ringBufferBySlug`;
   `bypassBySlug.delete(slug)`/`autoAnswerBySlug.delete(slug)` join that list. This is safety-relevant,
@@ -484,8 +496,9 @@ Confirmation text:
 - `/auto permission on`: *"🔓 Auto-permission is now ON for \"\<slug\>\" — every permission prompt
   this session would raise, including git commit/push, PR merge/create, npm publish, and anything
   else on the ask list, is auto-allowed with no Telegram prompt. `permissions.deny` (force-push,
-  secret reads, `rm -rf /`) still hard-blocks regardless — this cannot bypass that. `/auto permission
-  off` to revert; it also resets to off on every Bridge restart."*
+  secret reads, `rm -rf /`) still hard-blocks regardless — this cannot bypass that. This persists
+  across a Bridge restart — `/auto permission off` to revert."* (revised v0.24.0 — see the state
+  bullet above; this used to say "it also resets to off on every Bridge restart")
 - `/auto permission off`: *"Auto-permission is now off for \"\<slug\>\" — permission prompts resume
   as normal."*
 - `/auto answer on`: *"🔓 Auto-answer is now ON for \"\<slug\>\" — when Claude marks exactly one
@@ -1171,12 +1184,14 @@ Mirrors the existing `/kill --all`/`/rm --all` edge cases (`fleet-confirm-flow.t
   unchanged: the tap edits the card to say the confirm is gone and to resend the command.
 - **A session's toggle state surviving a crash-resume, and its interaction with
   [`plans/resume-nudge-on-lost-permission-plan.md`](resume-nudge-on-lost-permission-plan.md):**
-  `bypassBySlug`/`autoAnswerBySlug` are cleared only by a full Bridge process restart, not a
-  session-level `claude --resume`. That's intentional — the toggle reflects standing operator intent
-  a process crash shouldn't discard — but it means: if `auto permission` was already on for a session
-  before a crash, the resume-nudge plan's own re-triggered `PermissionRequest` is auto-allowed the
-  same as any other, and no card appears from that plan's point of view. Not a bug in either plan —
-  the operator who turned it on already asked for exactly that outcome, resumed or not.
+  `bypassBySlug`/`autoAnswerBySlug` survive both a session-level `claude --resume` (always true — they
+  were never tied to the PTY) and, as of v0.24.0, a full Bridge process restart too, via
+  `session-store.ts`'s persisted columns and `session-supervisor.ts`'s `hydrateAutoToggles` call. Both
+  are intentional — the toggle reflects standing operator intent neither a process crash nor a session
+  resume should discard — but it means: if `auto permission` was already on for a session before a
+  crash, the resume-nudge plan's own re-triggered `PermissionRequest` is auto-allowed the same as any
+  other, and no card appears from that plan's point of view. Not a bug in either plan — the operator
+  who turned it on already asked for exactly that outcome, resumed, restarted, or neither.
 - **Turning `auto permission` on while that session already has a pending permission card — the case
   an operator will hit constantly.** The common way to discover you want this is to be looking at a
   card you don't want to tap. `auto permission on`, on the `on` transition, therefore drains that

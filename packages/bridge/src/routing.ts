@@ -1,4 +1,14 @@
-import { DEFAULT_EFFORT, DEFAULT_MODE, type Effort, type Mode } from "./session-commands.ts";
+import { DEFAULT_EFFORT, DEFAULT_MODE, MODES, type Effort, type Mode } from "./session-commands.ts";
+
+/** Narrow slice of `session-store.ts`'s `SessionStore` that `Routing` needs for its restart-survival
+ * write-throughs (`/auto permission`, `/auto answer`, `/mode`) - kept as an interface rather than
+ * importing `SessionStore` directly so `routing.ts` doesn't need to know about SQLite, migrations, or
+ * any of `SessionStore`'s other columns. */
+export interface RoutingPersistence {
+  setBypassPermission(slug: string, on: boolean): void;
+  setAutoAnswer(slug: string, on: boolean): void;
+  setMode(slug: string, mode: string): void;
+}
 
 /**
  * In-memory routing table (§4.3). Phase 1 keeps this in memory only, seeded once at startup with
@@ -23,19 +33,36 @@ export class Routing {
   private readonly ptyWriteBySlug = new Map<string, (text: string) => void>();
   // §4.2.2: the protocol gives no ack for a Shift+Tab write, so this is the Bridge's own optimistic
   // belief about where the picker sits - not a verified read of the session's real state. Drifts if
-  // the operator cycles modes by hand at the desk; see the plan's honest caveat.
+  // the operator cycles modes by hand at the desk; see the plan's honest caveat. Revised 2026-08-11:
+  // unlike that drift caveat, losing this map's value entirely (a fresh Bridge process) is not
+  // cosmetic - `session-supervisor.ts`'s `resumeSession` reads `getMode` to build the real
+  // `--permission-mode` relaunch flag, so `setMode` mirrors every write into `session-store.ts`'s
+  // `mode` column and `hydrateFromRow` restores it before that relaunch, the same restart-survival
+  // shape as the two toggles below.
   private readonly modeBySlug = new Map<string, Mode>();
   // Same "Bridge's own optimistic belief, no ack exists" caveat as modeBySlug above - the
   // keyboard-current-value display (session-commands.ts's buildEffortKeyboard) is the only
-  // consumer, so drift here is cosmetic, not something any command's actual effect relies on.
+  // consumer, so drift here (including losing it entirely on a restart) is cosmetic, not something
+  // any command's actual effect relies on - confirmed by audit 2026-08-11, unlike modeBySlug above.
   private readonly effortBySlug = new Map<string, Effort>();
   private readonly ringBufferBySlug = new Map<string, string>();
-  // `/auto permission` / `/auto answer` (bypass-and-autoanswer-plan.md §0.2). In-memory only and
-  // deliberately so: a fresh `Routing` on every Bridge restart means both toggles come back OFF,
-  // fail-closed, mirroring permission-registry.ts's "a restart declares a pending prompt lost,
-  // never silently reconstructed" one level up. Not a gap to be "fixed" into a persisted column.
+  // `/auto permission` / `/auto answer` (bypass-and-autoanswer-plan.md §0.2, revised 2026-08-11).
+  // These maps are still the single read path for a live process - `getBypass`/`getAutoAnswer`
+  // never touch `persistence` - but `setBypass`/`setAutoAnswer` mirror every write into
+  // `session-store.ts`'s `bypass_permission`/`auto_answer` columns so the operator's standing
+  // intent survives a Bridge restart instead of silently resetting to off with no visible signal
+  // (the original design's tradeoff - see the plan's changelog for why it flipped). A restart still
+  // starts every map empty; `hydrateFromRow` is what `session-supervisor.ts`'s `resumeSession` calls
+  // to restore each slug's persisted values before its first post-restart permission request (and,
+  // for mode, before the relaunch itself).
   private readonly bypassBySlug = new Map<string, boolean>();
   private readonly autoAnswerBySlug = new Map<string, boolean>();
+
+  /** Optional - tests and the self-check route construct a `Routing` with no persistence at all,
+   * getting the pre-2026-08-11 in-memory-only behavior (mode, auto-permission and auto-answer all
+   * reset to their defaults on every restart). The live Bridge always passes `session-store.ts`'s
+   * `SessionStore`. */
+  constructor(private readonly persistence?: RoutingPersistence) {}
 
   add(route: SessionRoute): void {
     this.bySlug.set(route.slug, route);
@@ -95,6 +122,7 @@ export class Routing {
 
   setMode(slug: string, mode: Mode): void {
     this.modeBySlug.set(slug, mode);
+    this.persistence?.setMode(slug, mode);
   }
 
   getEffort(slug: string): Effort {
@@ -113,6 +141,7 @@ export class Routing {
 
   setBypass(slug: string, on: boolean): void {
     this.bypassBySlug.set(slug, on);
+    this.persistence?.setBypassPermission(slug, on);
   }
 
   /** `/auto answer` - whether this session's `AskUserQuestion` calls are auto-answered when Claude
@@ -123,6 +152,24 @@ export class Routing {
 
   setAutoAnswer(slug: string, on: boolean): void {
     this.autoAnswerBySlug.set(slug, on);
+    this.persistence?.setAutoAnswer(slug, on);
+  }
+
+  /** `session-supervisor.ts`'s `resumeSession`, once per slug, from the persisted row - for `mode`
+   * this must run *before* the relaunch (`getMode` feeds the real `--permission-mode` flag), so it's
+   * one call covering all three rather than mode hydrated separately from the two toggles. Sets the
+   * in-memory maps directly, without writing back through `persistence` - the values just came from
+   * there, so a write-back would be a same-value no-op `UPDATE` on every single resume. Not
+   * `setMode`/`setBypass`/`setAutoAnswer` for exactly that reason - this is a restore, not an
+   * operator action, and shouldn't be confused with one in a log line or a future
+   * `drainsOnEnable`-style side effect keyed off "the toggle just changed". Re-validates `mode`
+   * against `MODES` the same way `index.ts`'s own settingsStore-backed defaults do, in case a value
+   * was written by a build that later removed a mode - falls back to `DEFAULT_MODE` rather than
+   * trusting the column's raw string. */
+  hydrateFromRow(slug: string, row: { mode: string; bypassPermission: boolean; autoAnswer: boolean }): void {
+    this.modeBySlug.set(slug, (MODES as readonly string[]).includes(row.mode) ? (row.mode as Mode) : DEFAULT_MODE);
+    this.bypassBySlug.set(slug, row.bypassPermission);
+    this.autoAnswerBySlug.set(slug, row.autoAnswer);
   }
 
   /** Appends raw PTY output to `/attach`'s ring buffer, trimmed to the last
