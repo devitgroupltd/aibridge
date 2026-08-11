@@ -172,7 +172,7 @@ describe("deployBranch", () => {
     ]);
     const outcome = await deployBranch("C:\\repo", "claude/nope", [], run);
     expect(outcome.ok).toBe(false);
-    expect(outcome.message).toContain('branch "claude/nope" not found');
+    expect(outcome.message).toContain('Branch "claude/nope" not found');
   });
 
   test("reports a non-fast-forward branch and never resets anything (nothing was merged)", async () => {
@@ -220,8 +220,13 @@ describe("deployBranch", () => {
     const outcome = await deployBranch("C:\\repo", "claude/conflicted", [], run, "C:\\wt\\conflicted");
     expect(outcome.ok).toBe(false);
     expect(outcome.rolledBack).toBe(false);
+    expect(outcome.conflict).toBe(true);
     expect(outcome.message).toContain("auto-rebase");
     expect(outcome.message).toContain("conflicts");
+    // The raw git error (multi-line, not fit for the middle of a sentence) lives in `detail`,
+    // separate from the human-readable `message` - see `formatOutcomeHtml` in
+    // deploy-lifecycle-commands.ts for why.
+    expect(outcome.detail).toBe("CONFLICT");
     expect(calls).toContainEqual(["git", ["rebase", "--abort"], "C:\\wt\\conflicted"]);
     expect(calls.some(([cmd, args]) => cmd === "git" && args[0] === "reset")).toBe(false);
   });

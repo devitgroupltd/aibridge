@@ -722,6 +722,7 @@ async function main(): Promise<void> {
     supergroupChatId: config.supergroupChatId,
     entryScriptDir: import.meta.dirname,
     log,
+    ptyIo,
   });
 
   // os-power-commands.ts: `/os shutdown|reboot|cancel` (plans/swirling-crafting-pixel.md) - host

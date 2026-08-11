@@ -11,11 +11,29 @@ import {
   truncateForTelegram,
   writeDeployMarker,
 } from "./deploy.ts";
+import { escapeForFeed } from "./feed-escape.ts";
 import { resolveNodeExecutable } from "./session-launcher.ts";
+import type { DeployOutcome } from "./deploy.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
+import type { PtyIo } from "./pty-io.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
 import type { SendMessageSource } from "./telegram.ts";
 import type { SessionStore } from "./session-store.ts";
+
+/**
+ * Renders a `DeployOutcome` (or any ok/failure notice built the same way) for Telegram: a bold
+ * headline plus, only if there's raw command output to show, a separate `<pre>` block for it.
+ * Found live 2026-08-11: a rebase-conflict message used to fold git's multi-line stderr straight
+ * into the middle of a sentence - unreadable once Telegram wrapped it. Keeping the prose and the
+ * raw dump visually distinct fixes that without changing what's actually reported. Every
+ * interpolated part is untrusted (branch names, worktree paths, git output) so both go through
+ * `escapeForFeed` - same treatment feed cards give tool output, for the same reason (§9 scenario 21).
+ */
+function formatOutcomeHtml(message: string, detail?: string): string {
+  const head = `<b>${escapeForFeed(message)}</b>`;
+  if (!detail || detail.trim().length === 0) return head;
+  return `${head}\n<pre>${escapeForFeed(truncateForTelegram(detail))}</pre>`;
+}
 
 /** Result shape shared by `runSchtasks`/`runPowershell` - `/Query` against an unregistered task
  * exits non-zero, which is a valid "not registered" answer, not a transport failure, so both
@@ -108,6 +126,13 @@ export interface DeployLifecycleCommandsOptions {
    * steps need to be exercised in tests without a real git worktree/remote. */
   commitIfDirty?: typeof realCommitIfDirty;
   pushCurrentBranch?: typeof realPushCurrentBranch;
+  /** Lets `/merge`/`/ship` reach into the session that owns the branch being landed when
+   * `deployBranch` reports `conflict: true` - the auto-rebase hit real conflicts and backed out
+   * clean, and that session's own Claude is already sitting in the worktree with full context to
+   * resolve them, unlike the operator relaying a raw filesystem path over Telegram. Optional (not
+   * every caller needs the nudge exercised) - no live session just means `sendChannelText` logs a
+   * `WARN` and drops it, same as any other nudge with no PTY to write to. */
+  ptyIo?: Pick<PtyIo, "sendChannelText">;
 }
 
 export interface DeployLifecycleCommands {
@@ -122,6 +147,35 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
   const deployBranch = opts.deployBranch ?? realDeployBranch;
   const commitIfDirty = opts.commitIfDirty ?? realCommitIfDirty;
   const pushCurrentBranch = opts.pushCurrentBranch ?? realPushCurrentBranch;
+  const ptyIo = opts.ptyIo;
+
+  /**
+   * Reports a failed `DeployOutcome` to the control topic and, only when it's the specific
+   * "auto-rebase hit real conflicts" shape (`conflict: true`), also nudges the owning session
+   * (`sendChannelText` - same synthetic-inbound-turn mechanism as the resume/no-reply nudges in
+   * session-supervisor.ts/feed-wiring.ts) to resolve them itself: it's already sitting in
+   * `worktreePath` with full code context, which a raw filesystem path relayed over Telegram never
+   * gave the operator. The nudge points at the in-session `/ship` skill specifically because that
+   * one already does "fetch, check behind, merge, resolve conflicts" end to end - no need to spell
+   * the steps out twice.
+   */
+  async function reportFailure(topicId: number | undefined, outcome: DeployOutcome, row: { slug: string; topicId: number }, commandLabel: string): Promise<void> {
+    log("WARN", `${commandLabel} failed for "${row.slug}": ${outcome.message}${outcome.detail ? ` (${outcome.detail})` : ""}`);
+    if (outcome.conflict) {
+      ptyIo?.sendChannelText(
+        row.slug,
+        row.topicId,
+        `${commandLabel} from the control topic hit a rebase conflict landing your branch on main - aborted cleanly, nothing left half-done. Please resolve it yourself: run /ship here and it'll fetch main, check whether you're behind, merge it in, resolve the conflicts, gate, push, and open/merge a PR.`,
+        `${commandLabel}-conflict-nudge`,
+        "aibridge",
+      );
+    }
+    try {
+      await controlBot.sendMessage(supergroupChatId, topicId, formatOutcomeHtml(outcome.message, outcome.detail), undefined, "HTML");
+    } catch (err) {
+      log("WARN", `failed to send ${commandLabel} failure message: ${(err as Error).message}`);
+    }
+  }
 
   /**
    * The self-repo-restart tail shared by `/merge` and `/ship`: once a merge into `repoPath` has
@@ -218,16 +272,11 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     const packageDirs = discoverTypecheckedPackages(repoPath);
     const outcome = await deployBranch(repoPath, branch, packageDirs, undefined, worktreePath);
     if (!outcome.ok) {
-      log("WARN", `/merge failed for "${branch}": ${outcome.message}`);
-      try {
-        await controlBot.sendMessage(supergroupChatId, topicId, truncateForTelegram(outcome.message));
-      } catch (err) {
-        log("WARN", `failed to send /merge failure message: ${(err as Error).message}`);
-      }
+      await reportFailure(topicId, outcome, row, "/merge");
       return;
     }
     try {
-      await controlBot.sendMessage(supergroupChatId, topicId, truncateForTelegram(outcome.message));
+      await controlBot.sendMessage(supergroupChatId, topicId, formatOutcomeHtml(outcome.message), undefined, "HTML");
     } catch (err) {
       log("WARN", `failed to send /merge success message: ${(err as Error).message}`);
     }
@@ -288,20 +337,22 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     const packageDirs = discoverTypecheckedPackages(repoPath);
     const outcome = await deployBranch(repoPath, branch, packageDirs, undefined, worktreePath);
     if (!outcome.ok) {
-      log("WARN", `/ship failed for "${branch}": ${outcome.message}`);
-      try {
-        await controlBot.sendMessage(supergroupChatId, topicId, truncateForTelegram(outcome.message));
-      } catch (err) {
-        log("WARN", `failed to send /ship failure message: ${(err as Error).message}`);
-      }
+      await reportFailure(topicId, outcome, row, "/ship");
       return;
     }
 
     const push = await pushCurrentBranch(repoPath);
-    const pushNote = push.status === 0 ? "Pushed to origin." : `Merged locally, but the push to origin failed: ${push.stderr || push.stdout}`;
-    if (push.status !== 0) log("WARN", `/ship: push failed for ${repoPath}: ${push.stderr || push.stdout}`);
+    const pushFailed = push.status !== 0;
+    const pushNote = pushFailed ? "Merged locally, but the push to origin failed." : "Pushed to origin.";
+    if (pushFailed) log("WARN", `/ship: push failed for ${repoPath}: ${push.stderr || push.stdout}`);
     try {
-      await controlBot.sendMessage(supergroupChatId, topicId, `${truncateForTelegram(outcome.message)}\n${pushNote}`);
+      await controlBot.sendMessage(
+        supergroupChatId,
+        topicId,
+        formatOutcomeHtml(`${outcome.message} ${pushNote}`, pushFailed ? push.stderr || push.stdout : undefined),
+        undefined,
+        "HTML",
+      );
     } catch (err) {
       log("WARN", `failed to send /ship success message: ${(err as Error).message}`);
     }

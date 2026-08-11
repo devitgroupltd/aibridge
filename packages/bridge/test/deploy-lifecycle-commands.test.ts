@@ -48,6 +48,7 @@ async function setup(overrides: Partial<Parameters<typeof createDeployLifecycleC
   const stateDir = await fs.mkdtemp(path.join(os.tmpdir(), "aibridge-deploy-lifecycle-test-"));
   const runSchtasksCalls: string[][] = [];
   const runPowershellCalls: string[] = [];
+  const nudges: Array<{ slug: string; topicId: number; content: string; msgId: string; from: string }> = [];
   const deployLifecycle = createDeployLifecycleCommands({
     sessionStore,
     controlBot,
@@ -71,9 +72,14 @@ async function setup(overrides: Partial<Parameters<typeof createDeployLifecycleC
     supergroupChatId: "-100",
     entryScriptDir: "c:\\bridge-repo\\packages\\bridge\\src",
     log: () => {},
+    ptyIo: {
+      sendChannelText: (slug, topicId, content, msgId, from) => {
+        nudges.push({ slug, topicId, content, msgId, from });
+      },
+    },
     ...overrides,
   });
-  return { deployLifecycle, controlBot, sessionStore, confirmed, respawnCalls, stateDir, runSchtasksCalls, runPowershellCalls };
+  return { deployLifecycle, controlBot, sessionStore, confirmed, respawnCalls, stateDir, runSchtasksCalls, runPowershellCalls, nudges };
 }
 
 describe("createDeployLifecycleCommands", () => {
@@ -126,6 +132,49 @@ describe("createDeployLifecycleCommands", () => {
       expect(controlBot.sent.some((m) => m.text.includes("typecheck failed"))).toBe(true);
       expect(respawnCalls).toEqual([]);
       expect(readDeployMarker(stateDir)).toBeNull();
+    });
+
+    test("a plain (non-conflict) failure never nudges the session", async () => {
+      const failingOutcome: DeployOutcome = { ok: false, rolledBack: true, message: "typecheck failed" };
+      const { deployLifecycle, sessionStore, nudges } = await setup({
+        deployBranch: async () => failingOutcome,
+      });
+      sessionStore.insert(row());
+
+      await deployLifecycle.handleMergeCommand(undefined, "fix-bug");
+
+      expect(nudges).toEqual([]);
+    });
+
+    /** Found live 2026-08-11: a rebase-conflict message used to tell the operator to "resolve by
+     * hand in <worktree path>" - useless from a phone with no shell access. Now the session that
+     * owns the worktree (already sitting there with full code context) gets nudged to resolve it
+     * itself, and the control-topic message is rendered as HTML so the raw git output doesn't run
+     * into the middle of a sentence. */
+    test("a conflict failure nudges the owning session and renders detail as its own HTML block", async () => {
+      const conflictOutcome: DeployOutcome = {
+        ok: false,
+        rolledBack: false,
+        conflict: true,
+        message: '"claude/fix-bug-1" diverged from C:\\repo and auto-rebase onto it hit conflicts - aborted, C:\\wt\\fix-bug left clean.',
+        detail: "CONFLICT (content): Merge conflict in src/foo.ts",
+      };
+      const { deployLifecycle, sessionStore, controlBot, nudges } = await setup({
+        deployBranch: async () => conflictOutcome,
+      });
+      sessionStore.insert(row());
+
+      await deployLifecycle.handleMergeCommand(undefined, "fix-bug");
+
+      expect(nudges).toHaveLength(1);
+      expect(nudges[0]?.slug).toBe("fix-bug");
+      expect(nudges[0]?.topicId).toBe(5); // the session's own topic, not the control topic
+      expect(nudges[0]?.content).toContain("/ship");
+      expect(nudges[0]?.from).toBe("aibridge");
+
+      const sent = controlBot.sent.at(-1);
+      expect(sent?.text).toContain("<b>");
+      expect(sent?.text).toContain("<pre>CONFLICT (content): Merge conflict in src/foo.ts");
     });
 
     test("a successful gate against a non-self repo merges but never restarts or writes a marker", async () => {
@@ -285,6 +334,34 @@ describe("createDeployLifecycleCommands", () => {
       expect(controlBot.sent.some((m) => m.text.includes("typecheck failed"))).toBe(true);
       expect(pushCalls).toEqual([]);
       expect(respawnCalls).toEqual([]);
+    });
+
+    test("a conflict failure nudges the owning session here too, and never pushes", async () => {
+      const conflictOutcome: DeployOutcome = {
+        ok: false,
+        rolledBack: false,
+        conflict: true,
+        message: '"claude/fix-bug-1" diverged and auto-rebase hit conflicts - aborted, worktree left clean.',
+        detail: "CONFLICT (content): Merge conflict in src/foo.ts",
+      };
+      const pushCalls: string[] = [];
+      const { deployLifecycle, sessionStore, nudges } = await setup({
+        deployBranch: async () => conflictOutcome,
+        commitIfDirty: async () => ({ committed: false, message: "clean" }),
+        pushCurrentBranch: async (repoPath) => {
+          pushCalls.push(repoPath);
+          return { status: 0, stdout: "", stderr: "" };
+        },
+      });
+      sessionStore.insert(row());
+
+      await deployLifecycle.handleShipCommand(undefined, "fix-bug", undefined);
+
+      expect(nudges).toHaveLength(1);
+      expect(nudges[0]?.slug).toBe("fix-bug");
+      expect(nudges[0]?.topicId).toBe(5);
+      expect(nudges[0]?.content).toContain("/ship");
+      expect(pushCalls).toEqual([]);
     });
 
     test("a successful merge but a failed push reports the push failure without undoing the merge", async () => {
