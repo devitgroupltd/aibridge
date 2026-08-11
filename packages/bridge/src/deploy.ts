@@ -35,8 +35,20 @@ export async function defaultRunner(cmd: string, args: string[], cwd: string): P
     const { stdout, stderr } = await execFileAsync(cmd, args, { cwd, maxBuffer: 20 * 1024 * 1024 });
     return { status: 0, stdout, stderr };
   } catch (err) {
-    const e = err as { code?: number; stdout?: string; stderr?: string };
-    return { status: typeof e.code === "number" ? e.code : 1, stdout: e.stdout ?? "", stderr: e.stderr ?? "" };
+    const e = err as { code?: number | string; stdout?: string; stderr?: string; message?: string };
+    const stdout = e.stdout ?? "";
+    const stderr = e.stderr ?? "";
+    // A real git exit (nonzero `code`, plus whatever it wrote to stdout/stderr) is handled above as
+    // intended. But a *spawn-level* failure - `cwd` doesn't exist, `cmd` isn't resolvable, a
+    // permission/lock error - never actually runs the child process, so `e.code` is an errno string
+    // (e.g. "ENOENT") rather than a numeric exit code, and stdout/stderr are both empty. Without a
+    // fallback, that leaves callers (deployBranch's `git status failed.`, etc.) with an empty
+    // `detail` and no way to tell "git said no" apart from "git never ran at all" - found live,
+    // 2026-08-11: a `/ship` failure surfaced as a bare "git status failed." with nothing else to go
+    // on. Fall back to `e.message` (Node's own "spawn git ENOENT" / "ENOENT: ... chdir '...'" text)
+    // only when the process truly produced nothing else.
+    const status = typeof e.code === "number" ? e.code : 1;
+    return { status, stdout, stderr: stdout || stderr ? stderr : e.message ?? "" };
   }
 }
 
@@ -119,6 +131,16 @@ export interface DeployOutcome {
   ok: boolean;
   rolledBack: boolean;
   message: string;
+  /** Raw command output (git stderr/stdout, a gate's combined test+typecheck transcript) that
+   * belongs alongside `message` but isn't itself prose - kept separate so a caller rendering this
+   * for Telegram can put it in its own monospace block instead of folding a multi-line git error
+   * into the middle of a sentence (found live: a rebase-conflict message did exactly that, and
+   * came out unreadable - §9-adjacent, not a scenario the plan enumerates). */
+  detail?: string;
+  /** True only for the specific "auto-rebase hit real conflicts, aborted, worktree left clean"
+   * outcome - lets a caller offer a different next step (e.g. nudge the session that owns
+   * `worktreePath` to resolve them) instead of treating this the same as any other failure. */
+  conflict?: boolean;
   previousHeadSha?: string;
   newHeadSha?: string;
 }
@@ -149,17 +171,21 @@ export async function deployBranch(
   worktreePath?: string,
 ): Promise<DeployOutcome> {
   const status = await run("git", ["status", "--porcelain"], repoRoot);
-  if (status.status !== 0) return { ok: false, rolledBack: false, message: `git status failed: ${status.stderr || status.stdout}` };
+  if (status.status !== 0) return { ok: false, rolledBack: false, message: "git status failed.", detail: status.stderr || status.stdout };
   if (status.stdout.trim().length > 0) {
     return { ok: false, rolledBack: false, message: `${repoRoot} has uncommitted changes - refusing to deploy onto a dirty tree.` };
   }
 
   const headResult = await run("git", ["rev-parse", "HEAD"], repoRoot);
-  if (headResult.status !== 0) return { ok: false, rolledBack: false, message: `git rev-parse HEAD failed: ${headResult.stderr || headResult.stdout}` };
+  if (headResult.status !== 0) {
+    return { ok: false, rolledBack: false, message: "git rev-parse HEAD failed.", detail: headResult.stderr || headResult.stdout };
+  }
   const previousHead = headResult.stdout.trim();
 
   const verify = await run("git", ["rev-parse", "--verify", branch], repoRoot);
-  if (verify.status !== 0) return { ok: false, rolledBack: false, message: `branch "${branch}" not found: ${verify.stderr || verify.stdout}` };
+  if (verify.status !== 0) {
+    return { ok: false, rolledBack: false, message: `Branch "${branch}" not found.`, detail: verify.stderr || verify.stdout };
+  }
 
   let merge = await run("git", ["merge", "--ff-only", branch], repoRoot);
   let autoRebased = false;
@@ -170,7 +196,9 @@ export async function deployBranch(
       return {
         ok: false,
         rolledBack: false,
-        message: `"${branch}" diverged from ${repoRoot} and auto-rebase onto it hit conflicts (aborted, worktree left clean) - resolve by hand in ${worktreePath} and retry: ${rebase.stderr || rebase.stdout}`,
+        conflict: true,
+        message: `"${branch}" diverged from ${repoRoot} and auto-rebase onto it hit conflicts - aborted, ${worktreePath} left clean.`,
+        detail: rebase.stderr || rebase.stdout,
       };
     }
     autoRebased = true;
@@ -180,7 +208,8 @@ export async function deployBranch(
     return {
       ok: false,
       rolledBack: false,
-      message: `"${branch}" isn't a fast-forward of HEAD (diverged, or main has moved on)${autoRebased ? " even after auto-rebasing onto it" : ""} - rebase it and retry: ${merge.stderr || merge.stdout}`,
+      message: `"${branch}" isn't a fast-forward of HEAD (diverged, or main has moved on)${autoRebased ? " even after auto-rebasing onto it" : ""} - rebase it and retry.`,
+      detail: merge.stderr || merge.stdout,
     };
   }
 
@@ -197,7 +226,8 @@ export async function deployBranch(
       ok: false,
       rolledBack: true,
       previousHeadSha: previousHead,
-      message: `Gate failed after merging "${branch}" - rolled back to ${previousHead.slice(0, 8)}.\n\n${truncateForTelegram(gate.output)}`,
+      message: `Gate failed after merging "${branch}" - rolled back to ${previousHead.slice(0, 8)}.`,
+      detail: truncateForTelegram(gate.output),
     };
   }
 

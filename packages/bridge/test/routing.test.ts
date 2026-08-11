@@ -91,10 +91,63 @@ describe("Routing multi-session lookups (Phase 5)", () => {
     expect(routing.getBypass("a")).toBe(false);
   });
 
-  test("a fresh Routing starts both toggles off - the fail-closed Bridge-restart behavior", () => {
+  test("a fresh Routing with no persistence starts both toggles off (tests/self-check route shape, unchanged by v0.24.0)", () => {
     const before = new Routing();
     before.setBypass("a", true);
     expect(new Routing().getBypass("a")).toBe(false);
+  });
+
+  test("v0.24.0: setBypass/setAutoAnswer write through to an injected persistence sink", () => {
+    const calls: { method: string; slug: string; on: boolean }[] = [];
+    const routing = new Routing({
+      setBypassPermission: (slug, on) => calls.push({ method: "setBypassPermission", slug, on }),
+      setAutoAnswer: (slug, on) => calls.push({ method: "setAutoAnswer", slug, on }),
+      setMode: () => {},
+    });
+    routing.setBypass("a", true);
+    routing.setAutoAnswer("a", true);
+    routing.setBypass("a", false);
+    expect(calls).toEqual([
+      { method: "setBypassPermission", slug: "a", on: true },
+      { method: "setAutoAnswer", slug: "a", on: true },
+      { method: "setBypassPermission", slug: "a", on: false },
+    ]);
+    // The in-memory read path is unaffected by the presence of persistence - still readable
+    // immediately, same as before.
+    expect(routing.getBypass("a")).toBe(false);
+    expect(routing.getAutoAnswer("a")).toBe(true);
+  });
+
+  test("v0.24.0: setMode also writes through to the persistence sink", () => {
+    const calls: { slug: string; mode: string }[] = [];
+    const routing = new Routing({
+      setBypassPermission: () => {},
+      setAutoAnswer: () => {},
+      setMode: (slug, mode) => calls.push({ slug, mode }),
+    });
+    routing.setMode("a", "auto");
+    expect(calls).toEqual([{ slug: "a", mode: "auto" }]);
+    expect(routing.getMode("a")).toBe("auto");
+  });
+
+  test("v0.24.0: hydrateFromRow restores mode, bypass and auto-answer without writing back through persistence (session-supervisor.ts's resumeSession)", () => {
+    const calls: unknown[] = [];
+    const routing = new Routing({
+      setBypassPermission: (...args) => calls.push(args),
+      setAutoAnswer: (...args) => calls.push(args),
+      setMode: (...args) => calls.push(args),
+    });
+    routing.hydrateFromRow("a", { mode: "acceptEdits", bypassPermission: true, autoAnswer: true });
+    expect(routing.getMode("a")).toBe("acceptEdits");
+    expect(routing.getBypass("a")).toBe(true);
+    expect(routing.getAutoAnswer("a")).toBe(true);
+    expect(calls).toEqual([]);
+  });
+
+  test("v0.24.0: hydrateFromRow falls back to DEFAULT_MODE for a mode value MODES no longer recognises", () => {
+    const routing = new Routing();
+    routing.hydrateFromRow("a", { mode: "some-removed-mode", bypassPermission: false, autoAnswer: false });
+    expect(routing.getMode("a")).toBe("manual");
   });
 
   test("clearPtyWrite drops the write function but keeps the route (§4.2's /kill: worktree/topic mapping survive)", () => {

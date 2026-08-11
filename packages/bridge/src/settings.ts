@@ -171,6 +171,14 @@ export function generateSettings(hookClientPath?: string, otlpPort = 4318): Perm
         "Bash(git log *)",
         "Bash(git branch *)",
         "Bash(git show *)",
+        // Read-only against the worktree - updates this clone's remote-tracking refs (`origin/main`,
+        // ...) but never touches the working tree or an index the way `git pull`/`git merge` would,
+        // same trust tier as `git status`/`git log` right above. Added 2026-08-11 after a live prompt
+        // for `cd <worktree> && git fetch origin 2>&1 | tail -5 && ... && git status --short && ...` -
+        // every other piece of that chain was already allow-listed, so `compound-permission.ts`'s
+        // decomposer failed closed on this one missing entry alone (see that module's own doc
+        // comment on why one unlisted sub-command defeats the whole chain, by design).
+        "Bash(git fetch *)",
         // The read-only half of `gh pr` (see the `ask` list's comment above for why the mutating
         // half - merge/close/create/edit/comment/ready/reopen - stays gated there instead).
         "Bash(gh pr view *)",

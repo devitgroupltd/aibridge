@@ -10,13 +10,30 @@ import {
   resolveBridgeRepoRoot,
   truncateForTelegram,
   writeDeployMarker,
-  type DeployOutcome,
 } from "./deploy.ts";
+import { escapeForFeed } from "./feed-escape.ts";
 import { resolveNodeExecutable } from "./session-launcher.ts";
+import type { DeployOutcome } from "./deploy.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
+import type { PtyIo } from "./pty-io.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
 import type { SendMessageSource } from "./telegram.ts";
 import type { SessionRow, SessionStore } from "./session-store.ts";
+
+/**
+ * Renders a `DeployOutcome` (or any ok/failure notice built the same way) for Telegram: a bold
+ * headline plus, only if there's raw command output to show, a separate `<pre>` block for it.
+ * Found live 2026-08-11: a rebase-conflict message used to fold git's multi-line stderr straight
+ * into the middle of a sentence - unreadable once Telegram wrapped it. Keeping the prose and the
+ * raw dump visually distinct fixes that without changing what's actually reported. Every
+ * interpolated part is untrusted (branch names, worktree paths, git output) so both go through
+ * `escapeForFeed` - same treatment feed cards give tool output, for the same reason (§9 scenario 21).
+ */
+function formatOutcomeHtml(message: string, detail?: string): string {
+  const head = `<b>${escapeForFeed(message)}</b>`;
+  if (!detail || detail.trim().length === 0) return head;
+  return `${head}\n<pre>${escapeForFeed(truncateForTelegram(detail))}</pre>`;
+}
 
 /** Result shape shared by `runSchtasks`/`runPowershell` - `/Query` against an unregistered task
  * exits non-zero, which is a valid "not registered" answer, not a transport failure, so both
@@ -54,11 +71,22 @@ export interface ProcessRunner {
   runShutdown(args: string[]): Promise<ProcessRunResult>;
 }
 
+/** Same spawn-level-failure gap as `deploy.ts`'s `defaultRunner` (found live 2026-08-11, same day):
+ * a *real* run of `cmd` (task registered or not, script ran or not) reports through `stderr` as
+ * `execFileFn` already hands it back, but a *spawn-level* failure - `cmd` not resolvable, a
+ * permission error - never runs the child process at all, so `stderr` comes back empty and the
+ * only diagnostic left is `err.message` (Node's "spawn schtasks ENOENT"-shaped text). Without this
+ * fallback, callers built exactly the bare, undiagnosable failure the `deploy.ts` fix addressed -
+ * `schtasks /Create failed` / `(unknown error)` with nothing else to go on. */
+function stderrOrMessage(err: Error | null, stderr: string): string {
+  return stderr || (err?.message ?? "");
+}
+
 export function createProcessRunner(execFileFn: ExecFileFn = execFile as unknown as ExecFileFn): ProcessRunner {
   function runSchtasks(args: string[]): Promise<ProcessRunResult> {
     return new Promise((resolve) => {
       execFileFn("schtasks", args, { windowsHide: true }, (err, stdout, stderr) => {
-        resolve({ stdout: stdout ?? "", stderr: stderr ?? "", failed: err !== null });
+        resolve({ stdout: stdout ?? "", stderr: stderrOrMessage(err, stderr ?? ""), failed: err !== null });
       });
     });
   }
@@ -66,7 +94,7 @@ export function createProcessRunner(execFileFn: ExecFileFn = execFile as unknown
   function runPowershell(script: string): Promise<{ stdout: string; stderr: string; failed: boolean }> {
     return new Promise((resolve) => {
       execFileFn("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true }, (err, stdout, stderr) => {
-        resolve({ stdout: stdout ?? "", stderr: stderr ?? "", failed: err !== null });
+        resolve({ stdout: stdout ?? "", stderr: stderrOrMessage(err, stderr ?? ""), failed: err !== null });
       });
     });
   }
@@ -74,7 +102,7 @@ export function createProcessRunner(execFileFn: ExecFileFn = execFile as unknown
   function runShutdown(args: string[]): Promise<ProcessRunResult> {
     return new Promise((resolve) => {
       execFileFn("shutdown", args, { windowsHide: true }, (err, stdout, stderr) => {
-        resolve({ stdout: stdout ?? "", stderr: stderr ?? "", failed: err !== null });
+        resolve({ stdout: stdout ?? "", stderr: stderrOrMessage(err, stderr ?? ""), failed: err !== null });
       });
     });
   }
@@ -109,6 +137,13 @@ export interface DeployLifecycleCommandsOptions {
    * steps need to be exercised in tests without a real git worktree/remote. */
   commitIfDirty?: typeof realCommitIfDirty;
   pushCurrentBranch?: typeof realPushCurrentBranch;
+  /** Lets `/merge`/`/ship` reach into the session that owns the branch being landed when
+   * `deployBranch` reports `conflict: true` - the auto-rebase hit real conflicts and backed out
+   * clean, and that session's own Claude is already sitting in the worktree with full context to
+   * resolve them, unlike the operator relaying a raw filesystem path over Telegram. Optional (not
+   * every caller needs the nudge exercised) - no live session just means `sendChannelText` logs a
+   * `WARN` and drops it, same as any other nudge with no PTY to write to. */
+  ptyIo?: Pick<PtyIo, "sendChannelText">;
 }
 
 export interface DeployLifecycleCommands {
@@ -123,6 +158,35 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
   const deployBranch = opts.deployBranch ?? realDeployBranch;
   const commitIfDirty = opts.commitIfDirty ?? realCommitIfDirty;
   const pushCurrentBranch = opts.pushCurrentBranch ?? realPushCurrentBranch;
+  const ptyIo = opts.ptyIo;
+
+  /**
+   * Reports a failed `DeployOutcome` to the control topic and, only when it's the specific
+   * "auto-rebase hit real conflicts" shape (`conflict: true`), also nudges the owning session
+   * (`sendChannelText` - same synthetic-inbound-turn mechanism as the resume/no-reply nudges in
+   * session-supervisor.ts/feed-wiring.ts) to resolve them itself: it's already sitting in
+   * `worktreePath` with full code context, which a raw filesystem path relayed over Telegram never
+   * gave the operator. The nudge points at the in-session `/ship` skill specifically because that
+   * one already does "fetch, check behind, merge, resolve conflicts" end to end - no need to spell
+   * the steps out twice.
+   */
+  async function reportFailure(topicId: number | undefined, outcome: DeployOutcome, row: { slug: string; topicId: number }, commandLabel: string): Promise<void> {
+    log("WARN", `${commandLabel} failed for "${row.slug}": ${outcome.message}${outcome.detail ? ` (${outcome.detail})` : ""}`);
+    if (outcome.conflict) {
+      ptyIo?.sendChannelText(
+        row.slug,
+        row.topicId,
+        `${commandLabel} from the control topic hit a rebase conflict landing your branch on main - aborted cleanly, nothing left half-done. Please resolve it yourself: run /ship here and it'll fetch main, check whether you're behind, merge it in, resolve the conflicts, gate, push, and open/merge a PR.`,
+        `${commandLabel}-conflict-nudge`,
+        "aibridge",
+      );
+    }
+    try {
+      await controlBot.sendMessage(supergroupChatId, topicId, formatOutcomeHtml(outcome.message, outcome.detail), undefined, "HTML");
+    } catch (err) {
+      log("WARN", `failed to send ${commandLabel} failure message: ${(err as Error).message}`);
+    }
+  }
 
   /** `/merge`/`/ship`/`/restart` all send a best-effort Telegram notice and only log (never throw)
    * on a send failure - a dropped ack/failure/success message must not abort a merge that already
@@ -137,21 +201,31 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     }
   }
 
+  /** Same best-effort-send contract as `notify` above, but through `formatOutcomeHtml`'s `"HTML"`
+   * parse mode - the shape `/merge`'s and `/ship`'s own success messages need. */
+  async function notifyHtml(topicId: number | undefined, html: string, label: string): Promise<void> {
+    try {
+      await controlBot.sendMessage(supergroupChatId, topicId, html, undefined, "HTML");
+    } catch (err) {
+      log("WARN", `failed to send ${label}: ${(err as Error).message}`);
+    }
+  }
+
   /**
    * The merge+gate step shared by `/merge` and `/ship`: runs `deployBranch` and, on failure, reports
-   * and logs it - returns `undefined` in that case (already fully handled) so the caller's only job
-   * is "if there's an outcome, keep going". Success reporting is deliberately left to each caller
-   * instead of folded in here: `/merge` reports right away, `/ship` first pushes and folds the push
-   * result into one combined message, so there is no single "success text" this helper could emit
-   * that would be correct for both.
+   * it via `reportFailure` (which also fires the rebase-conflict nudge back into the owning session
+   * when `outcome.conflict` is set) - returns `undefined` in that case (already fully handled) so
+   * the caller's only job is "if there's an outcome, keep going". Success reporting is deliberately
+   * left to each caller instead of folded in here: `/merge` reports right away, `/ship` first pushes
+   * and folds the push result into one combined message, so there is no single "success text" this
+   * helper could emit that would be correct for both.
    */
   async function mergeAndReport(commandLabel: string, topicId: number | undefined, row: SessionRow): Promise<DeployOutcome | undefined> {
     const { repoPath, branch, worktreePath } = row;
     const packageDirs = discoverTypecheckedPackages(repoPath);
     const outcome = await deployBranch(repoPath, branch, packageDirs, undefined, worktreePath);
     if (!outcome.ok) {
-      log("WARN", `${commandLabel} failed for "${branch}": ${outcome.message}`);
-      await notify(topicId, truncateForTelegram(outcome.message), `${commandLabel} failure message`);
+      await reportFailure(topicId, outcome, row, commandLabel);
       return undefined;
     }
     return outcome;
@@ -239,7 +313,7 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     log("INFO", `/merge requested for slug "${slug}" -> merging "${branch}" into ${repoPath}`);
     const outcome = await mergeAndReport("/merge", topicId, row);
     if (!outcome) return;
-    await notify(topicId, truncateForTelegram(outcome.message), "/merge success message");
+    await notifyHtml(topicId, formatOutcomeHtml(outcome.message), "/merge success message");
 
     await restartIfSelfRepo("/merge", repoPath, branch, outcome, topicId);
   }
@@ -294,9 +368,14 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     if (!outcome) return;
 
     const push = await pushCurrentBranch(repoPath);
-    const pushNote = push.status === 0 ? "Pushed to origin." : `Merged locally, but the push to origin failed: ${push.stderr || push.stdout}`;
-    if (push.status !== 0) log("WARN", `/ship: push failed for ${repoPath}: ${push.stderr || push.stdout}`);
-    await notify(topicId, `${truncateForTelegram(outcome.message)}\n${pushNote}`, "/ship success message");
+    const pushFailed = push.status !== 0;
+    const pushNote = pushFailed ? "Merged locally, but the push to origin failed." : "Pushed to origin.";
+    if (pushFailed) log("WARN", `/ship: push failed for ${repoPath}: ${push.stderr || push.stdout}`);
+    await notifyHtml(
+      topicId,
+      formatOutcomeHtml(`${outcome.message} ${pushNote}`, pushFailed ? push.stderr || push.stdout : undefined),
+      "/ship success message",
+    );
 
     await restartIfSelfRepo("/ship", repoPath, branch, outcome, topicId);
   }

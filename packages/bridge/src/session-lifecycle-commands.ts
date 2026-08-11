@@ -382,6 +382,18 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // which targets `controlTopicId`) since this belongs in the new topic itself.
     confirmSessionCommand(topic.message_thread_id, newSessionContent(cmd));
 
+    // `/default mode`, applied as a launch flag instead of the post-launch Shift+Tab burst that never
+    // actually landed (see `buildClaudeSpawnArgs`). Read exactly once, here, and reused for all three
+    // places this value has to land (the launch flag below, the row's `mode` column, and
+    // `routing.setMode` after the startup gates) - `getDefaultSessionMode` is a *live* getter, and
+    // there are two `await`s between the insert and that `setMode`, so three separate reads let
+    // `/default mode <x>` land in the control topic mid-startup and be recorded as this session's mode
+    // while the session is actually running in whatever the launch flag captured. That divergence used
+    // to be in-memory-only; it is persisted and re-applied at the next restart now (v0.24.0/v0.25.0),
+    // which is what makes one read load-bearing rather than tidy. It also makes the code match what
+    // the `routing.setMode` comment below already claims: the tracked value is what the session
+    // actually started in.
+    const sessionMode = getDefaultSessionMode();
     let session: ReturnType<typeof launchSession>;
     try {
       session = launchSession({
@@ -390,11 +402,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         repoPath: repo.path,
         worktreesRoot: fleetWorktreesRoot,
         model,
-        // `/default mode`, applied as a launch flag instead of the post-launch Shift+Tab burst that
-        // never actually landed (see `buildClaudeSpawnArgs`). Read here rather than further down so
-        // it's part of the spawn itself; `routing.setMode` below keeps the tracked value in step, so
-        // a later live `/mode` switch still cycles from the right starting point.
-        permissionMode: getDefaultSessionMode(),
+        permissionMode: sessionMode,
         otlpPort,
         log,
       });
@@ -466,6 +474,14 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       renamed: false,
       feedDetail: "compact",
       feedVerbose: false,
+      // Both false at insert time regardless of `/default permission`/`/default answer` - the
+      // `autoCategorySpec(...).set(...)` calls a few lines below run after this row exists and go
+      // through `routing.setBypass`/`setAutoAnswer`, which write these columns through themselves.
+      bypassPermission: false,
+      autoAnswer: false,
+      // The same value the spawn flag above actually used, not a re-read - see `sessionMode`'s own
+      // note for why re-reading the live getter here would let the row disagree with the process.
+      mode: sessionMode,
       createdUtc: nowIso(),
       lastEventUtc: nowIso(),
     });
@@ -504,7 +520,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // `/mode` switch cycles from where the session actually is; no keystroke is sent, because the
     // session already started in that mode.
     const defaultSessionEffort = getDefaultSessionEffort();
-    routing.setMode(slug, getDefaultSessionMode());
+    routing.setMode(slug, sessionMode);
     if (defaultSessionEffort !== DEFAULT_EFFORT) ptyIo.sendEffortCommand(slug, defaultSessionEffort);
     // `/default permission`/`/default answer`: deliberately *not* the keystroke/typed-command
     // machinery its two neighbours above need. This state lives in `routing.ts`, on the Bridge side
@@ -804,7 +820,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
           drainsOnEnable: true,
           confirmation: (slug, on) =>
             on
-              ? `🔓 Auto-permission is now ON for "${slug}" - every permission prompt this session would raise, including git commit/push, PR merge/create, and npm publish, is auto-allowed with no Telegram prompt. The deny list (force-push, secret reads, rm -rf /) still hard-blocks regardless - this cannot bypass that. /auto permission off to revert; it also resets to off on every Bridge restart.`
+              ? `🔓 Auto-permission is now ON for "${slug}" - every permission prompt this session would raise, including git commit/push, PR merge/create, and npm publish, is auto-allowed with no Telegram prompt. The deny list (force-push, secret reads, rm -rf /) still hard-blocks regardless - this cannot bypass that. This persists across a Bridge restart - /auto permission off to revert.`
               : `Auto-permission is now off for "${slug}" - permission prompts resume as normal.`,
           bulkPrompt: (on) =>
             on

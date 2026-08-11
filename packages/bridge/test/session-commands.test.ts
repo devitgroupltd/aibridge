@@ -34,8 +34,10 @@ describe("parseSessionCommand", () => {
     expect(parseSessionCommand("/model OPUS")).toEqual({ kind: "model", model: "opus" });
   });
 
-  test("parses a valid /mode command", () => {
+  test("parses a valid /mode command, case-insensitively - including mixed-case acceptEdits", () => {
     expect(parseSessionCommand("/mode acceptEdits")).toEqual({ kind: "mode", mode: "acceptEdits" });
+    expect(parseSessionCommand("/mode ACCEPTEDITS")).toEqual({ kind: "mode", mode: "acceptEdits" });
+    expect(parseSessionCommand("/mode AUTO")).toEqual({ kind: "mode", mode: "auto" });
   });
 
   test("parses a valid /effort command, case-insensitively", () => {

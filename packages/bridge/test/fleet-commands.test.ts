@@ -239,6 +239,11 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/os poweroff")).toBeNull();
   });
 
+  test("/os is case-insensitive on the action", () => {
+    expect(parseFleetCommand("/os SHUTDOWN")).toEqual({ kind: "os", action: "shutdown" });
+    expect(parseFleetCommand("/os Reboot")).toEqual({ kind: "os", action: "reboot" });
+  });
+
   test("/rm --dead requests the bulk dead-row filter", () => {
     expect(parseFleetCommand("/rm --dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
   });
@@ -350,6 +355,16 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/auto permission fix-bug bogus")).toBeNull();
   });
 
+  // Operator-reported finding: "/auto permission ON" (and other casings) was silently parsed as
+  // targeting a session literally named "ON" instead of setting the value, because isOnOff checked
+  // the raw token. parseSlugAndValue now lowercases the value position before matching.
+  test("/auto <category> [on|off] is case-insensitive on the value", () => {
+    expect(parseFleetCommand("/auto permission ON")).toEqual({ kind: "auto", category: "permission", slug: undefined, on: true });
+    expect(parseFleetCommand("/auto permission On")).toEqual({ kind: "auto", category: "permission", slug: undefined, on: true });
+    expect(parseFleetCommand("/auto answer OFF")).toEqual({ kind: "auto", category: "answer", slug: undefined, on: false });
+    expect(parseFleetCommand("/auto answer fix-bug ON")).toEqual({ kind: "auto", category: "answer", slug: "fix-bug", on: true });
+  });
+
   test("/auto with no category, or an unknown one, is a parse error rather than defaulting to either", () => {
     expect(parseFleetCommand("/auto")).toBeNull();
     expect(parseFleetCommand("/auto ship on")).toBeNull();
@@ -368,6 +383,10 @@ describe("parseFleetCommand", () => {
   // v0.10.0's finding: a confirm card built from `on: undefined` says ON and does OFF on tap.
   test("/auto <category> --all with no value is the status form, carrying no on value at all", () => {
     expect(parseFleetCommand("/auto permission --all")).toEqual({ kind: "auto", category: "permission", all: true });
+  });
+
+  test("/auto <category> --all [on|off] is case-insensitive on the value, same as the non---all form", () => {
+    expect(parseFleetCommand("/auto permission --all ON")).toEqual({ kind: "auto", category: "permission", all: true, on: true });
   });
 
   // The one that breaks a shipped command if the alternation is written carelessly: `auto` is only
@@ -396,6 +415,10 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/autostart bogus")).toBeNull();
   });
 
+  test("/autostart is case-insensitive on the action", () => {
+    expect(parseFleetCommand("/autostart INSTALL")).toEqual({ kind: "autostart", action: "install" });
+  });
+
   test("/assist with no argument defaults to status", () => {
     expect(parseFleetCommand("/assist")).toEqual({ kind: "assist", action: "status" });
   });
@@ -407,6 +430,10 @@ describe("parseFleetCommand", () => {
 
   test("/assist with an unrecognised argument is invalid, not a different command", () => {
     expect(parseFleetCommand("/assist bogus")).toBeNull();
+  });
+
+  test("/assist is case-insensitive on the action", () => {
+    expect(parseFleetCommand("/assist ON")).toEqual({ kind: "assist", action: "on" });
   });
 
   test("/router with no argument defaults to status", () => {
@@ -422,6 +449,10 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/router bogus")).toBeNull();
   });
 
+  test("/router is case-insensitive on the action", () => {
+    expect(parseFleetCommand("/router API")).toEqual({ kind: "router", action: "api" });
+  });
+
   test("/voiceconfirm with no argument defaults to status", () => {
     expect(parseFleetCommand("/voiceconfirm")).toEqual({ kind: "voiceconfirm", action: "status" });
   });
@@ -433,6 +464,10 @@ describe("parseFleetCommand", () => {
 
   test("/voiceconfirm with an unrecognised argument is invalid, not a different command", () => {
     expect(parseFleetCommand("/voiceconfirm bogus")).toBeNull();
+  });
+
+  test("/voiceconfirm is case-insensitive on the action", () => {
+    expect(parseFleetCommand("/voiceconfirm OFF")).toEqual({ kind: "voiceconfirm", action: "off" });
   });
 
   test("/voiceconfirm is a distinct command from /voice, not a model name collision", () => {
@@ -465,6 +500,14 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/default effort max")).toEqual({ kind: "default", category: "effort", value: "max" });
   });
 
+  // acceptEdits is the one MODES value that isn't all-lowercase, so a blunt `.toLowerCase()` compare
+  // against the canonical list wouldn't recognise it - this needs an actual case-insensitive lookup.
+  test("/default mode|effort is case-insensitive on the value, including mixed-case acceptEdits", () => {
+    expect(parseFleetCommand("/default mode ACCEPTEDITS")).toEqual({ kind: "default", category: "mode", value: "acceptEdits" });
+    expect(parseFleetCommand("/default mode AUTO")).toEqual({ kind: "default", category: "mode", value: "auto" });
+    expect(parseFleetCommand("/default effort HIGH")).toEqual({ kind: "default", category: "effort", value: "high" });
+  });
+
   test("/default permission|answer parse to booleans, bare to the reports-status form", () => {
     expect(parseFleetCommand("/default permission on")).toEqual({ kind: "default", category: "permission", value: true });
     expect(parseFleetCommand("/default permission off")).toEqual({ kind: "default", category: "permission", value: false });
@@ -474,6 +517,11 @@ describe("parseFleetCommand", () => {
     // - there is nothing to pick between for a boolean.
     expect(parseFleetCommand("/default permission")).toEqual({ kind: "default", category: "permission" });
     expect(parseFleetCommand("/default answer")).toEqual({ kind: "default", category: "answer" });
+  });
+
+  test("/default permission|answer [on|off] is case-insensitive on the value, same as /auto", () => {
+    expect(parseFleetCommand("/default permission ON")).toEqual({ kind: "default", category: "permission", value: true });
+    expect(parseFleetCommand("/default answer Off")).toEqual({ kind: "default", category: "answer", value: false });
   });
 
   test("/default with an unrecognised category or value is invalid, not a different command", () => {
@@ -704,6 +752,9 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     renamed: false,
     feedDetail: "compact",
     feedVerbose: false,
+    bypassPermission: false,
+    autoAnswer: false,
+    mode: "manual",
     createdUtc: "2026-08-03T00:00:00.000Z",
     lastEventUtc: "2026-08-03T00:00:00.000Z",
     ...overrides,

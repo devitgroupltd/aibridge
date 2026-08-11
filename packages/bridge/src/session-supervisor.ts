@@ -468,6 +468,14 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
       confirmSessionCommand(topicId, `Session "${slug}" could not be resumed (no session id was recorded yet). Worktree preserved at ${row.worktreePath}.`);
       return;
     }
+    // Restores `/mode`/`/auto permission`/`/auto answer` from the persisted row *before* the
+    // relaunch below - `routing.ts`'s maps are empty this early in a fresh Bridge process (a full
+    // process restart, not this same `claude --resume`), so without this `routing.getMode(slug)` a
+    // few lines down would silently read back `DEFAULT_MODE` ("manual") regardless of what `/mode`
+    // had actually been set to before the crash (found live 2026-08-11, same audit that flagged
+    // `/auto permission`'s restart gap). See `hydrateFromRow`'s own doc comment for why this isn't
+    // `setMode`/`setBypass`/`setAutoAnswer`.
+    routing.hydrateFromRow(slug, current);
     try {
       const session = launchSession({
         slug,
@@ -475,11 +483,10 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
         repoPath: current.repoPath,
         worktreesRoot: path.dirname(current.worktreePath),
         model: current.model,
-        // A resumed PTY re-spawns `claude` from scratch (§4.5), so without this the session comes
-        // back at the CLI's own `manual` default however it was set before the crash - silently, and
-        // while `routing.getMode` still reports the old value, so a later `/mode` switch would cycle
-        // from a starting point the session isn't actually at. Cheap to carry now that it's a launch
-        // flag rather than a keystroke burst.
+        // A resumed PTY re-spawns `claude` from scratch (§4.5) - the `hydrateFromRow` call above is
+        // what makes this the pre-crash mode rather than the CLI's own `manual` spawn default;
+        // `routing.setMode` (a live `/mode` switch) mirrors right back into the same persisted column,
+        // so this stays correct across any number of crash/restart cycles.
         permissionMode: routing.getMode(slug),
         resumeSessionId: current.sessionId,
         otlpPort,

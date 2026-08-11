@@ -21,6 +21,9 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     renamed: false,
     feedDetail: "compact",
     feedVerbose: false,
+    bypassPermission: false,
+    autoAnswer: false,
+    mode: "manual",
     createdUtc: "2026-08-03T00:00:00.000Z",
     lastEventUtc: "2026-08-03T00:00:00.000Z",
     ...overrides,
@@ -464,6 +467,43 @@ describe("createSessionSupervisor", () => {
     expect(resumedPty.wasKilled()).toBe(true);
     expect(sessionStore.get("fix-bug")?.state).toBe("dead");
     expect(confirm.calls.some((c) => c.text.includes("couldn't resume its prior conversation"))).toBe(true);
+  });
+
+  // bypass-and-autoanswer-plan.md v0.24.0: found by the same restart audit as `/auto permission`'s
+  // own gap - `permissionMode` is a real relaunch flag, not a display value, so `resumeSession` must
+  // hydrate `routing.ts`'s `modeBySlug` from the persisted row *before* calling `launchSession`,
+  // not after. A fresh `Routing()` here has no `/mode` history at all (this is what a real Bridge
+  // restart looks like), so this only passes if `resumeSession` reads the row's `mode` column
+  // itself rather than trusting `routing.getMode` to already know it.
+  test("resumeSession relaunches with the persisted mode, not DEFAULT_MODE, even though routing.ts's own map starts empty (the restart case)", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "idle", mode: "acceptEdits" }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    let capturedPermissionMode: string | undefined;
+    const resumedPty = fakePty();
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      launchSession: (opts) => {
+        capturedPermissionMode = opts.permissionMode;
+        return {
+          worktreePath: "c:\\data\\worktrees\\fix-bug",
+          branch: "claude/fix-bug-1",
+          ptyProcess: resumedPty as unknown as LaunchedSession["ptyProcess"],
+          ready: Promise.resolve({ resumeFailed: false }),
+        };
+      },
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!);
+
+    expect(capturedPermissionMode).toBe("acceptEdits");
+    expect(routing.getMode("fix-bug")).toBe("acceptEdits");
   });
 
   // resume-nudge-on-lost-permission-plan.md §2/Testing: resumeSession sends a nudge into a
