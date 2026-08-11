@@ -13,7 +13,7 @@ import type { Routing, SessionRoute } from "./routing.ts";
 import type { SessionStore } from "./session-store.ts";
 import { buildStaleConfirmKeyboard, type StaleConfirmRegistry } from "./stale-confirm.ts";
 import { formatStaleAge, hasAttachment, isStaleInbound } from "./stale-inbound.ts";
-import type { SendMessageSource, TelegramMessage, TelegramReplyTarget } from "./telegram.ts";
+import type { SendMessageSource, TelegramMediaFields, TelegramMessage, TelegramReplyTarget } from "./telegram.ts";
 import { buildVoiceConfirmKeyboard, type VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { transcribeVoiceNote } from "./voice-transcribe.ts";
 
@@ -322,23 +322,29 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     threadId: number | undefined,
     caption: string | undefined,
   ): Promise<void> {
+    const rejection = `Send ${attachmentKindLabel(kind)} in a session topic - the control topic has no session to hand it to.`;
+    if (disableCaptionNew) {
+      confirmSessionCommand(threadId, rejection);
+      return;
+    }
     const literalCmd: FleetCommand | null = caption ? parseFleetCommand(caption) : null;
-    const isLiteralNew = !disableCaptionNew && literalCmd?.kind === "new";
-    // The NL fallback below carries its own LLM round-trip - only worth it once the literal syntax
-    // has ruled out `kind: "new"`, and only for a caption that isn't already some *other* known
-    // fleet command (code-review finding: a captioned "/ls" or "/help" would otherwise fire an LLM
-    // call just to be told it doesn't match "new" either, before the same rejection reply as before).
-    const nlCmd = !isLiteralNew && !disableCaptionNew && caption && !literalCmd ? await routeCaptionToNewCommand(caption) : null;
-    if (!isLiteralNew && !nlCmd) {
-      confirmSessionCommand(threadId, `Send ${attachmentKindLabel(kind)} in a session topic - the control topic has no session to hand it to.`);
+    // The NL fallback carries its own LLM round-trip - only worth it once the literal syntax has
+    // ruled out `kind: "new"`, and only for a caption that isn't already some *other* known fleet
+    // command (code-review finding: a captioned "/ls" or "/help" would otherwise fire an LLM call
+    // just to be told it doesn't match "new" either, before the same rejection reply as before).
+    // Resolved once, up front, rather than re-derived from `isLiteralNew`/`nlCmd` booleans at each
+    // use site - `matched === literalCmd` below is what tells the literal and NL paths apart.
+    const matched: Extract<FleetCommand, { kind: "new" }> | null =
+      literalCmd?.kind === "new" ? literalCmd : caption && !literalCmd ? await routeCaptionToNewCommand(caption) : null;
+    if (!matched) {
+      confirmSessionCommand(threadId, rejection);
       return;
     }
     const downloaded = await downloadAttachment(kind, fileId, fileSize, fileName, mimeType, threadId);
     if (!downloaded) return;
-    const matched = isLiteralNew ? (literalCmd as Extract<FleetCommand, { kind: "new" }>) : (nlCmd as Extract<FleetCommand, { kind: "new" }>);
     // `rawCaption` only set for the NL path - the literal path's `cmd.prompt` is already verbatim
     // (see PendingAttachment's own doc comment).
-    const rawCaption = isLiteralNew ? undefined : caption;
+    const rawCaption = matched === literalCmd ? undefined : caption;
     await createSessionFromAttachment({ ...matched, pendingAttachment: { kind, name: downloaded.name, bytes: downloaded.bytes, rawCaption } }, threadId);
   }
 
@@ -385,12 +391,16 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     }
   }
 
-  /** Reply-to-retry's own media-kind sniffing, against a `reply_to_message` rather than the
-   * top-level message - mirrors the mutually-exclusive photo/document/video/audio/video-note checks
-   * `routeInboundMessage` below runs against a live message. Returns `null` when the replied-to
-   * message carried no attachment at all (plain text/caption - handled separately by the
-   * `replyToText` path). */
-  function attachmentFromReplyTarget(target: TelegramReplyTarget): {
+  /** The one place that sniffs Telegram's mutually-exclusive photo/document/video/audio/video-note
+   * fields into a single `AttachmentKind` - shared by `routeInboundMessage` (a live top-level
+   * message) and `attachmentFromReplyTarget` (reply-to-retry, against a `reply_to_message`) since
+   * `TelegramMessage`/`TelegramReplyTarget` now carry identical `TelegramMediaFields`. A new
+   * attachment kind, or a Bot API field change, is one edit instead of two. Returns `null` when
+   * `fields` carries no attachment at all. */
+  function extractAttachment(
+    fields: TelegramMediaFields,
+    caption: string | undefined,
+  ): {
     kind: AttachmentKind;
     fileId: string;
     fileSize: number | undefined;
@@ -398,23 +408,30 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     mimeType: string | undefined;
     caption: string | undefined;
   } | null {
-    if (target.photo && target.photo.length > 0) {
-      const largest = target.photo[target.photo.length - 1]!;
-      return { kind: "image", fileId: largest.file_id, fileSize: largest.file_size, fileName: undefined, mimeType: undefined, caption: target.caption };
+    if (fields.photo && fields.photo.length > 0) {
+      const largest = fields.photo[fields.photo.length - 1]!;
+      return { kind: "image", fileId: largest.file_id, fileSize: largest.file_size, fileName: undefined, mimeType: undefined, caption };
     }
-    if (target.document) {
-      return { kind: "document", fileId: target.document.file_id, fileSize: target.document.file_size, fileName: target.document.file_name, mimeType: target.document.mime_type, caption: target.caption };
+    if (fields.document) {
+      return { kind: "document", fileId: fields.document.file_id, fileSize: fields.document.file_size, fileName: fields.document.file_name, mimeType: fields.document.mime_type, caption };
     }
-    if (target.video) {
-      return { kind: "video", fileId: target.video.file_id, fileSize: target.video.file_size, fileName: target.video.file_name, mimeType: target.video.mime_type, caption: target.caption };
+    if (fields.video) {
+      return { kind: "video", fileId: fields.video.file_id, fileSize: fields.video.file_size, fileName: fields.video.file_name, mimeType: fields.video.mime_type, caption };
     }
-    if (target.audio) {
-      return { kind: "audio", fileId: target.audio.file_id, fileSize: target.audio.file_size, fileName: target.audio.file_name, mimeType: target.audio.mime_type, caption: target.caption };
+    if (fields.audio) {
+      return { kind: "audio", fileId: fields.audio.file_id, fileSize: fields.audio.file_size, fileName: fields.audio.file_name, mimeType: fields.audio.mime_type, caption };
     }
-    if (target.video_note) {
-      return { kind: "video note", fileId: target.video_note.file_id, fileSize: target.video_note.file_size, fileName: undefined, mimeType: undefined, caption: target.caption };
+    if (fields.video_note) {
+      return { kind: "video note", fileId: fields.video_note.file_id, fileSize: fields.video_note.file_size, fileName: undefined, mimeType: undefined, caption };
     }
     return null;
+  }
+
+  /** Reply-to-retry's own media-kind sniffing, against a `reply_to_message` rather than the
+   * top-level message. Returns `null` when the replied-to message carried no attachment at all
+   * (plain text/caption - handled separately by the `replyToText` path). */
+  function attachmentFromReplyTarget(target: TelegramReplyTarget): ReturnType<typeof extractAttachment> {
+    return extractAttachment(target, target.caption);
   }
 
   function routeInboundMessage(message: TelegramMessage): void {
@@ -489,48 +506,12 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     // smallest to largest; the largest is the one worth downloading. Telegram allows a message
     // to carry at most one kind of media, so these are mutually exclusive with each other and
     // with `voice`/`text` above - order here doesn't matter beyond that.
-    if (message.photo && message.photo.length > 0) {
-      const largest = message.photo[message.photo.length - 1]!;
+    const attachment = extractAttachment(message, message.caption);
+    if (attachment) {
       fireAndForget(
-        handleAttachmentMessage("image", largest.file_id, largest.file_size, undefined, undefined, threadId, route, isControl, message.message_id, message.caption, from, message),
+        handleAttachmentMessage(attachment.kind, attachment.fileId, attachment.fileSize, attachment.fileName, attachment.mimeType, threadId, route, isControl, message.message_id, attachment.caption, from, message),
         log,
-        "inbound-media handleAttachmentMessage(image)",
-      );
-      return;
-    }
-    if (message.document) {
-      const doc = message.document;
-      fireAndForget(
-        handleAttachmentMessage("document", doc.file_id, doc.file_size, doc.file_name, doc.mime_type, threadId, route, isControl, message.message_id, message.caption, from, message),
-        log,
-        "inbound-media handleAttachmentMessage(document)",
-      );
-      return;
-    }
-    if (message.video) {
-      const video = message.video;
-      fireAndForget(
-        handleAttachmentMessage("video", video.file_id, video.file_size, video.file_name, video.mime_type, threadId, route, isControl, message.message_id, message.caption, from, message),
-        log,
-        "inbound-media handleAttachmentMessage(video)",
-      );
-      return;
-    }
-    if (message.audio) {
-      const audio = message.audio;
-      fireAndForget(
-        handleAttachmentMessage("audio", audio.file_id, audio.file_size, audio.file_name, audio.mime_type, threadId, route, isControl, message.message_id, message.caption, from, message),
-        log,
-        "inbound-media handleAttachmentMessage(audio)",
-      );
-      return;
-    }
-    if (message.video_note) {
-      const note = message.video_note;
-      fireAndForget(
-        handleAttachmentMessage("video note", note.file_id, note.file_size, undefined, undefined, threadId, route, isControl, message.message_id, message.caption, from, message),
-        log,
-        "inbound-media handleAttachmentMessage(video note)",
+        `inbound-media handleAttachmentMessage(${attachment.kind})`,
       );
       return;
     }

@@ -316,12 +316,26 @@ function parseOs(rest: string): FleetCommand | null {
   return action ? { kind: "os", action } : null;
 }
 
+/**
+ * Shared by every `/x [status|...]` toggle command below: bare invocation defaults to `"status"`,
+ * anything else must be one of `actions` (case-insensitive, `matchCaseInsensitive`'s note) or the
+ * whole command is malformed (`null`, not a different command). `/autostart`/`/assist`/`/router`/
+ * `/voiceconfirm` used to each hand-write this exact "trim, default-to-status, case-insensitively
+ * validate against a literal set" shape - a fifth toggle command needed a sixth hand-copy, and a
+ * fix to the "bare defaults to status" convention had to be applied in four places by hand. `/os`
+ * doesn't use this: a bare `/os` is rejected outright rather than defaulting to any action (there
+ * is no safe default for a power command).
+ */
+function parseStatusToggle<K extends string, A extends string>(rest: string, kind: K, actions: readonly A[]): { kind: K; action: A } | null {
+  const trimmed = rest.trim();
+  const action = matchCaseInsensitive(actions, trimmed.length === 0 ? "status" : trimmed);
+  return action ? { kind, action } : null;
+}
+
 /** `/autostart` with no argument defaults to `status`; anything besides `status`/`install`/
  * `uninstall` is a malformed argument, not a different command. */
 function parseAutostart(rest: string): FleetCommand | null {
-  const trimmed = rest.trim();
-  const action = matchCaseInsensitive(AUTOSTART_ACTIONS, trimmed.length === 0 ? "status" : trimmed);
-  return action ? { kind: "autostart", action } : null;
+  return parseStatusToggle(rest, "autostart", AUTOSTART_ACTIONS);
 }
 
 /** `/assist [on|off]` - whether a natural-language-matched *destructive* command shows a confirm
@@ -330,9 +344,7 @@ function parseAutostart(rest: string): FleetCommand | null {
  * as `/autostart`. Named for what it reads as in a sentence ("/assist off") rather than spelling
  * out "nl"/"confirm" literally - see the plan's changelog for the naming discussion. */
 function parseAssist(rest: string): FleetCommand | null {
-  const trimmed = rest.trim();
-  const action = matchCaseInsensitive(ASSIST_ACTIONS, trimmed.length === 0 ? "status" : trimmed);
-  return action ? { kind: "assist", action } : null;
+  return parseStatusToggle(rest, "assist", ASSIST_ACTIONS);
 }
 
 /** `/router [api|cli]` - live switch for the NL-router backend (`config.ts`'s `nlRouter.backend`
@@ -342,9 +354,7 @@ function parseAssist(rest: string): FleetCommand | null {
  * index.ts) is the only way to actually opt in to spending real money, and switching back to
  * `"cli"` is exactly as supported as switching to `"api"` in the first place. */
 function parseRouterBackend(rest: string): FleetCommand | null {
-  const trimmed = rest.trim();
-  const action = matchCaseInsensitive(ROUTER_ACTIONS, trimmed.length === 0 ? "status" : trimmed);
-  return action ? { kind: "router", action } : null;
+  return parseStatusToggle(rest, "router", ROUTER_ACTIONS);
 }
 
 /** `/voiceconfirm [on|off]` - whether a transcribed voice note shows a Send/Re-record/Type-instead
@@ -354,9 +364,7 @@ function parseRouterBackend(rest: string): FleetCommand | null {
  * than folded into `/voice` (which already takes an optional `<model>` token as its rest-of-line
  * argument, so `/voice off` would be ambiguous with a (nonexistent) model literally named "off"). */
 function parseVoiceConfirm(rest: string): FleetCommand | null {
-  const trimmed = rest.trim();
-  const action = matchCaseInsensitive(VOICE_CONFIRM_ACTIONS, trimmed.length === 0 ? "status" : trimmed);
-  return action ? { kind: "voiceconfirm", action } : null;
+  return parseStatusToggle(rest, "voiceconfirm", VOICE_CONFIRM_ACTIONS);
 }
 
 /** `/default [mode|effort] [<value>]` - one command for both new-session defaults (permission mode
@@ -604,12 +612,19 @@ export function parseFleetCommand(text: string): FleetCommand | null {
   }
 }
 
-function ageLabel(createdUtc: string, nowMs: number): string {
-  const ms = nowMs - new Date(createdUtc).getTime();
-  const minutes = Math.max(0, Math.round(ms / 60_000));
+/** Shared by `ageLabel`/`durationLabel` below - both eventually reduce to "given a whole number of
+ * minutes, render `Xm` or `Xh Ym`"; they only differ in what unit they start from (an ISO timestamp
+ * vs. a precomputed millisecond delta) and whether sub-minute precision matters. */
+function formatHoursMinutes(minutes: number): string {
   if (minutes < 60) return `${minutes}m`;
   const hours = Math.floor(minutes / 60);
   return `${hours}h${minutes % 60}m`;
+}
+
+function ageLabel(createdUtc: string, nowMs: number): string {
+  const ms = nowMs - new Date(createdUtc).getTime();
+  const minutes = Math.max(0, Math.round(ms / 60_000));
+  return formatHoursMinutes(minutes);
 }
 
 /** Left-pads every row's cells to its column's widest entry - Telegram has no real table markup,
@@ -679,10 +694,7 @@ export function renderLsTable(
 function durationLabel(ms: number): string {
   const seconds = Math.max(0, Math.round(ms / 1000));
   if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  const hours = Math.floor(minutes / 60);
-  return `${hours}h${minutes % 60}m`;
+  return formatHoursMinutes(Math.floor(seconds / 60));
 }
 
 /** Truncates a tool-input preview to keep the `/ls` detail line short - the full text is already
@@ -814,6 +826,8 @@ export function renderHelp(): string {
     "    confirm-gated unless --force; /rm is an alias)",
     "  /remove (bare, inside a topic with no tracked session) - offers to delete that orphaned Telegram topic itself, confirm-gated",
     "  /attach [<slug>] - show a session's PTY tail",
+    "  /stop [<slug>] - interrupt the current turn (Escape); the session stays alive, just send a",
+    "    message to continue",
     "  /pause [<slug>] - pause/resume this topic's feed updates (does not affect the session itself)",
     "  /resume [<slug>] - relaunch a dead session's process (claude --resume) on its preserved",
     "    worktree; a no-op note if the session is still alive (/stop leaves it alive - just send a",
@@ -857,6 +871,8 @@ export function renderHelp(): string {
     "    manual, effort default medium, both /auto toggles default off); bare /default shows a tappable",
     "    picker, 'auto' mode skips permission prompts entirely for every future session until changed",
     "    back, and /default permission on starts every future session already auto-allowing prompts",
+    "  /retry - re-arm the last expired confirmation in this topic (also works as spoken/typed",
+    "    'retry'/'try again')",
     "",
     "You can also just say what you want in plain English (typed or a voice note) instead of the",
     "exact command above - e.g. \"show me the sessions\" or \"restart this session\".",

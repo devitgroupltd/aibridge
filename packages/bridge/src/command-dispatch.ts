@@ -113,6 +113,10 @@ interface DispatchCtx {
  * normalises to `null` or a truthy payload) means "handle it, then stop." Typed with `unknown` at
  * this boundary rather than a per-rule generic so the table itself can be one plain array - `rule()`
  * is what keeps each individual match/handle pair internally type-safe despite that erasure. */
+/** The three bare (no-argument) level commands `bareLevelCommand` below recognises - checked as a
+ * cheap `Set.has` before that rule's `match` does any store/routing lookup. */
+const BARE_LEVEL_COMMANDS = new Set(["/model", "/mode", "/effort"]);
+
 interface ExactSyntaxRule {
   name: string;
   match(text: string, ctx: DispatchCtx): unknown;
@@ -374,6 +378,14 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     rule(
       "bareLevelCommand",
       (text, ctx) => {
+        // Checked before any store/routing lookup: this `match` runs against every single inbound
+        // message that isn't one of the exact-syntax commands above - i.e. essentially every plain
+        // chat turn forwarded to a live session - so a `sessionStore.get`/`routing.getMode`/
+        // `routing.getEffort` read for the overwhelming majority that will never match here is real
+        // per-message work on the hot path. `BARE_LEVEL_COMMANDS` alone decides "could this even
+        // match", cheaply, before anything below does a single lookup.
+        if (!BARE_LEVEL_COMMANDS.has(text)) return null;
+
         const currentModel = ctx.currentSlug ? sessionStore.get(ctx.currentSlug)?.model : undefined;
         const bareCommandKeyboards: Record<string, { prompt: string; keyboard: () => ReturnType<typeof buildEffortKeyboard> }> = {
           "/model": {
