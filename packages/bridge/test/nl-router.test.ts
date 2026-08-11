@@ -94,13 +94,34 @@ describe("ROUTER_KINDS completeness", () => {
 });
 
 describe("mapRouterOutput - one case per kind", () => {
-  test("new: requires both repo and prompt", () => {
+  test("new: requires at least a prompt", () => {
     expect(mapRouterOutput({ kind: "new", repo: "seowrite", prompt: "fix the bug" }, CONTROL)).toEqual({
       matched: true,
       command: { kind: "new", repo: "seowrite", prompt: "fix the bug", model: undefined },
       destructive: false,
     });
     expect(mapRouterOutput({ kind: "new", repo: "seowrite" }, CONTROL)).toEqual({ matched: false });
+  });
+
+  test("new: a missing repo auto-fills to the only registered repo - no other repo could have been meant", () => {
+    expect(mapRouterOutput({ kind: "new", prompt: "analyze this alarm" }, { ...CONTROL, repoNames: ["aibridge"] })).toEqual({
+      matched: true,
+      command: { kind: "new", repo: "aibridge", prompt: "analyze this alarm", model: undefined },
+      destructive: false,
+    });
+  });
+
+  test("new: a missing repo with 2+ registered is a real ambiguity - new_pick_repo, not a guess", () => {
+    expect(mapRouterOutput({ kind: "new", prompt: "analyze this alarm" }, { ...CONTROL, repoNames: ["aibridge", "seowrite"] })).toEqual({
+      matched: true,
+      command: { kind: "new_pick_repo", prompt: "analyze this alarm", model: undefined },
+      destructive: false,
+    });
+  });
+
+  test("new: a missing repo with none registered (or no hint given) is still a no-match, same as today", () => {
+    expect(mapRouterOutput({ kind: "new", prompt: "analyze this alarm" }, CONTROL)).toEqual({ matched: false });
+    expect(mapRouterOutput({ kind: "new", prompt: "analyze this alarm" }, { ...CONTROL, repoNames: [] })).toEqual({ matched: false });
   });
 
   test("new: rejected outside the control topic, same scoping as dispatchInboundMessage", () => {
