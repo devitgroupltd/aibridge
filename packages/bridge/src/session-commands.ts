@@ -53,6 +53,16 @@ function isEffort(value: string): value is Effort {
   return (EFFORTS as readonly string[]).includes(value);
 }
 
+/** Case-insensitive membership test against a canonical list - returns the list's own canonical
+ * casing (never the input's). A blunt `.toLowerCase()` compare only works when every canonical
+ * value is already all-lowercase; `MODES` isn't (`acceptEdits`), so `/mode ACCEPTEDITS` needs an
+ * actual lookup rather than a lowered string to already equal the canonical one. Used for every
+ * typed enum-valued argument across the fleet commands for the same reason, not just `/mode`. */
+export function matchCaseInsensitive<T extends string>(list: readonly T[], input: string): T | undefined {
+  const lowered = input.toLowerCase();
+  return list.find((candidate) => candidate.toLowerCase() === lowered);
+}
+
 /**
  * Returns null for anything that isn't one of these two commands - including a recognised command
  * name with a bad argument, so the caller can tell "not for us" apart from "for us, but invalid"
@@ -62,18 +72,18 @@ export function parseSessionCommand(text: string): SessionCommand | null {
   const trimmed = text.trim();
   const modelMatch = trimmed.match(/^\/model\s+(\S+)$/);
   if (modelMatch) {
-    const arg = (modelMatch[1] ?? "").toLowerCase();
-    return isModel(arg) ? { kind: "model", model: arg } : null;
+    const model = matchCaseInsensitive(MODELS, modelMatch[1] ?? "");
+    return model ? { kind: "model", model } : null;
   }
   const modeMatch = trimmed.match(/^\/mode\s+(\S+)$/);
   if (modeMatch) {
-    const arg = modeMatch[1] ?? "";
-    return isMode(arg) ? { kind: "mode", mode: arg } : null;
+    const mode = matchCaseInsensitive(MODES, modeMatch[1] ?? "");
+    return mode ? { kind: "mode", mode } : null;
   }
   const effortMatch = trimmed.match(/^\/effort\s+(\S+)$/);
   if (effortMatch) {
-    const arg = (effortMatch[1] ?? "").toLowerCase();
-    return isEffort(arg) ? { kind: "effort", effort: arg } : null;
+    const effort = matchCaseInsensitive(EFFORTS, effortMatch[1] ?? "");
+    return effort ? { kind: "effort", effort } : null;
   }
   return null;
 }

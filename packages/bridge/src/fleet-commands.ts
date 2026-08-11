@@ -2,7 +2,7 @@ import type { AttachmentKind } from "./attachment-inbox.ts";
 import { escapeForFeed } from "./feed-escape.ts";
 import type { RepoEntry } from "./repos-registry.ts";
 import type { Effort, Mode, Model } from "./session-commands.ts";
-import { EFFORTS, MODELS, MODES } from "./session-commands.ts";
+import { EFFORTS, MODELS, MODES, matchCaseInsensitive } from "./session-commands.ts";
 import type { SessionRow } from "./session-store.ts";
 
 /** Bytes for an attachment sent alongside a control-topic `/new <repo> <prompt>` caption
@@ -180,16 +180,22 @@ function parseSlugArg(kind: "attach" | "pause" | "usage" | "stop" | "resume", re
  * alphabet (`compact`/`full`, `on`/`off`) can never collide with a real slug (slugs are generated
  * from the session's own prompt text and never land on one of these exact words by construction).
  */
+/** Case-insensitive on the value token only (`/auto permission ON` reads the same as `... on`) -
+ * `isValue` is checked against the lowercased token and that lowercased form is what's returned,
+ * never the original casing. A slug is a session identifier, not an enum, so it's never
+ * lowercased - only the position that fails `isValue` (or doesn't exist) falls back to `slug`. */
 function parseSlugAndValue<V extends string>(rest: string, isValue: (s: string) => s is V): { slug?: string; value?: V } | null {
   const tokens = rest.trim().split(/\s+/).filter((t) => t.length > 0);
   if (tokens.length === 0) return {};
   if (tokens.length === 1) {
     const [only] = tokens as [string];
-    return isValue(only) ? { value: only } : { slug: only };
+    const lowered = only.toLowerCase();
+    return isValue(lowered) ? { value: lowered } : { slug: only };
   }
   if (tokens.length === 2) {
     const [slug, value] = tokens as [string, string];
-    return isValue(value) ? { slug, value } : null;
+    const lowered = value.toLowerCase();
+    return isValue(lowered) ? { slug, value: lowered } : null;
   }
   return null;
 }
@@ -230,8 +236,12 @@ function parseAuto(rest: string): FleetCommand | null {
   if (all) {
     if (withoutAll.length === 0) return { kind: "auto", category, all: true };
     // `--all` must be the sole token alongside an optional value, matching `parseKill`'s strictness -
-    // a creative fallthrough would target a session literally named "--all extra".
-    if (withoutAll.length === 1 && isOnOff(withoutAll[0]!)) return { kind: "auto", category, all: true, on: withoutAll[0] === "on" };
+    // a creative fallthrough would target a session literally named "--all extra". Value is
+    // case-insensitive, same as `parseSlugAndValue`'s handling below (`--all ON` reads as `--all on`).
+    if (withoutAll.length === 1) {
+      const lowered = withoutAll[0]!.toLowerCase();
+      if (isOnOff(lowered)) return { kind: "auto", category, all: true, on: lowered === "on" };
+    }
     return null;
   }
   const parsed = parseSlugAndValue(withoutAll.join(" "), isOnOff);
@@ -290,23 +300,28 @@ function parseRm(rest: string): FleetCommand {
   return { kind: "rm", slug: trimmed.length > 0 ? trimmed : undefined };
 }
 
+const OS_ACTIONS = ["shutdown", "reboot", "cancel"] as const;
+const AUTOSTART_ACTIONS = ["status", "install", "uninstall"] as const;
+const ASSIST_ACTIONS = ["status", "on", "off"] as const;
+const ROUTER_ACTIONS = ["status", "api", "cli"] as const;
+const VOICE_CONFIRM_ACTIONS = ["status", "on", "off"] as const;
+
 /** `/os shutdown|reboot|cancel` - host power control (plans/swirling-crafting-pixel.md), gated
  * behind a Yes/No confirm card in index.ts/os-power-commands.ts exactly like `/kill --all`. Unlike
  * `/autostart`'s bare-defaults-to-status shape, there is no safe default here - a bare `/os` with
- * no argument is rejected rather than assumed to mean anything. */
+ * no argument is rejected rather than assumed to mean anything. Case-insensitive on the action,
+ * same as every other typed enum argument (`matchCaseInsensitive`'s note). */
 function parseOs(rest: string): FleetCommand | null {
-  const action = rest.trim();
-  if (action !== "shutdown" && action !== "reboot" && action !== "cancel") return null;
-  return { kind: "os", action };
+  const action = matchCaseInsensitive(OS_ACTIONS, rest.trim());
+  return action ? { kind: "os", action } : null;
 }
 
 /** `/autostart` with no argument defaults to `status`; anything besides `status`/`install`/
  * `uninstall` is a malformed argument, not a different command. */
 function parseAutostart(rest: string): FleetCommand | null {
   const trimmed = rest.trim();
-  const action = trimmed.length === 0 ? "status" : trimmed;
-  if (action !== "status" && action !== "install" && action !== "uninstall") return null;
-  return { kind: "autostart", action };
+  const action = matchCaseInsensitive(AUTOSTART_ACTIONS, trimmed.length === 0 ? "status" : trimmed);
+  return action ? { kind: "autostart", action } : null;
 }
 
 /** `/assist [on|off]` - whether a natural-language-matched *destructive* command shows a confirm
@@ -316,9 +331,8 @@ function parseAutostart(rest: string): FleetCommand | null {
  * out "nl"/"confirm" literally - see the plan's changelog for the naming discussion. */
 function parseAssist(rest: string): FleetCommand | null {
   const trimmed = rest.trim();
-  const action = trimmed.length === 0 ? "status" : trimmed;
-  if (action !== "status" && action !== "on" && action !== "off") return null;
-  return { kind: "assist", action };
+  const action = matchCaseInsensitive(ASSIST_ACTIONS, trimmed.length === 0 ? "status" : trimmed);
+  return action ? { kind: "assist", action } : null;
 }
 
 /** `/router [api|cli]` - live switch for the NL-router backend (`config.ts`'s `nlRouter.backend`
@@ -329,9 +343,8 @@ function parseAssist(rest: string): FleetCommand | null {
  * `"cli"` is exactly as supported as switching to `"api"` in the first place. */
 function parseRouterBackend(rest: string): FleetCommand | null {
   const trimmed = rest.trim();
-  const action = trimmed.length === 0 ? "status" : trimmed;
-  if (action !== "status" && action !== "api" && action !== "cli") return null;
-  return { kind: "router", action };
+  const action = matchCaseInsensitive(ROUTER_ACTIONS, trimmed.length === 0 ? "status" : trimmed);
+  return action ? { kind: "router", action } : null;
 }
 
 /** `/voiceconfirm [on|off]` - whether a transcribed voice note shows a Send/Re-record/Type-instead
@@ -342,9 +355,8 @@ function parseRouterBackend(rest: string): FleetCommand | null {
  * argument, so `/voice off` would be ambiguous with a (nonexistent) model literally named "off"). */
 function parseVoiceConfirm(rest: string): FleetCommand | null {
   const trimmed = rest.trim();
-  const action = trimmed.length === 0 ? "status" : trimmed;
-  if (action !== "status" && action !== "on" && action !== "off") return null;
-  return { kind: "voiceconfirm", action };
+  const action = matchCaseInsensitive(VOICE_CONFIRM_ACTIONS, trimmed.length === 0 ? "status" : trimmed);
+  return action ? { kind: "voiceconfirm", action } : null;
 }
 
 /** `/default [mode|effort] [<value>]` - one command for both new-session defaults (permission mode
@@ -383,17 +395,21 @@ function parseDefault(rest: string): FleetCommand | null {
   const rawValue = tokens[1];
   if (category === "mode") {
     if (rawValue === undefined) return { kind: "default", category: "mode" };
-    return (MODES as readonly string[]).includes(rawValue) ? { kind: "default", category: "mode", value: rawValue as Mode } : null;
+    const mode = matchCaseInsensitive(MODES, rawValue);
+    return mode ? { kind: "default", category: "mode", value: mode } : null;
   }
   if (category === "effort") {
     if (rawValue === undefined) return { kind: "default", category: "effort" };
-    return (EFFORTS as readonly string[]).includes(rawValue) ? { kind: "default", category: "effort", value: rawValue as Effort } : null;
+    const effort = matchCaseInsensitive(EFFORTS, rawValue);
+    return effort ? { kind: "default", category: "effort", value: effort } : null;
   }
   // `/default permission|answer [on|off]` - booleans, not one-of-N pickers, so a bare form reports
   // the current setting rather than drilling into a value picker the way `mode`/`effort` do.
+  // Case-insensitive on the value, same as `/auto`'s own on/off (`parseSlugAndValue`'s note).
   if (isAutoCategory(category)) {
     if (rawValue === undefined) return { kind: "default", category };
-    return isOnOff(rawValue) ? { kind: "default", category, value: rawValue === "on" } : null;
+    const lowered = rawValue.toLowerCase();
+    return isOnOff(lowered) ? { kind: "default", category, value: lowered === "on" } : null;
   }
   return null;
 }
