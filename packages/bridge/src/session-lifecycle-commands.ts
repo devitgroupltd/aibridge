@@ -71,6 +71,13 @@ export interface SessionLifecycleCommandsOptions {
   /** Composition-root function today (channelConnectCoordinator isn't owned by any extracted
    * module) - injected rather than imported to avoid reaching back into index.ts. */
   waitForChannelConnected: (slug: string, timeoutMs?: number) => Promise<void>;
+  /** `pty-quiet-wait.ts`'s own doc comment has the full story: closes a third race
+   * `waitForChannelConnected` doesn't - Claude Code can still be busy registering its *other* MCP
+   * servers (Playwright in particular, cold-spawned on every brand-new worktree) when the aibridge
+   * channel's own handshake has already resolved, and that startup chatter fools `pty-io.ts`'s
+   * `confirmSubmitted` into reading a lost Enter as a landed one. Called once, right before the
+   * first `sendChannelText` write below - never for any later turn, which has no such startup race. */
+  waitForPtyQuiet: (slug: string) => Promise<void>;
   /** §4.1's control-topic predicate - same injection reasoning as inbound-media.ts's own copy of
    * this option: it's index.ts's one free top-level function today. */
   isControlTopic: (topicId: number | undefined) => boolean;
@@ -172,6 +179,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     postFleetConfirm,
     executeFleetActionDirect,
     waitForChannelConnected,
+    waitForPtyQuiet,
     isControlTopic,
     getReposRegistry,
     getDefaultSessionMode,
@@ -508,6 +516,14 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // lost even with the dialog long since confirmed, also confirmed live 2026-08-04).
     await session.ready;
     await waitForChannelConnected(slug);
+    // A third gate, closing the race the two above don't (`pty-quiet-wait.ts`'s own doc comment has
+    // the full story, live-confirmed 2026-08-11): Claude Code can still be busy registering its
+    // *other* MCP servers (Playwright's cold `npx` spawn on this brand-new worktree path, in
+    // particular) even once the aibridge channel's own handshake above has resolved, and that
+    // startup chatter is enough real PTY output to fool `confirmSubmitted` below into reading a lost
+    // Enter as a landed one - leaving the very first message sitting typed but never submitted, with
+    // no error anywhere and no hook ever firing to say so.
+    await waitForPtyQuiet(slug);
     // `/default effort`: applied before the initial prompt, not after, so the very first turn
     // already runs under the configured default rather than starting at the CLI's own "medium" and
     // switching mid-turn. Silent (no confirmSessionCommand) - a second "Switched..." message here

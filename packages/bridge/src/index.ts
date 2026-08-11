@@ -22,6 +22,7 @@ import { createControlTopicHistory } from "./control-topic-history.ts";
 import { LateBound } from "./late-bound.ts";
 import { RetryStore } from "./retry-store.ts";
 import { ChannelConnectCoordinator } from "./channel-connect-coordinator.ts";
+import { waitForPtyQuiet as waitForPtyQuietImpl } from "./pty-quiet-wait.ts";
 import type { RouterAction } from "./nl-router.ts";
 import { SettingsStore } from "./settings-store.ts";
 import { botCommandList } from "./fleet-commands.ts";
@@ -450,6 +451,17 @@ async function main(): Promise<void> {
     if (!connected) log("WARN", `timed out waiting for the channel server to connect for "${slug}" - proceeding anyway`);
   }
 
+  /** `pty-quiet-wait.ts`'s own doc comment has the full story - the third gate `handleNewCommand`
+   * needs before its first `sendChannelText` write, closing the race `waitForChannelConnected` above
+   * doesn't (Claude Code's *other* MCP servers, Playwright in particular, can still be mid-startup
+   * on a brand-new worktree even once the aibridge channel's own handshake has resolved). Backed by
+   * `sessionSupervisor.lastActivityAt`, the same PTY-liveness accessor `pty-io.ts`'s own
+   * `confirmSubmitted` already reads. */
+  async function waitForPtyQuiet(slug: string): Promise<void> {
+    const quiet = await waitForPtyQuietImpl(slug, { lastActivityAt: sessionSupervisor.lastActivityAt });
+    if (!quiet) log("WARN", `PTY for "${slug}" never went quiet before its first message - proceeding anyway (some other MCP server may still be starting up)`);
+  }
+
   // `/usage` (§4.2, added 2026-08-04): a slug can have at most one pending capture at a time - a
   // second `/usage` for the same slug while one is already in flight would garble both buffers, so
   // a concurrent request is refused up front (see `requestUsagePanel`). It used to *overwrite* the
@@ -675,6 +687,7 @@ async function main(): Promise<void> {
     postFleetConfirm: (kind, topicId, targets, promptText) => fleetConfirmFlow.get().postFleetConfirm(kind, topicId, targets, promptText),
     executeFleetActionDirect: (kind, topicId, targets) => fleetConfirmFlow.get().executeFleetActionDirect(kind, topicId, targets),
     waitForChannelConnected,
+    waitForPtyQuiet,
     isControlTopic,
     getReposRegistry: () => reposRegistry,
     getDefaultSessionMode: () => defaultSessionMode,

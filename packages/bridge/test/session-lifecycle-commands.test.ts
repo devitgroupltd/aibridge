@@ -140,6 +140,7 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
       executeFleetActionDirectCalls.push({ kind, topicId, targets: targets.map((r) => r.slug) });
     },
     waitForChannelConnected: async () => {},
+    waitForPtyQuiet: async () => {},
     isControlTopic: (topicId) => topicId === undefined || topicId === 1,
     getReposRegistry: () => undefined,
     getDefaultSessionMode: () => "manual",
