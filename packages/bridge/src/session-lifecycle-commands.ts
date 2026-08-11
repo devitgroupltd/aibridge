@@ -505,7 +505,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // making the operator find it by hand in the topic list - a `url` button, so no round trip
     // through the Bridge and no callback-registry entry to track or ever expire.
     await clearThinkingPlaceholder();
-    confirmSessionCommand(controlTopicId, `Created "${slug}" (${model}) in a new topic.${attachmentNote}`, undefined, {
+    confirmSessionCommand(controlTopicId, `Created "${slug}" (${model}, ${repo.name}) in a new topic.${attachmentNote}`, undefined, {
       inline_keyboard: [[{ text: `↪️ Open "${slug}"`, url: buildTopicDeepLink(supergroupChatId, topic.message_thread_id) }]],
     });
 
