@@ -87,6 +87,9 @@ function fakeConfirmCards() {
   const finalizedNl: Array<{ text: string }> = [];
   const finalizedStale: Array<{ text: string }> = [];
   const finalizedVoice: Array<{ text: string }> = [];
+  // What `handleSimpleConfirm` (callback-query-router.ts) calls directly for "fc:"/"os:" cancels,
+  // rather than through a kind-specific `finalize*ConfirmMessage` wrapper - shared by both.
+  const finalizedCard: Array<{ messageId: number; text: string }> = [];
   return {
     takeOrNotifyGone: (registry: { take(id: string): { entry: unknown; expired: boolean } | undefined; wasRecentlyAnswered(id: string): boolean }, id: string) => {
       const taken = registry.take(id);
@@ -95,8 +98,8 @@ function fakeConfirmCards() {
     },
     markConfirmCardExpired: async () => {},
     markNlConfirmCardExpired: async () => {},
-    finalizeFleetConfirmMessage: async (_p: unknown, text: string) => {
-      finalizedFleet.push({ text });
+    finalizeCard: async (messageId: number, text: string) => {
+      finalizedCard.push({ messageId, text });
     },
     finalizeNlConfirmMessage: async (_p: unknown, text: string) => {
       finalizedNl.push({ text });
@@ -111,6 +114,7 @@ function fakeConfirmCards() {
     finalizedNl,
     finalizedStale,
     finalizedVoice,
+    finalizedCard,
   };
 }
 
@@ -307,7 +311,30 @@ describe("createCallbackQueryRouter - every documented namespace resolves to its
     s.fleetConfirmRegistry.add({ id: "f2", kind: "rm", slugs: ["fix-bug"], topicId: 5, messageId: 9 });
     s.router.routeCallbackQuery(cq("fc:rm:f2:n"));
     expect(s.fleetConfirmFlow.executed.length).toBe(0);
-    expect(s.confirmCards.finalizedFleet).toEqual([{ text: "Cancelled - nothing was changed." }]);
+    expect(s.confirmCards.finalizedCard).toEqual([{ messageId: 9, text: "Cancelled - nothing was changed." }]);
+  });
+
+  test('"os:" confirmed executes the os confirm', () => {
+    const s = setup();
+    s.osConfirmRegistry.add({ id: "o1", action: "shutdown", topicId: 5, messageId: 9 });
+    s.router.routeCallbackQuery(cq("os:shutdown:o1:y"));
+    expect(s.osPowerCommands.executed.length).toBe(1);
+  });
+
+  test('"os:" cancelled finalizes without executing', () => {
+    const s = setup();
+    s.osConfirmRegistry.add({ id: "o2", action: "reboot", topicId: 5, messageId: 10 });
+    s.router.routeCallbackQuery(cq("os:reboot:o2:n"));
+    expect(s.osPowerCommands.executed.length).toBe(0);
+    expect(s.confirmCards.finalizedCard).toEqual([{ messageId: 10, text: "Cancelled - nothing was changed." }]);
+  });
+
+  test('"os:" a mismatched action (stale/replaced card) is ignored', () => {
+    const s = setup();
+    s.osConfirmRegistry.add({ id: "o3", action: "shutdown", topicId: 5, messageId: 11 });
+    s.router.routeCallbackQuery(cq("os:reboot:o3:y"));
+    expect(s.osPowerCommands.executed.length).toBe(0);
+    expect(s.confirmCards.finalizedCard).toEqual([]);
   });
 
   test('"nc:" run executes the matched command via nlDispatch', () => {

@@ -394,6 +394,33 @@ describe("createFeedWiring", () => {
     expect(noReplyNudges.length).toBe(2);
   });
 
+  // Regression: slugs are derived from prompt text and reused after `/rm` - without clearing
+  // `silentStopStreak` in `forgetSession`, a brand-new session reusing the same slug would inherit
+  // the removed session's streak count and skip straight to the give-up warning on its own very
+  // first silent turn (same leak class as codebase-hardening-plan.md's P1-2).
+  test("forgetSession clears the silent-stop streak so a slug reused after /rm starts fresh", () => {
+    const { feedWiring, sessionStore, routing, noReplyNudges, confirmCalls } = setup();
+    sessionStore.insert(row());
+    routing.add({ slug: "fix-bug", topicId: 2, worktreePath: "c:\\data\\worktrees\\fix-bug" });
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit" }));
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "Stop" })); // 1st silent turn - nudged
+    expect(noReplyNudges.length).toBe(1);
+
+    // /rm's teardown
+    feedWiring.forgetSession("fix-bug");
+    sessionStore.remove("fix-bug");
+
+    // A brand-new session reusing the same slug (a distinct session_id, same as a real resumed PTY)
+    sessionStore.insert(row({ sessionId: "sess-2" }));
+    routing.add({ slug: "fix-bug", topicId: 2, worktreePath: "c:\\data\\worktrees\\fix-bug" });
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit" }));
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "Stop" })); // silent again - should nudge, not give up
+
+    expect(noReplyNudges.length).toBe(2);
+    expect(confirmCalls).toEqual([]);
+  });
+
   test("markReplied on a slug with no tracked feed state is a no-op, not a throw", () => {
     const { feedWiring } = setup();
     expect(() => feedWiring.markReplied("no-such-slug")).not.toThrow();

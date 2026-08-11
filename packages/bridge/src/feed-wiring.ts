@@ -7,7 +7,7 @@ import { renderCard } from "./feed-renderer.ts";
 import { applyEvent, createFeedState, promptsInLastHour, shouldSplitCard, splitCard, type FeedState } from "./feed-state.ts";
 import { normalizeHookEvent } from "./hook-events.ts";
 import type { RateGovernor } from "./rate-governor.ts";
-import type { Routing } from "./routing.ts";
+import type { Routing, SessionRoute } from "./routing.ts";
 import { isValidTransition, type SessionState, type SessionStore } from "./session-store.ts";
 import { stateForHookEvent } from "./session-state-transitions.ts";
 import { isPermanentEditFailure, type SendMessageSource } from "./telegram.ts";
@@ -193,6 +193,54 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
       .catch((err) => log("WARN", `failed to post details button for "${slug}": ${(err as Error).message}`));
   }
 
+  /**
+   * §6.5's terminal-race fix (§13 check 4): if the operator answers Claude Code's own terminal
+   * prompt instead of tapping the Telegram card, there is no protocol event saying so - the first
+   * sign is one of these three hooks landing for the same tool the pending card is for.
+   * `PermissionDenied` on its own is ambiguous (fired by the sandbox's own deny rules too, with
+   * nothing pending to match), so it's folded into the same lookup rather than special-cased.
+   * Extracted out of `handleHookEvent`'s own body, which otherwise mixed this in with five other
+   * independent hook-driven concerns.
+   */
+  function resolveTerminalRacePermission(msg: HookEventMessage): void {
+    if (msg.hook_event_name !== "PostToolUse" && msg.hook_event_name !== "PostToolUseFailure" && msg.hook_event_name !== "PermissionDenied") return;
+    const toolName = typeof msg.payload.tool_name === "string" ? msg.payload.tool_name : undefined;
+    // The tool *input* is what makes this a match rather than a guess - see `resolveByToolMatch`
+    // and `toolInputMatches` on what pairing by tool name alone did, and on why the comparison has
+    // to parse the preview rather than substring-search it.
+    const resolved = toolName ? resolveByToolMatch(msg.slug, toolName, msg.payload.tool_input) : undefined;
+    if (!resolved) return;
+    // The card is only half of it: the channel server's permission call is still blocked, and
+    // nothing else will unblock it now that the entry is out of the registry (the expiry sweep
+    // can no longer see it). Send the verdict the operator's own terminal answer implies.
+    sendVerdict(resolved.slug, resolved.requestId, msg.hook_event_name === "PermissionDenied" ? "deny" : "allow");
+    const behaviorLabel = msg.hook_event_name === "PermissionDenied" ? "⛔ Denied" : "✅ Allowed";
+    finalizePermissionMessage(resolved.messageId, `${behaviorLabel}: ${resolved.toolName} (answered at terminal)`).catch((err) =>
+      log("WARN", `failed to finalize permission message resolved at the terminal for "${msg.slug}": ${(err as Error).message}`),
+    );
+  }
+
+  /**
+   * §7 of resume-nudge-on-lost-permission-plan.md: on a genuine `turn_end` that never called
+   * `reply()`, nudge once, then give up and warn if the *next* one is silent too - a nudge is
+   * itself a synthetic inbound turn, so a session that stays silent through it too must not nudge
+   * itself forever. `silentStopStreak` is incremented regardless of whether a route exists (so a
+   * route reappearing later still sees the right streak); with no route, there's simply nowhere to
+   * send anything. Extracted out of `handleHookEvent`'s own body for the same reason as
+   * `resolveTerminalRacePermission` above.
+   */
+  function handleNoReplyNudge(slug: string, route: SessionRoute | undefined): void {
+    const streak = (silentStopStreak.get(slug) ?? 0) + 1;
+    silentStopStreak.set(slug, streak);
+    if (!route) return;
+    if (streak === 1) {
+      sendNoReplyNudge(slug, route.topicId, "Your last turn ended without sending a reply - the operator saw nothing happen. Reply now with what you found/did, or say why there's nothing to report.");
+      return;
+    }
+    log("WARN", `session "${slug}" ended a turn without replying ${streak} times in a row - not nudging again`);
+    confirmSessionCommand(route.topicId, `⚠️ Session "${slug}" ended a turn without replying, ${streak} times in a row - the automatic nudge didn't help. It may need a manual look, or /restart.`);
+  }
+
   function handleHookEvent(msg: HookEventMessage): void {
     const row = sessionStore.get(msg.slug);
 
@@ -209,28 +257,7 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
       sessionStore.setSessionId(msg.slug, msg.session_id);
     }
 
-    // §6.5's terminal-race fix (§13 check 4): if the operator answers Claude Code's own terminal
-    // prompt instead of tapping the Telegram card, there is no protocol event saying so - the
-    // first sign is one of these three hooks landing for the same tool the pending card is for.
-    // `PermissionDenied` on its own is ambiguous (fired by the sandbox's own deny rules too, with
-    // nothing pending to match), so it's folded into the same lookup rather than special-cased.
-    if (msg.hook_event_name === "PostToolUse" || msg.hook_event_name === "PostToolUseFailure" || msg.hook_event_name === "PermissionDenied") {
-      const toolName = typeof msg.payload.tool_name === "string" ? msg.payload.tool_name : undefined;
-      // The tool *input* is what makes this a match rather than a guess - see `resolveByToolMatch`
-      // and `toolInputMatches` on what pairing by tool name alone did, and on why the comparison has
-      // to parse the preview rather than substring-search it.
-      const resolved = toolName ? resolveByToolMatch(msg.slug, toolName, msg.payload.tool_input) : undefined;
-      if (resolved) {
-        // The card is only half of it: the channel server's permission call is still blocked, and
-        // nothing else will unblock it now that the entry is out of the registry (the expiry sweep
-        // can no longer see it). Send the verdict the operator's own terminal answer implies.
-        sendVerdict(resolved.slug, resolved.requestId, msg.hook_event_name === "PermissionDenied" ? "deny" : "allow");
-        const behaviorLabel = msg.hook_event_name === "PermissionDenied" ? "⛔ Denied" : "✅ Allowed";
-        finalizePermissionMessage(resolved.messageId, `${behaviorLabel}: ${resolved.toolName} (answered at terminal)`).catch((err) =>
-          log("WARN", `failed to finalize permission message resolved at the terminal for "${msg.slug}": ${(err as Error).message}`),
-        );
-      }
-    }
+    resolveTerminalRacePermission(msg);
 
     // §4.3's state table, the hook-driven half (the permission/ask half is wired via
     // onAwaitingInput/maybeSetState in index.ts) - a stale/duplicate event is a silent no-op, not
@@ -271,22 +298,7 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
     // itself a synthetic inbound turn, so a session that stays silent through the nudge too must not
     // nudge itself forever.
     if (event.kind === "turn_end" && previous.turnActive && !previous.repliedThisTurn) {
-      const route = routing.get(msg.slug);
-      const streak = (silentStopStreak.get(msg.slug) ?? 0) + 1;
-      silentStopStreak.set(msg.slug, streak);
-      if (route && streak === 1) {
-        sendNoReplyNudge(
-          msg.slug,
-          route.topicId,
-          "Your last turn ended without sending a reply - the operator saw nothing happen. Reply now with what you found/did, or say why there's nothing to report.",
-        );
-      } else if (route) {
-        log("WARN", `session "${msg.slug}" ended a turn without replying ${streak} times in a row - not nudging again`);
-        confirmSessionCommand(
-          route.topicId,
-          `⚠️ Session "${msg.slug}" ended a turn without replying, ${streak} times in a row - the automatic nudge didn't help. It may need a manual look, or /restart.`,
-        );
-      }
+      handleNoReplyNudge(msg.slug, routing.get(msg.slug));
     }
 
     if (event.kind === "turn_start") {
@@ -348,6 +360,11 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
   function forgetSession(slug: string): void {
     feedStates.delete(slug);
     feedMessageIds.delete(slug);
+    // Same leak class as session-supervisor.ts's `untrack` was hardened against for
+    // `resumeAttempts`/`lastPtyActivityBySlug` (plans/codebase-hardening-plan.md P1-2): slugs are
+    // reused after `/rm` (they're derived from prompt text), so a stale streak left here would let
+    // a brand-new session inherit someone else's silent-stop count and lose its own first nudge.
+    silentStopStreak.delete(slug);
   }
 
   function resetCoalescer(slug: string): Promise<void> | void {

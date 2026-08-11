@@ -528,28 +528,36 @@ export function buildRouteViaCliArgs(text: string, ctx: RouterContext, model: st
   return ["-p", `${buildSystemInstructions(ctx)}\n\nMessage: ${text}`, "--output-format", "json", "--json-schema", schema, "--model", model, "--strict-mcp-config"];
 }
 
-function routeViaCli(text: string, ctx: RouterContext, model: string, log: RouterLog): Promise<RawRouterOutput | null> {
+/**
+ * Shared `execFile("claude", args, {cwd: os.tmpdir(), timeout: EXEC_TIMEOUT_MS}, ...)` wrapper for
+ * every `claude -p` shell-out in this module - `routeViaCli` and `answerControlTopicQuestion` used
+ * to each hand-write this exact promise/error/JSON-parse shape, differing only in the response field
+ * they pulled out and their log message text, which meant a fix to the exec/timeout/error-handling
+ * contract had to be made in both places by hand or silently drift between them. `extract` gets the
+ * parsed JSON and returns the field this caller actually wants (or `null`/`undefined` for "not
+ * present" - not found is not a parse failure, both are just "no usable answer").
+ */
+function execClaudeCli<T>(args: string[], log: RouterLog, extract: (parsed: unknown) => T | null | undefined, label: string): Promise<T | null> {
   return new Promise((resolve) => {
-    execFile(
-      "claude",
-      buildRouteViaCliArgs(text, ctx, model),
-      { cwd: os.tmpdir(), timeout: EXEC_TIMEOUT_MS },
-      (err, stdout) => {
-        if (err) {
-          log("WARN", `nl-router (cli backend) call failed: ${(err as Error).message}`);
-          resolve(null);
-          return;
-        }
-        try {
-          const parsed = JSON.parse(stdout) as { structured_output?: RawRouterOutput };
-          resolve(parsed.structured_output ?? null);
-        } catch {
-          log("WARN", "nl-router (cli backend): couldn't parse claude -p's stdout as JSON");
-          resolve(null);
-        }
-      },
-    );
+    execFile("claude", args, { cwd: os.tmpdir(), timeout: EXEC_TIMEOUT_MS }, (err, stdout) => {
+      if (err) {
+        log("WARN", `${label} call failed: ${(err as Error).message}`);
+        resolve(null);
+        return;
+      }
+      try {
+        const parsed = JSON.parse(stdout) as unknown;
+        resolve(extract(parsed) ?? null);
+      } catch {
+        log("WARN", `${label}: couldn't parse claude -p's stdout as JSON`);
+        resolve(null);
+      }
+    });
   });
+}
+
+function routeViaCli(text: string, ctx: RouterContext, model: string, log: RouterLog): Promise<RawRouterOutput | null> {
+  return execClaudeCli(buildRouteViaCliArgs(text, ctx, model), log, (parsed) => (parsed as { structured_output?: RawRouterOutput }).structured_output, "nl-router (cli backend)");
 }
 
 export interface RouterConfig {
@@ -613,21 +621,13 @@ export function buildAnswerViaCliArgs(text: string, groundingText: string, histo
  * since there's no `--json-schema` here) and returns `null` on any failure/empty/unparseable output -
  * the caller's "fail open to today's fallthrough" contract, same as `routeText` itself. */
 export async function answerControlTopicQuestion(text: string, groundingText: string, historyText: string, model: string, log: RouterLog): Promise<string | null> {
-  return new Promise((resolve) => {
-    execFile("claude", buildAnswerViaCliArgs(text, groundingText, historyText, model), { cwd: os.tmpdir(), timeout: EXEC_TIMEOUT_MS }, (err, stdout) => {
-      if (err) {
-        log("WARN", `control-topic Q&A call failed: ${(err as Error).message}`);
-        resolve(null);
-        return;
-      }
-      try {
-        const parsed = JSON.parse(stdout) as { result?: string };
-        const result = parsed.result?.trim();
-        resolve(result && result.length > 0 ? result : null);
-      } catch {
-        log("WARN", "control-topic Q&A call: couldn't parse claude -p's stdout as JSON");
-        resolve(null);
-      }
-    });
-  });
+  return execClaudeCli(
+    buildAnswerViaCliArgs(text, groundingText, historyText, model),
+    log,
+    (parsed) => {
+      const result = (parsed as { result?: string }).result?.trim();
+      return result && result.length > 0 ? result : null;
+    },
+    "control-topic Q&A call",
+  );
 }

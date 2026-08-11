@@ -386,6 +386,67 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
    * Bridge (see `markDeadIfPresent`'s own doc comment), and a `/kill` during the wait still let the
    * stale snapshot's resume fire, resurrecting a session the operator had just deliberately ended.
    */
+  /**
+   * `claude --resume` failing (`RESUME_FAILURE_PATTERN`) doesn't throw or exit the process - it
+   * silently falls through to a brand-new conversation in the same PTY - so `resumeSession` checks
+   * `session.ready`'s own `resumeFailed` flag rather than assuming success: found live 2026-08-07, a
+   * session whose crash-before-first-transcript-write left `row.sessionId` pointing at a
+   * conversation Claude Code could never find again sat "resumed" in the topic forever with no
+   * further reply, since the operator's original prompt was never resent into the fresh
+   * conversation underneath. That fresh conversation has no relation to what was actually asked
+   * for, and `dead` is `session-store.ts`'s own terminal state (no path back from it) - the row is
+   * very likely already `dead` by now anyway, from the `SessionEnd` hook that fires for the
+   * abandoned resume racing this very check (confirmed live 2026-08-07). Killing the pty here,
+   * rather than leaving Claude Code's own fresh-start running, is what makes §4.3's "This session
+   * has ended" reply true instead of a lie: an untracked live PTY behind a `dead` row would
+   * otherwise burn a Claude Code seat and a worktree forever with no way for the operator to reach
+   * or reclaim it. Same delete-then-kill ordering `killAndUntrack` uses, so the async `onExit` this
+   * fires sees the map entry already gone and treats it as a deliberate kill, not a crash to
+   * auto-resume.
+   */
+  function finishResumeFailure(row: SessionRow, session: LaunchedSession, sessionId: string): void {
+    const { slug, topicId } = row;
+    log("WARN", `session "${slug}"'s claude --resume ${sessionId} failed (no matching conversation) - it started a fresh conversation instead`);
+    ptyProcessBySlug.delete(slug);
+    session.ptyProcess.kill();
+    routing.clearPtyWrite(slug);
+    markDeadIfPresent(slug);
+    confirmSessionCommand(
+      topicId,
+      `⚠️ Session "${slug}" couldn't resume its prior conversation (Claude reported no matching session) - this session has ended. Worktree preserved at ${row.worktreePath}; /new to start a fresh one.`,
+    );
+  }
+
+  /**
+   * resume-nudge-on-lost-permission-plan.md §2: a resumed Claude comes back idle rather than
+   * retrying whatever tool call its lost permission prompt was blocking on (confirmed live
+   * 2026-08-10 - a pending `git commit` never happened after resume). Only for the row that
+   * actually lost a pending prompt on *this* resume - a normal working-state resume already has
+   * Claude mid-reply, and nudging that too would inject an unsolicited turn into work that was
+   * proceeding correctly on its own. Wording note (confirmed live 2026-08-10): a plain "please
+   * retry it" was NOT enough on its own - a live trial sat idle for minutes with no retry, and only
+   * started checking git state and re-attempting once explicitly asked "what were you in the middle
+   * of, check and retry." Folding that same check-first instruction into the nudge itself (rather
+   * than relying on the operator to send it by hand) is what makes this actually self-service.
+   */
+  function finishResumeSuccess(slug: string, topicId: number, hadLostPrompt: boolean): void {
+    confirmSessionCommand(topicId, `Session "${slug}" resumed.`);
+    if (!hadLostPrompt) return;
+    sendResumeNudge?.get()(
+      slug,
+      topicId,
+      "A Bridge restart interrupted you before your last action could complete or be approved - it never ran. Check what you were in the middle of (e.g. git status/log, or whatever else is relevant) and retry it.",
+    );
+    // §7: the nudge above is confirmed live (three trials, 2026-08-10) to NOT reliably land as the
+    // very first turn after a resume - the session's own turn completes in a handful of seconds and
+    // settles back to `idle` with nothing retried, no matter how the first nudge is worded. What did
+    // reliably work, in every trial: an *ordinary second* message reaching the session. This is that
+    // second message, sent automatically instead of requiring the operator to notice the silence
+    // and type it by hand - the one thing this plan's live investigation actually found working,
+    // not a new guess.
+    fireAndForget(sendFollowUpNudgeIfStillIdle(slug, topicId), log, `session-supervisor resume follow-up nudge(${slug})`);
+  }
+
   async function resumeSession(row: SessionRow): Promise<void> {
     const { slug, topicId } = row;
     const current = sessionStore.get(slug);
@@ -427,61 +488,11 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
       // a resumed session answered /ls (control topic, doesn't need routing) but never replied to
       // anything sent in its own topic - not the command being wrong, the route being missing.
       routing.add({ slug, topicId, worktreePath: current.worktreePath });
-      // `claude --resume` failing (`RESUME_FAILURE_PATTERN`) doesn't throw or exit the process - it
-      // silently falls through to a brand-new conversation in the same PTY - so this must be checked
-      // rather than assumed: found live 2026-08-07, a session whose crash-before-first-transcript-
-      // write left `row.sessionId` pointing at a conversation Claude Code could never find again sat
-      // "resumed" in the topic forever with no further reply, since the operator's original prompt
-      // was never resent into the fresh conversation underneath.
       const { resumeFailed } = await session.ready;
       if (resumeFailed) {
-        log("WARN", `session "${slug}"'s claude --resume ${current.sessionId} failed (no matching conversation) - it started a fresh conversation instead`);
-        // That fresh conversation has no relation to what was actually asked for, and `dead` is
-        // `session-store.ts`'s own terminal state (no path back from it) - the row is very likely
-        // already `dead` by now anyway, from the `SessionEnd` hook that fires for the abandoned
-        // resume racing this very check (confirmed live 2026-08-07). Killing the pty here, rather
-        // than leaving Claude Code's own fresh-start running, is what makes §4.3's "This session
-        // has ended" reply true instead of a lie: an untracked live PTY behind a `dead` row would
-        // otherwise burn a Claude Code seat and a worktree forever with no way for the operator to
-        // reach or reclaim it. Same delete-then-kill ordering `killAndUntrack` uses, so the async
-        // `onExit` this fires sees the map entry already gone and treats it as a deliberate kill,
-        // not a crash to auto-resume.
-        ptyProcessBySlug.delete(slug);
-        session.ptyProcess.kill();
-        routing.clearPtyWrite(slug);
-        markDeadIfPresent(slug);
-        confirmSessionCommand(
-          topicId,
-          `⚠️ Session "${slug}" couldn't resume its prior conversation (Claude reported no matching session) - this session has ended. Worktree preserved at ${row.worktreePath}; /new to start a fresh one.`,
-        );
+        finishResumeFailure(row, session, current.sessionId);
       } else {
-        confirmSessionCommand(topicId, `Session "${slug}" resumed.`);
-        // resume-nudge-on-lost-permission-plan.md §2: a resumed Claude comes back idle rather than
-        // retrying whatever tool call its lost permission prompt was blocking on (confirmed live
-        // 2026-08-10 - a pending `git commit` never happened after resume). Only for the row that
-        // actually lost a pending prompt on *this* resume - a normal working-state resume already
-        // has Claude mid-reply, and nudging that too would inject an unsolicited turn into work
-        // that was proceeding correctly on its own.
-        // Wording note (confirmed live 2026-08-10): a plain "please retry it" was NOT enough on its
-        // own - a live trial sat idle for minutes with no retry, and only started checking git
-        // state and re-attempting once explicitly asked "what were you in the middle of, check and
-        // retry." Folding that same check-first instruction into the nudge itself (rather than
-        // relying on the operator to send it by hand) is what makes this actually self-service.
-        if (hadLostPrompt) {
-          sendResumeNudge?.get()(
-            slug,
-            topicId,
-            "A Bridge restart interrupted you before your last action could complete or be approved - it never ran. Check what you were in the middle of (e.g. git status/log, or whatever else is relevant) and retry it.",
-          );
-          // §7: the nudge above is confirmed live (three trials, 2026-08-10) to NOT reliably land
-          // as the very first turn after a resume - the session's own turn completes in a handful
-          // of seconds and settles back to `idle` with nothing retried, no matter how the first
-          // nudge is worded. What did reliably work, in every trial: an *ordinary second* message
-          // reaching the session. This is that second message, sent automatically instead of
-          // requiring the operator to notice the silence and type it by hand - the one thing this
-          // plan's live investigation actually found working, not a new guess.
-          fireAndForget(sendFollowUpNudgeIfStillIdle(slug, topicId), log, `session-supervisor resume follow-up nudge(${slug})`);
-        }
+        finishResumeSuccess(slug, topicId, hadLostPrompt);
       }
     } catch (err) {
       markDeadIfPresent(slug);

@@ -10,12 +10,13 @@ import {
   resolveBridgeRepoRoot,
   truncateForTelegram,
   writeDeployMarker,
+  type DeployOutcome,
 } from "./deploy.ts";
 import { resolveNodeExecutable } from "./session-launcher.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
 import type { SendMessageSource } from "./telegram.ts";
-import type { SessionStore } from "./session-store.ts";
+import type { SessionRow, SessionStore } from "./session-store.ts";
 
 /** Result shape shared by `runSchtasks`/`runPowershell` - `/Query` against an unregistered task
  * exits non-zero, which is a valid "not registered" answer, not a transport failure, so both
@@ -123,6 +124,39 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
   const commitIfDirty = opts.commitIfDirty ?? realCommitIfDirty;
   const pushCurrentBranch = opts.pushCurrentBranch ?? realPushCurrentBranch;
 
+  /** `/merge`/`/ship`/`/restart` all send a best-effort Telegram notice and only log (never throw)
+   * on a send failure - a dropped ack/failure/success message must not abort a merge that already
+   * ran. Shared so the same log-label convention can't drift between the two commands' near-dozen
+   * call sites the way it had started to (found live during a DRY pass: `/merge`/`/ship` each wrote
+   * this try/catch out by hand at every step). */
+  async function notify(topicId: number | undefined, text: string, label: string): Promise<void> {
+    try {
+      await controlBot.sendMessage(supergroupChatId, topicId, text);
+    } catch (err) {
+      log("WARN", `failed to send ${label}: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * The merge+gate step shared by `/merge` and `/ship`: runs `deployBranch` and, on failure, reports
+   * and logs it - returns `undefined` in that case (already fully handled) so the caller's only job
+   * is "if there's an outcome, keep going". Success reporting is deliberately left to each caller
+   * instead of folded in here: `/merge` reports right away, `/ship` first pushes and folds the push
+   * result into one combined message, so there is no single "success text" this helper could emit
+   * that would be correct for both.
+   */
+  async function mergeAndReport(commandLabel: string, topicId: number | undefined, row: SessionRow): Promise<DeployOutcome | undefined> {
+    const { repoPath, branch, worktreePath } = row;
+    const packageDirs = discoverTypecheckedPackages(repoPath);
+    const outcome = await deployBranch(repoPath, branch, packageDirs, undefined, worktreePath);
+    if (!outcome.ok) {
+      log("WARN", `${commandLabel} failed for "${branch}": ${outcome.message}`);
+      await notify(topicId, truncateForTelegram(outcome.message), `${commandLabel} failure message`);
+      return undefined;
+    }
+    return outcome;
+  }
+
   /**
    * The self-repo-restart tail shared by `/merge` and `/ship`: once a merge into `repoPath` has
    * already succeeded, only if that repo is this Bridge's own checkout (`isSelfRepo`) does landing
@@ -148,15 +182,11 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
       topicId,
       deployedAtIso: new Date().toISOString(),
     });
-    try {
-      await controlBot.sendMessage(
-        supergroupChatId,
-        topicId,
-        "This is aibridge's own repo - restarting now to apply the fix (§5.9). If it doesn't come back up cleanly within a minute, it rolls itself back automatically and restarts again.",
-      );
-    } catch (err) {
-      log("WARN", `failed to send ${commandLabel} restart notice: ${(err as Error).message}`);
-    }
+    await notify(
+      topicId,
+      "This is aibridge's own repo - restarting now to apply the fix (§5.9). If it doesn't come back up cleanly within a minute, it rolls itself back automatically and restarts again.",
+      `${commandLabel} restart notice`,
+    );
     log("INFO", `${commandLabel}: self-repo, respawning and exiting`);
     await respawnSelfAndExit();
   }
@@ -172,15 +202,11 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
       confirmSessionCommand(topicId, "/restart only works from the control topic.");
       return;
     }
-    try {
-      await controlBot.sendMessage(
-        supergroupChatId,
-        topicId,
-        "Restarting the Bridge now (§4.5.1) - live sessions will relaunch via claude --resume once it's back up.",
-      );
-    } catch (err) {
-      log("WARN", `failed to send /restart confirmation: ${(err as Error).message}`);
-    }
+    await notify(
+      topicId,
+      "Restarting the Bridge now (§4.5.1) - live sessions will relaunch via claude --resume once it's back up.",
+      "/restart confirmation",
+    );
     log("INFO", "/restart requested - relaunching and exiting");
     await respawnSelfAndExit();
   }
@@ -208,29 +234,12 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
       confirmSessionCommand(topicId, `No session "${slug}".`);
       return;
     }
-    const { repoPath, branch, worktreePath } = row;
-    try {
-      await controlBot.sendMessage(supergroupChatId, topicId, `Merging "${branch}" (session "${slug}") into ${repoPath}…`);
-    } catch (err) {
-      log("WARN", `failed to send /merge ack: ${(err as Error).message}`);
-    }
+    const { repoPath, branch } = row;
+    await notify(topicId, `Merging "${branch}" (session "${slug}") into ${repoPath}…`, "/merge ack");
     log("INFO", `/merge requested for slug "${slug}" -> merging "${branch}" into ${repoPath}`);
-    const packageDirs = discoverTypecheckedPackages(repoPath);
-    const outcome = await deployBranch(repoPath, branch, packageDirs, undefined, worktreePath);
-    if (!outcome.ok) {
-      log("WARN", `/merge failed for "${branch}": ${outcome.message}`);
-      try {
-        await controlBot.sendMessage(supergroupChatId, topicId, truncateForTelegram(outcome.message));
-      } catch (err) {
-        log("WARN", `failed to send /merge failure message: ${(err as Error).message}`);
-      }
-      return;
-    }
-    try {
-      await controlBot.sendMessage(supergroupChatId, topicId, truncateForTelegram(outcome.message));
-    } catch (err) {
-      log("WARN", `failed to send /merge success message: ${(err as Error).message}`);
-    }
+    const outcome = await mergeAndReport("/merge", topicId, row);
+    if (!outcome) return;
+    await notify(topicId, truncateForTelegram(outcome.message), "/merge success message");
 
     await restartIfSelfRepo("/merge", repoPath, branch, outcome, topicId);
   }
@@ -273,11 +282,7 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
       return;
     }
     const { repoPath, branch, worktreePath } = row;
-    try {
-      await controlBot.sendMessage(supergroupChatId, topicId, `Shipping "${branch}" (session "${slug}") to main…`);
-    } catch (err) {
-      log("WARN", `failed to send /ship ack: ${(err as Error).message}`);
-    }
+    await notify(topicId, `Shipping "${branch}" (session "${slug}") to main…`, "/ship ack");
     log("INFO", `/ship requested for slug "${slug}" -> committing+merging "${branch}" into ${repoPath}`);
 
     const commitOutcome = await commitIfDirty(worktreePath);
@@ -285,26 +290,13 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
       log("INFO", `/ship: ${commitOutcome.message}`);
     }
 
-    const packageDirs = discoverTypecheckedPackages(repoPath);
-    const outcome = await deployBranch(repoPath, branch, packageDirs, undefined, worktreePath);
-    if (!outcome.ok) {
-      log("WARN", `/ship failed for "${branch}": ${outcome.message}`);
-      try {
-        await controlBot.sendMessage(supergroupChatId, topicId, truncateForTelegram(outcome.message));
-      } catch (err) {
-        log("WARN", `failed to send /ship failure message: ${(err as Error).message}`);
-      }
-      return;
-    }
+    const outcome = await mergeAndReport("/ship", topicId, row);
+    if (!outcome) return;
 
     const push = await pushCurrentBranch(repoPath);
     const pushNote = push.status === 0 ? "Pushed to origin." : `Merged locally, but the push to origin failed: ${push.stderr || push.stdout}`;
     if (push.status !== 0) log("WARN", `/ship: push failed for ${repoPath}: ${push.stderr || push.stdout}`);
-    try {
-      await controlBot.sendMessage(supergroupChatId, topicId, `${truncateForTelegram(outcome.message)}\n${pushNote}`);
-    } catch (err) {
-      log("WARN", `failed to send /ship success message: ${(err as Error).message}`);
-    }
+    await notify(topicId, `${truncateForTelegram(outcome.message)}\n${pushNote}`, "/ship success message");
 
     await restartIfSelfRepo("/ship", repoPath, branch, outcome, topicId);
   }

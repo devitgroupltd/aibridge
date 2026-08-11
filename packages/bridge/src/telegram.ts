@@ -10,26 +10,38 @@ export type TelegramForwardOrigin =
   | { type: "chat"; sender_chat: { title?: string; username?: string } }
   | { type: "channel"; chat: { title?: string; username?: string } };
 
-/** The message a reply quotes. Telegram itself never nests a second `reply_to_message` inside this
- * one (a reply to a reply only ever carries its immediate parent), so a shallow shape is safe -
- * no recursive type needed. */
-export interface TelegramReplyTarget {
-  message_id: number;
-  text?: string;
-  caption?: string;
-  /** Same media fields as the top-level `TelegramMessage` below - Telegram includes them verbatim
-   * on `reply_to_message` too. Carried through so reply-to-retry (inbound-media.ts) can re-run an
-   * attachment message, not just its caption, when the operator replies "retry" to a photo/document/
-   * video/audio/video-note rather than to a plain-text message - without these, that reply silently
-   * dropped the actual file/image and forwarded only the bare caption text. */
+/** The attachment-shaped fields Telegram puts on both a top-level message and its
+ * `reply_to_message` (verbatim, per the Bot API) - shared so `TelegramMessage` and
+ * `TelegramReplyTarget` below can't drift the way they did when first added (each hand-declared the
+ * same five fields with the same types). `caption` isn't included here even though it travels
+ * alongside these on both shapes - it stays declared separately by each interface below since it
+ * reads more naturally as "the message's own caption" than as part of "attachment fields". */
+export interface TelegramMediaFields {
+  /** One entry per resolution Telegram generated for an inbound photo, smallest to largest - the
+   * largest is what attachment-inbox.ts downloads. The caption (if any) travels on the message
+   * itself, not per-size. */
   photo?: Array<{ file_id: string; file_size?: number; width: number; height: number }>;
+  /** An inbound document (PDF, docx, ...) - forwarded/uploaded as a file rather than rendered as
+   * a photo or played inline. */
   document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  /** A forwarded/uploaded video file (not a photo, not the round "video note" bubble below). */
   video?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  /** A forwarded/uploaded audio file - distinct from `voice` (recorded in-app, transcribed). */
   audio?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
+  /** Telegram's round "video message" bubble - never carries a filename or mime type. */
   video_note?: { file_id: string; file_size?: number };
 }
 
-export interface TelegramMessage {
+/** The message a reply quotes. Telegram itself never nests a second `reply_to_message` inside this
+ * one (a reply to a reply only ever carries its immediate parent), so a shallow shape is safe -
+ * no recursive type needed. */
+export interface TelegramReplyTarget extends TelegramMediaFields {
+  message_id: number;
+  text?: string;
+  caption?: string;
+}
+
+export interface TelegramMessage extends TelegramMediaFields {
   message_id: number;
   chat: { id: number };
   message_thread_id?: number;
@@ -49,19 +61,6 @@ export interface TelegramMessage {
    * arrives as `message.audio` instead - see below, now handled via attachment-inbox.ts rather
    * than transcription. */
   voice?: { file_id: string; duration: number };
-  /** One entry per resolution Telegram generated for an inbound photo, smallest to largest - the
-   * largest is what attachment-inbox.ts downloads. The caption (if any) travels on the message
-   * itself, not per-size. */
-  photo?: Array<{ file_id: string; file_size?: number; width: number; height: number }>;
-  /** An inbound document (PDF, docx, ...) - forwarded/uploaded as a file rather than rendered as
-   * a photo or played inline. */
-  document?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
-  /** A forwarded/uploaded video file (not a photo, not the round "video note" bubble below). */
-  video?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
-  /** A forwarded/uploaded audio file - distinct from `voice` (recorded in-app, transcribed). */
-  audio?: { file_id: string; file_name?: string; mime_type?: string; file_size?: number };
-  /** Telegram's round "video message" bubble - never carries a filename or mime type. */
-  video_note?: { file_id: string; file_size?: number };
   /** §5.6: the one caption Telegram allows alongside a photo/document/video/audio in the same
    * message - never present alongside plain `text` or `voice`. */
   caption?: string;

@@ -51,7 +51,7 @@ function bareBranches(): string[] {
 describe("buildDiffReview - no changes", () => {
   test("no tracked or untracked changes -> kind empty, no push attempted", () => {
     const result = buildDiffReview(workDir, "test-slug");
-    expect(result).toEqual({ kind: "empty", filesChanged: 0, filePaths: [], untrackedFiles: [] });
+    expect(result).toEqual({ kind: "empty", filePaths: [], untrackedFiles: [] });
     expect(bareBranches()).toEqual([]);
   });
 
@@ -72,7 +72,6 @@ describe("buildDiffReview - link happy path", () => {
     const result = buildDiffReview(workDir, "test-slug");
 
     expect(result.kind).toBe("link");
-    expect(result.filesChanged).toBe(1);
     expect(result.filePaths).toEqual(["README.md"]);
     expect(result.url).toBe("https://github.com/testowner/testrepo/compare/main...aibridge-review/test-slug-head");
     expect(bareBranches().sort()).toEqual(["aibridge-review/test-slug-head", "main"]);
@@ -149,7 +148,6 @@ describe("renderFilesChangedSummary", () => {
   test("lists each changed path under the count, not just the count", () => {
     const text = renderFilesChangedSummary({
       kind: "link",
-      filesChanged: 2,
       filePaths: ["src/foo.ts", "src/bar.ts"],
       untrackedFiles: [],
     });
@@ -157,7 +155,7 @@ describe("renderFilesChangedSummary", () => {
   });
 
   test("falls back to the bare count when there are no file paths", () => {
-    const text = renderFilesChangedSummary({ kind: "document", filesChanged: 0, filePaths: [], untrackedFiles: [] });
+    const text = renderFilesChangedSummary({ kind: "document", filePaths: [], untrackedFiles: [] });
     expect(text).toBe("0 file(s) changed.");
   });
 });

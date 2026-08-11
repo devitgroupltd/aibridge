@@ -42,6 +42,7 @@ import {
   resolveModeCallback,
   resolveModelCallback,
 } from "./session-commands.ts";
+import type { ConfirmEntry, ConfirmRegistry } from "./confirm-registry.ts";
 import type { RateGovernor } from "./rate-governor.ts";
 import type { Routing } from "./routing.ts";
 import type { SessionStore } from "./session-store.ts";
@@ -186,6 +187,34 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
     log,
   } = opts;
 
+  /**
+   * Shared by "fleetConfirm" and "osConfirm" below: both do the identical take-or-notify-gone ->
+   * discriminator-check -> cancel-or-execute dance, differing only in the registry, which field on
+   * the pending entry acts as the discriminator (`kind` vs `action`), and what actually runs on
+   * confirm. Extracted so a third `/x`-style destructive confirm card doesn't have to copy-paste
+   * this a third time (found live as a fresh duplication introduced with the `/os` feature).
+   */
+  function handleSimpleConfirm<T extends ConfirmEntry & { messageId: number }, D>(
+    registry: ConfirmRegistry<T>,
+    action: { id: string; confirmed: boolean },
+    callbackMessageId: number | undefined,
+    actionDiscriminator: D,
+    entryDiscriminator: (entry: T) => D,
+    execute: (pending: T) => Promise<void>,
+    logLabel: string,
+  ): void {
+    const pending = confirmCards.takeOrNotifyGone(registry, action.id, callbackMessageId, (entry) =>
+      fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, `callback-query-router markConfirmCardExpired(${logLabel})`),
+    );
+    if (!pending) return;
+    if (entryDiscriminator(pending) !== actionDiscriminator) return;
+    if (!action.confirmed) {
+      fireAndForget(confirmCards.finalizeCard(pending.messageId, "Cancelled - nothing was changed."), log, `callback-query-router finalizeCard(${logLabel} cancel)`);
+      return;
+    }
+    fireAndForget(execute(pending), log, `callback-query-router execute(${logLabel})`);
+  }
+
   const NAMESPACE_RULES: NamespaceRule[] = [
     // §6.4's per-question keyboard - "ask:", checked first since it never collides with the other
     // namespaces ("perm:", "run:", etc.).
@@ -299,23 +328,22 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
 
     // `/kill --all`/`/rm --all`'s own confirm keyboard (fleet-confirm.ts) - "fc:", a fresh
     // namespace, checked alongside "perm:" since both gate a destructive action behind a tap.
+    // `take`, not `resolve`, inside `handleSimpleConfirm`: an expired card has to *say* it expired.
+    // `answerCallbackQuery` already cleared the spinner, so returning silently here left the
+    // operator with a tap that visibly did nothing - §6.5's stated failure mode.
     rule(
       "fleetConfirm",
       (data) => (data ? resolveFleetConfirmCallback(data) : null),
       (fleetConfirmAction, ctx) => {
-        // `take`, not `resolve`: an expired card has to *say* it expired. `answerCallbackQuery`
-        // already cleared the spinner, so returning silently here left the operator with a tap
-        // that visibly did nothing - §6.5's stated failure mode.
-        const pending = confirmCards.takeOrNotifyGone(fleetConfirmRegistry, fleetConfirmAction.id, ctx.callbackQuery.message?.message_id, (entry) =>
-          fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "callback-query-router markConfirmCardExpired(fleet)"),
+        handleSimpleConfirm(
+          fleetConfirmRegistry,
+          fleetConfirmAction,
+          ctx.callbackQuery.message?.message_id,
+          fleetConfirmAction.kind,
+          (entry) => entry.kind,
+          (pending) => fleetConfirmFlow.executeFleetConfirm(pending),
+          "fleet",
         );
-        if (!pending) return;
-        if (pending.kind !== fleetConfirmAction.kind) return;
-        if (!fleetConfirmAction.confirmed) {
-          fireAndForget(confirmCards.finalizeFleetConfirmMessage(pending, "Cancelled - nothing was changed."), log, "callback-query-router finalizeFleetConfirmMessage(cancel)");
-          return;
-        }
-        fireAndForget(fleetConfirmFlow.executeFleetConfirm(pending), log, "callback-query-router executeFleetConfirm");
       },
     ),
 
@@ -326,16 +354,15 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
       "osConfirm",
       (data) => (data ? resolveOsConfirmCallback(data) : null),
       (osConfirmAction, ctx) => {
-        const pending = confirmCards.takeOrNotifyGone(osConfirmRegistry, osConfirmAction.id, ctx.callbackQuery.message?.message_id, (entry) =>
-          fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "callback-query-router markConfirmCardExpired(os)"),
+        handleSimpleConfirm(
+          osConfirmRegistry,
+          osConfirmAction,
+          ctx.callbackQuery.message?.message_id,
+          osConfirmAction.action,
+          (entry) => entry.action,
+          (pending) => osPowerCommands.executeOsConfirm(pending),
+          "os",
         );
-        if (!pending) return;
-        if (pending.action !== osConfirmAction.action) return;
-        if (!osConfirmAction.confirmed) {
-          fireAndForget(confirmCards.finalizeCard(pending.messageId, "Cancelled - nothing was changed."), log, "callback-query-router finalizeCard(os cancel)");
-          return;
-        }
-        fireAndForget(osPowerCommands.executeOsConfirm(pending), log, "callback-query-router executeOsConfirm");
       },
     ),
 
