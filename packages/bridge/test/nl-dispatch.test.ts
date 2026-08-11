@@ -510,5 +510,91 @@ describe("createNlDispatch", () => {
         expect(pending?.threadId).toBe(1);
       });
     });
+
+    // Bug fix: a control-topic reply to an earlier message (e.g. a burn-rate alarm) used to reach
+    // the NL classifier and the new session's own `sourceText` as bare text - the reply's quoted
+    // context (built by inbound-media.ts's `buildContextPrefix`) never made it past this function's
+    // forward-to-a-live-session branch. `contextPrefix`, once passed, must reach both.
+    describe("contextPrefix (reply-to-an-earlier-message context)", () => {
+      test("is prepended to the text the classifier actually sees", async () => {
+        const seen: string[] = [];
+        const routeText = async (text: string) => {
+          seen.push(text);
+          return { matched: false as const };
+        };
+        const { nlDispatch } = await setup({ routeText });
+        const contextPrefix = '[Replying to an earlier message: "Burn-rate alarm: fleet has spent $10.00"]\n\n';
+
+        await nlDispatch.routeOrFallback(
+          "create a session for analyze this alarm",
+          { isControl: true, hasSession: false },
+          1,
+          true,
+          undefined,
+          () => {},
+          () => {},
+          contextPrefix,
+        );
+
+        expect(seen).toEqual([`${contextPrefix}create a session for analyze this alarm`]);
+      });
+
+      test("survives into a matched kind='new' command's sourceText", async () => {
+        const command = { kind: "new" as const, repo: "aibridge", prompt: "Analyze the burn-rate alarm" };
+        const routeText = async () => ({ matched: true as const, command, destructive: false });
+        const { nlDispatch, dispatchFleetCommandCalls } = await setup({ routeText });
+        const contextPrefix = '[Replying to an earlier message: "Burn-rate alarm: fleet has spent $10.00"]\n\n';
+
+        await nlDispatch.routeOrFallback(
+          "create a session for analyze this alarm",
+          { isControl: true, hasSession: false },
+          1,
+          true,
+          undefined,
+          () => {},
+          () => {},
+          contextPrefix,
+        );
+
+        const [dispatched] = dispatchFleetCommandCalls[0] as [{ sourceText?: string }];
+        expect(dispatched.sourceText).toBe(`${contextPrefix}create a session for analyze this alarm`);
+      });
+
+      test("survives into a matched kind='new_pick_repo' pending pick's sourceText", async () => {
+        const routeText = async () => ({ matched: true as const, command: { kind: "new_pick_repo" as const, prompt: "analyze this alarm" }, destructive: false });
+        const { nlDispatch, repoPickRegistry, controlBot } = await setup({ routeText });
+        const contextPrefix = '[Replying to an earlier message: "Burn-rate alarm: fleet has spent $10.00"]\n\n';
+
+        await nlDispatch.routeOrFallback(
+          "create a session for analyze this alarm",
+          { isControl: true, hasSession: false, repoNames: ["aibridge", "seowrite"] },
+          1,
+          true,
+          undefined,
+          () => {},
+          () => {},
+          contextPrefix,
+        );
+
+        const [sent] = controlBot.sent;
+        const keyboard = sent?.keyboard as { inline_keyboard: Array<Array<{ callback_data: string }>> };
+        const id = keyboard.inline_keyboard.flat()[0]!.callback_data.split(":")[1]!;
+        const pending = repoPickRegistry.resolve(id);
+        expect(pending?.sourceText).toBe(`${contextPrefix}create a session for analyze this alarm`);
+      });
+
+      test("defaults to \"\" - every pre-existing caller/test is unaffected", async () => {
+        const seen: string[] = [];
+        const routeText = async (text: string) => {
+          seen.push(text);
+          return { matched: false as const };
+        };
+        const { nlDispatch } = await setup({ routeText });
+
+        await nlDispatch.routeOrFallback("hello", { isControl: true, hasSession: false }, 1, true, undefined, () => {}, () => {});
+
+        expect(seen).toEqual(["hello"]);
+      });
+    });
   });
 });

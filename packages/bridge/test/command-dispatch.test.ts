@@ -172,8 +172,9 @@ function fakeNlDispatch() {
       currentSlug: unknown,
       onNoMatch: () => void,
       onRetryMatch: () => void | Promise<void>,
+      contextPrefix?: string,
     ) => {
-      routeOrFallbackCalls.push([text, ctx, threadId, isControl, currentSlug]);
+      routeOrFallbackCalls.push([text, ctx, threadId, isControl, currentSlug, contextPrefix]);
       // "retry" simulates nl-router.ts's `kind='retry'` match (any-language natural phrasing
       // `isRetryPhrase`'s regex missed) - command-dispatch.ts must wire its own `handleRetry` in as
       // `onRetryMatch` so this fires the exact same reply-to-retry/retryStore mechanics the regex
@@ -503,6 +504,22 @@ describe("dispatchInboundMessage - non-exact-syntax fallthrough", () => {
     expect(currentSlug).toBeUndefined();
     // on no match, the control-topic-only fallback message fires
     expect(s.confirmSessionCommand.calls[0]?.text).toContain("Unrecognised control-topic command");
+  });
+
+  // Bug fix: a control-topic reply to an earlier message (e.g. a burn-rate alarm) that reads
+  // "create a session for analyze this alarm" used to reach the NL router as bare text, with the
+  // alarm's own content dropped on the floor - the new session had no idea what "this alarm" was.
+  // `contextPrefix` (built by inbound-media.ts's `buildContextPrefix` from that reply's
+  // `reply_to_message`) must now reach `routeOrFallback` on this exact no-session branch.
+  test("a control-topic reply's contextPrefix reaches the NL router, not just a live session's forward", async () => {
+    const s = setup();
+    s.nlDispatch.setNoMatchBehavior("call");
+    const contextPrefix = '[Replying to an earlier message: "⚠️ Burn-rate alarm: fleet has spent $10.00..."]\n\n';
+    await s.commandDispatch.dispatchInboundMessage(1, "create a session for analyze this alarm", undefined, true, undefined, undefined, "op", contextPrefix);
+
+    expect(s.nlDispatch.routeOrFallbackCalls.length).toBe(1);
+    const [, , , , , passedContextPrefix] = s.nlDispatch.routeOrFallbackCalls[0]!;
+    expect(passedContextPrefix).toBe(contextPrefix);
   });
 
   test("a message to a dead session's topic (no route, restart-orphaned) is acknowledged, not routed", async () => {

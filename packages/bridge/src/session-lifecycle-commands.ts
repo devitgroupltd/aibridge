@@ -742,7 +742,12 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       confirmSessionCommand(topicId, `"${row.slug}" is still running - just send it a message to continue (a /stop interrupt leaves the process alive).`);
       return;
     }
-    await sessionSupervisor.resumeSession(row);
+    // `manuallyRequested: true` - `row.state === "dead"` here is the whole reason /resume was
+    // invoked, not a race for `resumeSession`'s own dead-guard to catch (see its doc comment: that
+    // guard is for the crash-backoff/reconciliation callers, which capture a non-dead row before
+    // doing async work). Omitting this silently no-ops every manual /resume (live-confirmed bug,
+    // 2026-08-11).
+    await sessionSupervisor.resumeSession(row, { manuallyRequested: true });
   }
 
   /**

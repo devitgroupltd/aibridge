@@ -357,6 +357,22 @@ describe("createSessionLifecycleCommands", () => {
       expect(resumed.map((r) => r.slug)).toEqual(["fix-bug"]);
     });
 
+    // Bug fix (live-confirmed 2026-08-11): without `manuallyRequested: true`, `resumeSession`'s own
+    // dead-guard (session-supervisor.ts, meant to catch a crash-backoff/reconciliation race) always
+    // fired here too - `row.state === "dead"` is the very reason /resume calls it, not a race - so
+    // every manual /resume on a dead session silently no-op'd. Asserted against the real
+    // `resumeSession` (not the mocked-away version above) so a regression here fails loudly again.
+    test("handleResumeCommand passes manuallyRequested:true so resumeSession's own dead-guard doesn't swallow it", async () => {
+      const { sessionLifecycle, sessionStore, sessionSupervisor } = setup();
+      sessionStore.insert(row({ state: "dead" }));
+      const calls: Array<{ slug: string; opts: unknown }> = [];
+      sessionSupervisor.resumeSession = async (r: SessionRow, opts?: unknown) => {
+        calls.push({ slug: r.slug, opts });
+      };
+      await sessionLifecycle.handleResumeCommand({ kind: "resume", slug: "fix-bug" }, 1, undefined);
+      expect(calls).toEqual([{ slug: "fix-bug", opts: { manuallyRequested: true } }]);
+    });
+
     test("handleResumeCommand is a no-op with an explanatory note for a still-alive session (/stop leaves the process alive)", async () => {
       const { sessionLifecycle, sessionStore, sessionSupervisor, confirmed } = setup();
       sessionStore.insert(row({ state: "working" }));

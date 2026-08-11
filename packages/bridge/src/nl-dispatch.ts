@@ -68,6 +68,12 @@ export interface NlDispatch {
     currentSlug: string | undefined,
     onNoMatch: () => void,
     onRetryMatch: () => void | Promise<void>,
+    // §5.x (message-context.ts): same value `dispatchInboundMessage` receives, forwarded through so
+    // a control-topic reply (no session yet to forward into) still reaches the NL classifier and,
+    // for a `kind='new'`/`kind='new_pick_repo'` match, the new session's own `sourceText` - the one
+    // gap `contextPrefix` didn't originally cover (it was applied only at the forward-into-a-live-
+    // session send in command-dispatch.ts). Defaults to "" so every existing caller/test is unaffected.
+    contextPrefix?: string,
   ): Promise<void>;
 }
 
@@ -227,11 +233,17 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     currentSlug: string | undefined,
     onNoMatch: () => void,
     onRetryMatch: () => void | Promise<void>,
+    contextPrefix = "",
   ): Promise<void> {
     if (!nlRouterConfig.enabled) {
       onNoMatch();
       return;
     }
+    // Fed to the classifier/Q&A call and into a `kind='new'`/`new_pick_repo` match's `sourceText`
+    // below - never into `history.recordOperator(text)` a few lines down, which stays the operator's
+    // own literal words (the history buffer is a transcript, not an interpretation aid). See this
+    // function's `contextPrefix` param doc for why a bare `text` here was the bug.
+    const contextedText = contextPrefix + text;
     // Recorded regardless of match outcome, but only in the control topic - the history buffer is a
     // control-topic-only concept (plans/control-topic-nl-dialogue-plan.md §4); a session's own topic
     // already has its own native conversation context and never reads this buffer.
@@ -251,7 +263,7 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     if (topicIdStr) typingIndicator.start(topicIdStr);
     if (usePlaceholder) thinkingPlaceholder.start(topicIdStr!);
 
-    const result = await routeText(text, ctx, { ...nlRouterConfig, backend: getNlRouterBackend() }, log);
+    const result = await routeText(contextedText, ctx, { ...nlRouterConfig, backend: getNlRouterBackend() }, log);
 
     if (topicIdStr) typingIndicator.stop(topicIdStr);
     // `kind === "new"` is the one outcome whose own latency (topic creation, worktree, PTY spawn -
@@ -286,7 +298,7 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
       if (ctx.isControl) {
         const groundingText = buildDialogueGroundingText();
         const historyText = formatHistoryForPrompt(history?.recent(nlRouterConfig.historyTurns ?? 0) ?? []);
-        const answer = await answerControlTopicQuestion(text, groundingText, historyText, nlRouterConfig.model, log);
+        const answer = await answerControlTopicQuestion(contextedText, groundingText, historyText, nlRouterConfig.model, log);
         if (answer) {
           history?.recordBot(answer);
           try {
@@ -316,7 +328,7 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     // `executeMatchedCommand`, only once a repo is actually tapped (callback-query-router.ts's `rp:`
     // rule turns that tap into a real `kind='new'` call).
     if (result.command.kind === "new_pick_repo") {
-      await postRepoPick(result.command.prompt, result.command.model, text, ctx.repoNames ?? [], threadId);
+      await postRepoPick(result.command.prompt, result.command.model, contextedText, ctx.repoNames ?? [], threadId);
       return;
     }
     // The router's own `prompt` field is an emergent English paraphrase (its classification prompt
@@ -324,8 +336,12 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     // wrong for what the session actually sees as its first turn. Attaching the raw message here
     // (before the destructive/confirm branch, so a deferred `/new` would carry it too - moot today
     // since 'new' is never destructive, but this keeps the guarantee in one place) lets
-    // `handleNewCommand` recover the operator's own words via `newSessionContent`.
-    if (result.command.kind === "new") result.command = { ...result.command, sourceText: text };
+    // `handleNewCommand` recover the operator's own words via `newSessionContent`. Uses
+    // `contextedText` (not bare `text`) so a control-topic reply's quoted context - e.g. replying to
+    // a burn-rate alarm with "create a session for analyze this alarm" - survives into both the new
+    // topic's announcement and the session's actual first turn, instead of leaving Claude to guess
+    // what "this alarm" refers to.
+    if (result.command.kind === "new") result.command = { ...result.command, sourceText: contextedText };
     if (result.destructive && getAssistEnabled()) {
       fireAndForget(postNlConfirm(result.command, threadId, currentSlug), log, "nl-dispatch postNlConfirm");
       return;

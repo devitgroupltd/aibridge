@@ -878,6 +878,68 @@ describe("createSessionSupervisor", () => {
     expect(sessionStore.get("fix-bug")?.state).toBe("dead");
   });
 
+  // Bug fix (live-confirmed 2026-08-11): the two tests above cover the *race* this dead-guard is
+  // actually for (a stale snapshot captured before an async wait, raced by a real /kill). Manual
+  // `/resume <slug>` is a different caller shape entirely - `row.state === "dead"` is already true,
+  // by construction, every single time it calls this (that's the whole point of /resume) - so
+  // without `manuallyRequested: true` opting out of the exact same guard, every manual resume of a
+  // dead session silently no-op'd: no relaunch, no confirm message, state stuck at `dead` forever.
+  test("resumeSession relaunches a dead row when manuallyRequested is true - the actual /resume path", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "dead" }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const resumedPty = fakePty();
+    let launchCount = 0;
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      launchSession: () => {
+        launchCount += 1;
+        return {
+          worktreePath: "c:\\data\\worktrees\\fix-bug",
+          branch: "claude/fix-bug-1",
+          ptyProcess: resumedPty as unknown as LaunchedSession["ptyProcess"],
+          ready: Promise.resolve({ resumeFailed: false }),
+        };
+      },
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!, { manuallyRequested: true });
+
+    expect(launchCount).toBe(1);
+    expect(confirm.calls.some((c) => c.text.includes('Session "fix-bug" resumed.'))).toBe(true);
+  });
+
+  test("resumeSession without manuallyRequested still no-ops on an already-dead row (default stays the race guard)", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "dead" }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    let launchCount = 0;
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      launchSession: () => {
+        launchCount += 1;
+        throw new Error("should not be called - manuallyRequested was not passed");
+      },
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!);
+
+    expect(launchCount).toBe(0);
+    expect(confirm.calls.length).toBe(0);
+  });
+
   test("handleUnexpectedExit's pending resume does not relaunch a session removed by /rm during the backoff wait", async () => {
     const sessionStore = new SessionStore(":memory:");
     sessionStore.insert(row());
