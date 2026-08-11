@@ -166,6 +166,11 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
   function maybeSetState(slug: string, target: SessionState): void {
     const row = sessionStore.get(slug);
     if (row && row.state !== target && isValidTransition(row.state, target)) {
+      // Debugging aid added 2026-08-11 after a boot-reconciliation race silently orphaned a live
+      // session ("remove-rm-alias" - a Bridge self-restart's own successor process reconciled zero
+      // rows with no log trace of why): every real state write now leaves a line, so "did this row
+      // go dead, and from what" is answerable from bridge.log alone instead of a live DB query.
+      log("INFO", `session "${slug}" state ${row.state} -> ${target}`);
       sessionStore.setState(slug, target, nowIso());
     }
   }
@@ -262,7 +267,14 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
     // §4.3's state table, the hook-driven half (the permission/ask half is wired via
     // onAwaitingInput/maybeSetState in index.ts) - a stale/duplicate event is a silent no-op, not
     // an error.
-    const targetState = stateForHookEvent(msg.hook_event_name, typeof msg.payload.reason === "string" ? msg.payload.reason : undefined);
+    const hookReason = typeof msg.payload.reason === "string" ? msg.payload.reason : undefined;
+    const targetState = stateForHookEvent(msg.hook_event_name, hookReason);
+    if (targetState === "dead") {
+      // Pinpoints *which* hook drove a dead transition - see maybeSetState's own log line for the
+      // resulting old->new state. Without this, a dead row and a boot-reconciliation race that
+      // skipped it (§4.5) were indistinguishable from the log alone (2026-08-11 live incident).
+      log("WARN", `session "${msg.slug}" hook event "${msg.hook_event_name}"${hookReason ? ` (reason: ${hookReason})` : ""} is marking the row dead`);
+    }
     if (targetState) maybeSetState(msg.slug, targetState);
 
     const event = normalizeHookEvent(msg.hook_event_name, msg.payload);

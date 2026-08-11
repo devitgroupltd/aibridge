@@ -108,7 +108,7 @@ export interface SessionSupervisor {
   runStartupReconciliation(): Promise<void>;
   wireSession(slug: string, ptyProcess: pty.IPty, topicId: number, ready: Promise<{ resumeFailed: boolean }>): void;
   handleUnexpectedExit(slug: string, ptyProcess: pty.IPty, topicId: number, exitCode: number): Promise<void>;
-  resumeSession(row: SessionRow, opts?: { manuallyRequested?: boolean }): Promise<void>;
+  resumeSession(row: SessionRow, opts?: { manuallyRequested?: boolean; bootReconciliation?: boolean }): Promise<void>;
   /** Read accessor for consumers that need to reach a tracked PTY without owning the map
    * themselves - the dev-control debug HTTP server (composition root) in particular. */
   getPtyProcess(slug: string): pty.IPty | undefined;
@@ -153,6 +153,33 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
    * session is actually alive again (`feed-wiring.ts`'s `handleHookEvent`, via `clearResumeAttempts`). */
   const resumeAttempts = new Map<string, number>();
   const lastPtyActivityBySlug = new Map<string, number>();
+
+  /**
+   * §4.5's boot-reconciliation race, found live 2026-08-11 ("remove-rm-alias", killed by its own
+   * self-repo `/ship` restart mid-turn, never auto-resumed, no trace in the log of why): a session
+   * whose `claude` process dies because the Bridge itself is dying (per this file's own
+   * `isPidAlive` doc comment - a live session's process never survives that) queues its own
+   * `SessionEnd` hook event, which can only reach the pipe once the successor process starts
+   * listening. `runStartupReconciliation` used to take its "which rows are non-dead" snapshot with
+   * a fresh `sessionStore.all()` read at the time it actually runs - by then the pipe server has
+   * been accepting connections for a while (composition root: `startPipeServer` runs *after* this
+   * factory), so a queued `SessionEnd` that flushed in the meantime had already marked the row
+   * `dead`, indistinguishable from a deliberate `/rm`/`/kill`, and reconciliation silently skipped
+   * it instead of resuming it.
+   *
+   * The fix is timing, not logic: this factory runs *before* `startPipeServer` (composition root's
+   * own ordering), so a snapshot taken right here, synchronously, is provably immune - nothing has
+   * had a chance yet to write to this row for reasons related to this restart. `runStartupReconciliation`
+   * (a few dozen lines below) treats slug membership in this set, not a row's live `state` column,
+   * as the source of truth for "does this need reconciling", and `resumeSession`'s own
+   * `bootReconciliation` opt-out lets it act on that even if the row now shows `dead`.
+   */
+  const bootLiveSlugs = new Set(
+    sessionStore
+      .all()
+      .filter((r) => r.slug !== selfCheckSlug && r.state !== "dead")
+      .map((r) => r.slug),
+  );
 
   /**
    * §4.5's reconciliation, wired for real: on this stack (measured 2026-08-03) a live session's
@@ -211,7 +238,14 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
 
   async function runStartupReconciliation(): Promise<void> {
     await reportOrphanProcesses();
-    const rows = sessionStore.all().filter((r) => r.slug !== selfCheckSlug && r.state !== "dead");
+    // Slug membership in `bootLiveSlugs` (captured before `startPipeServer` could ever accept a
+    // hook connection), not this row's live `state` column, decides who gets reconciled - see that
+    // set's own doc comment for the boot-restart race this closes. Logged unconditionally,
+    // including the zero case, so "nothing needed reconciling" and "this pass never ran" are no
+    // longer indistinguishable from bridge.log alone (the exact ambiguity that slowed down
+    // diagnosing the 2026-08-11 incident).
+    const rows = sessionStore.all().filter((r) => bootLiveSlugs.has(r.slug));
+    log("INFO", `startup reconciliation: ${rows.length} row(s) snapshotted live at boot (§4.5)`);
     if (rows.length === 0) return;
     const live = await reapRowsWithDeletedTopics(rows);
     if (live.length === 0) return;
@@ -222,8 +256,18 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
       }
     }
     for (const row of live) {
+      if (row.state === "dead") {
+        // The exact race `bootLiveSlugs` exists for: this row was live an instant ago (that's why
+        // it's in `live` at all) but its own crashed process's queued `SessionEnd` has since landed
+        // and flipped it to `dead`. `resumeSession`'s `bootReconciliation` opt-out is safe here
+        // specifically because no operator command can possibly be in flight yet - the getUpdates
+        // loop this process's own Telegram polling depends on doesn't start until after this whole
+        // function returns (index.ts), so there is no legitimate concurrent `/kill` this could be
+        // racing, unlike `resumeSession`'s other callers.
+        log("WARN", `session "${row.slug}" is marked dead but was live when this boot started (§4.5) - resuming anyway rather than orphaning it`);
+      }
       log("INFO", `reconciling session "${row.slug}" after a Bridge restart`);
-      await resumeSession(row);
+      await resumeSession(row, { bootReconciliation: true });
     }
   }
 
@@ -447,7 +491,10 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
     fireAndForget(sendFollowUpNudgeIfStillIdle(slug, topicId), log, `session-supervisor resume follow-up nudge(${slug})`);
   }
 
-  async function resumeSession(row: SessionRow, opts: { manuallyRequested?: boolean } = {}): Promise<void> {
+  async function resumeSession(
+    row: SessionRow,
+    opts: { manuallyRequested?: boolean; bootReconciliation?: boolean } = {},
+  ): Promise<void> {
     const { slug, topicId } = row;
     const current = sessionStore.get(slug);
     if (!current) {
@@ -466,7 +513,15 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
     // `manuallyRequested` opt-out, `current.state === "dead"` was true 100% of the time for that
     // caller, silently no-op'ing every manual `/resume` on a dead session (live-confirmed
     // 2026-08-11: `bridge.log` showed the skip line, no confirm message, `/ls` still `dead`).
-    if (!opts.manuallyRequested && current.state === "dead") {
+    //
+    // `runStartupReconciliation`'s `bootReconciliation` opt-out is the same bypass for a different
+    // reason: it already vouched for this slug via `bootLiveSlugs`, snapshotted before this boot's
+    // pipe server could accept the very `SessionEnd` that raced this row to `dead` (§4.5, found live
+    // 2026-08-11 - see that set's own doc comment). Safe specifically because this call only ever
+    // happens before this process's own `getUpdates` polling starts, so there is no legitimate
+    // concurrent manual `/kill` it could be mistaking for that race, unlike the caller this guard
+    // was built for.
+    if (!opts.manuallyRequested && !opts.bootReconciliation && current.state === "dead") {
       log("INFO", `resumeSession("${slug}") skipped - it was already marked dead (most likely by /kill) during the resume wait`);
       return;
     }
