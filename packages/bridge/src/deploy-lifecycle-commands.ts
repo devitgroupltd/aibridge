@@ -71,11 +71,22 @@ export interface ProcessRunner {
   runShutdown(args: string[]): Promise<ProcessRunResult>;
 }
 
+/** Same spawn-level-failure gap as `deploy.ts`'s `defaultRunner` (found live 2026-08-11, same day):
+ * a *real* run of `cmd` (task registered or not, script ran or not) reports through `stderr` as
+ * `execFileFn` already hands it back, but a *spawn-level* failure - `cmd` not resolvable, a
+ * permission error - never runs the child process at all, so `stderr` comes back empty and the
+ * only diagnostic left is `err.message` (Node's "spawn schtasks ENOENT"-shaped text). Without this
+ * fallback, callers built exactly the bare, undiagnosable failure the `deploy.ts` fix addressed -
+ * `schtasks /Create failed` / `(unknown error)` with nothing else to go on. */
+function stderrOrMessage(err: Error | null, stderr: string): string {
+  return stderr || (err?.message ?? "");
+}
+
 export function createProcessRunner(execFileFn: ExecFileFn = execFile as unknown as ExecFileFn): ProcessRunner {
   function runSchtasks(args: string[]): Promise<ProcessRunResult> {
     return new Promise((resolve) => {
       execFileFn("schtasks", args, { windowsHide: true }, (err, stdout, stderr) => {
-        resolve({ stdout: stdout ?? "", stderr: stderr ?? "", failed: err !== null });
+        resolve({ stdout: stdout ?? "", stderr: stderrOrMessage(err, stderr ?? ""), failed: err !== null });
       });
     });
   }
@@ -83,7 +94,7 @@ export function createProcessRunner(execFileFn: ExecFileFn = execFile as unknown
   function runPowershell(script: string): Promise<{ stdout: string; stderr: string; failed: boolean }> {
     return new Promise((resolve) => {
       execFileFn("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true }, (err, stdout, stderr) => {
-        resolve({ stdout: stdout ?? "", stderr: stderr ?? "", failed: err !== null });
+        resolve({ stdout: stdout ?? "", stderr: stderrOrMessage(err, stderr ?? ""), failed: err !== null });
       });
     });
   }
@@ -91,7 +102,7 @@ export function createProcessRunner(execFileFn: ExecFileFn = execFile as unknown
   function runShutdown(args: string[]): Promise<ProcessRunResult> {
     return new Promise((resolve) => {
       execFileFn("shutdown", args, { windowsHide: true }, (err, stdout, stderr) => {
-        resolve({ stdout: stdout ?? "", stderr: stderr ?? "", failed: err !== null });
+        resolve({ stdout: stdout ?? "", stderr: stderrOrMessage(err, stderr ?? ""), failed: err !== null });
       });
     });
   }

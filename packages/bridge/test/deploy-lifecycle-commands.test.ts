@@ -484,6 +484,14 @@ describe("createProcessRunner", () => {
     expect(result).toEqual({ stdout: "", stderr: "", failed: false });
   });
 
+  test("runSchtasks falls back to err.message on a spawn-level failure (schtasks not found, stderr never populated)", async () => {
+    const runner = createProcessRunner((_cmd, _args, _opts, cb) => cb(new Error("spawn schtasks ENOENT"), "", ""));
+
+    const result = await runner.runSchtasks(["/Query"]);
+
+    expect(result).toEqual({ stdout: "", stderr: "spawn schtasks ENOENT", failed: true });
+  });
+
   test("runPowershell resolves stdout/stderr/failed", async () => {
     const runner = createProcessRunner((_cmd, _args, _opts, cb) => cb(null, "1", ""));
 
@@ -500,6 +508,14 @@ describe("createProcessRunner", () => {
     expect(result).toEqual({ stdout: "", stderr: "access denied", failed: true });
   });
 
+  test("runPowershell falls back to err.message on a spawn-level failure (powershell not found, stderr never populated)", async () => {
+    const runner = createProcessRunner((_cmd, _args, _opts, cb) => cb(new Error("spawn powershell ENOENT"), "", ""));
+
+    const result = await runner.runPowershell("Set-ScheduledTask");
+
+    expect(result).toEqual({ stdout: "", stderr: "spawn powershell ENOENT", failed: true });
+  });
+
   test("runShutdown resolves with failed:false on a clean exit", async () => {
     const runner = createProcessRunner((_cmd, _args, _opts, cb) => cb(null, "", ""));
 
@@ -514,5 +530,13 @@ describe("createProcessRunner", () => {
     const result = await runner.runShutdown(["/a"]);
 
     expect(result).toEqual({ stdout: "", stderr: "nothing to abort", failed: true });
+  });
+
+  test("runShutdown falls back to err.message on a spawn-level failure (shutdown not found, stderr never populated)", async () => {
+    const runner = createProcessRunner((_cmd, _args, _opts, cb) => cb(new Error("spawn shutdown ENOENT"), "", ""));
+
+    const result = await runner.runShutdown(["/a"]);
+
+    expect(result).toEqual({ stdout: "", stderr: "spawn shutdown ENOENT", failed: true });
   });
 });
