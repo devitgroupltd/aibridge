@@ -44,8 +44,22 @@ export interface PendingAttachment {
  */
 export type RmBulkFilter = { mode: "dead" } | { mode: "prefix"; prefix: string } | { mode: "all" };
 
+/**
+ * `/auto <category>`'s two categories (bypass-and-autoanswer-plan.md §0.1). A real discriminant, not
+ * a stringly-typed argument: `session-lifecycle-commands.ts`'s `autoCategorySpec` resolves it to a
+ * descriptor behind a single `never` arm, so a future third category (`ship`) fails to compile in
+ * exactly one place rather than silently landing in someone's `else`.
+ *
+ * Naming split, stated once: only the *command surface* says permission/answer. The state underneath
+ * keeps its original names (`routing.ts`'s `getBypass`/`setBypass`, `getAutoAnswer`/`setAutoAnswer`),
+ * since nothing outside the code ever sees those and renaming them would be pure churn.
+ */
+export const AUTO_CATEGORIES = ["permission", "answer"] as const;
+export type AutoCategory = (typeof AUTO_CATEGORIES)[number];
+
 export type FleetCommand =
   | { kind: "new"; repo: string; prompt: string; model?: Model; sourceText?: string; pendingAttachment?: PendingAttachment }
+  | { kind: "auto"; category: AutoCategory; slug?: string; all?: boolean; on?: boolean }
   | { kind: "ls" }
   | { kind: "kill"; slug?: string; all?: boolean; force?: boolean }
   | { kind: "rm"; slug?: string; bulk?: RmBulkFilter; force?: boolean }
@@ -72,6 +86,11 @@ export type FleetCommand =
   | { kind: "default"; category: "status" }
   | { kind: "default"; category: "mode"; value?: Mode }
   | { kind: "default"; category: "effort"; value?: Effort }
+  /** `/default permission|answer [on|off]` - the new-session default for the two `/auto` toggles.
+   * One member covering both categories, unlike `mode`/`effort` above: those are separate members
+   * only because their `value` types differ, and these two share `boolean`. Narrowing on
+   * `category` still works either way. */
+  | { kind: "default"; category: AutoCategory; value?: boolean }
   | { kind: "os"; action: "shutdown" | "reboot" | "cancel" };
 
 const MODEL_FLAG_RE = new RegExp(`^--(${MODELS.join("|")})$`);
@@ -187,6 +206,37 @@ function isOnOff(s: string): s is "on" | "off" {
 function parseDetail(rest: string): FleetCommand | null {
   const parsed = parseSlugAndValue(rest, isDetailLevel);
   return parsed ? { kind: "detail", slug: parsed.slug, level: parsed.value } : null;
+}
+
+function isAutoCategory(s: string): s is AutoCategory {
+  return (AUTO_CATEGORIES as readonly string[]).includes(s);
+}
+
+/**
+ * `/auto <permission|answer> [<slug>] [on|off]` and `/auto <category> --all [on|off]` - the category
+ * token first (mirroring `/default [mode|effort] [<value>]`, whose shape the operator asked this to
+ * follow), then `parseKill`'s flag-first `--all` handling, then `parseSlugAndValue`'s two forms.
+ *
+ * A bare `/auto <category>` (no value) parses to `on: undefined` deliberately: that's the
+ * reports-status form, and a status read must never flip a safety gate. Same for `--all` with no
+ * value - a confirm card built from `undefined` would say ON and do OFF.
+ */
+function parseAuto(rest: string): FleetCommand | null {
+  const tokens = rest.trim().split(/\s+/).filter((t) => t.length > 0);
+  const [category, ...restTokens] = tokens;
+  if (!category || !isAutoCategory(category)) return null;
+  const all = restTokens.includes("--all");
+  const withoutAll = restTokens.filter((t) => t !== "--all");
+  if (all) {
+    if (withoutAll.length === 0) return { kind: "auto", category, all: true };
+    // `--all` must be the sole token alongside an optional value, matching `parseKill`'s strictness -
+    // a creative fallthrough would target a session literally named "--all extra".
+    if (withoutAll.length === 1 && isOnOff(withoutAll[0]!)) return { kind: "auto", category, all: true, on: withoutAll[0] === "on" };
+    return null;
+  }
+  const parsed = parseSlugAndValue(withoutAll.join(" "), isOnOff);
+  if (!parsed) return null;
+  return { kind: "auto", category, slug: parsed.slug, on: parsed.value === undefined ? undefined : parsed.value === "on" };
 }
 
 /** `/verbose [<slug>] [on|off]` - same shape as `parseDetail`. */
@@ -329,7 +379,7 @@ function parseVoiceConfirm(rest: string): FleetCommand | null {
 function parseDefault(rest: string): FleetCommand | null {
   const tokens = rest.trim().split(/\s+/).filter((t) => t.length > 0);
   if (tokens.length === 0 || tokens[0] === "status") return { kind: "default", category: "status" };
-  const category = tokens[0];
+  const category = tokens[0] ?? "";
   const rawValue = tokens[1];
   if (category === "mode") {
     if (rawValue === undefined) return { kind: "default", category: "mode" };
@@ -338,6 +388,12 @@ function parseDefault(rest: string): FleetCommand | null {
   if (category === "effort") {
     if (rawValue === undefined) return { kind: "default", category: "effort" };
     return (EFFORTS as readonly string[]).includes(rawValue) ? { kind: "default", category: "effort", value: rawValue as Effort } : null;
+  }
+  // `/default permission|answer [on|off]` - booleans, not one-of-N pickers, so a bare form reports
+  // the current setting rather than drilling into a value picker the way `mode`/`effort` do.
+  if (isAutoCategory(category)) {
+    if (rawValue === undefined) return { kind: "default", category };
+    return isOnOff(rawValue) ? { kind: "default", category, value: rawValue === "on" } : null;
   }
   return null;
 }
@@ -437,7 +493,12 @@ export function parseSkillsQuery(text: string): { term: string } | null {
 
 /** Shared between `parseFleetCommand` and `matchFleetCommandName` below - the list of command
  * *names* this module recognises, independent of whether the rest of the message parses. */
-const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|rm|remove|attach|pause|stop|resume|usage|budget|restart|merge|ship|detail|verbose|settings|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b/;
+/* `auto` sits next to `autostart` safely *only* because of the shared trailing `\b`: matching `auto`
+ * against `/autostart install` leaves the boundary assertion between "o" and "s", which fails and
+ * forces the engine to backtrack into the `autostart` alternative (the same mechanism `voice` and
+ * `voiceconfirm` have relied on here since before either was written). Any hand-rolled
+ * `startsWith("/auto")` check added elsewhere would not have that property. */
+const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|rm|remove|attach|pause|stop|resume|usage|budget|restart|merge|ship|detail|verbose|settings|auto|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b/;
 
 /**
  * Same command-name match as `parseFleetCommand`, but returns the bare word even when the rest of
@@ -499,6 +560,8 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return parseRouterBackend(rest);
     case "voiceconfirm":
       return parseVoiceConfirm(rest);
+    case "auto":
+      return parseAuto(rest);
     case "default":
       return parseDefault(rest);
     case "os":
@@ -766,9 +829,18 @@ export function renderHelp(): string {
     "    subscription (slower, no extra cost), 'api' uses a funded ANTHROPIC_API_KEY (faster, real",
     "    but small per-message cost). Defaults to 'cli' even if a key is configured - switch on",
     "    purpose, either direction, any time",
-    "  /default [mode|effort] [<value>] - what new sessions start with (mode default manual, effort",
-    "    default medium); bare /default shows a tappable picker, 'auto' mode skips permission prompts",
-    "    entirely for every future session until changed back",
+    "  /auto permission [<slug>] [on|off] - auto-allow this session's permission prompts with no",
+    "    Telegram card at all, including git commit/push and everything else on the ask list; the",
+    "    deny list (force-push, secret reads) still hard-blocks. Bare reports status; resets to off",
+    "    on every Bridge restart",
+    "  /auto answer [<slug>] [on|off] - auto-answer Claude's questions when it marked exactly one",
+    "    option as recommended; anything less clear still shows you the real buttons",
+    "  /auto permission|answer --all [on|off] - the same for every live session at once (confirm-gated",
+    "    like /kill --all); bare --all lists both settings per session instead",
+    "  /default [mode|effort|permission|answer] [<value>] - what new sessions start with (mode default",
+    "    manual, effort default medium, both /auto toggles default off); bare /default shows a tappable",
+    "    picker, 'auto' mode skips permission prompts entirely for every future session until changed",
+    "    back, and /default permission on starts every future session already auto-allowing prompts",
     "",
     "You can also just say what you want in plain English (typed or a voice note) instead of the",
     "exact command above - e.g. \"show me the sessions\" or \"restart this session\".",
@@ -832,6 +904,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "ship", description: "One-shot land to main: /ship [<slug>] - auto-commits uncommitted work, /merge's merge+gate, then pushes origin (bare, inside a session's own topic, targets that session)" },
     { command: "detail", description: "Feed card detail level: /detail [<slug>] [compact|full]" },
     { command: "verbose", description: "Show real tool output on the feed card: /verbose [<slug>] [on|off]" },
+    { command: "auto", description: "Auto-resolve escalations: /auto permission|answer [<slug>] [on|off] - permission auto-allows prompts (incl. git commit/push; deny list still blocks), answer auto-picks Claude's own recommended option" },
     { command: "settings", description: "Registered repos + concurrency budget" },
     { command: "repos", description: "Manage repos.toml: list|add <name> [path|git-url]|rm <name>" },
     { command: "autostart", description: "Manage the logon Task Scheduler entry: status|install|uninstall" },
@@ -839,7 +912,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "voiceconfirm", description: "Confirm before sending a transcribed voice note: /voiceconfirm [on|off]" },
     { command: "assist", description: "Confirm before running a natural-language-matched destructive command: /assist [on|off]" },
     { command: "router", description: "NL-routing backend: /router [api|cli] - subscription (cli, default) or a funded API key (api)" },
-    { command: "default", description: "What new sessions start with: /default [mode|effort] [<value>] - bare shows a tappable picker" },
+    { command: "default", description: "What new sessions start with: /default [mode|effort|permission|answer] [<value>] - bare shows a tappable picker" },
     { command: "help", description: "Show the full command list" },
     { command: "model", description: `Set model: /model <${MODELS.join("|")}>` },
     { command: "mode", description: `Set mode: /mode <${MODES.join("|")}>` },

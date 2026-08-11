@@ -748,6 +748,375 @@ describe("startPipeServer", () => {
     });
   });
 
+  // `/auto permission` / `/auto answer` (bypass-and-autoanswer-plan.md §1.1/§2.2): the Bridge
+  // resolves the escalation itself instead of posting a card, and leaves a plain-text trace.
+  describe("auto-resolve toggles", () => {
+    async function connectedSession(routing: Routing, controlBot: SendMessageSource) {
+      const path_ = pipePath();
+      const handle = startPipeServer({ pipePath: path_, routing, controlBot, chatId: "-1" });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+      const { socket, received } = connectClient(path_);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "hello", role: "channel", slug: "test-session", pid: 1 } satisfies HelloFromChannel));
+      await waitFor(() => received.some((m) => m.type === "hello_ack"));
+      return { socket, received };
+    }
+
+    const permissionRequest = (requestId: string): PermissionRequestMessage => ({
+      v: PROTOCOL_VERSION,
+      type: "permission_request",
+      slug: "test-session",
+      request_id: requestId,
+      tool_name: "Bash",
+      description: "run a command",
+      input_preview: JSON.stringify({ command: "git push origin main" }),
+    });
+
+    const ask = (requestId: string, questions: HookAskMessage["questions"]): HookAskMessage => ({
+      v: PROTOCOL_VERSION,
+      type: "ask",
+      slug: "test-session",
+      request_id: requestId,
+      questions,
+    });
+
+    test("bypass on auto-allows with no card, and posts a plain-text notice naming the call", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      routing.setBypass("test-session", true);
+      const sent: string[] = [];
+      const { socket, received } = await connectedSession(routing, {
+        sendMessage: async (_c, _t, text) => {
+          sent.push(text);
+          return { message_id: 1 };
+        },
+      });
+
+      socket.write(encodeMessage(permissionRequest("req-bypass")));
+
+      await waitFor(() => received.some((m) => m.type === "verdict"));
+      expect(received.find((m) => m.type === "verdict")).toMatchObject({ request_id: "req-bypass", behavior: "allow" });
+      await waitFor(() => sent.length >= 1);
+      expect(sent[0]).toContain("🔓 auto-approved (auto permission)");
+      // The command itself, not the JSON envelope it arrives in - `Bash({ "command": "git push…",…)`
+      // crowds out the one thing the operator is reading the line for.
+      expect(sent[0]).toContain("Bash(git push origin main)");
+      // Plain text, not the card's HTML - postAutoApprovedNote sends with no parse_mode, so reusing
+      // renderPermissionCard's helpers would print literal tags.
+      expect(sent[0]).not.toContain("<b>");
+    });
+
+    // The whole point of the feature is that the verdict is decided instantly and locally. Awaiting
+    // the notice would gate it on a rate-governor token (~one per 3s once the bucket drains), so a
+    // tool-heavy turn would freeze for minutes. A sendMessage that resolves immediately passes
+    // whether the await is there or not - this one never resolves.
+    test("the verdict does not wait for the notice's sendMessage to settle", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      routing.setBypass("test-session", true);
+      const { socket, received } = await connectedSession(routing, { sendMessage: () => new Promise(() => {}) });
+
+      socket.write(encodeMessage(permissionRequest("req-slow-note")));
+
+      await waitFor(() => received.some((m) => m.type === "verdict"));
+      expect(received.find((m) => m.type === "verdict")).toMatchObject({ request_id: "req-slow-note", behavior: "allow" });
+    });
+
+    test("a rejecting notice send still delivers the verdict", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      routing.setBypass("test-session", true);
+      const { socket, received } = await connectedSession(routing, { sendMessage: async () => Promise.reject(new Error("telegram down")) });
+
+      socket.write(encodeMessage(permissionRequest("req-failed-note")));
+
+      await waitFor(() => received.some((m) => m.type === "verdict"));
+      expect(received.find((m) => m.type === "verdict")).toMatchObject({ behavior: "allow" });
+    });
+
+    test("bypass off posts the real card and sends no verdict", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const sent: string[] = [];
+      const { socket, received } = await connectedSession(routing, {
+        sendMessage: async (_c, _t, text) => {
+          sent.push(text);
+          return { message_id: 1 };
+        },
+      });
+
+      socket.write(encodeMessage(permissionRequest("req-normal")));
+
+      await waitFor(() => sent.length >= 1);
+      expect(sent[0]).toContain("<b>");
+      expect(received.some((m) => m.type === "verdict")).toBe(false);
+    });
+
+    // The assertion that matters: a "no card posted" check alone passes in the exact failure mode
+    // where the answer is built but never written, leaving the hook client blocked forever.
+    test("auto-answer picks every recommended option and writes the answer to the waiting socket", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      routing.setAutoAnswer("test-session", true);
+      const sent: string[] = [];
+      const { socket, received } = await connectedSession(routing, {
+        sendMessage: async (_c, _t, text) => {
+          sent.push(text);
+          return { message_id: 1 };
+        },
+      });
+
+      socket.write(
+        encodeMessage(
+          ask("ask-auto", [
+            { question: "Which database?", header: "DB", options: [{ label: "Postgres (Recommended)" }, { label: "MySQL" }], multiSelect: false },
+            { question: "Run migrations?", header: "Migrate", options: [{ label: "No" }, { label: "Yes (Recommended)" }], multiSelect: false },
+          ]),
+        ),
+      );
+
+      await waitFor(() => received.some((m) => m.type === "answer"));
+      expect(received.find((m) => m.type === "answer")).toMatchObject({
+        answers: { "Which database?": "Postgres (Recommended)", "Run migrations?": "Yes (Recommended)" },
+      });
+      // The label goes back verbatim - a real button tap sends `option.label` unchanged, so
+      // stripping it here would be a different answer than the operator could have given. Only the
+      // notice strips the suffix, for readability.
+      await waitFor(() => sent.length >= 2);
+      expect(sent[0]).toContain('"Postgres"');
+      expect(sent[0]).not.toContain("(Recommended)");
+    });
+
+    test("one question without exactly one recommendation posts the whole card, never a partial answer", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      routing.setAutoAnswer("test-session", true);
+      const sent: string[] = [];
+      const { socket, received } = await connectedSession(routing, {
+        sendMessage: async (_c, _t, text) => {
+          sent.push(text);
+          return { message_id: 1 };
+        },
+      });
+
+      socket.write(
+        encodeMessage(
+          ask("ask-mixed", [
+            { question: "Which database?", header: "DB", options: [{ label: "Postgres (Recommended)" }, { label: "MySQL" }], multiSelect: false },
+            { question: "Which cache?", header: "Cache", options: [{ label: "Redis" }, { label: "Memcached" }], multiSelect: false },
+          ]),
+        ),
+      );
+
+      await waitFor(() => sent.length >= 2);
+      expect(received.some((m) => m.type === "answer")).toBe(false);
+    });
+
+    // Operator-requested 2026-08-11. Every fixture below is a verbatim option set from a real
+    // AskUserQuestion call in this machine's own Claude Code transcripts - the same 715-question
+    // corpus the veto's ~11% firing rate was measured against.
+    test("an investigate-first option alongside the recommendation posts the real card instead", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      routing.setAutoAnswer("test-session", true);
+      const sent: string[] = [];
+      const { socket, received } = await connectedSession(routing, {
+        sendMessage: async (_c, _t, text) => {
+          sent.push(text);
+          return { message_id: 1 };
+        },
+      });
+
+      socket.write(
+        encodeMessage(
+          ask("ask-investigate", [
+            {
+              question: "Given auto mode is already on fleet-wide, how should this be handled?",
+              header: "Approach",
+              options: [
+                { label: "Bridge-side decomposition only (Recommended)" },
+                { label: "Verify against a real VS Code auto-mode session first" },
+                { label: "Widen what counts as 'safe to auto-approve'" },
+              ],
+              multiSelect: false,
+            },
+          ]),
+        ),
+      );
+
+      await waitFor(() => sent.length >= 1);
+      expect(received.some((m) => m.type === "answer")).toBe(false);
+      expect(sent[0]).toContain("Given auto mode is already on fleet-wide");
+    });
+
+    test.each([
+      ["Hold off, review the plan changes first", "Yes, implement now (Recommended)"],
+      ["Not yet", "Yes, launch it now (Recommended)"],
+      ["Need something else first", "Re-running now (Recommended)"],
+    ])("real-corpus defer option %p vetoes the auto-answer", async (deferLabel, recLabel) => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      routing.setAutoAnswer("test-session", true);
+      const sent: string[] = [];
+      const { socket, received } = await connectedSession(routing, {
+        sendMessage: async (_c, _t, text) => {
+          sent.push(text);
+          return { message_id: 1 };
+        },
+      });
+
+      socket.write(encodeMessage(ask("ask-defer", [{ question: "Proceed?", header: "Go", options: [{ label: recLabel }, { label: deferLabel }], multiSelect: false }])));
+
+      await waitFor(() => sent.length >= 1);
+      expect(received.some((m) => m.type === "answer")).toBe(false);
+    });
+
+    // The veto must not swallow the ordinary case it shares a corpus with - a plain two-way choice
+    // with no defer option still auto-answers, or the feature is off in all but name.
+    test.each([
+      ["Keep topic title English always (Recommended)", "Let the topic title follow the reply's language"],
+      ["Add a bulk command (Recommended)", "Future sessions only"],
+      ["Session-only (Recommended)", "Also control-topic, repo-scoped"],
+    ])("real-corpus non-defer pair %p still auto-answers", async (recLabel, otherLabel) => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      routing.setAutoAnswer("test-session", true);
+      const { socket, received } = await connectedSession(routing, noopControlBot);
+
+      socket.write(encodeMessage(ask("ask-plain", [{ question: "Pick", header: "P", options: [{ label: recLabel }, { label: otherLabel }], multiSelect: false }])));
+
+      await waitFor(() => received.some((m) => m.type === "answer"));
+      expect(received.find((m) => m.type === "answer")).toMatchObject({ answers: { Pick: recLabel } });
+    });
+
+    // The measured inversion that made "select the investigate option" unshippable: a selection
+    // heuristic matching "confirm" inside "no confirmation" would have answered away the very
+    // safety confirmation the question existed to enable. Two things keep that impossible here -
+    // the veto never *picks* anything, and DEFER_OPTION_RE deliberately omits "confirm" (far too
+    // common outside defer contexts to be a signal). Note the recommended label itself contains
+    // "first"; the veto only ever inspects the *other* options, or every well-written
+    // "do the safe thing first (Recommended)" would veto itself.
+    test("the 'no confirmation' inversion case answers the recommended (safe) option, never the other one", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      routing.setAutoAnswer("test-session", true);
+      const { socket, received } = await connectedSession(routing, noopControlBot);
+
+      const question = "What should happen after a voice message is transcribed?";
+      socket.write(
+        encodeMessage(
+          ask("ask-inversion", [
+            {
+              question,
+              header: "Voice",
+              options: [{ label: "Always show a confirm card first (Recommended)" }, { label: "Auto-send immediately, no confirmation" }],
+              multiSelect: false,
+            },
+          ]),
+        ),
+      );
+
+      await waitFor(() => received.some((m) => m.type === "answer"));
+      expect(received.find((m) => m.type === "answer")).toMatchObject({ answers: { [question]: "Always show a confirm card first (Recommended)" } });
+    });
+
+    test("two recommended options in one question is treated as no recommendation", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      routing.setAutoAnswer("test-session", true);
+      const sent: string[] = [];
+      const { socket, received } = await connectedSession(routing, {
+        sendMessage: async (_c, _t, text) => {
+          sent.push(text);
+          return { message_id: 1 };
+        },
+      });
+
+      socket.write(
+        encodeMessage(ask("ask-two", [{ question: "Pick", header: "P", options: [{ label: "A (Recommended)" }, { label: "B (Recommended)" }], multiSelect: false }])),
+      );
+
+      await waitFor(() => sent.length >= 1);
+      expect(received.some((m) => m.type === "answer")).toBe(false);
+    });
+
+    // `[]` is non-null, so a `findAutoAnswer` without its length guard would take the auto-answer
+    // path here and write an empty answers map to a client that then unblocks having answered nothing.
+    test("an ask carrying zero questions is not auto-answered", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      routing.setAutoAnswer("test-session", true);
+      const { socket, received } = await connectedSession(routing, noopControlBot);
+
+      socket.write(encodeMessage(ask("ask-empty", [])));
+
+      await new Promise((r) => setTimeout(r, 100));
+      expect(received.some((m) => m.type === "answer")).toBe(false);
+    });
+
+    test("auto-answer off posts the card regardless of recommendations", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const sent: string[] = [];
+      const { socket, received } = await connectedSession(routing, {
+        sendMessage: async (_c, _t, text) => {
+          sent.push(text);
+          return { message_id: 1 };
+        },
+      });
+
+      socket.write(encodeMessage(ask("ask-off", [{ question: "Pick", header: "P", options: [{ label: "A (Recommended)" }, { label: "B" }], multiSelect: false }])));
+
+      await waitFor(() => sent.length >= 1);
+      expect(received.some((m) => m.type === "answer")).toBe(false);
+    });
+
+    // Placement guard: a re-sent ask for an entry still pending from before the toggle went on must
+    // keep rebinding its socket, not be answered out from under a card the operator is looking at.
+    test("an ask whose request_id is already registered rebinds instead of being auto-answered", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const sent: string[] = [];
+      const { socket, received } = await connectedSession(routing, {
+        sendMessage: async (_c, _t, text) => {
+          sent.push(text);
+          return { message_id: 1 };
+        },
+      });
+
+      const questions: HookAskMessage["questions"] = [{ question: "Pick", header: "P", options: [{ label: "A (Recommended)" }, { label: "B" }], multiSelect: false }];
+      socket.write(encodeMessage(ask("ask-rebind", questions)));
+      await waitFor(() => sent.length >= 1);
+
+      routing.setAutoAnswer("test-session", true);
+      socket.write(encodeMessage(ask("ask-rebind", questions)));
+
+      await new Promise((r) => setTimeout(r, 100));
+      expect(received.some((m) => m.type === "answer")).toBe(false);
+      expect(sent.length).toBe(1);
+    });
+
+    test("an ask for an unknown slug is still WARN-and-dropped, not auto-answered", async () => {
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const { socket, received } = await connectedSession(routing, noopControlBot);
+
+      socket.write(
+        encodeMessage({
+          v: PROTOCOL_VERSION,
+          type: "ask",
+          slug: "ghost",
+          request_id: "ask-ghost",
+          questions: [{ question: "Pick", header: "P", options: [{ label: "A (Recommended)" }], multiSelect: false }],
+        } satisfies HookAskMessage),
+      );
+
+      await new Promise((r) => setTimeout(r, 100));
+      expect(received.some((m) => m.type === "answer")).toBe(false);
+    });
+  });
+
   // compound-permission.ts (2026-08-10): a Bash `permission_request` built entirely out of pieces
   // this session's own generated settings.json already allows individually gets auto-approved -
   // a `verdict` sent straight back over the pipe - instead of ever posting a Telegram card.
@@ -795,7 +1164,12 @@ describe("startPipeServer", () => {
 
       await waitFor(() => received.some((m) => m.type === "verdict"));
       expect(received.find((m) => m.type === "verdict")).toMatchObject({ request_id: "req-compound", behavior: "allow" });
-      expect(sendMessageCalls.length).toBe(0);
+      // No *card* - but this shortcut does now post a plain one-line notice, brought up to the same
+      // observability standard as /auto permission (it was server-log-only before 2026-08-11, with
+      // no Telegram-visible trace of what the Bridge approved on the operator's behalf).
+      expect(sendMessageCalls.length).toBe(1);
+      expect(sendMessageCalls[0]).toContain("auto-approved");
+      expect(sendMessageCalls[0]).toContain("every sub-command already allowed");
     });
 
     test("sed -i chained with already-allowed pieces is auto-approved via the widened prefix, but a lone sed -i is not", async () => {

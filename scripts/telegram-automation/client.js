@@ -40,7 +40,21 @@ async function sendMessage(page, text) {
   const composer = page.locator('div[contenteditable="true"][data-peer-id]');
   await composer.click();
   await composer.type(text);
-  await page.keyboard.press("Enter");
+  // Click the send button rather than pressing Enter. Telegram's native command-autocomplete popup
+  // (fed by setMyCommands) stays open while a message starting with a known "/command" is typed, and
+  // Enter then *selects the popup entry* instead of sending what was typed - silently replacing
+  // "/auto permission on" with "/auto@om_..._bot" and dropping every argument (live-observed
+  // 2026-08-11, twice, after /auto joined botCommandList(); any command name that prefixes a
+  // registered one hits this). Escape is not the fix: with the popup up it dismisses the popup, but
+  // Telegram Web K also treats Escape in the composer as "clear the draft", so the send that follows
+  // posts nothing at all - swapping a wrong message for a silently missing one (also live-observed).
+  // The send button acts on the composer's actual content whatever the popup is doing.
+  const sendButton = page.locator("button.btn-send, .btn-send").first();
+  if (await sendButton.isVisible().catch(() => false)) {
+    await sendButton.click();
+  } else {
+    await page.keyboard.press("Enter");
+  }
   await page.waitForTimeout(1000);
 }
 

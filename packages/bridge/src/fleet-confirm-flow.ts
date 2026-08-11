@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { buildFleetConfirmKeyboard, FleetConfirmRegistry } from "./fleet-confirm.ts";
-import type { PendingFleetConfirm } from "./fleet-confirm.ts";
+import { buildFleetConfirmKeyboard, FleetConfirmRegistry, parseAutoConfirmKind } from "./fleet-confirm.ts";
+import type { FleetBulkKind, FleetConfirmKind, PendingFleetConfirm } from "./fleet-confirm.ts";
 import type { ConfirmCards } from "./confirm-cards.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import type { SessionLifecycleCommands } from "./session-lifecycle-commands.ts";
@@ -89,7 +89,12 @@ export interface FleetConfirmFlowOptions {
   sessionStore: SessionStore;
   confirmCards: ConfirmCards;
   fleetConfirmRegistry: FleetConfirmRegistry;
-  sessionLifecycle: Pick<SessionLifecycleCommands, "killSessionRow" | "removeSessionRow" | "resolveTargetSlug">;
+  /** `applyAutoToggle` is genuinely needed here, not a convenience: `/auto <category> --all on` must
+   * go through it rather than `routing.setBypass` (which this module already has, via `routing`) or
+   * the fleet-bulk form silently skips §4's drain and leaves every already-posted permission card
+   * wedged forever - the precise failure the drain exists to prevent, and the one an operator
+   * reaching for `--all on` is *more* likely to be in the middle of than a single-session toggle. */
+  sessionLifecycle: Pick<SessionLifecycleCommands, "killSessionRow" | "removeSessionRow" | "resolveTargetSlug" | "applyAutoToggle">;
   confirmSessionCommand: ConfirmSessionCommand;
   usageWaiters: Map<string, { buffer: string; check: () => void }>;
   orphanTopicNote: string;
@@ -98,8 +103,15 @@ export interface FleetConfirmFlowOptions {
 }
 
 export interface FleetConfirmFlow {
-  postFleetConfirm(kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[], promptText: string): Promise<void>;
+  postFleetConfirm(kind: FleetBulkKind, topicId: number | undefined, targets: readonly SessionRow[], promptText: string): Promise<void>;
   executeFleetConfirm(pending: PendingFleetConfirm): Promise<void>;
+  /** Deliberately still `"kill" | "rm"` while `postFleetConfirm` above widens: `--force` is only
+   * parsed for `/kill`/`/rm` (`parseKill`/`parseRm`), never for `/auto`, so nothing can route an
+   * auto kind here. Widening it "for consistency" would trade a property the compiler enforces at
+   * every call site for a runtime default arm that hopes someone reads it - the narrow signature is
+   * the guarantee. If `--force` is ever added to `/auto`, widen this *and* give it the same
+   * `parseAutoConfirmKind` early-return `executeFleetConfirm` has; the kill/rm loop below carries the
+   * same bare-else hazard. */
   executeFleetActionDirect(kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[]): Promise<void>;
   requestUsagePanel(slug: string, timeoutMs?: number): Promise<string>;
   handleUsageCommand(cmd: Extract<FleetCommand, { kind: "usage" }>, topicId: number | undefined, currentSlug: string | undefined): Promise<void>;
@@ -114,15 +126,41 @@ export interface FleetConfirmFlow {
  * value is assigned to immediately after - the same "forward reference resolved before it's ever
  * actually called" shape hoisted function declarations gave every pre-split function in `index.ts`
  * for free; explicit here only because a `const` factory result can't itself be hoisted. */
+/** The two strings every fleet-bulk kind needs: what to say when there's nothing to act on, and the
+ * past-tense verb the summary opens with. A lookup rather than the `kind === "kill" ? ... : ...`
+ * ternaries this replaces - there were five of those across this file, and every one of them read as
+ * a complete dispatch while actually meaning "kill, or literally anything else", which is what made
+ * widening `FleetConfirmKind` dangerous enough for §0.3 to call the worst instance in the plan.
+ * `satisfies` makes a newly-added kind a compile error here instead of a wrong verb. */
+const BULK_KIND_COPY = {
+  kill: { empty: "No live sessions to kill.", verb: "Killed" },
+  rm: { empty: "No sessions to remove.", verb: "Removed" },
+  "permission-on": { empty: "No live sessions to change.", verb: "Auto-permission ON for" },
+  "permission-off": { empty: "No live sessions to change.", verb: "Auto-permission OFF for" },
+  "answer-on": { empty: "No live sessions to change.", verb: "Auto-answer ON for" },
+  "answer-off": { empty: "No live sessions to change.", verb: "Auto-answer OFF for" },
+} satisfies Record<FleetBulkKind, { empty: string; verb: string }>;
+
 export function createFleetConfirmFlow(opts: FleetConfirmFlowOptions): FleetConfirmFlow {
   const { controlBot, routing, sessionStore, confirmCards, fleetConfirmRegistry, sessionLifecycle, confirmSessionCommand, usageWaiters, orphanTopicNote, supergroupChatId, log } = opts;
+
+  /** `BULK_KIND_COPY` for a kind that isn't statically known to be in it - i.e. `pending.kind`, which
+   * is the full `FleetConfirmKind` including `rm-topic` (already early-returned by every caller).
+   * The fallback logs rather than silently picking a teardown verb: "Removed 4 sessions" under a card
+   * that said something else is exactly the confusion this file's bare `else`s used to produce. */
+  function bulkCopy(kind: FleetConfirmKind): { empty: string; verb: string } {
+    const copy = (BULK_KIND_COPY as Partial<Record<FleetConfirmKind, { empty: string; verb: string }>>)[kind];
+    if (copy) return copy;
+    log("WARN", `no fleet-bulk summary copy for confirm kind "${kind}" - falling back to a neutral verb`);
+    return { empty: "No sessions to act on.", verb: "Updated" };
+  }
 
   /** Posts the Yes/No confirm card for `/kill --all`/`/rm --all` and registers it in
    * `fleetConfirmRegistry` - shared since the two commands differ only in wording and which
    * teardown function eventually runs. Returns without posting if there's nothing to act on. */
-  async function postFleetConfirm(kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[], promptText: string): Promise<void> {
+  async function postFleetConfirm(kind: FleetBulkKind, topicId: number | undefined, targets: readonly SessionRow[], promptText: string): Promise<void> {
     if (targets.length === 0) {
-      confirmSessionCommand(topicId, kind === "kill" ? "No live sessions to kill." : "No sessions to remove.");
+      confirmSessionCommand(topicId, BULK_KIND_COPY[kind].empty);
       return;
     }
     const id = randomUUID().slice(0, 8);
@@ -159,17 +197,37 @@ export function createFleetConfirmFlow(opts: FleetConfirmFlowOptions): FleetConf
     }
 
     const rows = pending.slugs.map((s) => sessionStore.get(s)).filter((r): r is SessionRow => r !== undefined);
+    const { verb } = bulkCopy(pending.kind);
+    const summary = (note: string) =>
+      rows.length === 0 ? "Nothing left to act on." : `${verb} ${rows.length} session${rows.length === 1 ? "" : "s"}: ${rows.map((r) => r.slug).join(", ")}${note}`;
+
+    // `/auto <category> --all on|off` (§0.3). This block's *placement* - ahead of the kill/rm loop
+    // below, mirroring the `rm-topic` early return above - is load-bearing, not stylistic: that loop
+    // dispatches `kill` explicitly and treats every other kind as `rm`, so four new kinds reaching it
+    // would tear the whole fleet down from a tap on a card that said "turn auto-permission on", and
+    // nothing about that fails to compile. Iterates the re-looked-up `rows`, never `pending.slugs`:
+    // a slug removed between posting and tapping is free for `uniqueSlug` to hand to an unrelated new
+    // session, which would then start silently auto-permitted.
+    const auto = parseAutoConfirmKind(pending.kind);
+    if (auto) {
+      for (const row of rows) sessionLifecycle.applyAutoToggle(row.slug, auto.category, auto.on);
+      await confirmCards.finalizeFleetConfirmMessage(pending, summary(""));
+      return;
+    }
+
     let allTopicsDeleted = true;
     for (const row of rows) {
       if (pending.kind === "kill") {
         await sessionLifecycle.killSessionRow(row);
-      } else if (!(await sessionLifecycle.removeSessionRow(row))) {
-        allTopicsDeleted = false;
+      } else if (pending.kind === "rm") {
+        if (!(await sessionLifecycle.removeSessionRow(row))) allTopicsDeleted = false;
+      } else {
+        // Unreachable: `rm-topic` and every auto kind returned above. Loud rather than silently
+        // falling into a teardown - see this loop's own history for why that default matters.
+        log("WARN", `executeFleetConfirm reached the kill/rm loop with unhandled kind "${pending.kind}" - "${row.slug}" left untouched`);
       }
     }
-    const verb = pending.kind === "kill" ? "Killed" : "Removed";
-    const note = pending.kind === "rm" && !allTopicsDeleted ? orphanTopicNote : "";
-    await confirmCards.finalizeFleetConfirmMessage(pending, rows.length === 0 ? "Nothing left to act on." : `${verb} ${rows.length} session${rows.length === 1 ? "" : "s"}: ${rows.map((r) => r.slug).join(", ")}${note}`);
+    await confirmCards.finalizeFleetConfirmMessage(pending, summary(pending.kind === "rm" && !allTopicsDeleted ? orphanTopicNote : ""));
   }
 
   /** `/kill --all --force`/`/rm --all --force` (operator-requested 2026-08-08): the same teardown
@@ -179,7 +237,7 @@ export function createFleetConfirmFlow(opts: FleetConfirmFlowOptions): FleetConf
    * since there's no card here to finalize. */
   async function executeFleetActionDirect(kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[]): Promise<void> {
     if (targets.length === 0) {
-      confirmSessionCommand(topicId, kind === "kill" ? "No live sessions to kill." : "No sessions to remove.");
+      confirmSessionCommand(topicId, BULK_KIND_COPY[kind].empty);
       return;
     }
     let allTopicsDeleted = true;
@@ -190,7 +248,7 @@ export function createFleetConfirmFlow(opts: FleetConfirmFlowOptions): FleetConf
         allTopicsDeleted = false;
       }
     }
-    const verb = kind === "kill" ? "Killed" : "Removed";
+    const { verb } = BULK_KIND_COPY[kind];
     const note = kind === "rm" && !allTopicsDeleted ? orphanTopicNote : "";
     confirmSessionCommand(topicId, `${verb} ${targets.length} session${targets.length === 1 ? "" : "s"}: ${targets.map((r) => r.slug).join(", ")}${note}`);
   }

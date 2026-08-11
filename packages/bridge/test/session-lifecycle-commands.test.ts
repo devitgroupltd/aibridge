@@ -102,6 +102,10 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
   const postFleetConfirmCalls: Array<{ kind: string; topicId: number | undefined; targets: string[] }> = [];
   const executeFleetActionDirectCalls: Array<{ kind: string; topicId: number | undefined; targets: string[] }> = [];
   const finalizedMessages: Array<{ messageId: number; text: string }> = [];
+  const verdicts: Array<{ slug: string; requestId: string; behavior: string }> = [];
+  // Flipped by the drain-with-a-disconnected-channel case: `sendVerdict` returning false is the
+  // situation a stale pending card is most likely to be in, and the card text must follow it.
+  let verdictDelivered = true;
 
   const sessionLifecycle = createSessionLifecycleCommands({
     sessionStore,
@@ -120,6 +124,10 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
     finalizePermissionMessage: async (messageId, text) => {
       finalizedMessages.push({ messageId, text });
     },
+    sendVerdict: (slug, requestId, behavior) => {
+      verdicts.push({ slug, requestId, behavior });
+      return verdictDelivered;
+    },
     stopIndicatorsForTopic: () => {},
     thinkingPlaceholder: { start: () => {}, consume: async () => undefined },
     postFleetConfirm: async (kind, topicId, targets) => {
@@ -128,12 +136,13 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
     executeFleetActionDirect: async (kind, topicId, targets) => {
       executeFleetActionDirectCalls.push({ kind, topicId, targets: targets.map((r) => r.slug) });
     },
-    writeModeKeystrokes: () => {},
     waitForChannelConnected: async () => {},
     isControlTopic: (topicId) => topicId === undefined || topicId === 1,
     getReposRegistry: () => undefined,
     getDefaultSessionMode: () => "manual",
     getDefaultSessionEffort: () => "medium",
+    getDefaultBypassEnabled: () => false,
+    getDefaultAutoAnswerEnabled: () => false,
     supergroupChatId: "-100",
     selfCheckSlug: "self-check",
     fleetWorktreesRoot: undefined,
@@ -152,6 +161,10 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
     askRegistry,
     confirmed,
     finalizedMessages,
+    verdicts,
+    setVerdictDelivered: (delivered: boolean) => {
+      verdictDelivered = delivered;
+    },
     postFleetConfirmCalls,
     executeFleetActionDirectCalls,
   };
@@ -427,6 +440,186 @@ describe("createSessionLifecycleCommands", () => {
       await sessionLifecycle.handleRmCommand({ kind: "rm", slug: "fix-bug" }, 1, undefined);
       expect(sessionStore.get("fix-bug")).toBeUndefined();
       expect(confirmed[0]?.text).toContain('Removed "fix-bug"');
+    });
+  });
+
+  describe("handleAutoCommand", () => {
+    const pending = (requestId: string, messageId: number) => ({
+      requestId,
+      slug: "fix-bug",
+      toolName: "Bash",
+      description: "run a command",
+      inputPreview: '{ "command": "git push" }',
+      topicId: 1,
+      messageId,
+    });
+
+    test("bare /auto permission reports status without toggling", () => {
+      const { sessionLifecycle, sessionStore, routing, confirmed } = setup();
+      sessionStore.insert(row());
+
+      sessionLifecycle.handleAutoCommand({ kind: "auto", category: "permission", slug: "fix-bug" }, 1, undefined);
+
+      expect(confirmed[0]?.text).toBe('"fix-bug" auto-permission: off.');
+      expect(routing.getBypass("fix-bug")).toBe(false);
+    });
+
+    test("bare /auto answer reports its own category, not permission's", () => {
+      const { sessionLifecycle, sessionStore, routing, confirmed } = setup();
+      sessionStore.insert(row());
+      routing.setAutoAnswer("fix-bug", true);
+
+      sessionLifecycle.handleAutoCommand({ kind: "auto", category: "answer", slug: "fix-bug" }, 1, undefined);
+
+      expect(confirmed[0]?.text).toBe('"fix-bug" auto-answer: on.');
+      expect(routing.getBypass("fix-bug")).toBe(false);
+    });
+
+    test("explicit on/off sets the flag and confirms, naming the ask list it now auto-allows", () => {
+      const { sessionLifecycle, sessionStore, routing, confirmed } = setup();
+      sessionStore.insert(row());
+
+      sessionLifecycle.handleAutoCommand({ kind: "auto", category: "permission", slug: "fix-bug", on: true }, 1, undefined);
+      expect(routing.getBypass("fix-bug")).toBe(true);
+      expect(confirmed[0]?.text).toContain("git commit/push");
+      expect(confirmed[0]?.text).toContain("deny list");
+
+      sessionLifecycle.handleAutoCommand({ kind: "auto", category: "permission", slug: "fix-bug", on: false }, 1, undefined);
+      expect(routing.getBypass("fix-bug")).toBe(false);
+    });
+
+    test("the two categories are independent", () => {
+      const { sessionLifecycle, sessionStore, routing } = setup();
+      sessionStore.insert(row());
+
+      sessionLifecycle.handleAutoCommand({ kind: "auto", category: "answer", slug: "fix-bug", on: true }, 1, undefined);
+
+      expect(routing.getAutoAnswer("fix-bug")).toBe(true);
+      expect(routing.getBypass("fix-bug")).toBe(false);
+    });
+
+    test("an unknown slug bails via resolveSessionOrBail without setting anything", () => {
+      const { sessionLifecycle, routing, confirmed } = setup();
+
+      sessionLifecycle.handleAutoCommand({ kind: "auto", category: "permission", slug: "nope", on: true }, 1, undefined);
+
+      expect(confirmed[0]?.text).toContain('"nope"');
+      expect(routing.getBypass("nope")).toBe(false);
+    });
+
+    // The common way to discover you want this is to be looking at a card you don't want to tap.
+    test("turning permission on drains already-pending requests: verdict THEN card finalize", () => {
+      const { sessionLifecycle, sessionStore, permissionRegistry, verdicts, finalizedMessages } = setup();
+      sessionStore.insert(row());
+      permissionRegistry.add(pending("req-1", 10));
+      permissionRegistry.add(pending("req-2", 11));
+
+      sessionLifecycle.handleAutoCommand({ kind: "auto", category: "permission", slug: "fix-bug", on: true }, 1, undefined);
+
+      expect(verdicts).toEqual([
+        { slug: "fix-bug", requestId: "req-1", behavior: "allow" },
+        { slug: "fix-bug", requestId: "req-2", behavior: "allow" },
+      ]);
+      expect(permissionRegistry.get("req-1")).toBeUndefined();
+      expect(finalizedMessages.map((m) => m.messageId)).toEqual([10, 11]);
+      expect(finalizedMessages[0]?.text).toContain("auto-approved");
+    });
+
+    // The worst possible combination is: entry gone from the registry, card claiming approval,
+    // verdict delivered to nothing - past any sweep's reach, session hung forever.
+    test("a drain whose verdict reaches no live channel says so, rather than claiming approval", () => {
+      const { sessionLifecycle, sessionStore, permissionRegistry, finalizedMessages, setVerdictDelivered } = setup();
+      sessionStore.insert(row());
+      permissionRegistry.add(pending("req-1", 10));
+      setVerdictDelivered(false);
+
+      sessionLifecycle.handleAutoCommand({ kind: "auto", category: "permission", slug: "fix-bug", on: true }, 1, undefined);
+
+      expect(finalizedMessages[0]?.text).toContain("couldn't be auto-approved");
+      expect(finalizedMessages[0]?.text).not.toContain("🔓 auto-approved");
+    });
+
+    test("turning permission OFF drains nothing", () => {
+      const { sessionLifecycle, sessionStore, permissionRegistry, verdicts } = setup();
+      sessionStore.insert(row());
+      permissionRegistry.add(pending("req-1", 10));
+
+      sessionLifecycle.handleAutoCommand({ kind: "auto", category: "permission", slug: "fix-bug", on: false }, 1, undefined);
+
+      expect(verdicts).toEqual([]);
+      expect(permissionRegistry.get("req-1")).toBeDefined();
+    });
+
+    // The deliberate asymmetry: draining a pending question would answer it on the operator's
+    // behalf with an option they never saw.
+    test("turning answer on leaves a pending permission request alone", () => {
+      const { sessionLifecycle, sessionStore, permissionRegistry, verdicts, finalizedMessages } = setup();
+      sessionStore.insert(row());
+      permissionRegistry.add(pending("req-1", 10));
+
+      sessionLifecycle.handleAutoCommand({ kind: "auto", category: "answer", slug: "fix-bug", on: true }, 1, undefined);
+
+      expect(verdicts).toEqual([]);
+      expect(finalizedMessages).toEqual([]);
+      expect(permissionRegistry.get("req-1")).toBeDefined();
+    });
+
+    describe("--all", () => {
+      test("posts a confirm card keyed to the category AND the value, changing nothing yet", async () => {
+        const { sessionLifecycle, sessionStore, routing, postFleetConfirmCalls } = setup();
+        sessionStore.insert(row());
+        sessionStore.insert(row({ slug: "other", topicId: 2, sessionId: "sess-2" }));
+
+        await sessionLifecycle.handleAutoCommand({ kind: "auto", category: "permission", all: true, on: true }, 1, "fix-bug");
+
+        expect(postFleetConfirmCalls).toEqual([{ kind: "permission-on", topicId: 1, targets: ["fix-bug", "other"] }]);
+        // The card is the gate: nothing is applied until it's tapped.
+        expect(routing.getBypass("fix-bug")).toBe(false);
+      });
+
+      test("off posts the -off kind, so the tap can't coerce its way into the opposite action", async () => {
+        const { sessionLifecycle, sessionStore, postFleetConfirmCalls } = setup();
+        sessionStore.insert(row());
+
+        await sessionLifecycle.handleAutoCommand({ kind: "auto", category: "answer", all: true, on: false }, 1, undefined);
+
+        expect(postFleetConfirmCalls[0]?.kind).toBe("answer-off");
+      });
+
+      test("excludes the self-check slug and dead sessions, same as /kill --all", async () => {
+        const { sessionLifecycle, sessionStore, postFleetConfirmCalls } = setup();
+        sessionStore.insert(row());
+        sessionStore.insert(row({ slug: "self-check", topicId: 2, sessionId: "sess-2" }));
+        sessionStore.insert(row({ slug: "gone", topicId: 3, state: "dead", sessionId: "sess-3" }));
+
+        await sessionLifecycle.handleAutoCommand({ kind: "auto", category: "permission", all: true, on: true }, 1, undefined);
+
+        expect(postFleetConfirmCalls[0]?.targets).toEqual(["fix-bug"]);
+      });
+
+      // §0.3: `FleetConfirmKind` carries the value, so a card built from `on: undefined` would read
+      // "Turn auto-permission ON" and turn it off everywhere. Bare `--all` reports instead.
+      test("bare --all reports fleet status for BOTH categories and posts no card", async () => {
+        const { sessionLifecycle, sessionStore, routing, confirmed, postFleetConfirmCalls } = setup();
+        sessionStore.insert(row());
+        sessionStore.insert(row({ slug: "other", topicId: 2, sessionId: "sess-2" }));
+        routing.setBypass("fix-bug", true);
+        routing.setAutoAnswer("other", true);
+
+        await sessionLifecycle.handleAutoCommand({ kind: "auto", category: "permission", all: true }, 1, undefined);
+
+        expect(postFleetConfirmCalls).toEqual([]);
+        expect(confirmed[0]?.text).toContain("fix-bug: permission on, answer off");
+        expect(confirmed[0]?.text).toContain("other: permission off, answer on");
+      });
+
+      test("bare --all with no live sessions says so instead of rendering an empty list", async () => {
+        const { sessionLifecycle, confirmed } = setup();
+
+        await sessionLifecycle.handleAutoCommand({ kind: "auto", category: "answer", all: true }, 1, undefined);
+
+        expect(confirmed[0]?.text).toBe("No live sessions.");
+      });
     });
   });
 

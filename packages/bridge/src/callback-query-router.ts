@@ -37,6 +37,7 @@ import {
   isModelCancelCallback,
   resolveDefaultCategoryCallback,
   resolveDefaultEffortCallback,
+  resolveDefaultToggleCallback,
   resolveDefaultModeCallback,
   resolveEffortCallback,
   resolveModeCallback,
@@ -94,7 +95,7 @@ export interface CallbackQueryRouterOptions {
   commandDispatch: Pick<CommandDispatch, "dispatchInboundMessage">;
   voiceModeCommands: Pick<
     VoiceModeCommands,
-    "applyVoiceModelSwitch" | "applyModelSwitch" | "applyModeSwitch" | "applyEffortSwitch" | "applyDefaultMode" | "applyDefaultEffort"
+    "applyVoiceModelSwitch" | "applyModelSwitch" | "applyModeSwitch" | "applyEffortSwitch" | "applyDefaultMode" | "applyDefaultEffort" | "applyDefaultAutoToggle"
   >;
   confirmSessionCommand: ConfirmSessionCommand;
   isControlTopic: (threadId: number | undefined) => boolean;
@@ -607,10 +608,20 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
         if (defaultMode) return { defaultMsgId, action: { kind: "mode" as const, mode: defaultMode } };
         const defaultEffort = resolveDefaultEffortCallback(data);
         if (defaultEffort) return { defaultMsgId, action: { kind: "effort" as const, effort: defaultEffort } };
+        // The status card's two direct-toggle rows (`default:permission:on` etc.). Without this
+        // branch `match` returns null for them, the rule declines, and the tap falls through to the
+        // catch-all - a live-looking button that does nothing.
+        const defaultToggle = resolveDefaultToggleCallback(data);
+        if (defaultToggle) return { defaultMsgId, action: { kind: "toggle" as const, ...defaultToggle } };
         return null;
       },
       ({ defaultMsgId, action }) => {
         if (action.kind === "category") {
+          // `action.category` is `DefaultPickerCategory`, not the full `DefaultCategory` - the two
+          // boolean categories arrive as `kind: "toggle"` below and have no picker to drill into.
+          // That narrowing is what keeps this two-way choice honest as `/default` grows categories:
+          // widening a union never breaks a ternary, it just silently routes the new members into
+          // whichever arm happens to be last.
           const [prompt, keyboard] =
             action.category === "mode"
               ? [`Choose the default permission mode for new sessions (current: ${getDefaultSessionMode()}):`, buildDefaultModeKeyboard(getDefaultSessionMode())]
@@ -628,6 +639,12 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
           controlBot
             .editMessageText!(supergroupChatId, defaultMsgId, voiceModeCommands.applyDefaultMode(action.mode), { inline_keyboard: [] })
             .catch((err) => log("WARN", `editMessageText (/default mode) failed: ${(err as Error).message}`));
+          return;
+        }
+        if (action.kind === "toggle") {
+          controlBot
+            .editMessageText!(supergroupChatId, defaultMsgId, voiceModeCommands.applyDefaultAutoToggle(action.category, action.value), { inline_keyboard: [] })
+            .catch((err) => log("WARN", `editMessageText (/default ${action.category}) failed: ${(err as Error).message}`));
           return;
         }
         controlBot

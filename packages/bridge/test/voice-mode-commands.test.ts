@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createVoiceModeCommands } from "../src/voice-mode-commands.ts";
+import { createVoiceModeCommands, MODE_KEYSTROKE_GAP_MS } from "../src/voice-mode-commands.ts";
+import { SHIFT_TAB } from "../src/session-commands.ts";
 import { Routing } from "../src/routing.ts";
 import { SessionStore } from "../src/session-store.ts";
 import { SettingsStore } from "../src/settings-store.ts";
@@ -71,6 +72,8 @@ async function setup(overrides: Partial<Parameters<typeof createVoiceModeCommand
   let defaultSessionMode: "manual" | "auto" | "plan" | "acceptEdits" = "manual" as never;
   let defaultSessionEffort: "low" | "medium" | "high" | "xhigh" | "max" = "medium" as never;
   let nlRouterBackend: "api" | "cli" = "cli";
+  let defaultBypassEnabled = false;
+  let defaultAutoAnswerEnabled = false;
   const voiceModeCommands = createVoiceModeCommands({
     ptyIo,
     routing,
@@ -98,6 +101,14 @@ async function setup(overrides: Partial<Parameters<typeof createVoiceModeCommand
     setDefaultSessionEffort: (e) => {
       defaultSessionEffort = e;
     },
+    getDefaultBypassEnabled: () => defaultBypassEnabled,
+    setDefaultBypassEnabled: (v) => {
+      defaultBypassEnabled = v;
+    },
+    getDefaultAutoAnswerEnabled: () => defaultAutoAnswerEnabled,
+    setDefaultAutoAnswerEnabled: (v) => {
+      defaultAutoAnswerEnabled = v;
+    },
     getNlRouterBackend: () => nlRouterBackend,
     setNlRouterBackend: (b) => {
       nlRouterBackend = b;
@@ -119,6 +130,8 @@ async function setup(overrides: Partial<Parameters<typeof createVoiceModeCommand
     getVoiceConfirmEnabled: () => voiceConfirmEnabled,
     getDefaultSessionMode: () => defaultSessionMode,
     getDefaultSessionEffort: () => defaultSessionEffort,
+    getDefaultBypassEnabled: () => defaultBypassEnabled,
+    getDefaultAutoAnswerEnabled: () => defaultAutoAnswerEnabled,
     getNlRouterBackend: () => nlRouterBackend,
   };
 }
@@ -141,6 +154,53 @@ describe("createVoiceModeCommands", () => {
 
       expect(routing.getMode("fix-bug")).toBe("plan");
       expect(confirmed[0]?.text).toBe("Switched fix-bug to plan mode");
+    });
+
+    // Live-reproduced 2026-08-10: a three-press burst written in one go advanced the picker exactly
+    // once (manual -> "accept edits on"), because the TUI consumes one key per render frame and
+    // drops the rest of the buffer. Asserting one write per press is the regression guard.
+    test("writeModeKeystrokes sends one press per write, spaced apart - not one concatenated burst", async () => {
+      const writes: string[] = [];
+      const delays: number[] = [];
+      const routing = new Routing();
+      routing.setPtyWrite("fix-bug", (text) => writes.push(text));
+      const { voiceModeCommands } = await setup({
+        routing,
+        setTimeoutFn: (fn: () => void, ms: number) => {
+          delays.push(ms);
+          fn();
+          return 0;
+        },
+      });
+
+      // manual -> auto is three steps around the MODES cycle.
+      voiceModeCommands.writeModeKeystrokes("fix-bug", "auto");
+
+      expect(writes).toEqual([SHIFT_TAB, SHIFT_TAB, SHIFT_TAB]);
+      // The first press goes out immediately; only the rest are deferred, each further out than the
+      // last, so they can't collapse back into one frame.
+      expect(delays).toEqual([MODE_KEYSTROKE_GAP_MS, MODE_KEYSTROKE_GAP_MS * 2]);
+      expect(routing.getMode("fix-bug")).toBe("auto");
+    });
+
+    test("a one-step switch sends a single press and schedules nothing", async () => {
+      const writes: string[] = [];
+      const delays: number[] = [];
+      const routing = new Routing();
+      routing.setPtyWrite("fix-bug", (text) => writes.push(text));
+      const { voiceModeCommands } = await setup({
+        routing,
+        setTimeoutFn: (fn: () => void, ms: number) => {
+          delays.push(ms);
+          fn();
+          return 0;
+        },
+      });
+
+      voiceModeCommands.writeModeKeystrokes("fix-bug", "acceptEdits");
+
+      expect(writes).toEqual([SHIFT_TAB]);
+      expect(delays).toEqual([]);
     });
 
     test("writeModeKeystrokes sends nothing through the pty write when already at the target mode", async () => {
@@ -346,7 +406,16 @@ describe("createVoiceModeCommands", () => {
 
       expect(getDefaultSessionMode()).toBe("auto");
       expect(settingsStore.get("default_session_mode", "?")).toBe("auto");
-      expect(confirmed[0]?.text).toContain("no permission prompts at all");
+      // Was asserting "no permission prompts at all", which pinned a claim Claude Code's own docs
+      // contradict: auto mode still prompts for every `permissions.ask` match (git commit/push is
+      // deliberately on that list) and falls back to full prompting after repeated classifier
+      // blocks. The warning has to describe the limits, not promise they don't exist.
+      expect(confirmed[0]?.text).toContain("still asks");
+      expect(confirmed[0]?.text).toContain("git commit/push");
+      expect(confirmed[0]?.text).toContain("classifier blocks");
+      expect(confirmed[0]?.text).not.toContain("no permission prompts at all");
+      // ...and points at the control that does make that promise.
+      expect(confirmed[0]?.text).toContain("/default permission on");
     });
 
     test("effort with a value applies it, persists it, and confirms", async () => {
@@ -357,6 +426,79 @@ describe("createVoiceModeCommands", () => {
       expect(getDefaultSessionEffort()).toBe("high");
       expect(settingsStore.get("default_session_effort", "?")).toBe("high");
       expect(confirmed[0]?.text).toContain("start at high effort");
+    });
+
+    // The regression this whole exhaustive-switch conversion exists for: the previous
+    // if/if/implicit-tail shape treated "anything that isn't status or mode" as effort, so
+    // `/default permission on` reached `applyDefaultEffort(true)` - writing a boolean into the
+    // effort key, reporting "start at true effort", and leaving `permission` untouched.
+    test("permission on does not touch the effort default or its settings key", async () => {
+      const { voiceModeCommands, settingsStore, confirmed, getDefaultSessionEffort, getDefaultBypassEnabled } = await setup();
+
+      voiceModeCommands.handleDefaultCommand({ kind: "default", category: "permission", value: true }, undefined);
+
+      expect(getDefaultBypassEnabled()).toBe(true);
+      expect(settingsStore.get("default_bypass_enabled", "?")).toBe("true");
+      expect(getDefaultSessionEffort()).toBe("medium");
+      expect(settingsStore.get("default_session_effort", "(unset)")).toBe("(unset)");
+      expect(confirmed[0]?.text).toContain("auto-permission ON");
+      expect(confirmed[0]?.text).toContain("git commit/push");
+    });
+
+    test("answer on writes its own key, leaving permission's alone", async () => {
+      const { voiceModeCommands, settingsStore, confirmed, getDefaultBypassEnabled, getDefaultAutoAnswerEnabled } = await setup();
+
+      voiceModeCommands.handleDefaultCommand({ kind: "default", category: "answer", value: true }, undefined);
+
+      expect(getDefaultAutoAnswerEnabled()).toBe(true);
+      expect(getDefaultBypassEnabled()).toBe(false);
+      expect(settingsStore.get("default_autoanswer_enabled", "?")).toBe("true");
+      expect(settingsStore.get("default_bypass_enabled", "(unset)")).toBe("(unset)");
+      expect(confirmed[0]?.text).toContain("auto-answer ON");
+    });
+
+    test("off persists false rather than deleting the key, so a restart rehydrates it", async () => {
+      const { voiceModeCommands, settingsStore, getDefaultBypassEnabled } = await setup();
+
+      voiceModeCommands.handleDefaultCommand({ kind: "default", category: "permission", value: true }, undefined);
+      voiceModeCommands.handleDefaultCommand({ kind: "default", category: "permission", value: false }, undefined);
+
+      expect(getDefaultBypassEnabled()).toBe(false);
+      expect(settingsStore.get("default_bypass_enabled", "?")).toBe("false");
+    });
+
+    test("bare permission reports the current setting - a status read must not flip a safety gate", async () => {
+      const { voiceModeCommands, controlBot, confirmed, getDefaultBypassEnabled } = await setup();
+
+      voiceModeCommands.handleDefaultCommand({ kind: "default", category: "permission", value: undefined }, undefined);
+      await Promise.resolve();
+
+      expect(getDefaultBypassEnabled()).toBe(false);
+      expect(confirmed[0]?.text).toContain("auto-permission off");
+      // Specifically not the effort picker, which is where the old implicit tail sent it.
+      expect(controlBot.sent).toEqual([]);
+    });
+
+    test("applyDefaultAutoToggle is the shared path the status card's own taps use", async () => {
+      const { voiceModeCommands, settingsStore, getDefaultAutoAnswerEnabled } = await setup();
+
+      const text = voiceModeCommands.applyDefaultAutoToggle("answer", true);
+
+      expect(getDefaultAutoAnswerEnabled()).toBe(true);
+      expect(settingsStore.get("default_autoanswer_enabled", "?")).toBe("true");
+      expect(text).toContain("auto-answer ON");
+    });
+
+    test("the status card's keyboard reflects the live toggle values, not construction-time ones", async () => {
+      const { voiceModeCommands, controlBot } = await setup();
+
+      voiceModeCommands.applyDefaultAutoToggle("permission", true);
+      voiceModeCommands.handleDefaultCommand({ kind: "default", category: "status" }, undefined);
+      await Promise.resolve();
+
+      const keyboard = controlBot.sent[0]?.keyboard as { inline_keyboard: Array<Array<{ callback_data: string }>> };
+      expect(keyboard.inline_keyboard[2]?.[0]?.callback_data).toBe("default:permission:off");
+      expect(controlBot.sent[0]?.text).toContain("Auto-permission on");
     });
   });
 

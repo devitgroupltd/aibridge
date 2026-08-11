@@ -146,6 +146,7 @@ function setup(overrides: { killSessionRow?: (row: SessionRow) => Promise<void>;
   const confirmed: Array<{ topicId: number | undefined; text: string }> = [];
   const killed: string[] = [];
   const removed: string[] = [];
+  const autoToggles: Array<{ slug: string; category: string; on: boolean }> = [];
   const usageWaiters = new Map<string, { buffer: string; check: () => void }>();
   const confirmCards = {
     finalizeFleetConfirmMessage: async (pending: PendingFleetConfirm, text: string) => {
@@ -164,6 +165,12 @@ function setup(overrides: { killSessionRow?: (row: SessionRow) => Promise<void>;
       const slug = explicit ?? currentSlug;
       return slug ? { slug } : { error: "No session specified and this isn't a session topic." };
     }),
+    // Recorded by name, not by its effect on `routing`: a test asserting only the resulting
+    // `getBypass(slug)` value passes just as happily against a `routing.setBypass` call here, which
+    // is the drain-skipping path §0.3 exists to forbid.
+    applyAutoToggle: (slug: string, category: "permission" | "answer", on: boolean) => {
+      autoToggles.push({ slug, category, on });
+    },
   };
   const fleetConfirmFlow = createFleetConfirmFlow({
     controlBot,
@@ -180,7 +187,7 @@ function setup(overrides: { killSessionRow?: (row: SessionRow) => Promise<void>;
     supergroupChatId: "-100",
     log: () => {},
   });
-  return { fleetConfirmFlow, controlBot, routing, sessionStore, fleetConfirmRegistry, finalizeCalls, confirmed, killed, removed };
+  return { fleetConfirmFlow, controlBot, routing, sessionStore, fleetConfirmRegistry, finalizeCalls, confirmed, killed, removed, autoToggles };
 }
 
 describe("createFleetConfirmFlow", () => {
@@ -191,6 +198,15 @@ describe("createFleetConfirmFlow", () => {
       await fleetConfirmFlow.postFleetConfirm("kill", 1, [], "Kill 0 sessions?");
 
       expect(confirmed[0]?.text).toBe("No live sessions to kill.");
+      expect(controlBot.sent).toEqual([]);
+    });
+
+    test("with no targets for an auto kind, uses that kind's own copy, not the teardown wording", async () => {
+      const { fleetConfirmFlow, controlBot, confirmed } = setup();
+
+      await fleetConfirmFlow.postFleetConfirm("permission-on", 1, [], "Turn auto-permission ON for every live session?");
+
+      expect(confirmed[0]?.text).toBe("No live sessions to change.");
       expect(controlBot.sent).toEqual([]);
     });
 
@@ -259,6 +275,70 @@ describe("createFleetConfirmFlow", () => {
 
       expect(finalizeCalls[0]?.text).toContain("Removed 1 session: a");
       expect(finalizeCalls[0]?.text).toContain("couldn't be deleted");
+    });
+
+    // bypass-and-autoanswer-plan.md §0.3: the four `/auto <category> --all` kinds must be handled by
+    // an early return placed *ahead* of the kill/rm loop. Without it the loop's bare `else` absorbs
+    // them and a tap on "Turn auto-permission ON for every live session?" removes the entire fleet -
+    // while still compiling cleanly, since `pending.kind === "kill"` stays well-typed as the union
+    // grows. These four tests are that regression's guard.
+    describe("the /auto --all kinds", () => {
+      test("permission-on toggles every re-looked-up row via applyAutoToggle and tears nothing down", async () => {
+        const { fleetConfirmFlow, sessionStore, autoToggles, killed, removed, finalizeCalls } = setup();
+        sessionStore.insert(row({ slug: "a", sessionId: "s-a", topicId: 10 }));
+        sessionStore.insert(row({ slug: "b", sessionId: "s-b", topicId: 11 }));
+        const pending: PendingFleetConfirm = { id: "abc", kind: "permission-on", slugs: ["a", "b"], topicId: 1, messageId: 1, createdAt: Date.now() };
+
+        await fleetConfirmFlow.executeFleetConfirm(pending);
+
+        expect(autoToggles).toEqual([
+          { slug: "a", category: "permission", on: true },
+          { slug: "b", category: "permission", on: true },
+        ]);
+        // The assertion `applyAutoToggle` does *not* imply: an explicit zero call-count on the
+        // teardown the misplaced-branch bug would have run instead.
+        expect(removed).toHaveLength(0);
+        expect(killed).toHaveLength(0);
+        // Line 170's *second* bare else, which survives a correctly-placed branch: the summary must
+        // not say "Removed 2 sessions" under a card that said the opposite.
+        expect(finalizeCalls[0]?.text).toBe("Auto-permission ON for 2 sessions: a, b");
+      });
+
+      test("answer-off carries the category and value through the kind, not a hyphen-split guess", async () => {
+        const { fleetConfirmFlow, sessionStore, autoToggles, finalizeCalls } = setup();
+        sessionStore.insert(row({ slug: "a", sessionId: "s-a" }));
+        const pending: PendingFleetConfirm = { id: "abc", kind: "answer-off", slugs: ["a"], topicId: 1, messageId: 1, createdAt: Date.now() };
+
+        await fleetConfirmFlow.executeFleetConfirm(pending);
+
+        expect(autoToggles).toEqual([{ slug: "a", category: "answer", on: false }]);
+        expect(finalizeCalls[0]?.text).toBe("Auto-answer OFF for 1 session: a");
+      });
+
+      test("a slug whose row is gone by tap time is skipped, by slug, not merely by count", async () => {
+        // §0.3's stale-slug hazard: `uniqueSlug` de-duplicates only against *live* slugs, so a name
+        // freed between posting and tapping can already belong to an unrelated new session - which
+        // would then start silently auto-permitted. A call-count check alone passes when the wrong
+        // set of slugs is toggled, hence asserting on the argument.
+        const { fleetConfirmFlow, sessionStore, autoToggles, finalizeCalls } = setup();
+        sessionStore.insert(row({ slug: "a", sessionId: "s-a" }));
+        const pending: PendingFleetConfirm = { id: "abc", kind: "permission-on", slugs: ["a", "gone"], topicId: 1, messageId: 1, createdAt: Date.now() };
+
+        await fleetConfirmFlow.executeFleetConfirm(pending);
+
+        expect(autoToggles).toEqual([{ slug: "a", category: "permission", on: true }]);
+        expect(finalizeCalls[0]?.text).toBe("Auto-permission ON for 1 session: a");
+      });
+
+      test("every slug gone finalizes 'nothing left', not an empty ON summary", async () => {
+        const { fleetConfirmFlow, autoToggles, finalizeCalls } = setup();
+        const pending: PendingFleetConfirm = { id: "abc", kind: "permission-on", slugs: ["ghost"], topicId: 1, messageId: 1, createdAt: Date.now() };
+
+        await fleetConfirmFlow.executeFleetConfirm(pending);
+
+        expect(autoToggles).toEqual([]);
+        expect(finalizeCalls[0]?.text).toBe("Nothing left to act on.");
+      });
     });
 
     test("no rows left to act on (all slugs vanished) finalizes 'nothing left'", async () => {

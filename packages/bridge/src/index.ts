@@ -191,6 +191,15 @@ async function main(): Promise<void> {
     const stored = settingsStore.get("default_session_effort", DEFAULT_EFFORT);
     return (EFFORTS as readonly string[]).includes(stored) ? (stored as Effort) : DEFAULT_EFFORT;
   })();
+  // `/default permission` / `/default answer` (bypass-and-autoanswer-plan.md §0.4) - the new-session
+  // default for `/auto`'s two toggles, same in-memory-for-reads, persisted-on-write shape as the two
+  // above. Both fall back to "false" - fail-closed, deliberately unlike `voice_confirm_enabled`'s
+  // "true" fallback, which defaults a confirmation *on*; these default a confirmation *away*.
+  // Note the asymmetry with the per-session flags (`routing.ts`'s `bypassBySlug`/`autoAnswerBySlug`),
+  // which are in-memory only and reset on every restart: this is standing configuration for sessions
+  // that don't exist yet, not a live session's own state.
+  let defaultBypassEnabled = settingsStore.get("default_bypass_enabled", "false") === "true";
+  let defaultAutoAnswerEnabled = settingsStore.get("default_autoanswer_enabled", "false") === "true";
   if (!sessionStore.get(config.selfCheck.slug)) {
     sessionStore.insert({
       slug: config.selfCheck.slug,
@@ -592,6 +601,14 @@ async function main(): Promise<void> {
     setDefaultSessionEffort: (effort) => {
       defaultSessionEffort = effort;
     },
+    getDefaultBypassEnabled: () => defaultBypassEnabled,
+    setDefaultBypassEnabled: (value) => {
+      defaultBypassEnabled = value;
+    },
+    getDefaultAutoAnswerEnabled: () => defaultAutoAnswerEnabled,
+    setDefaultAutoAnswerEnabled: (value) => {
+      defaultAutoAnswerEnabled = value;
+    },
     getNlRouterBackend: () => nlRouterBackend,
     setNlRouterBackend: (backend) => {
       nlRouterBackend = backend;
@@ -639,16 +656,18 @@ async function main(): Promise<void> {
     fleetConfirmRegistry,
     confirmSessionCommand,
     finalizePermissionMessage: (messageId, text) => pipeHandle.finalizePermissionMessage(messageId, text),
+    sendVerdict: (slug, requestId, behavior) => pipeHandle.sendVerdict(slug, requestId, behavior),
     stopIndicatorsForTopic,
     thinkingPlaceholder,
     postFleetConfirm: (kind, topicId, targets, promptText) => fleetConfirmFlow.get().postFleetConfirm(kind, topicId, targets, promptText),
     executeFleetActionDirect: (kind, topicId, targets) => fleetConfirmFlow.get().executeFleetActionDirect(kind, topicId, targets),
-    writeModeKeystrokes: voiceModeCommands.writeModeKeystrokes,
     waitForChannelConnected,
     isControlTopic,
     getReposRegistry: () => reposRegistry,
     getDefaultSessionMode: () => defaultSessionMode,
     getDefaultSessionEffort: () => defaultSessionEffort,
+    getDefaultBypassEnabled: () => defaultBypassEnabled,
+    getDefaultAutoAnswerEnabled: () => defaultAutoAnswerEnabled,
     supergroupChatId: config.supergroupChatId,
     selfCheckSlug: config.selfCheck.slug,
     fleetWorktreesRoot,

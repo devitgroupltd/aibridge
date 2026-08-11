@@ -131,4 +131,23 @@ describe("buildClaudeSpawnArgs", () => {
     expect(resumeIdx).toBeGreaterThan(-1);
     expect(args[resumeIdx + 1]).toBe("abc-123");
   });
+
+  // The fix for the live-reproduced 2026-08-10 defect: `/default mode auto` used to be three
+  // post-launch Shift+Tab presses, of which exactly one landed, leaving every new session stuck at
+  // "accept edits on". A launch flag has no picker to cycle and nothing to race.
+  test("passes --permission-mode when a mode is given, and omits it entirely when not", () => {
+    const args = buildClaudeSpawnArgs({ model: "sonnet", settingsPath: "settings.json", permissionMode: "auto" });
+    const idx = args.indexOf("--permission-mode");
+    expect(idx).toBeGreaterThan(-1);
+    expect(args[idx + 1]).toBe("auto");
+
+    expect(buildClaudeSpawnArgs({ model: "sonnet", settingsPath: "settings.json" })).not.toContain("--permission-mode");
+  });
+
+  test("--permission-mode composes with --resume rather than replacing it", () => {
+    // A resumed PTY re-spawns `claude` from scratch, so it needs both.
+    const args = buildClaudeSpawnArgs({ model: "sonnet", settingsPath: "settings.json", permissionMode: "plan", resumeSessionId: "abc-123" });
+    expect(args[args.indexOf("--permission-mode") + 1]).toBe("plan");
+    expect(args[args.indexOf("--resume") + 1]).toBe("abc-123");
+  });
 });
