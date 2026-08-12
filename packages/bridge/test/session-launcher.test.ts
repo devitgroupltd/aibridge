@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type * as pty from "node-pty";
-import { buildClaudeSpawnArgs, firstNonEmptyLine, stripAnsi, waitForStartupPrompt } from "../src/session-launcher.ts";
+import { buildClaudeSpawnArgs, ensureHookBinary, firstNonEmptyLine, stripAnsi, waitForStartupPrompt } from "../src/session-launcher.ts";
 
 // 0.100.0: the resolveNodeExecutable/resolveBunExecutable/resolveClaudeExecutable trio all parse
 // `where.exe`'s output through this exact logic - pulled out and tested on its own, since the exec
@@ -149,5 +149,93 @@ describe("buildClaudeSpawnArgs", () => {
     const args = buildClaudeSpawnArgs({ model: "sonnet", settingsPath: "settings.json", permissionMode: "plan", resumeSessionId: "abc-123" });
     expect(args[args.indexOf("--permission-mode") + 1]).toBe("plan");
     expect(args[args.indexOf("--resume") + 1]).toBe("abc-123");
+  });
+});
+
+// The launch path's own rebuild-of-the-hook-binary step, which took the whole daemon down once
+// (2026-08-12: `bun build --compile` can't replace a mapped .exe on Windows, and a blocked `--ask`
+// hook process keeps it mapped indefinitely - EPERM out of execFileSync, uncaught, fleet dead over a
+// merely-stale binary). The exec itself stays untestable I/O; the fresh/stale/missing decision and
+// the fallback are not.
+describe("ensureHookBinary", () => {
+  const EXE = "C:\\repo\\packages\\hook-client\\dist\\aibridge-hook.exe";
+
+  test("a fresh binary is used as-is, with no build attempt at all", () => {
+    let builds = 0;
+    const result = ensureHookBinary({ exePath: EXE, state: "fresh", build: () => void builds++ });
+    expect(result).toEqual({ path: EXE, degraded: false });
+    expect(builds).toBe(0);
+  });
+
+  test("a stale binary is rebuilt, and a successful rebuild is not degraded", () => {
+    let builds = 0;
+    const result = ensureHookBinary({ exePath: EXE, state: "stale", build: () => void builds++ });
+    expect(result).toEqual({ path: EXE, degraded: false });
+    expect(builds).toBe(1);
+  });
+
+  test("a missing binary is built too", () => {
+    let builds = 0;
+    const result = ensureHookBinary({ exePath: EXE, state: "missing", build: () => void builds++ });
+    expect(result).toEqual({ path: EXE, degraded: false });
+    expect(builds).toBe(1);
+  });
+
+  test("a failed rebuild over a stale binary degrades to that binary instead of throwing", () => {
+    const logged: Array<[string, string]> = [];
+    const result = ensureHookBinary({
+      exePath: EXE,
+      state: "stale",
+      build: () => {
+        throw new Error("failed to move executable to ...\\dist\\aibridge-hook.exe: EPERM");
+      },
+      log: (level, message) => void logged.push([level, message]),
+    });
+    expect(result).toEqual({ path: EXE, degraded: true });
+    expect(logged).toHaveLength(1);
+    expect(logged[0]![0]).toBe("WARN");
+    // The operator has to be able to tell from the log line alone that the edit isn't live and what
+    // to do about it - not just that "something failed".
+    expect(logged[0]![1]).toContain("EPERM");
+    expect(logged[0]![1]).toContain("stale");
+    expect(logged[0]![1]).toContain("bun run build");
+  });
+
+  test("a failed build with no binary at all rethrows - there is nothing to degrade to", () => {
+    expect(() =>
+      ensureHookBinary({
+        exePath: EXE,
+        state: "missing",
+        build: () => {
+          throw new Error("bun build --compile failed");
+        },
+      }),
+    ).toThrow("bun build --compile failed");
+  });
+
+  test("degrading survives a build that throws a non-Error value", () => {
+    const logged: string[] = [];
+    const result = ensureHookBinary({
+      exePath: EXE,
+      state: "stale",
+      build: () => {
+        throw "EPERM";
+      },
+      log: (_level, message) => void logged.push(message),
+    });
+    expect(result.degraded).toBe(true);
+    expect(logged[0]).toContain("EPERM");
+  });
+
+  test("a failed rebuild with no log callback still degrades rather than throwing", () => {
+    expect(
+      ensureHookBinary({
+        exePath: EXE,
+        state: "stale",
+        build: () => {
+          throw new Error("EPERM");
+        },
+      }),
+    ).toEqual({ path: EXE, degraded: true });
   });
 });

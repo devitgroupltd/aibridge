@@ -2,6 +2,11 @@ node_modules/
 dist/
 *.log
 
+# `bun build --compile` writes the whole ~94MB binary to a .<hash>-NNNNNNNN.bun-build temp file in
+# the *package* dir (not dist/) and renames it into place last - a failed rename orphans it there,
+# so dist/ above doesn't cover it. See ensureHookBinary in packages/bridge/src/session-launcher.ts.
+*.bun-build
+
 # aibridge's own runtime state, if ever run from inside this checkout
 .aibridge-state/
 
