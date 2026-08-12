@@ -56,18 +56,18 @@ describe("normalizeDashFlags", () => {
 });
 
 describe("parseFleetCommand with a single-dash flag", () => {
-  test("/rm -all parses the same as /rm --all", () => {
-    expect(parseFleetCommand("/rm -all")).toEqual(parseFleetCommand("/rm --all"));
-    expect(parseFleetCommand("/rm -all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
+  test("/remove -all parses the same as /remove --all", () => {
+    expect(parseFleetCommand("/remove -all")).toEqual(parseFleetCommand("/remove --all"));
+    expect(parseFleetCommand("/remove -all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
   });
 
   test("/kill -all parses the same as /kill --all", () => {
     expect(parseFleetCommand("/kill -all")).toEqual({ kind: "kill", all: true });
   });
 
-  test("/rm -dead and /rm -prefix <text> also work single-dash", () => {
-    expect(parseFleetCommand("/rm -dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
-    expect(parseFleetCommand("/rm -prefix foo")).toEqual({ kind: "rm", bulk: { mode: "prefix", prefix: "foo" } });
+  test("/remove -dead and /remove -prefix <text> also work single-dash", () => {
+    expect(parseFleetCommand("/remove -dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
+    expect(parseFleetCommand("/remove -prefix foo")).toEqual({ kind: "rm", bulk: { mode: "prefix", prefix: "foo" } });
   });
 });
 
@@ -192,21 +192,27 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/ls")).toEqual({ kind: "ls" });
   });
 
-  test("/kill, /rm, /attach, /pause with and without a slug", () => {
+  test("/kill, /remove, /attach, /pause with and without a slug", () => {
     expect(parseFleetCommand("/kill fix-bug")).toEqual({ kind: "kill", slug: "fix-bug" });
     expect(parseFleetCommand("/kill")).toEqual({ kind: "kill", slug: undefined });
-    expect(parseFleetCommand("/rm fix-bug")).toEqual({ kind: "rm", slug: "fix-bug" });
+    expect(parseFleetCommand("/remove fix-bug")).toEqual({ kind: "rm", slug: "fix-bug" });
     expect(parseFleetCommand("/attach fix-bug")).toEqual({ kind: "attach", slug: "fix-bug" });
     expect(parseFleetCommand("/pause fix-bug")).toEqual({ kind: "pause", slug: "fix-bug" });
   });
 
-  test("/remove is an alias for /rm, including its bulk forms", () => {
+  test("/remove, including its bulk forms", () => {
     expect(parseFleetCommand("/remove fix-bug")).toEqual({ kind: "rm", slug: "fix-bug" });
     expect(parseFleetCommand("/remove")).toEqual({ kind: "rm", slug: undefined });
     expect(parseFleetCommand("/remove --dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
     expect(parseFleetCommand("/remove --prefix say-hello")).toEqual({ kind: "rm", bulk: { mode: "prefix", prefix: "say-hello" } });
     expect(parseFleetCommand("/remove --all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
     expect(parseFleetCommand("/remove --all --force")).toEqual({ kind: "rm", bulk: { mode: "all" }, force: true });
+  });
+
+  test("/rm no longer parses - the alias was removed 2026-08-12", () => {
+    expect(parseFleetCommand("/rm fix-bug")).toBeNull();
+    expect(parseFleetCommand("/rm --all")).toBeNull();
+    expect(matchFleetCommandName("/rm")).toBeNull();
   });
 
   test("/usage with and without a slug", () => {
@@ -249,24 +255,24 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/os Reboot")).toEqual({ kind: "os", action: "reboot" });
   });
 
-  test("/rm --dead requests the bulk dead-row filter", () => {
-    expect(parseFleetCommand("/rm --dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
+  test("/remove --dead requests the bulk dead-row filter", () => {
+    expect(parseFleetCommand("/remove --dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
   });
 
-  test("/rm --prefix <text> requests the bulk prefix filter", () => {
-    expect(parseFleetCommand("/rm --prefix say-hello")).toEqual({ kind: "rm", bulk: { mode: "prefix", prefix: "say-hello" } });
+  test("/remove --prefix <text> requests the bulk prefix filter", () => {
+    expect(parseFleetCommand("/remove --prefix say-hello")).toEqual({ kind: "rm", bulk: { mode: "prefix", prefix: "say-hello" } });
   });
 
-  test("/rm --prefix with no argument falls through to the ordinary single-slug form", () => {
-    expect(parseFleetCommand("/rm --prefix")).toEqual({ kind: "rm", slug: "--prefix" });
+  test("/remove --prefix with no argument falls through to the ordinary single-slug form", () => {
+    expect(parseFleetCommand("/remove --prefix")).toEqual({ kind: "rm", slug: "--prefix" });
   });
 
   test("/kill --all requests the fleet-wide confirm flow", () => {
     expect(parseFleetCommand("/kill --all")).toEqual({ kind: "kill", all: true });
   });
 
-  test("/rm --all requests the bulk all-row filter", () => {
-    expect(parseFleetCommand("/rm --all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
+  test("/remove --all requests the bulk all-row filter", () => {
+    expect(parseFleetCommand("/remove --all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
   });
 
   test("/kill --all --force skips the confirm flow", () => {
@@ -274,26 +280,26 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/kill --force --all")).toEqual({ kind: "kill", all: true, force: true });
   });
 
-  test("/rm --all --force skips the confirm flow", () => {
-    expect(parseFleetCommand("/rm --all --force")).toEqual({ kind: "rm", bulk: { mode: "all" }, force: true });
+  test("/remove --all --force skips the confirm flow", () => {
+    expect(parseFleetCommand("/remove --all --force")).toEqual({ kind: "rm", bulk: { mode: "all" }, force: true });
   });
 
   test("-force and -f are recognised as --force aliases", () => {
     expect(parseFleetCommand("/kill --all -force")).toEqual({ kind: "kill", all: true, force: true });
     expect(parseFleetCommand("/kill --all -f")).toEqual({ kind: "kill", all: true, force: true });
-    expect(parseFleetCommand("/rm --all -f")).toEqual({ kind: "rm", bulk: { mode: "all" }, force: true });
+    expect(parseFleetCommand("/remove --all -f")).toEqual({ kind: "rm", bulk: { mode: "all" }, force: true });
   });
 
   test("--force with no --all is a no-op flag on the single-slug/bulk forms, stripped rather than rejected", () => {
     expect(parseFleetCommand("/kill fix-bug --force")).toEqual({ kind: "kill", slug: "fix-bug" });
-    expect(parseFleetCommand("/rm --dead --force")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
+    expect(parseFleetCommand("/remove --dead --force")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
   });
 
   test("a mobile keyboard's autocorrected dash (en/em/figure) in place of -- is normalized before parsing", () => {
     expect(parseFleetCommand("/kill –all")).toEqual({ kind: "kill", all: true });
-    expect(parseFleetCommand("/rm —all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
-    expect(parseFleetCommand("/rm ‒dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
-    expect(parseFleetCommand("/rm —prefix say-hello")).toEqual({ kind: "rm", bulk: { mode: "prefix", prefix: "say-hello" } });
+    expect(parseFleetCommand("/remove —all")).toEqual({ kind: "rm", bulk: { mode: "all" } });
+    expect(parseFleetCommand("/remove ‒dead")).toEqual({ kind: "rm", bulk: { mode: "dead" } });
+    expect(parseFleetCommand("/remove —prefix say-hello")).toEqual({ kind: "rm", bulk: { mode: "prefix", prefix: "say-hello" } });
     expect(parseFleetCommand("/repos add seowrite –base main —model opus")).toEqual({
       kind: "repos",
       action: "add",
@@ -653,7 +659,7 @@ describe("renderHelp", () => {
       "/new",
       "/ls",
       "/kill",
-      "/rm",
+      "/remove",
       "/attach",
       "/pause",
       "/usage",
@@ -689,8 +695,8 @@ describe("renderHelp", () => {
   // doc comment), but `renderHelp()`'s prose is a wholly separate hand-written block with nothing
   // enforcing the two stay consistent - a command added to one and forgotten in the other used to
   // ship silently wrong (found live: /stop and /retry were both in `botCommandList()` but missing
-  // from `renderHelp()`'s text entirely). "/help" and "/rm" pass via the header line and the
-  // /remove line's "/rm is an alias" mention respectively - neither needs its own bullet.
+  // from `renderHelp()`'s text entirely). "/help" passes via the header line's "also /help, /?, /h"
+  // mention - it needs no bullet of its own.
   test("every botCommandList() command is mentioned somewhere in renderHelp()'s text", () => {
     const text = renderHelp();
     for (const { command } of botCommandList()) {

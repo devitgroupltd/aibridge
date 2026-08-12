@@ -293,8 +293,8 @@ function parseKill(rest: string): FleetCommand {
  * `dead`-state row whose slug starts with `<text>` (still `dead`-only, for the same reason
  * `--dead` is - see `RmBulkFilter`'s own note); `/remove --all` requests fleet-confirm-gated
  * removal of every session regardless of state. Anything else falls through to the ordinary
- * single-slug form. `/rm` is kept as a bare alias for the whole command (renamed 2026-08-09 -
- * "remove" reads more naturally, but the short form was already muscle memory).
+ * single-slug form. `/rm` was a bare alias for the whole command from 2026-08-09 until
+ * 2026-08-12, when it was removed at the operator's request - `/remove` only, now.
  *
  * `--force` is `parseKill`'s same escape hatch, scoped the same way: only meaningful alongside
  * `--all`, since that's the only `/remove` form that posts a confirm card - `--dead`/`--prefix`
@@ -535,7 +535,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
  * forces the engine to backtrack into the `autostart` alternative (the same mechanism `voice` and
  * `voiceconfirm` have relied on here since before either was written). Any hand-rolled
  * `startsWith("/auto")` check added elsewhere would not have that property. */
-const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|rm|remove|attach|pause|stop|resume|usage|budget|restart|merge|ship|detail|verbose|settings|auto|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b/;
+const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|remove|attach|pause|stop|resume|usage|budget|restart|merge|ship|detail|verbose|settings|auto|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b/;
 
 /**
  * Same command-name match as `parseFleetCommand`, but returns the bare word even when the rest of
@@ -609,7 +609,6 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       const model = rest.trim();
       return { kind: "voice", model: model.length > 0 ? model : undefined };
     }
-    case "rm":
     case "remove":
       return parseRm(rest);
     case "kill":
@@ -837,7 +836,7 @@ export function renderHelp(): string {
     "  /ls - list sessions, with what's running/waiting on each",
     "  /kill [<slug>|--all [--force]] - stop a session (or all, confirm-gated unless --force)",
     "  /remove [<slug>|--dead|--prefix <text>|--all [--force]] - remove a dead session row (--all is",
-    "    confirm-gated unless --force; /rm is an alias)",
+    "    confirm-gated unless --force)",
     "  /remove (bare, inside a topic with no tracked session) - offers to delete that orphaned Telegram topic itself, confirm-gated",
     "  /attach [<slug>] - show a session's PTY tail",
     "  /stop [<slug>] - interrupt the current turn (Escape); the session stays alive, just send a",
@@ -941,8 +940,7 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "new", description: "Start a new session: /new [--model] <repo> <prompt> (or a captioned attachment here)" },
     { command: "ls", description: "List sessions, with what's running/waiting on each" },
     { command: "kill", description: "Stop a session: /kill [<slug>|--all [--force]]" },
-    { command: "remove", description: "Remove a dead session row: /remove [<slug>|--dead|--prefix <text>|--all [--force]] (/rm is an alias)" },
-    { command: "rm", description: "Alias for /remove" },
+    { command: "remove", description: "Remove a dead session row: /remove [<slug>|--dead|--prefix <text>|--all [--force]]" },
     { command: "attach", description: "Show a session's PTY tail" },
     { command: "stop", description: "Interrupt the current turn (Escape) - session stays alive, just send a message to continue: /stop [<slug>]" },
     { command: "resume", description: "Relaunch a dead session's process on its preserved worktree: /resume [<slug>|--all] (no-op note if it's still alive)" },
