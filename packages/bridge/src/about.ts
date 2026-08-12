@@ -2,7 +2,7 @@
  * `/about`: a friendly, short capability overview - distinct from `/help` (§4.2's fixed
  * command-syntax reference, one line per command, no prose). `/about` answers "what can this bot
  * even do" for someone who hasn't read the plan doc, then offers a "more info" button per feature
- * that's too fiddly to explain in one line (bulk `/rm`, permission modes, autostart, the
+ * that's too fiddly to explain in one line (bulk `/remove`, permission modes, autostart, the
  * approve/deny/always buttons) - tapping one sends a short worked example instead of making the
  * overview itself longer. `/help` still owns the exhaustive syntax list; `/about` is the on-ramp.
  */
@@ -52,7 +52,7 @@ export const ABOUT_TOPICS: Record<string, { label: string; blurb: string; detail
       "",
       "/kill --all is the same idea for stopping (not removing) everything live - also confirm-gated.",
       "",
-      "A bare /remove sent inside a topic the Bridge has no session row for (e.g. a Telegram topic left behind after an earlier removal) offers to delete that topic itself instead - also confirm-gated. (/rm still works everywhere too, as a shorthand alias.)",
+      "A bare /remove sent inside a topic the Bridge has no session row for (e.g. a Telegram topic left behind after an earlier removal) offers to delete that topic itself instead - also confirm-gated.",
     ].join("\n"),
   },
   tuning: {
