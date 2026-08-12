@@ -19,6 +19,7 @@ import {
 } from "./browse-nav.ts";
 import { listDirectory, MAX_SEND_BYTES, prepareFileForSend, readForPreview, resolveGithubLink } from "./worktree-fs.ts";
 import { FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
+import { RestartConfirmRegistry, resolveRestartConfirmCallback } from "./deploy-lifecycle-commands.ts";
 import { OsConfirmRegistry, resolveOsConfirmCallback } from "./os-power-commands.ts";
 import { resolveStaleConfirmCallback, StaleConfirmRegistry } from "./stale-confirm.ts";
 import { resolveVoiceConfirmCallback, VoiceConfirmRegistry } from "./voice-confirm.ts";
@@ -45,6 +46,7 @@ import {
   resolveModelCallback,
 } from "./session-commands.ts";
 import type { ConfirmEntry, ConfirmRegistry } from "./confirm-registry.ts";
+import type { DeployLifecycleCommands } from "./deploy-lifecycle-commands.ts";
 import type { RateGovernor } from "./rate-governor.ts";
 import type { Routing } from "./routing.ts";
 import type { SessionStore } from "./session-store.ts";
@@ -91,8 +93,10 @@ export interface CallbackQueryRouterOptions {
   nlConfirmRegistry: NlConfirmRegistry;
   repoPickRegistry: RepoPickRegistry;
   osConfirmRegistry: OsConfirmRegistry;
+  restartConfirmRegistry: RestartConfirmRegistry;
   fleetConfirmFlow: Pick<FleetConfirmFlow, "executeFleetConfirm">;
   osPowerCommands: Pick<OsPowerCommands, "executeOsConfirm">;
+  deployLifecycle: Pick<DeployLifecycleCommands, "executeRestartConfirm">;
   browseRegistry: BrowseRegistry;
   nlDispatch: Pick<NlDispatch, "describeNlCommand" | "executeMatchedCommand">;
   commandDispatch: Pick<CommandDispatch, "dispatchInboundMessage">;
@@ -171,8 +175,10 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
     nlConfirmRegistry,
     repoPickRegistry,
     osConfirmRegistry,
+    restartConfirmRegistry,
     fleetConfirmFlow,
     osPowerCommands,
+    deployLifecycle,
     browseRegistry,
     nlDispatch,
     commandDispatch,
@@ -367,6 +373,28 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
           (pending) => osPowerCommands.executeOsConfirm(pending),
           "os",
         );
+      },
+    ),
+
+    // `/restart`'s own confirm keyboard (deploy-lifecycle-commands.ts) - "rs:", a fresh namespace
+    // alongside "fc:"/"os:". Not routed through `handleSimpleConfirm` like "fleetConfirm"/"osConfirm"
+    // above - both of those share one registry across several distinct actions, which is what the
+    // discriminator check exists for; `restartConfirmRegistry` only ever holds one kind of pending
+    // card, same reasoning "staleConfirm"/"repoPick" below take their own `takeOrNotifyGone` path
+    // instead of that helper.
+    rule(
+      "restartConfirm",
+      (data) => (data ? resolveRestartConfirmCallback(data) : null),
+      (restartConfirmAction, ctx) => {
+        const pending = confirmCards.takeOrNotifyGone(restartConfirmRegistry, restartConfirmAction.id, ctx.callbackQuery.message?.message_id, (entry) =>
+          fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "callback-query-router markConfirmCardExpired(restart)"),
+        );
+        if (!pending) return;
+        if (!restartConfirmAction.confirmed) {
+          fireAndForget(confirmCards.finalizeCard(pending.messageId, "Cancelled - nothing was changed."), log, "callback-query-router finalizeCard(restart cancel)");
+          return;
+        }
+        fireAndForget(deployLifecycle.executeRestartConfirm(pending), log, "callback-query-router executeRestartConfirm");
       },
     ),
 

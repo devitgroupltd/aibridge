@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createDeployLifecycleCommands, createProcessRunner } from "../src/deploy-lifecycle-commands.ts";
+import { createDeployLifecycleCommands, createProcessRunner, RestartConfirmRegistry, resolveRestartConfirmCallback, buildRestartConfirmKeyboard } from "../src/deploy-lifecycle-commands.ts";
 import { readDeployMarker } from "../src/deploy.ts";
 import { SessionStore, type SessionRow } from "../src/session-store.ts";
 import type { DeployOutcome } from "../src/deploy.ts";
@@ -33,10 +33,10 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
 }
 
 function fakeControlBot() {
-  const sent: Array<{ topicId: number | undefined; text: string }> = [];
+  const sent: Array<{ topicId: number | undefined; text: string; keyboard?: unknown }> = [];
   return {
-    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string) => {
-      sent.push({ topicId, text });
+    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string, replyMarkup?: unknown) => {
+      sent.push({ topicId, text, keyboard: replyMarkup });
       return { message_id: sent.length };
     },
     sent,
@@ -52,6 +52,8 @@ async function setup(overrides: Partial<Parameters<typeof createDeployLifecycleC
   const runSchtasksCalls: string[][] = [];
   const runPowershellCalls: string[] = [];
   const nudges: Array<{ slug: string; topicId: number; content: string; msgId: string; from: string }> = [];
+  const restartConfirmRegistry = new RestartConfirmRegistry();
+  const finalized: Array<{ messageId: number; text: string }> = [];
   const deployLifecycle = createDeployLifecycleCommands({
     sessionStore,
     controlBot,
@@ -71,6 +73,10 @@ async function setup(overrides: Partial<Parameters<typeof createDeployLifecycleC
       respawnCalls.push(1);
       return undefined as never;
     },
+    restartConfirmRegistry,
+    finalizeCard: async (messageId, text) => {
+      finalized.push({ messageId, text });
+    },
     stateDir,
     supergroupChatId: "-100",
     entryScriptDir: "c:\\bridge-repo\\packages\\bridge\\src",
@@ -82,7 +88,7 @@ async function setup(overrides: Partial<Parameters<typeof createDeployLifecycleC
     },
     ...overrides,
   });
-  return { deployLifecycle, controlBot, sessionStore, confirmed, respawnCalls, stateDir, runSchtasksCalls, runPowershellCalls, nudges };
+  return { deployLifecycle, controlBot, sessionStore, confirmed, respawnCalls, stateDir, runSchtasksCalls, runPowershellCalls, nudges, restartConfirmRegistry, finalized };
 }
 
 describe("createDeployLifecycleCommands", () => {
@@ -96,12 +102,59 @@ describe("createDeployLifecycleCommands", () => {
       expect(respawnCalls).toEqual([]);
     });
 
-    test("in the control topic, acknowledges then respawns", async () => {
+    test("in the control topic with no live sessions, restarts immediately - nothing to lose", async () => {
       const { deployLifecycle, controlBot, respawnCalls } = await setup();
 
       await deployLifecycle.handleRestartCommand(undefined);
 
       expect(controlBot.sent[0]?.text).toContain("Restarting the Bridge now");
+      expect(respawnCalls).toEqual([1]);
+    });
+
+    test("dead sessions alone don't count as live - still restarts immediately", async () => {
+      const { deployLifecycle, sessionStore, respawnCalls } = await setup();
+      sessionStore.insert(row({ state: "dead" }));
+
+      await deployLifecycle.handleRestartCommand(undefined);
+
+      expect(respawnCalls).toEqual([1]);
+    });
+  });
+
+  describe("handleRestartCommand - confirm gate", () => {
+    test("posts a Yes/Cancel card naming each live session, and registers the pending confirm", async () => {
+      const { deployLifecycle, sessionStore, controlBot, respawnCalls, restartConfirmRegistry } = await setup();
+      sessionStore.insert(row({ slug: "fix-bug", state: "working" }));
+      sessionStore.insert(row({ slug: "other-thing", state: "awaiting_input", sessionId: "sess-2", topicId: 6 }));
+
+      await deployLifecycle.handleRestartCommand(undefined);
+
+      expect(respawnCalls).toEqual([]);
+      const posted = controlBot.sent[0];
+      expect(posted?.text).toContain("2 live sessions");
+      expect(posted?.text).toContain("fix-bug (working)");
+      expect(posted?.text).toContain("other-thing (awaiting_input)");
+      expect(posted?.keyboard).toBeDefined();
+      expect(restartConfirmRegistry.size).toBe(1);
+    });
+
+    test("a single live session is worded in the singular", async () => {
+      const { deployLifecycle, sessionStore, controlBot } = await setup();
+      sessionStore.insert(row({ slug: "fix-bug", state: "idle" }));
+
+      await deployLifecycle.handleRestartCommand(undefined);
+
+      expect(controlBot.sent[0]?.text).toContain("1 live session ");
+    });
+
+    test("executeRestartConfirm finalizes the card then respawns", async () => {
+      const { deployLifecycle, sessionStore, respawnCalls, finalized } = await setup();
+      sessionStore.insert(row({ slug: "fix-bug", state: "working" }));
+      await deployLifecycle.handleRestartCommand(undefined);
+
+      await deployLifecycle.executeRestartConfirm({ id: "r1", topicId: undefined, messageId: 1, createdAt: 0 });
+
+      expect(finalized).toEqual([{ messageId: 1, text: "✅ Restarting the Bridge now (§4.5.1) - live sessions will relaunch via claude --resume once it's back up." }]);
       expect(respawnCalls).toEqual([1]);
     });
   });
@@ -212,6 +265,62 @@ describe("createDeployLifecycleCommands", () => {
       expect(marker?.branch).toBe("claude/fix-bug-1");
       expect(marker?.previousHeadSha).toBe("aaa");
       expect(marker?.newHeadSha).toBe("bbb");
+    });
+
+    test("a successful gate against aibridge's own repo, with another live session, posts a confirm card instead of respawning", async () => {
+      const okOutcome: DeployOutcome = { ok: true, rolledBack: false, message: "merged cleanly", previousHeadSha: "aaa", newHeadSha: "bbb" };
+      const { deployLifecycle, sessionStore, controlBot, respawnCalls, stateDir, restartConfirmRegistry } = await setup({
+        deployBranch: async () => okOutcome,
+      });
+      sessionStore.insert(row({ repoPath: "c:\\bridge-repo" }));
+      sessionStore.insert(row({ slug: "other-thing", state: "working", sessionId: "sess-2", topicId: 6 }));
+
+      await deployLifecycle.handleMergeCommand(undefined, "fix-bug");
+
+      expect(respawnCalls).toEqual([]);
+      expect(readDeployMarker(stateDir)).toBeNull();
+      const posted = controlBot.sent.at(-1);
+      expect(posted?.text).toContain("landed a fix to aibridge's own repo");
+      expect(posted?.text).toContain("other-thing (working)");
+      expect(posted?.keyboard).toBeDefined();
+      expect(restartConfirmRegistry.size).toBe(1);
+    });
+
+    test("the session doing the merging itself doesn't count as an 'other' live session - still restarts immediately", async () => {
+      const okOutcome: DeployOutcome = { ok: true, rolledBack: false, message: "merged cleanly", previousHeadSha: "aaa", newHeadSha: "bbb" };
+      const { deployLifecycle, sessionStore, respawnCalls } = await setup({
+        deployBranch: async () => okOutcome,
+      });
+      // "fix-bug" is both the session running /merge and the only live row - excluded from the
+      // "other live sessions" check, so this must behave exactly like the zero-live-sessions case.
+      sessionStore.insert(row({ repoPath: "c:\\bridge-repo", state: "working" }));
+
+      await deployLifecycle.handleMergeCommand(undefined, "fix-bug");
+
+      expect(respawnCalls).toEqual([1]);
+    });
+
+    test("confirming a self-repo restart card writes the deploy marker (deferred from merge time) and respawns", async () => {
+      // `handleMergeCommand`/`handleShipCommand` don't hand the posted card's generated id back to
+      // the caller (same as the plain `/restart` gate) - exercised here the way the
+      // callback-query-router rule actually reaches it, via a hand-built `PendingRestartConfirm`
+      // carrying the same `selfRepoRestart` shape `restartIfSelfRepo` puts in the registry.
+      const { deployLifecycle, respawnCalls, stateDir, finalized } = await setup();
+
+      await deployLifecycle.executeRestartConfirm({
+        id: "irrelevant",
+        topicId: undefined,
+        messageId: 1,
+        createdAt: 0,
+        selfRepoRestart: { commandLabel: "/merge", repoPath: "c:\\bridge-repo", branch: "claude/fix-bug-1", previousHeadSha: "aaa", newHeadSha: "bbb" },
+      });
+
+      expect(respawnCalls).toEqual([1]);
+      const marker = readDeployMarker(stateDir);
+      expect(marker?.branch).toBe("claude/fix-bug-1");
+      expect(marker?.previousHeadSha).toBe("aaa");
+      expect(marker?.newHeadSha).toBe("bbb");
+      expect(finalized[0]?.text).toContain("Restarting the Bridge now to apply the fix");
     });
   });
 
@@ -398,6 +507,26 @@ describe("createDeployLifecycleCommands", () => {
       const marker = readDeployMarker(stateDir);
       expect(marker?.branch).toBe("claude/fix-bug-1");
     });
+
+    test("a successful ship against aibridge's own repo, with another live session, posts a confirm card instead of respawning", async () => {
+      const okOutcome: DeployOutcome = { ok: true, rolledBack: false, message: "merged cleanly", previousHeadSha: "aaa", newHeadSha: "bbb" };
+      const { deployLifecycle, sessionStore, controlBot, respawnCalls, stateDir, restartConfirmRegistry } = await setup({
+        deployBranch: async () => okOutcome,
+        commitIfDirty: async () => ({ committed: false, message: "clean" }),
+        pushCurrentBranch: async () => ({ status: 0, stdout: "", stderr: "" }),
+      });
+      sessionStore.insert(row({ repoPath: "c:\\bridge-repo" }));
+      sessionStore.insert(row({ slug: "other-thing", state: "awaiting_input", sessionId: "sess-2", topicId: 6 }));
+
+      await deployLifecycle.handleShipCommand(undefined, "fix-bug", undefined);
+
+      expect(respawnCalls).toEqual([]);
+      expect(readDeployMarker(stateDir)).toBeNull();
+      const posted = controlBot.sent.at(-1);
+      expect(posted?.text).toContain("landed a fix to aibridge's own repo");
+      expect(posted?.text).toContain("other-thing (awaiting_input)");
+      expect(restartConfirmRegistry.size).toBe(1);
+    });
   });
 
   describe("handleAutostartCommand", () => {
@@ -458,6 +587,21 @@ describe("createDeployLifecycleCommands", () => {
       expect(runSchtasksCalls.length).toBe(1);
       expect(confirmed[0]?.text).toContain("Removed");
     });
+  });
+});
+
+describe("resolveRestartConfirmCallback / buildRestartConfirmKeyboard", () => {
+  test("round-trips buildRestartConfirmKeyboard's own output", () => {
+    const keyboard = buildRestartConfirmKeyboard("abc123");
+    const yes = resolveRestartConfirmCallback((keyboard[0]?.[0] as { callback_data: string }).callback_data);
+    const no = resolveRestartConfirmCallback((keyboard[0]?.[1] as { callback_data: string }).callback_data);
+    expect(yes).toEqual({ id: "abc123", confirmed: true });
+    expect(no).toEqual({ id: "abc123", confirmed: false });
+  });
+
+  test("rejects malformed callback_data", () => {
+    expect(resolveRestartConfirmCallback("os:shutdown:abc:y")).toBeNull();
+    expect(resolveRestartConfirmCallback("rs:abc:maybe")).toBeNull();
   });
 });
 

@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { execFile } from "node:child_process";
 import path from "node:path";
 import { buildCreateArgs, buildDeleteArgs, buildFixTaskSettingsScript, buildQueryArgs, parseQueryOutput, renderAutostartStatus, TASK_NAME } from "./autostart.ts";
+import { ConfirmRegistry, type ConfirmRegistryOptions } from "./confirm-registry.ts";
 import {
   commitIfDirty as realCommitIfDirty,
   deployBranch as realDeployBranch,
@@ -17,7 +19,7 @@ import type { DeployOutcome } from "./deploy.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import type { PtyIo } from "./pty-io.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
-import type { SendMessageSource } from "./telegram.ts";
+import type { InlineKeyboardButton, SendMessageSource } from "./telegram.ts";
 import type { SessionRow, SessionStore } from "./session-store.ts";
 
 /**
@@ -82,6 +84,68 @@ function stderrOrMessage(err: Error | null, stderr: string): string {
   return stderr || (err?.message ?? "");
 }
 
+/** Confirm gate for `/restart` (2026-08-12 operator request): with at least one non-`dead` session
+ * in the fleet, a typed `/restart` is destructive enough - it kills every live session with the
+ * process, per §4.5's own measurement - to get the same Yes/Cancel confirm card `/os shutdown|reboot`
+ * already does, rather than executing on the same message the way it did before this. With zero
+ * live sessions there is nothing to lose, so `handleRestartCommand` skips this registry entirely and
+ * restarts immediately, same as always. Deliberately its own registry rather than piggybacking on
+ * `fleet-confirm.ts`'s `FleetConfirmRegistry`: that one's `kind` discriminator exists because several
+ * *different* destructive actions share one registry/namespace, which `/restart` has no need for -
+ * one pending card, one action, same "own `Map`, own TTL, own `callback_data` namespace" shape as
+ * `OsConfirmRegistry`. */
+export interface PendingRestartConfirm {
+  id: string;
+  topicId: number | undefined;
+  messageId: number;
+  createdAt: number;
+  /** Only set when this confirm originated from `/merge`'s or `/ship`'s self-repo restart tail
+   * (`restartIfSelfRepo`) rather than a direct `/restart` - `executeRestartConfirm` uses it to write
+   * the deploy marker at confirm time (not at merge time, since a Cancel tap must leave nothing
+   * written) and to log/notify with the right command label and outcome shas. */
+  selfRepoRestart?: {
+    commandLabel: string;
+    repoPath: string;
+    branch: string;
+    previousHeadSha: string;
+    newHeadSha: string;
+  };
+}
+
+const RESTART_CONFIRM_TTL_MS = 2 * 60 * 1000;
+
+/** TTL + clock injection, both from `ConfirmRegistry` - this registry adds nothing of its own. */
+export type RestartConfirmRegistryOptions = ConfirmRegistryOptions;
+
+export class RestartConfirmRegistry extends ConfirmRegistry<PendingRestartConfirm> {
+  constructor(opts: RestartConfirmRegistryOptions = {}) {
+    super(RESTART_CONFIRM_TTL_MS, opts);
+  }
+}
+
+export interface RestartConfirmCallback {
+  id: string;
+  confirmed: boolean;
+}
+
+/** `rs:<id>:<y|n>` - a fresh namespace alongside `fc:`/`os:`/`nc:`/`sc:`/`vc:`/`rp:`, well inside
+ * Telegram's 64-byte `callback_data` cap. Re-validates the format rather than trusting the tap, same
+ * defensive pattern as every other `resolve*Callback` in this codebase. */
+export function resolveRestartConfirmCallback(data: string): RestartConfirmCallback | null {
+  const match = data.match(/^rs:([A-Za-z0-9]{1,20}):(y|n)$/);
+  if (!match) return null;
+  return { id: match[1] ?? "", confirmed: match[2] === "y" };
+}
+
+export function buildRestartConfirmKeyboard(id: string): InlineKeyboardButton[][] {
+  return [
+    [
+      { text: "✅ Yes, restart", callback_data: `rs:${id}:y` },
+      { text: "⛔ Cancel", callback_data: `rs:${id}:n` },
+    ],
+  ];
+}
+
 export function createProcessRunner(execFileFn: ExecFileFn = execFile as unknown as ExecFileFn): ProcessRunner {
   function runSchtasks(args: string[]): Promise<ProcessRunResult> {
     return new Promise((resolve) => {
@@ -124,6 +188,15 @@ export interface DeployLifecycleCommandsOptions {
    * stale-deploy-rollback check at boot is safety-critical - injected here as a callback rather
    * than relocated (plan Risks). */
   respawnSelfAndExit: () => Promise<never>;
+  /** `/restart`'s own confirm-gate registry (see `RestartConfirmRegistry`'s doc comment) - constructed
+   * once in index.ts alongside `osConfirmRegistry`/`fleetConfirmRegistry`, so a pending card survives
+   * exactly as long as this process does and is swept by the same periodic sweep. */
+  restartConfirmRegistry: RestartConfirmRegistry;
+  /** Edits the tapped confirm card in place - `confirmCards.finalizeCard` bound at construction, same
+   * as `os-power-commands.ts`'s identically-named option. Kept as a plain function rather than the
+   * whole `ConfirmCards` object so this module doesn't gain a dependency on every other confirm-card
+   * protocol it has nothing to do with. */
+  finalizeCard: (messageId: number, text: string) => Promise<void>;
   stateDir: string;
   supergroupChatId: string;
   entryScriptDir: string;
@@ -148,13 +221,17 @@ export interface DeployLifecycleCommandsOptions {
 
 export interface DeployLifecycleCommands {
   handleRestartCommand(topicId: number | undefined): Promise<void>;
+  /** Runs after a `/restart` confirm tap - the actual respawn `handleRestartCommand` used to fire
+   * unconditionally. Only ever called with `confirmed: true` (the callback-query-router rule
+   * finalizes a cancel itself, same as every other simple Yes/Cancel card). */
+  executeRestartConfirm(pending: PendingRestartConfirm): Promise<void>;
   handleMergeCommand(topicId: number | undefined, slug: string): Promise<void>;
   handleShipCommand(topicId: number | undefined, explicitSlug: string | undefined, currentSlug: string | undefined): Promise<void>;
   handleAutostartCommand(cmd: Extract<FleetCommand, { kind: "autostart" }>, topicId: number | undefined): Promise<void>;
 }
 
 export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptions): DeployLifecycleCommands {
-  const { sessionStore, controlBot, confirmSessionCommand, isControlTopic, runSchtasks, runPowershell, respawnSelfAndExit, stateDir, supergroupChatId, entryScriptDir, log } = opts;
+  const { sessionStore, controlBot, confirmSessionCommand, isControlTopic, runSchtasks, runPowershell, respawnSelfAndExit, restartConfirmRegistry, finalizeCard, stateDir, supergroupChatId, entryScriptDir, log } = opts;
   const deployBranch = opts.deployBranch ?? realDeployBranch;
   const commitIfDirty = opts.commitIfDirty ?? realCommitIfDirty;
   const pushCurrentBranch = opts.pushCurrentBranch ?? realPushCurrentBranch;
@@ -231,38 +308,61 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     return outcome;
   }
 
+  /** Writes `deployMarker` and actually respawns - the tail end both `restartIfSelfRepo`'s immediate
+   * path and `executeRestartConfirm`'s self-repo branch need, extracted so the marker write can't
+   * drift between "restart right away" and "restart once confirmed". */
+  async function writeMarkerAndRespawn(commandLabel: string, repoPath: string, branch: string, previousHeadSha: string, newHeadSha: string, topicId: number | undefined): Promise<void> {
+    writeDeployMarker(stateDir, { previousHeadSha, newHeadSha, repoRoot: repoPath, branch, chatId: supergroupChatId, topicId, deployedAtIso: new Date().toISOString() });
+    log("INFO", `${commandLabel}: self-repo, respawning and exiting`);
+    await respawnSelfAndExit();
+  }
+
   /**
    * The self-repo-restart tail shared by `/merge` and `/ship`: once a merge into `repoPath` has
    * already succeeded, only if that repo is this Bridge's own checkout (`isSelfRepo`) does landing
    * the fix also mean respawning to run it - any other project's branch is just a merge+test, there
-   * is no "Bridge" to restart for it. Writes `deployMarker` first so a boot that never comes up
-   * cleanly gets rolled back automatically (see the startup check near the end of `main()`) rather
-   * than crash-looping on a bad commit with no way to say so. Extracted so `/ship` gets the exact
-   * same self-repo behaviour as `/merge` without duplicating it.
+   * is no "Bridge" to restart for it.
+   *
+   * Confirm-gated (2026-08-12 operator request) on *other* live sessions, not on `ownSlug` (the
+   * session that owns `branch`) - that one is expected to die and cold-resume as a direct, deliberate
+   * consequence of the `/merge`/`/ship` the operator (or the session itself, for a bare `/ship`) just
+   * ran, the same way a `/restart` with only its own topic's session alive would restart immediately
+   * (§4.5.1's `handleRestartCommand`). It's *other* sessions this would surprise-kill that need a Yes/
+   * Cancel card first, via the same `RestartConfirmRegistry` `/restart` itself uses -
+   * `PendingRestartConfirm.selfRepoRestart` carries what `executeRestartConfirm` needs to write the
+   * deploy marker at confirm time instead of now, since a Cancel tap must leave nothing written.
    */
-  async function restartIfSelfRepo(commandLabel: string, repoPath: string, branch: string, outcome: { previousHeadSha?: string; newHeadSha?: string }, topicId: number | undefined): Promise<void> {
+  async function restartIfSelfRepo(commandLabel: string, repoPath: string, branch: string, outcome: { previousHeadSha?: string; newHeadSha?: string }, topicId: number | undefined, ownSlug: string): Promise<void> {
     const bridgeRepoRoot = resolveBridgeRepoRoot(entryScriptDir);
     if (!isSelfRepo(repoPath, bridgeRepoRoot)) {
       log("INFO", `${commandLabel}: "${repoPath}" isn't this Bridge's own repo - merged only, no restart`);
       return;
     }
 
-    writeDeployMarker(stateDir, {
-      previousHeadSha: outcome.previousHeadSha ?? "",
-      newHeadSha: outcome.newHeadSha ?? "",
-      repoRoot: repoPath,
-      branch,
-      chatId: supergroupChatId,
-      topicId,
-      deployedAtIso: new Date().toISOString(),
-    });
-    await notify(
-      topicId,
-      "This is aibridge's own repo - restarting now to apply the fix (§5.9). If it doesn't come back up cleanly within a minute, it rolls itself back automatically and restarts again.",
-      `${commandLabel} restart notice`,
-    );
-    log("INFO", `${commandLabel}: self-repo, respawning and exiting`);
-    await respawnSelfAndExit();
+    const previousHeadSha = outcome.previousHeadSha ?? "";
+    const newHeadSha = outcome.newHeadSha ?? "";
+    const otherLiveRows = sessionStore.all().filter((r) => r.state !== "dead" && r.slug !== ownSlug);
+
+    if (otherLiveRows.length === 0) {
+      await notify(
+        topicId,
+        "This is aibridge's own repo - restarting now to apply the fix (§5.9). If it doesn't come back up cleanly within a minute, it rolls itself back automatically and restarts again.",
+        `${commandLabel} restart notice`,
+      );
+      await writeMarkerAndRespawn(commandLabel, repoPath, branch, previousHeadSha, newHeadSha, topicId);
+      return;
+    }
+
+    const id = randomUUID().slice(0, 8);
+    const sessionList = otherLiveRows.map((r) => `${r.slug} (${r.state})`).join(", ");
+    const promptText =
+      `⚠️ ${commandLabel} landed a fix to aibridge's own repo - restarting to apply it would also kill ${otherLiveRows.length} other live session${otherLiveRows.length === 1 ? "" : "s"} (cold-resumed via claude --resume once back up):\n${sessionList}\nRestart now?`;
+    try {
+      const sent = await controlBot.sendMessage(supergroupChatId, topicId, promptText, { inline_keyboard: buildRestartConfirmKeyboard(id) });
+      restartConfirmRegistry.add({ id, topicId, messageId: sent.message_id, selfRepoRestart: { commandLabel, repoPath, branch, previousHeadSha, newHeadSha } });
+    } catch (err) {
+      log("WARN", `failed to post ${commandLabel} restart confirmation: ${(err as Error).message}`);
+    }
   }
 
   /**
@@ -270,18 +370,52 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
    * this process (§4.5's measurement) and comes back via `resumeSession`'s `claude --resume` path
    * once the successor's own startup reconciliation runs - the same cold-start cost as any other
    * Bridge restart, just operator-triggered instead of waiting for a crash.
+   *
+   * Confirm-gated (2026-08-12 operator request) whenever that cost is real: with at least one
+   * non-`dead` session in the fleet, this posts the same Yes/Cancel card `/os shutdown|reboot` uses
+   * (`RestartConfirmRegistry`, above) instead of restarting on the same message, and returns without
+   * touching `respawnSelfAndExit` - `executeRestartConfirm` runs it once the operator actually taps
+   * Yes. With zero live sessions there's nothing to lose, so this still restarts immediately, exactly
+   * as it always has.
    */
   async function handleRestartCommand(topicId: number | undefined): Promise<void> {
     if (!isControlTopic(topicId)) {
       confirmSessionCommand(topicId, "/restart only works from the control topic.");
       return;
     }
-    await notify(
-      topicId,
-      "Restarting the Bridge now (§4.5.1) - live sessions will relaunch via claude --resume once it's back up.",
-      "/restart confirmation",
-    );
-    log("INFO", "/restart requested - relaunching and exiting");
+
+    const liveRows = sessionStore.all().filter((r) => r.state !== "dead");
+    if (liveRows.length === 0) {
+      await notify(topicId, "Restarting the Bridge now (§4.5.1) - no live sessions to lose.", "/restart confirmation");
+      log("INFO", "/restart requested - no live sessions, relaunching and exiting");
+      await respawnSelfAndExit();
+      return;
+    }
+
+    const id = randomUUID().slice(0, 8);
+    const sessionList = liveRows.map((r) => `${r.slug} (${r.state})`).join(", ");
+    const promptText =
+      `⚠️ This will restart the Bridge - ${liveRows.length} live session${liveRows.length === 1 ? "" : "s"} will be killed and cold-resumed via claude --resume:\n${sessionList}\nConfirm?`;
+    try {
+      const sent = await controlBot.sendMessage(supergroupChatId, topicId, promptText, { inline_keyboard: buildRestartConfirmKeyboard(id) });
+      restartConfirmRegistry.add({ id, topicId, messageId: sent.message_id });
+    } catch (err) {
+      log("WARN", `failed to post /restart confirmation: ${(err as Error).message}`);
+    }
+  }
+
+  async function executeRestartConfirm(pending: PendingRestartConfirm): Promise<void> {
+    if (pending.selfRepoRestart) {
+      const { commandLabel, repoPath, branch, previousHeadSha, newHeadSha } = pending.selfRepoRestart;
+      await finalizeCard(
+        pending.messageId,
+        "✅ Restarting the Bridge now to apply the fix (§5.9). If it doesn't come back up cleanly within a minute, it rolls itself back automatically and restarts again.",
+      );
+      await writeMarkerAndRespawn(commandLabel, repoPath, branch, previousHeadSha, newHeadSha, pending.topicId);
+      return;
+    }
+    await finalizeCard(pending.messageId, "✅ Restarting the Bridge now (§4.5.1) - live sessions will relaunch via claude --resume once it's back up.");
+    log("INFO", "/restart confirmed - relaunching and exiting");
     await respawnSelfAndExit();
   }
 
@@ -315,7 +449,7 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     if (!outcome) return;
     await notifyHtml(topicId, formatOutcomeHtml(outcome.message), "/merge success message");
 
-    await restartIfSelfRepo("/merge", repoPath, branch, outcome, topicId);
+    await restartIfSelfRepo("/merge", repoPath, branch, outcome, topicId, slug);
   }
 
   /**
@@ -377,7 +511,7 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
       "/ship success message",
     );
 
-    await restartIfSelfRepo("/ship", repoPath, branch, outcome, topicId);
+    await restartIfSelfRepo("/ship", repoPath, branch, outcome, topicId, slug);
   }
 
   /** `/autostart status|install|uninstall`: §7.2's Task Scheduler entry, made reachable from
@@ -420,5 +554,5 @@ export function createDeployLifecycleCommands(opts: DeployLifecycleCommandsOptio
     }
   }
 
-  return { handleRestartCommand, handleMergeCommand, handleShipCommand, handleAutostartCommand };
+  return { handleRestartCommand, executeRestartConfirm, handleMergeCommand, handleShipCommand, handleAutostartCommand };
 }
