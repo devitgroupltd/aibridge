@@ -54,7 +54,7 @@ import { createInboundMedia } from "./inbound-media.ts";
 import { createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE } from "./session-lifecycle-commands.ts";
 import type { SessionLifecycleCommands } from "./session-lifecycle-commands.ts";
 import { createFleetReportingCommands } from "./fleet-reporting-commands.ts";
-import { createDeployLifecycleCommands, createProcessRunner } from "./deploy-lifecycle-commands.ts";
+import { createDeployLifecycleCommands, createProcessRunner, RestartConfirmRegistry } from "./deploy-lifecycle-commands.ts";
 import { createVoiceModeCommands } from "./voice-mode-commands.ts";
 import { createConfirmSessionCommand, createFleetConfirmFlow, createStopIndicatorsForTopic } from "./fleet-confirm-flow.ts";
 import type { FleetConfirmFlow } from "./fleet-confirm-flow.ts";
@@ -305,6 +305,10 @@ async function main(): Promise<void> {
   // `/os shutdown|reboot` (os-power-commands.ts) - same confirm-button pattern as `/kill --all`
   // above, for a strictly more consequential action (kills the Bridge itself, not just a session).
   const osConfirmRegistry = new OsConfirmRegistry();
+  // `/restart` (deploy-lifecycle-commands.ts), confirm-gated 2026-08-12 whenever a live session
+  // would be lost - same confirm-button pattern as `osConfirmRegistry` above, own registry since it
+  // gates one action rather than several.
+  const restartConfirmRegistry = new RestartConfirmRegistry();
   const staleConfirmRegistry = new StaleConfirmRegistry();
   // Voice input (self-hosted Whisper via whisper.cpp) - a transcribed voice note is never
   // dispatched directly, only replayed from a tap on its own Send/Re-record/Type-instead card
@@ -744,6 +748,8 @@ async function main(): Promise<void> {
     runSchtasks: processRunner.runSchtasks,
     runPowershell: processRunner.runPowershell,
     respawnSelfAndExit,
+    restartConfirmRegistry,
+    finalizeCard: confirmCards.finalizeCard,
     stateDir: STATE_DIR,
     supergroupChatId: config.supergroupChatId,
     entryScriptDir: import.meta.dirname,
@@ -817,6 +823,7 @@ async function main(): Promise<void> {
     for (const entry of repoPickRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "index sweep markConfirmCardExpired(repoPick)");
     for (const entry of fleetConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "index sweep markConfirmCardExpired(fleet)");
     for (const entry of osConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "index sweep markConfirmCardExpired(os)");
+    for (const entry of restartConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.messageId), log, "index sweep markConfirmCardExpired(restart)");
     for (const entry of staleConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.confirmCardMessageId), log, "index sweep markConfirmCardExpired(stale)");
     for (const entry of voiceConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.confirmCardMessageId), log, "index sweep markConfirmCardExpired(voice)");
 
@@ -1035,8 +1042,10 @@ async function main(): Promise<void> {
     nlConfirmRegistry,
     repoPickRegistry,
     osConfirmRegistry,
+    restartConfirmRegistry,
     fleetConfirmFlow: fleetConfirmFlow.get(),
     osPowerCommands,
+    deployLifecycle,
     browseRegistry,
     nlDispatch,
     commandDispatch: commandDispatch.get(),

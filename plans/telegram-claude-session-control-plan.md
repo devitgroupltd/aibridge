@@ -1685,6 +1685,20 @@ deliberately, on their own schedule, instead of only when something crashes. It 
 once Phase 5's session-id persistence lands, and not before - **`/restart` is therefore Phase 5 scope**,
 not a Phase 1 retrofit, same as the supervisor duty it's a manual trigger for.
 
+**Confirm-gated whenever it's actually destructive (operator request, 2026-08-12).** `/restart` used
+to respawn on the same message unconditionally, regardless of how many sessions were live - the one
+fleet-scoped command with no confirm step of any kind, even though §4.5's own measurement is that it
+kills every one of them along with the process. Now `handleRestartCommand` (deploy-lifecycle-
+commands.ts) checks `sessionStore.all()` for any row `!== "dead"` first: with none, it restarts
+immediately exactly as before (there's nothing to lose); with at least one, it posts the same Yes/
+Cancel confirm card `/os shutdown|reboot` already uses - naming each live session and its state -
+via its own `RestartConfirmRegistry` (same "own `Map`, own TTL, own `callback_data` namespace" shape
+as `OsConfirmRegistry`, kept separate from `fleet-confirm.ts`'s multi-kind registry since this gates
+exactly one action). A tap on Cancel finalizes the card and changes nothing; a tap on Yes runs
+`executeRestartConfirm`, which finalizes the card in place and then does exactly what the immediate
+path always did. This only changes *when* the respawn is confirmed, not the respawn/cold-resume
+mechanism itself - the honest Phase 1 caveat above still applies unchanged.
+
 ### 4.5.2 Orphaned-topic reconciliation (implemented 0.68.0; live verification found a sharper edge)
 
 A removed session's Telegram topic can outlive its DB row: `removeSessionRow` only `WARN`-logs if
@@ -2071,6 +2085,18 @@ the first place.
    `process.exit(0)`), so every live session dies and comes back the same way any other Bridge
    restart already does (§4.5) - not a new code path, `/deploy`'s self-repo branch *is* `/restart`,
    just reached after a merge+gate instead of on its own.
+
+   **Confirm-gated on *other* live sessions (operator request, 2026-08-12), same as `/restart`'s own
+   gate above.** `restartIfSelfRepo` checks `sessionStore.all()` for any non-`dead` row other than the
+   one whose branch was just merged - that one is expected to die and cold-resume as a direct
+   consequence of the `/merge`/`/ship`/`/deploy` the operator (or the session itself, for a bare
+   `/ship`) just ran, the same way `/restart` itself restarts immediately when only its own topic's
+   session is alive. It's specifically *other* sessions this would surprise-kill without warning that
+   get a Yes/Cancel confirm card first (`RestartConfirmRegistry`, shared with `/restart`), naming each
+   one and its state. `deployMarker` is written only once the operator actually confirms (or
+   immediately, on the no-other-live-sessions path) - never at merge time - so a Cancel tap, or a card
+   that simply expires, leaves nothing written and the merge stays merged-but-not-yet-applied until
+   either a tap or a later plain `/restart` picks it up.
 
 **The crash-loop problem `/restart` never had to solve, because a human always triggered it
 knowingly.** A `/deploy`-triggered restart can be wrong in a way `/restart` itself can't: the commit

@@ -6,6 +6,7 @@ import { createCallbackQueryRouter } from "../src/callback-query-router.ts";
 import { RateGovernor } from "../src/rate-governor.ts";
 import { Routing } from "../src/routing.ts";
 import { FleetConfirmRegistry } from "../src/fleet-confirm.ts";
+import { RestartConfirmRegistry } from "../src/deploy-lifecycle-commands.ts";
 import { OsConfirmRegistry } from "../src/os-power-commands.ts";
 import { StaleConfirmRegistry } from "../src/stale-confirm.ts";
 import { VoiceConfirmRegistry } from "../src/voice-confirm.ts";
@@ -130,6 +131,11 @@ function fakeOsPowerCommands() {
   return { executeOsConfirm: async (pending: unknown) => void executed.push(pending), executed };
 }
 
+function fakeDeployLifecycle() {
+  const executed: unknown[] = [];
+  return { executeRestartConfirm: async (pending: unknown) => void executed.push(pending), executed };
+}
+
 function fakeNlDispatch() {
   const executed: unknown[][] = [];
   return {
@@ -192,8 +198,10 @@ function setup() {
   const nlConfirmRegistry = new NlConfirmRegistry();
   const repoPickRegistry = new RepoPickRegistry();
   const osConfirmRegistry = new OsConfirmRegistry();
+  const restartConfirmRegistry = new RestartConfirmRegistry();
   const fleetConfirmFlow = fakeFleetConfirmFlow();
   const osPowerCommands = fakeOsPowerCommands();
+  const deployLifecycle = fakeDeployLifecycle();
   const browseRegistry = new BrowseRegistry();
   const nlDispatch = fakeNlDispatch();
   const commandDispatch = fakeCommandDispatch();
@@ -220,8 +228,10 @@ function setup() {
     nlConfirmRegistry,
     repoPickRegistry,
     osConfirmRegistry,
+    restartConfirmRegistry,
     fleetConfirmFlow: fleetConfirmFlow as never,
     osPowerCommands: osPowerCommands as never,
+    deployLifecycle: deployLifecycle as never,
     browseRegistry,
     nlDispatch: nlDispatch as never,
     commandDispatch: commandDispatch as never,
@@ -256,8 +266,10 @@ function setup() {
     nlConfirmRegistry,
     repoPickRegistry,
     osConfirmRegistry,
+    restartConfirmRegistry,
     fleetConfirmFlow,
     osPowerCommands,
+    deployLifecycle,
     browseRegistry,
     nlDispatch,
     commandDispatch,
@@ -344,6 +356,27 @@ describe("createCallbackQueryRouter - every documented namespace resolves to its
     s.router.routeCallbackQuery(cq("os:reboot:o3:y"));
     expect(s.osPowerCommands.executed.length).toBe(0);
     expect(s.confirmCards.finalizedCard).toEqual([]);
+  });
+
+  test('"rs:" confirmed executes the restart confirm', () => {
+    const s = setup();
+    s.restartConfirmRegistry.add({ id: "r1", topicId: 5, messageId: 9 });
+    s.router.routeCallbackQuery(cq("rs:r1:y"));
+    expect(s.deployLifecycle.executed.length).toBe(1);
+  });
+
+  test('"rs:" cancelled finalizes without executing', () => {
+    const s = setup();
+    s.restartConfirmRegistry.add({ id: "r2", topicId: 5, messageId: 10 });
+    s.router.routeCallbackQuery(cq("rs:r2:n"));
+    expect(s.deployLifecycle.executed.length).toBe(0);
+    expect(s.confirmCards.finalizedCard).toEqual([{ messageId: 10, text: "Cancelled - nothing was changed." }]);
+  });
+
+  test('"rs:" an unknown/expired id is a silent no-op, not a crash', () => {
+    const s = setup();
+    expect(() => s.router.routeCallbackQuery(cq("rs:nosuch:y"))).not.toThrow();
+    expect(s.deployLifecycle.executed.length).toBe(0);
   });
 
   test('"nc:" run executes the matched command via nlDispatch', () => {
