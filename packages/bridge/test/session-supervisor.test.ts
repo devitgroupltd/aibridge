@@ -14,7 +14,13 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     branch: "claude/fix-bug-1",
     repoPath: "c:\\data\\projects\\seowrite",
     model: "sonnet",
-    ptyPid: 1234,
+    // 0, not some arbitrary nonzero fixture number - `resumeSession`'s stale-orphan-kill check
+    // (below) probes this pid for real via the default `isPidAlive`, and `isPidAlive(0)` is the
+    // one input guaranteed to short-circuit to `false` without an actual syscall (its own `if
+    // (!pid) return false` guard) - anything else risks signalling a real, unrelated OS process
+    // that happens to reuse whatever number a fixture picked. Tests exercising the kill-check
+    // itself override this explicitly alongside an injected `isPidAlive`/`killProcess`.
+    ptyPid: 0,
     state: "working",
     turnCardMsg: null,
     paused: false,
@@ -910,6 +916,109 @@ describe("createSessionSupervisor", () => {
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
+      launchSession: () => {
+        launchCount += 1;
+        return {
+          worktreePath: "c:\\data\\worktrees\\fix-bug",
+          branch: "claude/fix-bug-1",
+          ptyProcess: resumedPty as unknown as LaunchedSession["ptyProcess"],
+          ready: Promise.resolve({ resumeFailed: false }),
+        };
+      },
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!, { manuallyRequested: true });
+
+    expect(launchCount).toBe(1);
+    expect(confirm.calls.some((c) => c.text.includes('Session "fix-bug" resumed.'))).toBe(true);
+  });
+
+  // Live-confirmed 2026-08-12: `ptyProcessBySlug` is this process's own in-memory view, empty
+  // after any Bridge restart - it has no record of a still-running previous process for this slug,
+  // so a resume that doesn't check the OS directly spawns a second `claude` on top of the first.
+  // Three such orphans piled up in one afternoon of repeated resume attempts, each dying silently
+  // later with no trace in the log. `resumeSession` now probes the row's own last-known `ptyPid`
+  // and kills it first when it's still alive.
+  test("resumeSession kills a still-alive previous process for this slug before spawning its replacement", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "dead", ptyPid: 9999 }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const resumedPty = fakePty();
+    const killed: number[] = [];
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      isPidAlive: (pid) => pid === 9999,
+      killProcess: (pid) => {
+        killed.push(pid);
+      },
+      launchSession: () => ({
+        worktreePath: "c:\\data\\worktrees\\fix-bug",
+        branch: "claude/fix-bug-1",
+        ptyProcess: resumedPty as unknown as LaunchedSession["ptyProcess"],
+        ready: Promise.resolve({ resumeFailed: false }),
+      }),
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!, { manuallyRequested: true });
+
+    expect(killed).toEqual([9999]);
+  });
+
+  test("resumeSession does not attempt a kill when the row's previous pid is no longer alive (the ordinary case)", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "dead", ptyPid: 9999 }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const resumedPty = fakePty();
+    const killed: number[] = [];
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      isPidAlive: () => false,
+      killProcess: (pid) => {
+        killed.push(pid);
+      },
+      launchSession: () => ({
+        worktreePath: "c:\\data\\worktrees\\fix-bug",
+        branch: "claude/fix-bug-1",
+        ptyProcess: resumedPty as unknown as LaunchedSession["ptyProcess"],
+        ready: Promise.resolve({ resumeFailed: false }),
+      }),
+    });
+
+    await supervisor.resumeSession(sessionStore.get("fix-bug")!, { manuallyRequested: true });
+
+    expect(killed).toEqual([]);
+  });
+
+  test("resumeSession still relaunches even if killing the stale previous process throws (e.g. it exited in the gap between the probe and the kill)", async () => {
+    const sessionStore = new SessionStore(":memory:");
+    sessionStore.insert(row({ state: "dead", ptyPid: 9999 }));
+    const routing = new Routing();
+    const confirm = fakeConfirm();
+    const resumedPty = fakePty();
+    let launchCount = 0;
+    const supervisor = createSessionSupervisor({
+      sessionStore,
+      routing,
+      controlBot: fakeControlBot(),
+      confirmSessionCommand: confirm.fn,
+      supergroupChatId: "-100",
+      selfCheckSlug: "selfcheck",
+      isPidAlive: () => true,
+      killProcess: () => {
+        throw new Error("ESRCH: no such process");
+      },
       launchSession: () => {
         launchCount += 1;
         return {

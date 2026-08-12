@@ -73,6 +73,15 @@ export interface SessionSupervisorOptions {
    * `resumeFailed` branch and the whole crash-resume loop are otherwise only reachable by actually
    * spawning a `claude` PTY process. Defaults to the real `launchSession`. */
   launchSession?: (opts: SessionLaunchOptions) => LaunchedSession;
+  /** Injectable in place of the real OS pid-liveness probe (`process.kill(pid, 0)`, a read-only
+   * signal) - shared by boot reconciliation's `reconcile()` call and `resumeSession`'s stale-orphan
+   * check below. Defaults to the real probe; tests inject a fake so a fixture row's arbitrary
+   * `ptyPid` never actually signals whatever real OS process happens to own that number. */
+  isPidAlive?: (pid: number) => boolean;
+  /** Injectable in place of the real `process.kill` - only `resumeSession`'s stale-orphan-before-
+   * relaunch check (below) needs this. Defaults to the real kill; tests inject a fake to assert a
+   * kill was requested without ever sending a real signal to a fixture's pid. */
+  killProcess?: (pid: number) => void;
   /** Best-effort consume-and-delete for a topic's pending "🤔 Thinking..." placeholder (§5,
    * thinking-placeholder.ts), pre-built by the composition root the same way `confirmSessionCommand`
    * is - this module only knows a `ChatActionSource`, not the send/delete/governor plumbing needed
@@ -145,6 +154,7 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
   const delay = opts.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const usageWaiters = opts.usageWaiters ?? new Map<string, { buffer: string; check: () => void }>();
   const launchSession = opts.launchSession ?? realLaunchSession;
+  const killProcess = opts.killProcess ?? ((pid: number) => process.kill(pid));
   const sendResumeNudge = opts.sendResumeNudge;
 
   const ptyProcessBySlug = new Map<string, pty.IPty>();
@@ -189,15 +199,17 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
    * lands on `resume`. Scoped to every slug except the hardcoded self-check one, which the
    * composition root already launches fresh unconditionally rather than resuming.
    */
-  function isPidAlive(pid: number): boolean {
-    if (!pid) return false;
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  }
+  const isPidAlive =
+    opts.isPidAlive ??
+    ((pid: number): boolean => {
+      if (!pid) return false;
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    });
 
   /** §4.5's "row exists, topic deleted in Telegram" row: probed live (there's no `getForumTopic`
    * to just ask - see `topic-probe.ts`) before spending a resume attempt on a topic nothing can be
@@ -554,6 +566,26 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
     // `/auto permission`'s restart gap). See `hydrateFromRow`'s own doc comment for why this isn't
     // `setMode`/`setBypass`/`setAutoAnswer`.
     routing.hydrateFromRow(slug, current);
+    // Live-confirmed 2026-08-12: `ptyProcessBySlug` is this *process's own* view of what's
+    // running, empty after any full Bridge restart - it has no memory of `current.ptyPid`'s
+    // process even though that process itself is very likely still alive (this stack's `claude`
+    // survives a Bridge restart just fine, only the Bridge's handle to it is lost). Resuming
+    // without checking left that old process running untracked while a brand-new one was spawned
+    // on top of the same worktree/`session_id` - three such orphans piled up in one afternoon
+    // across repeated resume attempts, and every one of them died silently (no `SessionEnd`, no
+    // exit log) once the Bridge finally restarted enough times to notice them. Unlike
+    // `reportOrphanProcesses`'s deliberately-hands-off stance on *unrecognized* processes (killing
+    // is the operator's call there), this pid is fully identified - it's precisely the process this
+    // same relaunch is about to replace - so killing it first isn't a heuristic guess, it's the
+    // other half of the resume this call already committed to doing.
+    if (isPidAlive(current.ptyPid)) {
+      log("WARN", `session "${slug}"'s previous process (pid ${current.ptyPid}) is still running - killing it before spawning its replacement`);
+      try {
+        killProcess(current.ptyPid);
+      } catch (err) {
+        log("WARN", `failed to kill session "${slug}"'s stale pid ${current.ptyPid}: ${(err as Error).message}`);
+      }
+    }
     try {
       const session = launchSession({
         slug,
