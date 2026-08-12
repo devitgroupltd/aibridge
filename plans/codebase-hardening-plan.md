@@ -1,7 +1,7 @@
 ---
-version: 1.3.0
+version: 1.4.0
 status: solid
-last_modified_utc: 2026-08-12T18:44:34Z
+last_modified_utc: 2026-08-12T19:21:30Z
 changelog:
   - "0.1.0 (2026-08-12): Frontmatter added — plan previously lacked valid frontmatter"
   - "1.0.0 (2026-08-12): /plan-craft full review. Re-verified every finding against current source: P0-1–P0-4, P1-1–P1-8 (except its still-open test-gap list), and P2-1–P2-6 were already fixed by commit `a511834` (2026-08-09, same day as the audit) — this document's \"Nothing here has been applied yet\" framing has been stale since that commit landed. Restructured around that: only P0-5 (added earlier today) is a live finding; everything else moved to a compact ## Resolved record. Trimmed \"Missing tests\" from 10 items to the 1 (5b/P0-5) that isn't already covered — 9 of 10 already have passing tests. Corrected P1-5's \"statements are never finalized\" overstatement (bun:sqlite finalizes via GC; the real fix was re-parse cost). Refined P0-5's fix direction to reuse the existing `turn_card_msg`-column persistence pattern instead of proposing a new mechanism, noted that `RESUME_NUDGE_FOLLOWUP_DELAY_MS`'s follow-up nudge shares the same in-memory-only limitation (not a mitigation), and flagged Telegram's bot-message edit-age limit as unverified from docs (defensive fallback recommended). Rewrote \"Suggested sequencing\" and \"Verification per stage\" to reflect only the remaining work."
@@ -10,6 +10,7 @@ changelog:
   - "1.1.2 (2026-08-12): /plan-craft pass 4. fleet-commands.test.ts's count had already drifted again mid-review (133 → 140, the file is under active development concurrently with this review) — corrected and added a note that any cited test count here is a point-in-time snapshot, not a fact to defend. Cross-plan and codebase re-verification passes both now report zero remaining findings — marked solid."
   - "1.2.0 (2026-08-12): implemented P0-5 and the remaining P2-2 setter cleanup for real, not just documented. P0-5: added a nullable `thinking_placeholder_msg` SessionStore column (same shape as `turn_card_msg`), a `persist` hook on `thinking-placeholder.ts`'s `start`/`consume` (covers every placeholder, not just resume-nudge ones - no special-casing needed since the nudge already shares `sendChannelText`), and a `relabelStalePlaceholder` callback `runStartupReconciliation` now calls for any leftover from the previous process, edited to an honest \"interrupted by a restart\" notice instead of staying \"Thinking...\" forever. P2-2: added the private `setColumn` every typed setter now delegates to. 8 new tests (`thinking-placeholder.test.ts`, `session-supervisor.test.ts`); `tsc --noEmit` clean across all 5 packages; 1632/1632 tests passing monorepo-wide. Moved both to ## Resolved, removed the now-empty P0-5 open section and the P2-2 Still-open entry, closed out missing-test item 1, and rewrote Suggested sequencing/Verification per stage around the one thing not yet done: a live restart-test against the real Bridge, deliberately left for the operator to trigger rather than done unprompted."
   - "1.2.1 (2026-08-12): P0-5 live-verified against the real Bridge, per operator request. Two real restarts against a throwaway session (`p0-5-check`), reproducing the `unify-work-with-voice-and` scenario exactly: both placeholders got correctly relabeled to \"Interrupted by a restart - resuming...\", none left stuck; the pre-existing lost-pending-question mechanism fired correctly alongside it with no interference. Throwaway session killed and removed afterward. Removed stage 1 (P0-5 live-verify) from Suggested sequencing - only the P1-8 test-gap stage remains."
+  - "1.4.0 (2026-08-12): new finding P0-6, found and fixed the same evening from a real incident - `resolveHookClientBinary`'s stale-binary rebuild threw out of `execFileSync` on the launch path (Windows `EPERM`: `bun build --compile` can't replace a mapped `.exe`, and a blocked `--ask` hook client keeps the old one mapped indefinitely), surfacing as an uncaught exception that killed the daemon seconds after a `/restart` and took the whole fleet down over a merely-stale binary. Extracted `ensureHookBinary` (fresh/stale/missing state + degrade-to-existing-binary-with-WARN on failure, rethrowing only when there is no binary at all), stopped caching a degraded resolution so the next launch retries, and threaded the launch `log` through. Second half of the same incident: bun orphans a ~94MB `.<hash>-NNNNNNNN.bun-build` temp file in the *package* dir (not `dist/`) when the rename fails, so it showed up as untracked in `git status` - `*.bun-build` added to `.gitignore`, with the sweep-on-failure alternative deliberately rejected (a concurrent launch's in-progress build writes an indistinguishable temp file). 7 new tests; `tsc --noEmit` clean across all 5 packages; 1704/1704 passing; live-verified by a real restart."
   - "1.3.0 (2026-08-12): closed out the last open item - P1-8's remaining test gaps - for real, not just documented. card-senders.ts/fleet-reporting-commands.ts got real wiring/guard coverage (their own doc comments' low-risk claim confirmed, not assumed). channel-server/src/index.ts and hook-client/src/index.ts were both genuinely untestable as entry-point scripts, so each got a small, behavior-preserving extraction (channel-handlers.ts, run-hook.ts) making the real dispatch logic injectable. send-once.ts got real socket-level tests despite its own doc comment arguing against them, surfacing a real bun-vs-Node socket-backpressure difference worth recording. protocol/src/types.ts (no runtime behavior beyond assertValidBehavior, already covered elsewhere) got a compile-time exhaustiveness check locking the Message union's own completeness. 61 new tests; tsc --noEmit clean across all 5 packages; 1697/1697 passing monorepo-wide. Nothing remains open in this document - Suggested sequencing is now empty by design."
 v100_touched_sections:
   - section: "Overall read"
@@ -111,6 +112,16 @@ v130_touched_sections:
   - section: "Verification per stage"
     type: modified
     summary: "Recorded the final bun test/tsc results (1697/1697, clean)."
+v140_touched_sections:
+  - section: "Overall read"
+    type: modified
+    summary: "Records P0-6 (hook-binary rebuild failure killed the daemon), found from a live incident on 2026-08-12 and fixed the same evening; updates the test/typecheck totals."
+  - section: "Resolved (verified against current code, 2026-08-12)"
+    type: modified
+    summary: "Added the P0-6 record: ensureHookBinary's degrade-instead-of-throw fix plus the *.bun-build gitignore half, including the rejected sweep-on-failure alternative."
+  - section: "Verification per stage"
+    type: modified
+    summary: "Recorded P0-6's results (1704/1704, tsc clean) and its live restart verification against the real dev Bridge."
 ---
 
 # aibridge codebase hardening plan
@@ -136,10 +147,11 @@ whoever reads those plans next, not something this document can fix on its own.
 
 **Every finding in this document has been implemented, tested, and (where it was a live behavioral
 bug rather than a documentation/cleanup item) live-verified, as of 2026-08-12** — P0-5's persist-and-
-relabel mechanism, P2-2's setter cleanup, and P1-8's remaining test gaps all closed the same day.
-`tsc --noEmit` is clean across all 5 packages; the full suite is at 1697/1697 tests passing. Nothing
-in this document is currently open. Every item is recorded compactly under **## Resolved** for
-traceability rather than deleted outright.
+relabel mechanism, P2-2's setter cleanup, P1-8's remaining test gaps, and P0-6 (added late the same
+evening from a real fleet-down incident) all closed the same day. `tsc --noEmit` is clean across all
+5 packages; the full suite is at 1704/1704 tests passing. Nothing in this document is currently open.
+Every item is recorded compactly under **## Resolved** for traceability rather than deleted
+outright.
 
 ---
 
@@ -149,6 +161,36 @@ All items below were open in the 2026-08-09 audit and confirmed fixed in commit 
 day) unless noted otherwise. Kept as a compact record for traceability — see that commit for
 implementation detail.
 
+- **P0-6** (a failed hook-client rebuild on the launch path killed the whole daemon - live incident
+  2026-08-12 19:07Z, found while asking why an untracked `.bun-build` file was in `git status`) —
+  found and fixed the same evening; not part of the 2026-08-09 audit. `resolveHookClientBinary`'s
+  staleness check (added for the good reason recorded at `newestSourceMtimeMs`: a stale binary had
+  silently kept running old behaviour once already) called `execFileSync("bun build --compile")`
+  unguarded. On Windows that rename cannot replace a *mapped* executable, and hook clients invoked
+  with `--ask` block indefinitely by design (§5.1), so two hook processes left over from an
+  unanswered question - alive ~57 minutes - were enough to make every rebuild fail with
+  `failed to move executable to ...\dist\aibridge-hook.exe: EPERM`. The throw propagated out of
+  `launchSession` as `uncaught exception` and killed the Bridge ~2s after a `/restart` had relaunched
+  it, i.e. the entire fleet went down because a binary was *newer in source than on disk* - strictly
+  worse than running the previous build for one more session. Fix: a new exported
+  `ensureHookBinary({exePath, state, build, log})` with an explicit `fresh | stale | missing` state;
+  `stale` + build failure now logs a WARN naming the likely cause and the manual
+  `bun run build` recovery, and returns the existing binary, while `missing` (nothing to degrade to)
+  still rethrows. A degraded resolution is deliberately not written to `cachedHookClientPath`, so the
+  next launch retries instead of pinning the daemon's whole lifetime to one transient `EPERM`. The
+  launch-path `log` is threaded in so the WARN actually reaches `bridge.log`. Second half of the same
+  incident, tooling: bun writes the whole ~94MB binary to a `.<hash>-NNNNNNNN.bun-build` temp file in
+  the *package* dir - not `dist/`, so the existing `dist/` ignore never covered it - and orphans it
+  when the rename fails, which is how this surfaced. `*.bun-build` added to `.gitignore` with a
+  comment pointing at `ensureHookBinary`. Sweeping orphaned temps on failure was considered and
+  rejected: a concurrent launch's in-progress build writes an indistinguishable temp file into the
+  same directory, so a pattern delete could break a build that was about to succeed - disk cleanup
+  stays manual, and the doc comment says so. 7 new tests (`session-launcher.test.ts`'s
+  `ensureHookBinary` block: each state's build-or-skip decision, the stale-degrade path including
+  WARN content, the missing-rethrow path, a non-`Error` throw, and a degrade with no log callback);
+  `tsc --noEmit` clean across all 5 packages; 1704/1704 passing. Live-verified - the two wedged
+  `--ask` processes cleared, the orphan deleted, `bun run build` landed the pending source edit, and
+  the daemon restarted clean (pid 13364) and relaunched its session with no `EPERM`.
 - **P0-5** (a resume nudge's "🤔 Thinking..." placeholder couldn't survive the Bridge restart that
   triggered it - live-confirmed 2026-08-12, `unify-work-with-voice-and`) — fixed 2026-08-12, same
   day as the write-up. Added a nullable `thinking_placeholder_msg` column to `SessionStore` (same
@@ -280,10 +322,17 @@ than removed outright, so a future finding added to this plan has an obvious pla
 
 ## Verification per stage
 
-- `bun test` — 1697/1697 passing as of the P1-8 test-gap closeout (2026-08-12, the final pass);
-  the plan's original "1255 baseline" predates `a511834`'s own test additions and was already
-  stale even at the time this document was first written.
+- `bun test` — 1704/1704 passing as of P0-6 (2026-08-12, the final pass; 1697 at the P1-8 test-gap
+  closeout earlier the same day). The plan's original "1255 baseline" predates `a511834`'s own test
+  additions and was already stale even at the time this document was first written.
 - `tsc --noEmit` per package — clean across all 5 packages as of the same commit.
+- **P0-6 live-verified 2026-08-12** against the real dev Bridge, which was dead at the time from the
+  very exception this finding is about: killed the two wedged `--ask` hook clients that had been
+  holding `dist/aibridge-hook.exe` mapped, deleted the orphaned 94MB `.bun-build` temp, rebuilt the
+  binary by hand (612ms, succeeded once nothing held the file), and restarted the daemon - which came
+  up clean and relaunched its session with no `EPERM` and no rebuild WARN in `bridge-dev.log`. The
+  degrade path itself is covered by unit tests rather than reproduced live, since forcing it again
+  would mean deliberately wedging a hook process on the real fleet.
 - **P0-5 live-verified 2026-08-12** via `scripts/telegram-automation/`, against a real throwaway
   session (`p0-5-check`) and two real Bridge restarts, reproducing the exact `unify-work-with-voice-and`
   scenario that surfaced this finding: sent an inbound message (creates a placeholder), restarted

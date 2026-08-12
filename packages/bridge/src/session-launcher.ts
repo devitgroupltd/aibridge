@@ -121,6 +121,61 @@ function newestSourceMtimeMs(srcDir: string): number {
  */
 let cachedHookClientPath: string | undefined;
 
+/**
+ * Whether the compiled hook binary needs a rebuild, and - when it does - whether there is an older
+ * one to fall back on. The distinction matters only on the failure path: a *stale* binary is still
+ * a working binary (it just predates the newest source edit), while a *missing* one leaves nothing
+ * to launch a session with.
+ */
+export type HookBinaryState = "fresh" | "stale" | "missing";
+
+export interface HookBinaryResolution {
+  path: string;
+  /**
+   * A rebuild was attempted, failed, and the pre-existing binary is being reused. Deliberately
+   * *not* cached by the caller, so the next launch retries the build once whatever blocked it is
+   * gone.
+   */
+  degraded: boolean;
+}
+
+/**
+ * The build half of `resolveHookClientBinary`, split out so the "what happens when the rebuild
+ * fails" branch is decidable without shelling out to a real `bun build`.
+ *
+ * Why it degrades rather than throwing: live-observed 2026-08-12. Windows refuses to replace a
+ * mapped executable, so `bun build --compile`'s final rename fails with `EPERM` ("failed to move
+ * executable to ...\dist\aibridge-hook.exe") whenever *any* hook-client process still holds the old
+ * binary open - and `--ask` invocations block indefinitely by design (§5.1), so one unanswered
+ * question is enough to wedge every subsequent rebuild. That threw out of `execFileSync` on the
+ * launch path, which surfaced as `uncaught exception` and killed the whole daemon seconds after a
+ * `/restart`, taking the entire fleet down over a *stale binary* - a strictly worse outcome than
+ * running the previous build for one more session. Only the `missing` case is genuinely fatal, and
+ * it rethrows.
+ *
+ * The orphaned `.<hash>-NNNNNNNN.bun-build` temp file bun leaves behind on a failed rename is not
+ * swept here on purpose: a concurrent launch's in-progress build writes an indistinguishable temp
+ * file into the same directory, so deleting by pattern could break a build that was about to
+ * succeed. `.gitignore` keeps it out of `git status` instead; disk cleanup stays manual.
+ */
+export function ensureHookBinary(opts: { exePath: string; state: HookBinaryState; build: () => void; log?: LogFn }): HookBinaryResolution {
+  if (opts.state === "fresh") return { path: opts.exePath, degraded: false };
+  try {
+    opts.build();
+  } catch (error) {
+    if (opts.state === "missing") throw error;
+    const detail = error instanceof Error ? error.message : String(error);
+    opts.log?.(
+      "WARN",
+      `hook client rebuild failed - reusing the existing (stale) binary at ${opts.exePath}, so a source edit may not be live yet. ` +
+        `On Windows this is usually a still-running hook process holding the file open (a blocked --ask); ` +
+        `\`bun run build\` in packages/hook-client once no session is mid-question to pick the edit up. Cause: ${detail}`,
+    );
+    return { path: opts.exePath, degraded: true };
+  }
+  return { path: opts.exePath, degraded: false };
+}
+
 /** §5.8: the desktop-capture helper (System.Drawing screenshot, whole desktop or one named
  * window) - a plain asset file, not a compiled binary like the hook client, so there is nothing
  * to build here, only a path to resolve once. */
@@ -128,20 +183,30 @@ function resolveScreenshotScriptPath(): string {
   return path.resolve(import.meta.dirname, "../assets/screenshot-desktop.ps1");
 }
 
-function resolveHookClientBinary(): string {
+function resolveHookClientBinary(log?: LogFn): string {
   if (cachedHookClientPath) return cachedHookClientPath;
   const packageDir = path.resolve(import.meta.dirname, "../../hook-client");
   const srcDir = path.join(packageDir, "src");
   const exeName = process.platform === "win32" ? "aibridge-hook.exe" : "aibridge-hook";
   const exePath = path.join(packageDir, "dist", exeName);
-  const stale = !existsSync(exePath) || statSync(exePath).mtimeMs < newestSourceMtimeMs(srcDir);
-  if (stale) {
-    execFileSync(resolveBunExecutable(), ["build", "--compile", "src/index.ts", "--outfile", path.join("dist", "aibridge-hook")], {
-      cwd: packageDir,
-    });
-  }
-  cachedHookClientPath = exePath;
-  return exePath;
+  const state: HookBinaryState = !existsSync(exePath)
+    ? "missing"
+    : statSync(exePath).mtimeMs < newestSourceMtimeMs(srcDir)
+      ? "stale"
+      : "fresh";
+  const { path: resolved, degraded } = ensureHookBinary({
+    exePath,
+    state,
+    build: () =>
+      void execFileSync(resolveBunExecutable(), ["build", "--compile", "src/index.ts", "--outfile", path.join("dist", "aibridge-hook")], {
+        cwd: packageDir,
+      }),
+    log,
+  });
+  // Not cached when degraded: the next launch should retry the build rather than pin the whole
+  // daemon's lifetime to one transient EPERM.
+  if (!degraded) cachedHookClientPath = resolved;
+  return resolved;
 }
 
 type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
@@ -373,7 +438,7 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   // requirement as the `.claude.json` registrations above. Resolving the hook client binary can
   // trigger a one-time `bun build --compile`, so it happens before the settings file (and
   // therefore the spawn) rather than racing it.
-  const settingsPath = writeSettingsFile(opts.stateDir ?? STATE_DIR, opts.slug, generateSettings(resolveHookClientBinary(), opts.otlpPort));
+  const settingsPath = writeSettingsFile(opts.stateDir ?? STATE_DIR, opts.slug, generateSettings(resolveHookClientBinary(log), opts.otlpPort));
   log("INFO", `wrote permission settings baseline to ${settingsPath}`);
 
   // §10.1: `--channels plugin:aibridge-telegram@devitgroup-plugins` - the fleet's real default as
