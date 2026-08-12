@@ -1,15 +1,17 @@
 import type { AttachmentKind } from "./attachment-inbox.ts";
 import { attachmentKindLabel, buildAttachmentAnnouncement, guessAttachmentFilename, TELEGRAM_MAX_DOWNLOAD_BYTES, writeAttachmentToInbox } from "./attachment-inbox.ts";
 import { fireAndForget } from "./fire-and-forget.ts";
-import type { FleetCommand } from "./fleet-commands.ts";
+import type { FleetCommand, PendingAttachment } from "./fleet-commands.ts";
 import { isKnownCommandText, parseFleetCommand } from "./fleet-commands.ts";
 import { buildContextPrefix, type MessageOrigin } from "./message-context.ts";
 import { randomUUID } from "node:crypto";
-import { routeText as realRouteText } from "./nl-router.ts";
+import { routeText as realRouteText, type RouterAction } from "./nl-router.ts";
 import type { RateGovernor } from "./rate-governor.ts";
 import type { ReposRegistry } from "./repos-registry.ts";
+import { buildRepoPickKeyboard, type RepoPickRegistry } from "./repo-picker.ts";
 import { isRetryPhrase } from "./retry-store.ts";
 import type { Routing, SessionRoute } from "./routing.ts";
+import type { Model } from "./session-commands.ts";
 import type { SessionStore } from "./session-store.ts";
 import { buildStaleConfirmKeyboard, type StaleConfirmRegistry } from "./stale-confirm.ts";
 import { formatStaleAge, hasAttachment, isStaleInbound } from "./stale-inbound.ts";
@@ -67,6 +69,12 @@ export interface InboundMediaOptions {
    * the control topic falls back to today's plain rejection reply, same as any other malformed
    * caption. See that plan's Attachment-to-Session Handoff section for why this exists. */
   disableCaptionNew: boolean;
+  /** Ambiguous-repo gap fix: the same registry `nl-dispatch.ts`'s `postRepoPick`/`callback-query-
+   * router.ts`'s `"rp:"` rule already use for a typed/NL `/new` that never named one of 2+
+   * registered repos. A caption that NL-matches session-creation intent without naming a repo used
+   * to fall straight through to the fixed rejection reply and silently drop the attachment - this
+   * lets the caption path raise the same ask-which-repo card, with the attachment riding along. */
+  repoPickRegistry: RepoPickRegistry;
   /** Feature A of the caption-triggered `/new` follow-up: when a control-topic attachment's caption
    * isn't literal `/new <repo> <prompt>` syntax, route it through the same NL-router
    * (`nl-router.ts`'s `routeText`) every other unmatched control-topic message already goes through,
@@ -140,6 +148,7 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     dispatchInboundMessage,
     createSessionFromAttachment,
     disableCaptionNew,
+    repoPickRegistry,
     nlRouterConfig,
     getNlRouterBackend,
     getReposRegistry,
@@ -301,7 +310,9 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
    * since there's no existing precedent for running non-`/new` commands from an image caption and
    * widening that surface isn't this feature's job. `/assist`'s confirm gate never applies either
    * way - `new` is never in `isDestructive`'s set (nl-router.ts), same as a typed NL `/new` today. */
-  async function routeCaptionToNewCommand(caption: string): Promise<Extract<FleetCommand, { kind: "new" }> | null> {
+  async function routeCaptionToNewCommand(
+    caption: string,
+  ): Promise<Extract<FleetCommand, { kind: "new" }> | Extract<RouterAction, { kind: "new_pick_repo" }> | null> {
     if (!nlRouterConfig.enabled) return null;
     const result = await routeText(
       caption,
@@ -309,8 +320,43 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
       { ...nlRouterConfig, backend: getNlRouterBackend() },
       log,
     );
-    if (!result.matched || result.command.kind !== "new") return null;
-    return result.command;
+    if (!result.matched) return null;
+    // `new_pick_repo` is included alongside `new` (widened from a `kind !== "new"` narrow-and-reject
+    // check) - the ambiguous-repo gap fix below: a caption that NL-matches session-creation intent
+    // without naming one of 2+ registered repos used to be treated the same as a non-`new` match
+    // (e.g. "list my sessions") and fall straight through to the fixed rejection reply.
+    if (result.command.kind === "new" || result.command.kind === "new_pick_repo") return result.command;
+    return null;
+  }
+
+  /** Attachment-caption equivalent of `nl-dispatch.ts`'s `postRepoPick` - same ask-which-repo
+   * keyboard (repo-picker.ts) and registry, raised here instead for a control-topic attachment whose
+   * caption NL-matched session-creation intent without naming one of 2+ registered repos. Carries
+   * `pendingAttachment` along in the registry entry so a tap on `"rp:"` still attaches the image/
+   * document/etc. (`callback-query-router.ts`'s `repoPick` rule) rather than silently dropping it -
+   * the gap this whole function exists to close. */
+  async function postRepoPickForAttachment(
+    prompt: string,
+    model: Model | undefined,
+    sourceText: string,
+    threadId: number | undefined,
+    pendingAttachment: PendingAttachment,
+  ): Promise<void> {
+    const repoNames = getReposRegistry()?.names() ?? [];
+    const id = randomUUID().slice(0, 8);
+    try {
+      const sent = await controlBot.sendMessage(
+        supergroupChatId,
+        threadId,
+        // `attachmentKindLabel` already carries its own article ("a document"/"an image" -
+        // attachment-inbox.ts's own doc comment) - no "the" in front, or this reads "the a document".
+        `🤖 Which repo should I start "${prompt}" against? (attaching ${attachmentKindLabel(pendingAttachment.kind)} you sent)`,
+        { inline_keyboard: buildRepoPickKeyboard(id, repoNames) },
+      );
+      repoPickRegistry.add({ id, prompt, sourceText, model, threadId, messageId: sent.message_id, pendingAttachment });
+    } catch (err) {
+      log("WARN", `failed to post repo-pick card for attachment: ${(err as Error).message}`);
+    }
   }
 
   async function handleControlTopicAttachment(
@@ -334,7 +380,7 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     // just to be told it doesn't match "new" either, before the same rejection reply as before).
     // Resolved once, up front, rather than re-derived from `isLiteralNew`/`nlCmd` booleans at each
     // use site - `matched === literalCmd` below is what tells the literal and NL paths apart.
-    const matched: Extract<FleetCommand, { kind: "new" }> | null =
+    const matched: Extract<FleetCommand, { kind: "new" }> | Extract<RouterAction, { kind: "new_pick_repo" }> | null =
       literalCmd?.kind === "new" ? literalCmd : caption && !literalCmd ? await routeCaptionToNewCommand(caption) : null;
     if (!matched) {
       confirmSessionCommand(threadId, rejection);
@@ -343,9 +389,16 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     const downloaded = await downloadAttachment(kind, fileId, fileSize, fileName, mimeType, threadId);
     if (!downloaded) return;
     // `rawCaption` only set for the NL path - the literal path's `cmd.prompt` is already verbatim
-    // (see PendingAttachment's own doc comment).
+    // (see PendingAttachment's own doc comment). `literalCmd` is never `new_pick_repo` (only
+    // `parseFleetCommand`'s literal grammar can produce it, and that grammar has no such kind), so
+    // `matched.kind === "new_pick_repo"` below always means this is the NL path and `rawCaption` is set.
     const rawCaption = matched === literalCmd ? undefined : caption;
-    await createSessionFromAttachment({ ...matched, pendingAttachment: { kind, name: downloaded.name, bytes: downloaded.bytes, rawCaption } }, threadId);
+    const pendingAttachment: PendingAttachment = { kind, name: downloaded.name, bytes: downloaded.bytes, rawCaption };
+    if (matched.kind === "new_pick_repo") {
+      await postRepoPickForAttachment(matched.prompt, matched.model, rawCaption ?? "", threadId, pendingAttachment);
+      return;
+    }
+    await createSessionFromAttachment({ ...matched, pendingAttachment }, threadId);
   }
 
   /** Inbound photos/documents/videos/audio/video-notes (§5.6): downloaded into the session's own

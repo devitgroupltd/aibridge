@@ -377,6 +377,9 @@ async function main(): Promise<void> {
     // anything else, given this plan documents a couple of risks (the widened slug race, git
     // worktree collisions) it deliberately doesn't fully close.
     disableCaptionNew: process.env.AIBRIDGE_DISABLE_CAPTION_NEW === "1",
+    // Ambiguous-repo gap fix: same registry `nlDispatch`'s own construction further down passes to
+    // `callback-query-router.ts` - already constructed by this point (`repoPickRegistry`, above).
+    repoPickRegistry,
     // Feature A of the caption-triggered `/new` follow-up: NL-router fallback for a freeform
     // caption. Plain values/getters (not `LateBound`) - both already exist by this point in the
     // composition root, same as `nlDispatch`'s own construction further down uses.
