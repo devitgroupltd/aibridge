@@ -42,7 +42,7 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
   const staleConfirmRegistry = new StaleConfirmRegistry();
   const voiceConfirmRegistry = new VoiceConfirmRegistry();
   const repoPickRegistry = new RepoPickRegistry();
-  const dispatched: Array<{ messageId: number; rawText: string; threadId: number | undefined; replyToText: string | undefined }> = [];
+  const dispatched: Array<{ messageId: number; rawText: string; threadId: number | undefined; currentSlug: string | undefined; replyToText: string | undefined }> = [];
   const confirmed: Array<{ topicId: number | undefined; text: string }> = [];
   const createdFromAttachment: Array<{ cmd: unknown; controlTopicId: number | undefined }> = [];
   const inboundMedia = createInboundMedia({
@@ -56,8 +56,8 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
     confirmSessionCommand: (topicId, text) => {
       confirmed.push({ topicId, text });
     },
-    dispatchInboundMessage: async (messageId, rawText, threadId, _isControl, _route, _currentSlug, _from, _contextPrefix, replyToText) => {
-      dispatched.push({ messageId, rawText, threadId, replyToText });
+    dispatchInboundMessage: async (messageId, rawText, threadId, _isControl, _route, currentSlug, _from, _contextPrefix, replyToText) => {
+      dispatched.push({ messageId, rawText, threadId, currentSlug, replyToText });
     },
     createSessionFromAttachment: async (cmd, controlTopicId) => {
       createdFromAttachment.push({ cmd, controlTopicId });
@@ -119,7 +119,7 @@ describe("createInboundMedia", () => {
       inboundMedia.routeInboundMessage(message({ message_thread_id: 5, text: "hello" }));
       await Promise.resolve();
 
-      expect(dispatched).toEqual([{ messageId: 1, rawText: "hello", threadId: 5, replyToText: undefined }]);
+      expect(dispatched).toEqual([{ messageId: 1, rawText: "hello", threadId: 5, currentSlug: "fix-bug", replyToText: undefined }]);
     });
 
     test("a message in an unrouted, unknown topic with no known command is dropped", async () => {
@@ -138,7 +138,45 @@ describe("createInboundMedia", () => {
       inboundMedia.routeInboundMessage(message({ message_thread_id: 999, text: "/help" }));
       await Promise.resolve();
 
-      expect(dispatched).toEqual([{ messageId: 1, rawText: "/help", threadId: 999, replyToText: undefined }]);
+      expect(dispatched).toEqual([{ messageId: 1, rawText: "/help", threadId: 999, currentSlug: undefined, replyToText: undefined }]);
+    });
+
+    test("a bare slug-optional command resolves currentSlug from the session store when a dead row's topic has lost its routing entry", async () => {
+      // Mirrors reconciliation.ts's own behavior (`if (row.state === "dead") continue`): a dead
+      // row is never re-added to `routing` on restart, so `routing.getByTopicId` alone can't find
+      // it - `sessionStore.getByTopicId` is what still has it. `/resume [<slug>]` (and every other
+      // slug-optional fleet command) falls back to `currentSlug` for its "no explicit slug - use
+      // the topic this arrived in" resolution (session-lifecycle-commands.ts's `resolveTargetSlug`)
+      // and needs this to actually be the slug, not `undefined`, live-confirmed 2026-08-12: a bare
+      // `/resume` inside a dead session's own topic answered "usage: <command> <slug> ..." instead
+      // of resuming it.
+      const { inboundMedia, sessionStore, dispatched } = await setup();
+      sessionStore.insert({
+        slug: "fix-bug",
+        topicId: 5,
+        sessionId: "abc123",
+        worktreePath: routeWorktreeDir,
+        branch: "claude/fix-bug",
+        repoPath: routeWorktreeDir,
+        model: "sonnet",
+        ptyPid: 0,
+        state: "dead",
+        turnCardMsg: null,
+        paused: false,
+        renamed: false,
+        feedDetail: "compact",
+        feedVerbose: false,
+        bypassPermission: false,
+        autoAnswer: false,
+        mode: "default",
+        createdUtc: new Date().toISOString(),
+        lastEventUtc: new Date().toISOString(),
+      });
+
+      inboundMedia.routeInboundMessage(message({ message_thread_id: 5, text: "/resume" }));
+      await Promise.resolve();
+
+      expect(dispatched).toEqual([{ messageId: 1, rawText: "/resume", threadId: 5, currentSlug: "fix-bug", replyToText: undefined }]);
     });
 
     // Reply-to-retry follow-up: reply_to_message's text/caption is threaded through to
@@ -154,7 +192,7 @@ describe("createInboundMedia", () => {
         );
         await Promise.resolve();
 
-        expect(dispatched).toEqual([{ messageId: 1, rawText: "retry", threadId: 5, replyToText: "Start a new session for demo-repo" }]);
+        expect(dispatched).toEqual([{ messageId: 1, rawText: "retry", threadId: 5, currentSlug: "fix-bug", replyToText: "Start a new session for demo-repo" }]);
       });
 
       test("falls back to the reply target's caption when it has no text", async () => {
@@ -230,7 +268,7 @@ describe("createInboundMedia", () => {
         );
         await Promise.resolve();
 
-        expect(dispatched).toEqual([{ messageId: 1, rawText: "looks good", threadId: 5, replyToText: "check this bug" }]);
+        expect(dispatched).toEqual([{ messageId: 1, rawText: "looks good", threadId: 5, currentSlug: "fix-bug", replyToText: "check this bug" }]);
       });
     });
 
