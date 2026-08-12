@@ -533,7 +533,7 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
         fireAndForget(confirmCards.finalizeCard(pending.messageId, `✅ Starting a session against "${repoPickAction.repo}"...`), log, "callback-query-router finalizeCard(repoPick run)");
         const pendingIsControl = isControlTopic(pending.threadId);
         nlDispatch.executeMatchedCommand(
-          { kind: "new", repo: repoPickAction.repo, prompt: pending.prompt, model: pending.model, sourceText: pending.sourceText },
+          { kind: "new", repo: repoPickAction.repo, prompt: pending.prompt, model: pending.model, sourceText: pending.sourceText, pendingAttachment: pending.pendingAttachment },
           pending.threadId,
           pendingIsControl,
           undefined,

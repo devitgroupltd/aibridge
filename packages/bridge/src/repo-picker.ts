@@ -1,4 +1,5 @@
 import { ConfirmRegistry, type ConfirmRegistryOptions } from "./confirm-registry.ts";
+import type { PendingAttachment } from "./fleet-commands.ts";
 import type { Model } from "./session-commands.ts";
 import type { InlineKeyboardButton } from "./telegram.ts";
 
@@ -26,6 +27,11 @@ export interface PendingRepoPick {
   threadId: number | undefined;
   messageId: number;
   createdAt: number;
+  /** Set only when this pick was raised from a control-topic attachment's caption
+   * (inbound-media.ts's `handleControlTopicAttachment`) rather than typed/NL-forwarded text - carried
+   * through so a tap still attaches the image/document/etc. instead of silently dropping it, the same
+   * "operator's own words, not the classifier's paraphrase" treatment `sourceText` already gets. */
+  pendingAttachment?: PendingAttachment;
 }
 
 /** Same as `nl-confirm.ts`'s `DEFAULT_TTL_MS` - this card is a step removed from what the operator

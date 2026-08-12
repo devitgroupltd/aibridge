@@ -5,6 +5,7 @@ import path from "node:path";
 import { createInboundMedia } from "../src/inbound-media.ts";
 import { Routing } from "../src/routing.ts";
 import { RateGovernor } from "../src/rate-governor.ts";
+import { RepoPickRegistry } from "../src/repo-picker.ts";
 import { SessionStore } from "../src/session-store.ts";
 import { StaleConfirmRegistry } from "../src/stale-confirm.ts";
 import { VoiceConfirmRegistry } from "../src/voice-confirm.ts";
@@ -40,6 +41,7 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
   const sessionStore = new SessionStore(":memory:");
   const staleConfirmRegistry = new StaleConfirmRegistry();
   const voiceConfirmRegistry = new VoiceConfirmRegistry();
+  const repoPickRegistry = new RepoPickRegistry();
   const dispatched: Array<{ messageId: number; rawText: string; threadId: number | undefined; replyToText: string | undefined }> = [];
   const confirmed: Array<{ topicId: number | undefined; text: string }> = [];
   const createdFromAttachment: Array<{ cmd: unknown; controlTopicId: number | undefined }> = [];
@@ -50,6 +52,7 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
     sessionStore,
     staleConfirmRegistry,
     voiceConfirmRegistry,
+    repoPickRegistry,
     confirmSessionCommand: (topicId, text) => {
       confirmed.push({ topicId, text });
     },
@@ -71,7 +74,7 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
     supergroupChatId: "-100",
     ...overrides,
   });
-  return { inboundMedia, controlBot, routing, sessionStore, staleConfirmRegistry, voiceConfirmRegistry, dispatched, confirmed, createdFromAttachment };
+  return { inboundMedia, controlBot, routing, sessionStore, staleConfirmRegistry, voiceConfirmRegistry, repoPickRegistry, dispatched, confirmed, createdFromAttachment };
 }
 
 // A real temp directory, not a bare string literal - `writeAttachmentToInbox` (attachment-inbox.ts)
@@ -474,6 +477,84 @@ describe("createInboundMedia", () => {
 
           expect(createdFromAttachment).toEqual([]);
           expect(confirmed[0]?.text).toContain("session topic");
+        });
+
+        // Ambiguous-repo gap fix: a caption that NL-matches session-creation intent without naming
+        // one of 2+ registered repos used to be treated the same as any other non-"new" match and
+        // fall straight through to the fixed rejection reply, silently dropping the attachment.
+        describe("NL match to new_pick_repo (ambiguous repo)", () => {
+          test("posts the ask-which-repo card instead of rejecting, and stashes the attachment", async () => {
+            const { inboundMedia, controlBot, confirmed, createdFromAttachment, repoPickRegistry } = await setup({
+              nlRouterConfig: { enabled: true, apiKey: undefined, model: "test-model" },
+              getReposRegistry: () => ({ names: () => ["demo-repo", "other-repo"] }) as never,
+              routeText: async () => ({ matched: true, command: { kind: "new_pick_repo", prompt: "fix the login bug" }, destructive: false }),
+            });
+
+            await inboundMedia.handleAttachmentMessage(
+              "image",
+              "i1",
+              undefined,
+              undefined,
+              undefined,
+              1,
+              undefined,
+              true,
+              1,
+              "create a session and fix the login bug",
+              "op",
+              message(),
+            );
+
+            // No rejection, and no session created yet - creation only happens once a repo is picked.
+            expect(confirmed).toEqual([]);
+            expect(createdFromAttachment).toEqual([]);
+
+            expect(controlBot.sent.length).toBe(1);
+            expect(controlBot.sent[0]?.text).toContain("Which repo");
+            expect(controlBot.sent[0]?.text).toContain("image");
+            const keyboard = controlBot.sent[0]?.keyboard as { inline_keyboard: Array<Array<{ text: string; callback_data: string }>> };
+            const buttons = keyboard.inline_keyboard.flat();
+            expect(buttons.map((b) => b.text)).toEqual(["demo-repo", "other-repo", "❌ Cancel"]);
+
+            // The stashed pending pick carries the attachment bytes and raw caption, ready for a
+            // repo tap (callback-query-router.ts's "rp:" rule) to hand off to createSessionFromAttachment.
+            const id = buttons[0]!.callback_data.split(":")[1]!;
+            const pending = repoPickRegistry.resolve(id);
+            expect(pending?.prompt).toBe("fix the login bug");
+            expect(pending?.sourceText).toBe("create a session and fix the login bug");
+            expect(pending?.pendingAttachment).toMatchObject({
+              kind: "image",
+              name: expect.any(String),
+              bytes: expect.any(Uint8Array),
+              rawCaption: "create a session and fix the login bug",
+            });
+          });
+
+          test("a caption that NL-matches new_pick_repo with an oversized attachment is rejected without ever posting the pick card", async () => {
+            const { inboundMedia, confirmed, controlBot } = await setup({
+              nlRouterConfig: { enabled: true, apiKey: undefined, model: "test-model" },
+              getReposRegistry: () => ({ names: () => ["demo-repo", "other-repo"] }) as never,
+              routeText: async () => ({ matched: true, command: { kind: "new_pick_repo", prompt: "fix the login bug" }, destructive: false }),
+            });
+
+            await inboundMedia.handleAttachmentMessage(
+              "video",
+              "v1",
+              25 * 1024 * 1024,
+              undefined,
+              undefined,
+              1,
+              undefined,
+              true,
+              1,
+              "create a session and fix the login bug",
+              "op",
+              message(),
+            );
+
+            expect(controlBot.sent).toEqual([]);
+            expect(confirmed[0]?.text).toContain("Bot API caps");
+          });
         });
 
         test("nlRouterConfig.enabled: false never calls routeText and falls back to rejection", async () => {
