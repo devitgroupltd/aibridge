@@ -232,7 +232,7 @@ describe("createVoiceModeCommands", () => {
     test("reports voice input as disabled when there's no whisper server", async () => {
       const { voiceModeCommands, confirmed } = await setup({ voiceServer: null });
 
-      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", model: undefined }, undefined);
+      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", category: "model", model: undefined }, undefined);
 
       expect(confirmed[0]?.text).toContain("isn't enabled");
     });
@@ -245,7 +245,7 @@ describe("createVoiceModeCommands", () => {
         voiceModelPath: path.join(emptyDir, "ggml-base.bin"),
       });
 
-      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", model: undefined }, undefined);
+      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", category: "model", model: undefined }, undefined);
       await Promise.resolve();
 
       expect(confirmed[0]?.text).toContain("No Whisper models found");
@@ -261,7 +261,7 @@ describe("createVoiceModeCommands", () => {
         voiceModelPath: path.join(dir, "ggml-base.bin"),
       });
 
-      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", model: undefined }, undefined);
+      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", category: "model", model: undefined }, undefined);
       await Promise.resolve();
 
       expect(controlBot.sent[0]?.text).toContain("Current model: base");
@@ -277,7 +277,7 @@ describe("createVoiceModeCommands", () => {
         voiceModelPath: path.join(dir, "ggml-base.bin"),
       });
 
-      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", model: "base" }, undefined);
+      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", category: "model", model: "base" }, undefined);
       await Promise.resolve();
 
       expect(confirmed[0]?.text).toContain('Already using "base"');
@@ -293,7 +293,7 @@ describe("createVoiceModeCommands", () => {
         voiceModelPath: path.join(dir, "ggml-base.bin"),
       });
 
-      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", model: "nonexistent" }, undefined);
+      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", category: "model", model: "nonexistent" }, undefined);
       await Promise.resolve();
 
       expect(confirmed[0]?.text).toContain('Unknown model "nonexistent"');
@@ -310,7 +310,7 @@ describe("createVoiceModeCommands", () => {
         voiceModelPath: path.join(dir, "ggml-base.bin"),
       });
 
-      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", model: "small" }, undefined);
+      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", category: "model", model: "small" }, undefined);
       await Promise.resolve();
 
       expect(voiceServer.switchModelCalls).toEqual([path.join(dir, "ggml-small.bin")]);
@@ -328,7 +328,7 @@ describe("createVoiceModeCommands", () => {
         voiceModelPath: path.join(dir, "ggml-base.bin"),
       });
 
-      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", model: "small" }, undefined);
+      voiceModeCommands.handleVoiceModelCommand({ kind: "voice", category: "model", model: "small" }, undefined);
       await Promise.resolve();
       await Promise.resolve();
 
@@ -361,7 +361,7 @@ describe("createVoiceModeCommands", () => {
     test("status reports the current value without changing it", async () => {
       const { voiceModeCommands, confirmed, getVoiceConfirmEnabled } = await setup();
 
-      voiceModeCommands.handleVoiceConfirmCommand({ kind: "voiceconfirm", action: "status" }, undefined);
+      voiceModeCommands.handleVoiceConfirmCommand({ kind: "voice", category: "confirm", action: "status" }, undefined);
 
       expect(confirmed[0]?.text).toContain("is on");
       expect(getVoiceConfirmEnabled()).toBe(true);
@@ -370,10 +370,29 @@ describe("createVoiceModeCommands", () => {
     test("off persists the change and confirms", async () => {
       const { voiceModeCommands, settingsStore, confirmed, getVoiceConfirmEnabled } = await setup();
 
-      voiceModeCommands.handleVoiceConfirmCommand({ kind: "voiceconfirm", action: "off" }, undefined);
+      voiceModeCommands.handleVoiceConfirmCommand({ kind: "voice", category: "confirm", action: "off" }, undefined);
 
       expect(getVoiceConfirmEnabled()).toBe(false);
       expect(settingsStore.get("voice_confirm_enabled", "?")).toBe("false");
+      expect(confirmed[0]?.text).toContain("now off");
+    });
+  });
+
+  describe("handleVoiceCommand", () => {
+    test("routes the model category to handleVoiceModelCommand", async () => {
+      const { voiceModeCommands, confirmed } = await setup({ voiceServer: null });
+
+      voiceModeCommands.handleVoiceCommand({ kind: "voice", category: "model", model: undefined }, undefined);
+
+      expect(confirmed[0]?.text).toContain("isn't enabled");
+    });
+
+    test("routes the confirm category to handleVoiceConfirmCommand", async () => {
+      const { voiceModeCommands, confirmed, getVoiceConfirmEnabled } = await setup();
+
+      voiceModeCommands.handleVoiceCommand({ kind: "voice", category: "confirm", action: "off" }, undefined);
+
+      expect(getVoiceConfirmEnabled()).toBe(false);
       expect(confirmed[0]?.text).toContain("now off");
     });
   });

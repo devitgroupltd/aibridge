@@ -1,7 +1,7 @@
 ---
-version: 0.106.0
+version: 0.107.0
 status: solid
-last_modified_utc: 2026-08-09T19:10:00Z
+last_modified_utc: 2026-08-12T12:16:36Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,26 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.107.0 (2026-08-12): operator asked to unify `/voice` and `/voiceconfirm` into one command,
+    suggesting `/voice model ...`/`/voice confirm on|off` - the same \"category first\" shape
+    `/auto`/`/default` already use. `FleetCommand`'s `voice` member gained a `category: \"model\" |
+    \"confirm\"` discriminant (replacing the separate `voiceconfirm` kind); `fleet-commands.ts`'s new
+    `parseVoice` routes on an explicit `model`/`confirm` token first, falling back to `/voice <name>`
+    with no keyword (pre-merge back-compat, since \"model\" was implicit long before \"confirm\" needed
+    a keyword to disambiguate from it) and defaulting bare `/voice` to the model category's list form.
+    `/voiceconfirm [on|off]` still parses, via new `parseVoiceConfirmAction`, as a bare alias into the
+    same unified shape - same \"rename, don't break muscle memory\" treatment `/rm`/`/remove` already
+    got. `voice-mode-commands.ts` gained a `handleVoiceCommand` dispatcher (exhaustive switch on
+    `category`) that `command-dispatch.ts` now calls instead of the two separate branches it used to
+    have. `nl-router.ts` folded the `voiceconfirm` router kind into `voice` via a new `voiceCategory`
+    schema field (mirroring `/auto`'s own `autoCategory`), and updated `isDestructive`'s
+    \"turning voice-note confirmation off is as destructive as `assist off`\" check to match the new
+    shape. `botCommandList()`/`renderHelp()` updated to describe the new syntax, with `/voiceconfirm`
+    kept listed as a working alias. `nl-router.test.ts`'s `COMMAND_TO_ROUTER_KIND` completeness map
+    gained the same `voiceconfirm -> voice` entry `remove -> rm` already has. 9 new tests
+    (`fleet-commands.test.ts`'s parser coverage for both the canonical `/voice model|confirm` forms
+    and the `/voiceconfirm` alias; `voice-mode-commands.test.ts`'s new `handleVoiceCommand` dispatch
+    tests), full suite green (1596 total, up from 1587), `tsc --noEmit` clean across all 5 packages."
   - "0.106.0 (2026-08-09): made `/ship`'s `<slug>` optional (§5.9), matching `/kill`/`/rm`/`/pause`/
     `/usage`'s existing bare-inside-a-session's-own-topic convention instead of `/deploy`'s
     control-topic-only restriction - live use the same day found that a bare `/ship` typed inside a
@@ -1189,7 +1209,7 @@ Russian, Ukrainian and Azerbaijani reliably - a transcript is never dispatched t
 directly. It's posted back as its own card (`🎤 <transcript text>` under a ✅ Send / 🔁 Re-record /
 ✏️ I'll type instead keyboard, `voice-confirm.ts`), and only a Send tap feeds it into
 `dispatchInboundMessage`, the same path a typed message takes; that confirmation step is itself
-independently skippable per session (`/voiceconfirm off`, §3.5). `VOICE_ENABLED` (`.env`) defaults to
+independently skippable per session (`/voice confirm off`, §3.5). `VOICE_ENABLED` (`.env`) defaults to
 on, but `startWhisperServer` checks for the binary/model first and no-ops with a warning rather than
 retry-looping forever on a machine where `scripts/setup-windows.ps1`'s voice step hasn't run yet.
 
@@ -1222,13 +1242,17 @@ set (`/kill --all`/`/rm --all` only) - single-slug and every `/rm` form of `kill
 persisted across restarts in `settings-store.ts`'s `bridge_settings` table (part of the existing
 `aibridge.db`, not a second database).
 
-**Voice-note confirmation is an independent toggle (0.62.0).** §3.4's own Send/Re-record/Type-instead
-card can be turned off the same way (`/voiceconfirm [on|off]`, plus a "don't ask again" row on the
-card itself) - deliberately not folded into `/assist` despite the similar shape, since one gates
-whether a *destructive fleet command matched from NL text* asks first and the other gates whether a
-*transcribed voice note* is sent at all. With it off, a transcribed note dispatches immediately but
-still shows its transcript rather than a bare "Sent."; an empty/unrecognised transcript always shows
-the card regardless of the setting.
+**Voice-note confirmation is an independent toggle (0.62.0), unified under `/voice` (0.106.0).** §3.4's
+own Send/Re-record/Type-instead card can be turned off via `/voice confirm [on|off]` (plus a "don't ask
+again" row on the card itself) - the model-switch command's original bare/`<model>` shape (§3.4) and
+this toggle share one `/voice` route under an explicit `model`/`confirm` sub-category, the same
+"category first" shape §4.2's `/auto`/`/default` already use, rather than two separately-named
+commands for two voice-input settings. `/voiceconfirm [on|off]` still works as a bare alias (same
+"rename, don't break muscle memory" treatment `/rm`/`/remove` got). This toggle is deliberately not
+folded into `/assist` despite the similar shape, since one gates whether a *destructive fleet command
+matched from NL text* asks first and the other gates whether a *transcribed voice note* is sent at
+all. With it off, a transcribed note dispatches immediately but still shows its transcript rather than
+a bare "Sent."; an empty/unrecognised transcript always shows the card regardless of the setting.
 
 ### 3.6 File browser + search (added 0.65.0; NL routing added 0.66.0)
 

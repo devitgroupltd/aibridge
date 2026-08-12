@@ -66,7 +66,7 @@ export interface CommandDispatchOptions {
   osPowerCommands: Pick<OsPowerCommands, "handleOsCommand">;
   voiceModeCommands: Pick<
     VoiceModeCommands,
-    "handleVoiceModelCommand" | "handleAssistCommand" | "handleRouterBackendCommand" | "handleVoiceConfirmCommand" | "handleDefaultCommand" | "applyModelSwitch" | "applyModeSwitch" | "applyEffortSwitch"
+    "handleVoiceCommand" | "handleAssistCommand" | "handleRouterBackendCommand" | "handleDefaultCommand" | "applyModelSwitch" | "applyModeSwitch" | "applyEffortSwitch"
   >;
   cardSenders: CardSenders;
   feedWiring: Pick<FeedWiring, "markInterjected">;
@@ -259,7 +259,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
       return;
     }
     if (fleetCmd.kind === "voice") {
-      voiceModeCommands.handleVoiceModelCommand(fleetCmd, threadId);
+      voiceModeCommands.handleVoiceCommand(fleetCmd, threadId);
       return;
     }
     if (fleetCmd.kind === "assist") {
@@ -268,10 +268,6 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     }
     if (fleetCmd.kind === "router") {
       voiceModeCommands.handleRouterBackendCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "voiceconfirm") {
-      voiceModeCommands.handleVoiceConfirmCommand(fleetCmd, threadId);
       return;
     }
     if (fleetCmd.kind === "default") {

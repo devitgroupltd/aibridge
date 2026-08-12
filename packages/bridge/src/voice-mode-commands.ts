@@ -18,7 +18,8 @@ import type { SettingsStore } from "./settings-store.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
 import type { SendMessageSource } from "./telegram.ts";
 
-/** §4.2's `/model`/`/mode`/`/effort`/`/voice`/`/assist`/`/voiceconfirm`/`/default`/`/router` fleet
+/** §4.2's `/model`/`/mode`/`/effort`/`/voice` (including its `/voice confirm` sub-route and the
+ * `/voiceconfirm` alias)/`/assist`/`/default`/`/router` fleet
  * commands and their shared apply-and-confirm primitives. Split into its own module because these
  * are all "switch a live setting, persist it, confirm it" commands operating on session-scoped or
  * fleet-wide in-memory state - a distinct responsibility from process/deploy lifecycle (item 9) or
@@ -74,10 +75,11 @@ export interface VoiceModeCommands {
   writeModeKeystrokes(slug: string, mode: Mode): void;
   applyModeSwitch(slug: string, topicId: number, mode: Mode): void;
   applyEffortSwitch(slug: string, topicId: number, effort: Effort): void;
-  handleVoiceModelCommand(cmd: Extract<FleetCommand, { kind: "voice" }>, topicId: number | undefined): void;
+  handleVoiceModelCommand(cmd: Extract<FleetCommand, { kind: "voice"; category: "model" }>, topicId: number | undefined): void;
   applyVoiceModelSwitch(topicId: number | undefined, name: string, voiceDir: string, models: readonly string[], currentName: string): Promise<void>;
   handleAssistCommand(cmd: Extract<FleetCommand, { kind: "assist" }>, topicId: number | undefined): void;
-  handleVoiceConfirmCommand(cmd: Extract<FleetCommand, { kind: "voiceconfirm" }>, topicId: number | undefined): void;
+  handleVoiceConfirmCommand(cmd: Extract<FleetCommand, { kind: "voice"; category: "confirm" }>, topicId: number | undefined): void;
+  handleVoiceCommand(cmd: Extract<FleetCommand, { kind: "voice" }>, topicId: number | undefined): void;
   renderDefaultModeConfirmation(mode: Mode): string;
   sendDefaultStatusCard(topicId: number | undefined): void;
   sendDefaultCategoryPicker(topicId: number | undefined, category: DefaultPickerCategory): void;
@@ -168,7 +170,7 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
    * nothing to scope this to besides the fleet itself. Bare `/voice` lists what's on disk with a
    * button per model (current one checkmarked); `/voice <model>` or a button tap switches live via
    * `/load` - live-verified 2026-08-05, no process restart needed. */
-  function handleVoiceModelCommand(cmd: Extract<FleetCommand, { kind: "voice" }>, topicId: number | undefined): void {
+  function handleVoiceModelCommand(cmd: Extract<FleetCommand, { kind: "voice"; category: "model" }>, topicId: number | undefined): void {
     if (!voiceServer) {
       confirmSessionCommand(topicId, "Voice input isn't enabled on this Bridge (VOICE_ENABLED=false).");
       return;
@@ -230,10 +232,10 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
     );
   }
 
-  /** `/voiceconfirm [on|off]` - whether a transcribed voice note shows a Send/Re-record/Type-
-   * instead card first (voice-confirm.ts) or is auto-sent straight through. Same in-memory-for-
-   * reads, persisted-on-write shape as `handleAssistCommand`. */
-  function handleVoiceConfirmCommand(cmd: Extract<FleetCommand, { kind: "voiceconfirm" }>, topicId: number | undefined): void {
+  /** `/voice confirm [on|off]` (plus its `/voiceconfirm [on|off]` alias) - whether a transcribed
+   * voice note shows a Send/Re-record/Type-instead card first (voice-confirm.ts) or is auto-sent
+   * straight through. Same in-memory-for-reads, persisted-on-write shape as `handleAssistCommand`. */
+  function handleVoiceConfirmCommand(cmd: Extract<FleetCommand, { kind: "voice"; category: "confirm" }>, topicId: number | undefined): void {
     if (cmd.action === "status") {
       confirmSessionCommand(topicId, `Voice-note send confirmation is ${getVoiceConfirmEnabled() ? "on" : "off"}.`);
       return;
@@ -245,8 +247,28 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
       topicId,
       voiceConfirmEnabled
         ? "Voice-note send confirmation is now on - a transcribed voice note shows a Send/Re-record/Type-instead card before it's dispatched."
-        : "Voice-note send confirmation is now off - a transcribed voice note is sent straight through, with the transcript still shown so you can see what was sent - /voiceconfirm on to review before sending again.",
+        : "Voice-note send confirmation is now off - a transcribed voice note is sent straight through, with the transcript still shown so you can see what was sent - /voice confirm on to review before sending again.",
     );
+  }
+
+  /** `/voice`'s own dispatch: `command-dispatch.ts`'s single entry point for the whole unified
+   * command, routed on to whichever facet-specific handler above actually owns it - same
+   * exhaustive-`switch`-over-a-real-discriminant shape as `handleDefaultCommand`, for the same
+   * reason (a future third `/voice` facet fails to compile here instead of silently falling
+   * through to one of these two). */
+  function handleVoiceCommand(cmd: Extract<FleetCommand, { kind: "voice" }>, topicId: number | undefined): void {
+    switch (cmd.category) {
+      case "model":
+        handleVoiceModelCommand(cmd, topicId);
+        return;
+      case "confirm":
+        handleVoiceConfirmCommand(cmd, topicId);
+        return;
+      default: {
+        const _exhaustive: never = cmd;
+        throw new Error(`unhandled /voice category: ${JSON.stringify(_exhaustive)}`);
+      }
+    }
   }
 
   /** Text shown by both bare `/default` and the "Cancel"-free result of applying a mode change -
@@ -457,6 +479,7 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
     applyVoiceModelSwitch,
     handleAssistCommand,
     handleVoiceConfirmCommand,
+    handleVoiceCommand,
     renderDefaultModeConfirmation,
     sendDefaultStatusCard,
     sendDefaultCategoryPicker,

@@ -139,10 +139,9 @@ function fakeVoiceModeCommands() {
   const calls: Array<{ fn: string; args: unknown[] }> = [];
   const record = (fn: string) => (...args: unknown[]) => calls.push({ fn, args });
   return {
-    handleVoiceModelCommand: record("handleVoiceModelCommand"),
+    handleVoiceCommand: record("handleVoiceCommand"),
     handleAssistCommand: record("handleAssistCommand"),
     handleRouterBackendCommand: record("handleRouterBackendCommand"),
-    handleVoiceConfirmCommand: record("handleVoiceConfirmCommand"),
     handleDefaultCommand: record("handleDefaultCommand"),
     applyModelSwitch: record("applyModelSwitch"),
     applyModeSwitch: record("applyModeSwitch"),
@@ -277,8 +276,8 @@ describe("dispatchFleetCommand", () => {
     s.commandDispatch.dispatchFleetCommand({ kind: "ship", slug: "fix-bug" }, 5, true, undefined);
     expect(s.deployLifecycle.calls.map((c) => c.fn)).toContain("handleShipCommand");
 
-    s.commandDispatch.dispatchFleetCommand({ kind: "voice" }, 5, true, undefined);
-    expect(s.voiceModeCommands.calls.map((c) => c.fn)).toContain("handleVoiceModelCommand");
+    s.commandDispatch.dispatchFleetCommand({ kind: "voice", category: "model" }, 5, true, undefined);
+    expect(s.voiceModeCommands.calls.map((c) => c.fn)).toContain("handleVoiceCommand");
 
     s.commandDispatch.dispatchFleetCommand({ kind: "usage", slug: "fix-bug" }, 5, true, "fix-bug");
     expect(s.fleetConfirmFlow.calls.map((c) => c.fn)).toContain("handleUsageCommand");

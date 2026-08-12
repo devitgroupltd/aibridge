@@ -94,11 +94,12 @@ function isDestructive(command: FleetCommand | SessionCommand | RouterAction): b
   // permission on this one" is a very plausible match for `mode auto`, which fires the Shift+Tab
   // keystrokes and leaves that session running every tool call with no approval card at all -
   // decision 3's whole allowlist+button-escalation model, switched off by one fuzzy guess. `assist
-  // off` and `voiceconfirm off` are the same shape one level up: they remove the confirm card from
+  // off` and `voice confirm off` are the same shape one level up: they remove the confirm card from
   // *every subsequent* destructive match, so an unconfirmed match that disables confirmation is
   // self-propagating.
   if (command.kind === "mode" && command.mode === "auto") return true;
-  if ((command.kind === "assist" || command.kind === "voiceconfirm") && command.action === "off") return true;
+  if (command.kind === "assist" && command.action === "off") return true;
+  if (command.kind === "voice" && command.category === "confirm" && command.action === "off") return true;
   // `/auto <category> on` is that same "stop asking me for permission" sentence, only more so - the
   // comment above names it as `mode auto`'s most plausible fuzzy match, and it describes this command
   // more exactly than the one it was written about. Gated on the `on` transition only (turning a
@@ -154,7 +155,6 @@ export const ROUTER_KINDS = [
   "autostart",
   "repos",
   "voice",
-  "voiceconfirm",
   "assist",
   "router",
   "default",
@@ -232,7 +232,13 @@ function buildSchema(ctx: RouterContext): Record<string, unknown> {
       reposPath: { type: "string", description: "For 'repos add', optional." },
       reposBase: { type: "string", description: "For 'repos add', optional." },
       autostartAction: { type: "string", enum: ["status", "install", "uninstall"], description: "For 'autostart'." },
-      voiceModel: { type: "string", description: "For 'voice', optional model name to switch to." },
+      voiceCategory: {
+        type: "string",
+        enum: ["model", "confirm"],
+        description:
+          "For 'voice': which facet - 'model' (show/switch the Whisper model, via 'voiceModel') or 'confirm' (the voice-note send-confirmation toggle, via 'voiceConfirmAction'). Omit for 'model'.",
+      },
+      voiceModel: { type: "string", description: "For 'voice' with voiceCategory 'model', optional model name to switch to." },
       mode: { type: "string", enum: [...MODES], description: "For 'session_mode' (the current session) or 'default' with defaultCategory='mode' (all future new sessions)." },
       effort: { type: "string", enum: [...EFFORTS], description: "For 'session_effort' (the current session) or 'default' with defaultCategory='effort' (all future new sessions)." },
       autoCategory: {
@@ -247,7 +253,11 @@ function buildSchema(ctx: RouterContext): Record<string, unknown> {
           "For 'default': which new-session default to show/change - 'mode', 'effort', or the two /auto toggles 'permission'/'answer' (whose value goes in 'on', not 'mode'/'effort'). Omit for a bare status report.",
       },
       assistAction: { type: "string", enum: ["status", "on", "off"], description: "For 'assist': confirm-before-destructive-NL-command toggle." },
-      voiceConfirmAction: { type: "string", enum: ["status", "on", "off"], description: "For 'voiceconfirm': confirm-before-sending-a-transcribed-voice-note toggle." },
+      voiceConfirmAction: {
+        type: "string",
+        enum: ["status", "on", "off"],
+        description: "For 'voice' with voiceCategory 'confirm': confirm-before-sending-a-transcribed-voice-note toggle.",
+      },
       routerAction: { type: "string", enum: ["status", "api", "cli"], description: "For 'router': NL-routing backend toggle." },
       term: { type: "string", description: "For 'commands'/'skills': an optional search term to filter the list." },
       builtinName: { type: "string", enum: ["compact", "clear"], description: "For 'builtin': which built-in Claude Code command to run." },
@@ -386,6 +396,7 @@ interface RawRouterOutput {
   reposPath?: string;
   reposBase?: string;
   autostartAction?: string;
+  voiceCategory?: string;
   voiceModel?: string;
   mode?: string;
   effort?: string;
@@ -493,13 +504,14 @@ export function mapRouterOutput(raw: RawRouterOutput, ctx: RouterContext): Route
         if (raw.reposAction === "rm" && raw.reposName) return { kind: "repos", action: "rm", name: raw.reposName };
         return null;
       case "voice":
-        return { kind: "voice", model: raw.voiceModel };
+        if (raw.voiceCategory === "confirm") {
+          return raw.voiceConfirmAction === "status" || raw.voiceConfirmAction === "on" || raw.voiceConfirmAction === "off"
+            ? { kind: "voice", category: "confirm", action: raw.voiceConfirmAction }
+            : null;
+        }
+        return { kind: "voice", category: "model", model: raw.voiceModel };
       case "assist":
         return raw.assistAction === "status" || raw.assistAction === "on" || raw.assistAction === "off" ? { kind: "assist", action: raw.assistAction } : null;
-      case "voiceconfirm":
-        return raw.voiceConfirmAction === "status" || raw.voiceConfirmAction === "on" || raw.voiceConfirmAction === "off"
-          ? { kind: "voiceconfirm", action: raw.voiceConfirmAction }
-          : null;
       case "router":
         return raw.routerAction === "status" || raw.routerAction === "api" || raw.routerAction === "cli" ? { kind: "router", action: raw.routerAction } : null;
       case "default":

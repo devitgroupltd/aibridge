@@ -360,7 +360,7 @@ async function main(): Promise<void> {
 
   // inbound-media.ts: voice/attachment handling plus the onUpdate plain-message routing entry
   // point - `dispatchInboundMessage` and `voiceConfirmEnabled` (read live via a getter, not a
-  // snapshot, since `/voiceconfirm` flips it at runtime) are both injected.
+  // snapshot, since `/voice confirm` flips it at runtime) are both injected.
   const inboundMedia = createInboundMedia({
     controlBot,
     feedGovernor,

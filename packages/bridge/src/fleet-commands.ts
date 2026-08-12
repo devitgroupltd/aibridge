@@ -79,10 +79,16 @@ export type FleetCommand =
   | { kind: "repos"; action: "list" }
   | { kind: "repos"; action: "add"; name: string; path?: string; base?: string; model?: string }
   | { kind: "repos"; action: "rm"; name: string }
-  | { kind: "voice"; model?: string }
+  /** `/voice model [<name>]` / `/voice confirm [status|on|off]` - one command, two facets, same
+   * "category first" shape `/auto`/`/default` already use (operator feedback, 2026-08-12: two
+   * separately-named commands for two voice-input settings was one more thing to remember than
+   * necessary). `/voiceconfirm [on|off]` still parses (see `parseVoiceConfirmAction`'s call site in
+   * `parseFleetCommand`'s switch) - same "rename, but don't break muscle memory" treatment
+   * `/rm`/`/remove` already got. */
+  | { kind: "voice"; category: "model"; model?: string }
+  | { kind: "voice"; category: "confirm"; action: "status" | "on" | "off" }
   | { kind: "assist"; action: "status" | "on" | "off" }
   | { kind: "router"; action: "status" | "api" | "cli" }
-  | { kind: "voiceconfirm"; action: "status" | "on" | "off" }
   | { kind: "default"; category: "status" }
   | { kind: "default"; category: "mode"; value?: Mode }
   | { kind: "default"; category: "effort"; value?: Effort }
@@ -333,7 +339,7 @@ function parseOs(rest: string): FleetCommand | null {
  * Shared by every `/x [status|...]` toggle command below: bare invocation defaults to `"status"`,
  * anything else must be one of `actions` (case-insensitive, `matchCaseInsensitive`'s note) or the
  * whole command is malformed (`null`, not a different command). `/autostart`/`/assist`/`/router`/
- * `/voiceconfirm` used to each hand-write this exact "trim, default-to-status, case-insensitively
+ * `/voice confirm` used to each hand-write this exact "trim, default-to-status, case-insensitively
  * validate against a literal set" shape - a fifth toggle command needed a sixth hand-copy, and a
  * fix to the "bare defaults to status" convention had to be applied in four places by hand. `/os`
  * doesn't use this: a bare `/os` is rejected outright rather than defaulting to any action (there
@@ -370,14 +376,39 @@ function parseRouterBackend(rest: string): FleetCommand | null {
   return parseStatusToggle(rest, "router", ROUTER_ACTIONS);
 }
 
-/** `/voiceconfirm [on|off]` - whether a transcribed voice note shows a Send/Re-record/Type-instead
- * card first (voice-confirm.ts) before it's dispatched, or the typeable equivalent of that card's
- * own "Send, don't ask again" button. Bare `/voiceconfirm` reports the current setting, same
- * "no argument defaults to status" shape as `/assist`/`/autostart`. Kept as its own command rather
- * than folded into `/voice` (which already takes an optional `<model>` token as its rest-of-line
- * argument, so `/voice off` would be ambiguous with a (nonexistent) model literally named "off"). */
-function parseVoiceConfirm(rest: string): FleetCommand | null {
-  return parseStatusToggle(rest, "voiceconfirm", VOICE_CONFIRM_ACTIONS);
+/** `/voice confirm [status|on|off]` (and its bare `/voiceconfirm [on|off]` alias below) - whether a
+ * transcribed voice note shows a Send/Re-record/Type-instead card first (voice-confirm.ts) before
+ * it's dispatched, or the typeable equivalent of that card's own "Send, don't ask again" button.
+ * Bare `/voice confirm` reports the current setting, same "no argument defaults to status" shape
+ * as `/assist`/`/autostart`. */
+function parseVoiceConfirmAction(rest: string): Extract<FleetCommand, { kind: "voice"; category: "confirm" }> | null {
+  const parsed = parseStatusToggle(rest, "confirm", VOICE_CONFIRM_ACTIONS);
+  return parsed ? { kind: "voice", category: "confirm", action: parsed.action } : null;
+}
+
+/** `/voice [model [<name>]] | [confirm [status|on|off]]` - the model-switch command (`/voice`/
+ * `/voice <name>`, unchanged since before `/voiceconfirm` merged in below it) and that same
+ * `/voiceconfirm` toggle, unified under one `/voice` route via an explicit sub-category token - the
+ * same "category first" shape `/auto`/`/default` already use (see `FleetCommand`'s own doc comment
+ * on this member).
+ *
+ * Bare `/voice` (no sub-category at all) still lists available models, and `/voice <name>` with no
+ * leading `model` keyword still switches directly - both preserve this command's original,
+ * pre-merge shape, since "model" was implicit long before "confirm" needed a keyword to
+ * disambiguate from it. A model is never actually going to be named "model" or "confirm", so
+ * treating those two words as reserved here isn't a real collision risk. */
+function parseVoice(rest: string): FleetCommand | null {
+  const trimmed = rest.trim();
+  if (trimmed.length === 0) return { kind: "voice", category: "model", model: undefined };
+  const tokens = trimmed.split(/\s+/).filter((t) => t.length > 0);
+  const first = tokens[0]!.toLowerCase();
+  const restTokens = tokens.slice(1);
+  if (first === "model") {
+    const model = restTokens.join(" ");
+    return { kind: "voice", category: "model", model: model.length > 0 ? model : undefined };
+  }
+  if (first === "confirm") return parseVoiceConfirmAction(restTokens.join(" "));
+  return { kind: "voice", category: "model", model: trimmed };
 }
 
 /** `/default [mode|effort] [<value>]` - one command for both new-session defaults (permission mode
@@ -596,7 +627,9 @@ export function parseFleetCommand(text: string): FleetCommand | null {
     case "router":
       return parseRouterBackend(rest);
     case "voiceconfirm":
-      return parseVoiceConfirm(rest);
+      // Bare alias for `/voice confirm` - kept working for the same "rename, don't break muscle
+      // memory" reason `/rm` still works alongside `/remove`.
+      return parseVoiceConfirmAction(rest);
     case "auto":
       return parseAuto(rest);
     case "default":
@@ -605,10 +638,8 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return parseOs(rest);
     case "repos":
       return parseRepos(rest);
-    case "voice": {
-      const model = rest.trim();
-      return { kind: "voice", model: model.length > 0 ? model : undefined };
-    }
+    case "voice":
+      return parseVoice(rest);
     case "remove":
       return parseRm(rest);
     case "kill":
@@ -868,9 +899,10 @@ export function renderHelp(): string {
     "  /settings - registered repos + concurrency budget",
     "  /repos [list|add <name> [path|git-url] [--base <b>] [--model <m>]|rm <name>] - manage repos.toml",
     "  /autostart [status|install|uninstall] - manage the logon Task Scheduler entry",
-    "  /voice [<model>] - show/switch the Whisper model used for voice-note transcription",
-    "  /voiceconfirm [on|off] - whether a transcribed voice note shows a Send/Re-record/Type-instead",
-    "    card first before it's dispatched (default on)",
+    "  /voice model [<model>] - show/switch the Whisper model used for voice-note transcription",
+    "    (bare /voice, or /voice <model> with no 'model' keyword, both still work)",
+    "  /voice confirm [on|off] - whether a transcribed voice note shows a Send/Re-record/Type-instead",
+    "    card first before it's dispatched (default on; /voiceconfirm [on|off] is still a working alias)",
     "  /assist [on|off] - whether a natural-language-matched destructive command (kill/remove/",
     "    restart/merge/ship/repos rm) shows a confirm card first (default on)",
     "  /router [api|cli] - natural-language routing backend: 'cli' uses your Claude Code",
@@ -957,8 +989,11 @@ export function botCommandList(): { command: string; description: string }[] {
     { command: "settings", description: "Registered repos + concurrency budget" },
     { command: "repos", description: "Manage repos.toml: list|add <name> [path|git-url]|rm <name>" },
     { command: "autostart", description: "Manage the logon Task Scheduler entry: status|install|uninstall" },
-    { command: "voice", description: "Show/switch the Whisper model used for voice-note transcription" },
-    { command: "voiceconfirm", description: "Confirm before sending a transcribed voice note: /voiceconfirm [on|off]" },
+    {
+      command: "voice",
+      description: "Whisper model (/voice model [<name>]) or voice-note send confirm (/voice confirm [on|off]) - bare /voice lists models",
+    },
+    { command: "voiceconfirm", description: "Alias for /voice confirm [on|off]" },
     { command: "assist", description: "Confirm before running a natural-language-matched destructive command: /assist [on|off]" },
     { command: "router", description: "NL-routing backend: /router [api|cli] - subscription (cli, default) or a funded API key (api)" },
     { command: "default", description: "What new sessions start with: /default [mode|effort|permission|answer] [<value>] - bare shows a tappable picker" },

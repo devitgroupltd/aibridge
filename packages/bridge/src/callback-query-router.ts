@@ -575,7 +575,7 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
     // only in which follow-up text is shown, so all three fall into the same finalize call below
     // rather than needing separate registry/dispatch handling. "Send, don't ask again" additionally
     // flips `voiceConfirmEnabled` off (and persists it) before sending, the typeable equivalent
-    // being `/voiceconfirm off`.
+    // being `/voice confirm off`.
     rule(
       "voiceConfirm",
       (data) => (data ? resolveVoiceConfirmCallback(data) : null),
@@ -590,7 +590,7 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
             settingsStore.set("voice_confirm_enabled", "false");
           }
           fireAndForget(
-            confirmCards.finalizeVoiceConfirmMessage(pending, voiceConfirmAction.action === "send_and_stop_asking" ? "✅ Sent (confirmation now off - /voiceconfirm on to re-enable)." : "✅ Sent."),
+            confirmCards.finalizeVoiceConfirmMessage(pending, voiceConfirmAction.action === "send_and_stop_asking" ? "✅ Sent (confirmation now off - /voice confirm on to re-enable)." : "✅ Sent."),
             log,
             "callback-query-router finalizeVoiceConfirmMessage(send)",
           );

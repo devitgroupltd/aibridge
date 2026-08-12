@@ -31,7 +31,6 @@ const ALL_FLEET_COMMAND_KINDS = [
   "autostart",
   "repos",
   "voice",
-  "voiceconfirm",
   "assist",
   "router",
 ] as const;
@@ -68,6 +67,9 @@ describe("ROUTER_KINDS completeness", () => {
     compact: "builtin",
     clear: "builtin",
     remove: "rm",
+    // Bare alias for `/voice confirm` (fleet-commands.ts's `parseVoiceConfirmAction` call site in
+    // `parseFleetCommand`'s switch) - same "real rename" shape as `remove: "rm"` above.
+    voiceconfirm: "voice",
   };
 
   /** `/retry` (retry-store.ts) is one deliberate exception: `isRetryPhrase` intercepts it (and its
@@ -301,7 +303,7 @@ describe("mapRouterOutput - one case per kind", () => {
     expect(mapRouterOutput({ kind: "autostart", autostartAction: "bogus" }, CONTROL)).toEqual({ matched: false });
     expect(mapRouterOutput({ kind: "voice", voiceModel: "medium" }, CONTROL)).toEqual({
       matched: true,
-      command: { kind: "voice", model: "medium" },
+      command: { kind: "voice", category: "model", model: "medium" },
       destructive: false,
     });
   });
@@ -400,20 +402,20 @@ describe("mapRouterOutput - one case per kind", () => {
     expect(mapRouterOutput({ kind: "router", routerAction: "bogus" }, CONTROL)).toEqual({ matched: false });
   });
 
-  test("voiceconfirm: its own status/on/off enum; turning it off is gated like any other guard", () => {
+  test("voice confirm: its own status/on/off enum (via voiceCategory 'confirm'); turning it off is gated like any other guard", () => {
     // Same reasoning as `assist off` above - switching a review step off is at least as consequential
     // as the thing it reviews, and "don't keep asking me" is an easy accidental NL match.
-    expect(mapRouterOutput({ kind: "voiceconfirm", voiceConfirmAction: "off" }, CONTROL)).toEqual({
+    expect(mapRouterOutput({ kind: "voice", voiceCategory: "confirm", voiceConfirmAction: "off" }, CONTROL)).toEqual({
       matched: true,
-      command: { kind: "voiceconfirm", action: "off" },
+      command: { kind: "voice", category: "confirm", action: "off" },
       destructive: true,
     });
-    expect(mapRouterOutput({ kind: "voiceconfirm", voiceConfirmAction: "on" }, CONTROL)).toEqual({
+    expect(mapRouterOutput({ kind: "voice", voiceCategory: "confirm", voiceConfirmAction: "on" }, CONTROL)).toEqual({
       matched: true,
-      command: { kind: "voiceconfirm", action: "on" },
+      command: { kind: "voice", category: "confirm", action: "on" },
       destructive: false,
     });
-    expect(mapRouterOutput({ kind: "voiceconfirm", voiceConfirmAction: "bogus" }, CONTROL)).toEqual({ matched: false });
+    expect(mapRouterOutput({ kind: "voice", voiceCategory: "confirm", voiceConfirmAction: "bogus" }, CONTROL)).toEqual({ matched: false });
   });
 
   test("commands and skills: session-scoped, optional term, never destructive", () => {

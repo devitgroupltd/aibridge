@@ -94,7 +94,7 @@ export interface InboundMediaOptions {
   /** §4.1's control-topic predicate - injected rather than imported since it's index.ts's one free
    * top-level function today, with call sites remaining in not-yet-extracted modules too. */
   isControlTopic: (threadId: number | undefined) => boolean;
-  /** Getter, not a snapshot boolean: `/voiceconfirm` flips this at runtime and `handleVoiceMessage`
+  /** Getter, not a snapshot boolean: `/voice confirm` flips this at runtime and `handleVoiceMessage`
    * must see the current value on every call, the same "live getter" shape feed-coalescer.ts's
    * `quietMode` option already uses for the same reason. */
   voiceConfirmEnabled: () => boolean;
@@ -237,13 +237,13 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
       }
       // Confirmation is off - send straight through, but the transcript stays visible on the
       // finalized message (not just a bare "Sent") so there's still something to read before
-      // deciding to flip /voiceconfirm back on.
+      // deciding to flip /voice confirm back on.
       if (controlBot.editMessageText) {
         await feedGovernor.scheduleAsync("P1", () =>
           controlBot.editMessageText!(
             supergroupChatId,
             placeholderId!,
-            `🎤 ${preview}\n\n✅ Auto-sent (confirmation off - /voiceconfirm on to review before sending).`,
+            `🎤 ${preview}\n\n✅ Auto-sent (confirmation off - /voice confirm on to review before sending).`,
             { inline_keyboard: [] },
           ),
         );

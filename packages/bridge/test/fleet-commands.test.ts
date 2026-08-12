@@ -464,26 +464,61 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/router API")).toEqual({ kind: "router", action: "api" });
   });
 
-  test("/voiceconfirm with no argument defaults to status", () => {
-    expect(parseFleetCommand("/voiceconfirm")).toEqual({ kind: "voiceconfirm", action: "status" });
+  test("bare /voice defaults to the model category, listing (no model)", () => {
+    expect(parseFleetCommand("/voice")).toEqual({ kind: "voice", category: "model", model: undefined });
   });
 
-  test("/voiceconfirm on and /voiceconfirm off", () => {
-    expect(parseFleetCommand("/voiceconfirm on")).toEqual({ kind: "voiceconfirm", action: "on" });
-    expect(parseFleetCommand("/voiceconfirm off")).toEqual({ kind: "voiceconfirm", action: "off" });
+  test("/voice model, with and without a name", () => {
+    expect(parseFleetCommand("/voice model")).toEqual({ kind: "voice", category: "model", model: undefined });
+    expect(parseFleetCommand("/voice model small")).toEqual({ kind: "voice", category: "model", model: "small" });
   });
 
-  test("/voiceconfirm with an unrecognised argument is invalid, not a different command", () => {
+  test("/voice <name> with no 'model' keyword still switches directly - pre-merge back-compat", () => {
+    expect(parseFleetCommand("/voice off")).toEqual({ kind: "voice", category: "model", model: "off" });
+    expect(parseFleetCommand("/voice small")).toEqual({ kind: "voice", category: "model", model: "small" });
+  });
+
+  test("/voice confirm with no argument defaults to status", () => {
+    expect(parseFleetCommand("/voice confirm")).toEqual({ kind: "voice", category: "confirm", action: "status" });
+  });
+
+  test("/voice confirm on and /voice confirm off", () => {
+    expect(parseFleetCommand("/voice confirm on")).toEqual({ kind: "voice", category: "confirm", action: "on" });
+    expect(parseFleetCommand("/voice confirm off")).toEqual({ kind: "voice", category: "confirm", action: "off" });
+  });
+
+  test("/voice confirm with an unrecognised argument is invalid, not a different command", () => {
+    expect(parseFleetCommand("/voice confirm bogus")).toBeNull();
+  });
+
+  test("/voice confirm is case-insensitive on the action", () => {
+    expect(parseFleetCommand("/voice confirm OFF")).toEqual({ kind: "voice", category: "confirm", action: "off" });
+  });
+
+  // `/voiceconfirm` used to be its own command; kept working as a bare alias for `/voice confirm`
+  // (same "rename, don't break muscle memory" treatment `/rm`/`/remove` already got) - same shape,
+  // same coverage.
+  test("/voiceconfirm alias with no argument defaults to status", () => {
+    expect(parseFleetCommand("/voiceconfirm")).toEqual({ kind: "voice", category: "confirm", action: "status" });
+  });
+
+  test("/voiceconfirm alias on and off", () => {
+    expect(parseFleetCommand("/voiceconfirm on")).toEqual({ kind: "voice", category: "confirm", action: "on" });
+    expect(parseFleetCommand("/voiceconfirm off")).toEqual({ kind: "voice", category: "confirm", action: "off" });
+  });
+
+  test("/voiceconfirm alias with an unrecognised argument is invalid, not a different command", () => {
     expect(parseFleetCommand("/voiceconfirm bogus")).toBeNull();
   });
 
-  test("/voiceconfirm is case-insensitive on the action", () => {
-    expect(parseFleetCommand("/voiceconfirm OFF")).toEqual({ kind: "voiceconfirm", action: "off" });
+  test("/voiceconfirm alias is case-insensitive on the action", () => {
+    expect(parseFleetCommand("/voiceconfirm OFF")).toEqual({ kind: "voice", category: "confirm", action: "off" });
   });
 
-  test("/voiceconfirm is a distinct command from /voice, not a model name collision", () => {
-    expect(parseFleetCommand("/voice off")).toEqual({ kind: "voice", model: "off" });
-    expect(parseFleetCommand("/voiceconfirm off")).toEqual({ kind: "voiceconfirm", action: "off" });
+  test("/voice model and /voice confirm are distinct, not a model-name collision", () => {
+    expect(parseFleetCommand("/voice off")).toEqual({ kind: "voice", category: "model", model: "off" });
+    expect(parseFleetCommand("/voice confirm off")).toEqual({ kind: "voice", category: "confirm", action: "off" });
+    expect(parseFleetCommand("/voiceconfirm off")).toEqual({ kind: "voice", category: "confirm", action: "off" });
   });
 
   test("/default with no argument (or 'status') reports the status category", () => {
