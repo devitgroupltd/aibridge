@@ -493,7 +493,6 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     const threadId = message.message_thread_id;
     const isControl = isControlTopic(threadId);
     const route = threadId !== undefined ? routing.getByTopicId(threadId) : undefined;
-    const currentSlug = route?.slug;
     // A topic with no *live route* may still be a topic this Bridge knows about: a `dead` row's
     // topic (reconciliation only re-routes non-dead rows, so every `/kill`ed session's topic
     // loses its route on the next restart), or an orphaned topic whose row is gone entirely -
@@ -512,6 +511,15 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     // "this session has ended" acknowledgement can fire there.
     const knownRow = threadId !== undefined ? sessionStore.getByTopicId(threadId) : undefined;
     if (!isControl && !route && knownRow === undefined && !isKnownCommandText(message.text)) return;
+    // Falls back to `knownRow` - not just `route` - so a bare `/resume` (or `/rm`, `/ls`-style
+    // slug-optional command) typed inside a `dead` session's own topic still resolves to that
+    // session: `routing` drops the entry for any `dead` row on the very next restart (see the
+    // comment above), but `sessionStore` keeps the row, and `/resume`'s entire purpose is to act on
+    // exactly that row. Without this fallback `currentSlug` went undefined here even though the
+    // topic unambiguously belongs to one session, and `resolveTargetSlug` (session-lifecycle-
+    // commands.ts) had nothing to fall back to either - live-confirmed 2026-08-12: a bare `/resume`
+    // in a dead session's own topic answered "usage: <command> <slug> ..." instead of resuming it.
+    const currentSlug = route?.slug ?? knownRow?.slug;
 
     const from = message.from?.username ?? message.from?.first_name ?? "unknown";
 
