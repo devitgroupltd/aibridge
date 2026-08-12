@@ -405,6 +405,19 @@ describe("createCallbackQueryRouter - every documented namespace resolves to its
     expect(s.confirmCards.finalizedCard).toEqual([{ messageId: 11, text: '✅ Starting a session against "aibridge"...' }]);
   });
 
+  // Ambiguous-repo gap fix (inbound-media.ts): a repo-pick raised from a control-topic attachment's
+  // caption carries a `pendingAttachment` on the registry entry - a tap here must hand it through
+  // to `executeMatchedCommand`'s `kind: "new"` call so the attachment isn't silently dropped.
+  test('"rp:" a repo tap on an attachment-originated pick carries pendingAttachment through', () => {
+    const s = setup();
+    const pendingAttachment = { kind: "image" as const, name: "screenshot.jpg", bytes: new Uint8Array([1, 2, 3]), rawCaption: "create a session and fix the login bug" };
+    s.repoPickRegistry.add({ id: "r3", prompt: "fix the login bug", sourceText: "create a session and fix the login bug", model: undefined, threadId: undefined, messageId: 13, pendingAttachment });
+    s.router.routeCallbackQuery(cq("rp:r3:aibridge", 1, undefined));
+    expect(s.nlDispatch.executed).toEqual([
+      [{ kind: "new", repo: "aibridge", prompt: "fix the login bug", model: undefined, sourceText: "create a session and fix the login bug", pendingAttachment }, undefined, true, undefined],
+    ]);
+  });
+
   test('"rp:" cancel finalizes without ever calling nlDispatch', () => {
     const s = setup();
     s.repoPickRegistry.add({ id: "r2", prompt: "analyze this alarm", sourceText: "create a session for analyze this alarm", model: undefined, threadId: undefined, messageId: 12 });
