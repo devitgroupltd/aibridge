@@ -478,6 +478,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       ptyPid: session.ptyProcess.pid ?? 0,
       state: "starting",
       turnCardMsg: null,
+      thinkingPlaceholderMsg: null,
       paused: false,
       renamed: false,
       feedDetail: "compact",

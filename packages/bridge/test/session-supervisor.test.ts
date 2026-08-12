@@ -23,6 +23,7 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     ptyPid: 0,
     state: "working",
     turnCardMsg: null,
+    thinkingPlaceholderMsg: null,
     paused: false,
     renamed: false,
     feedDetail: "compact",
@@ -1143,5 +1144,98 @@ describe("createSessionSupervisor", () => {
 
     // Started over at attempt 1's delay, not attempt 2's - proof the counter was actually reset.
     expect(delays).toEqual([RESUME_BACKOFF_MS[0], RESUME_NUDGE_FOLLOWUP_DELAY_MS]);
+  });
+
+  // P0-5 (codebase-hardening-plan.md, missing-test item 5b): `runStartupReconciliation`'s own
+  // `relabelStalePlaceholder` call - the cross-restart counterpart to `clearThinkingPlaceholder`,
+  // which only ever fires for a same-process crash. Live-confirmed 2026-08-12
+  // ("unify-work-with-voice-and"): a second Bridge restart before a resume nudge's own turn replies
+  // otherwise leaves "🤔 Thinking..." stuck in Telegram forever.
+  describe("runStartupReconciliation relabels a leftover thinking placeholder (P0-5)", () => {
+    test("a row with a non-null thinkingPlaceholderMsg gets it relabeled and cleared before resuming", async () => {
+      const sessionStore = new SessionStore(":memory:");
+      sessionStore.insert(row({ thinkingPlaceholderMsg: 3008 }));
+      const routing = new Routing();
+      const confirm = fakeConfirm();
+      const relabeled: Array<{ topicId: number; messageId: number }> = [];
+      const supervisor = createSessionSupervisor({
+        sessionStore,
+        routing,
+        controlBot: fakeControlBot(),
+        confirmSessionCommand: confirm.fn,
+        supergroupChatId: "-100",
+        selfCheckSlug: "selfcheck",
+        relabelStalePlaceholder: (topicId, messageId) => {
+          relabeled.push({ topicId, messageId });
+        },
+        launchSession: () => ({
+          worktreePath: "c:\\data\\worktrees\\fix-bug",
+          branch: "claude/fix-bug-1",
+          ptyProcess: fakePty() as unknown as LaunchedSession["ptyProcess"],
+          ready: Promise.resolve({ resumeFailed: false }),
+        }),
+      });
+
+      await supervisor.runStartupReconciliation();
+
+      expect(relabeled).toEqual([{ topicId: 2, messageId: 3008 }]);
+      // Cleared, not left behind - a *later* restart's reconciliation must not relabel the same
+      // leftover a second time against whatever new placeholder the resume nudge just created.
+      expect(sessionStore.get("fix-bug")?.thinkingPlaceholderMsg).toBeNull();
+    });
+
+    test("a row with no outstanding placeholder never calls relabelStalePlaceholder", async () => {
+      const sessionStore = new SessionStore(":memory:");
+      sessionStore.insert(row({ thinkingPlaceholderMsg: null }));
+      const routing = new Routing();
+      const confirm = fakeConfirm();
+      let relabelCalls = 0;
+      const supervisor = createSessionSupervisor({
+        sessionStore,
+        routing,
+        controlBot: fakeControlBot(),
+        confirmSessionCommand: confirm.fn,
+        supergroupChatId: "-100",
+        selfCheckSlug: "selfcheck",
+        relabelStalePlaceholder: () => {
+          relabelCalls += 1;
+        },
+        launchSession: () => ({
+          worktreePath: "c:\\data\\worktrees\\fix-bug",
+          branch: "claude/fix-bug-1",
+          ptyProcess: fakePty() as unknown as LaunchedSession["ptyProcess"],
+          ready: Promise.resolve({ resumeFailed: false }),
+        }),
+      });
+
+      await supervisor.runStartupReconciliation();
+
+      expect(relabelCalls).toBe(0);
+    });
+
+    test("omitting relabelStalePlaceholder entirely still reconciles cleanly (optional, like clearThinkingPlaceholder)", async () => {
+      const sessionStore = new SessionStore(":memory:");
+      sessionStore.insert(row({ thinkingPlaceholderMsg: 3008 }));
+      const routing = new Routing();
+      const confirm = fakeConfirm();
+      const supervisor = createSessionSupervisor({
+        sessionStore,
+        routing,
+        controlBot: fakeControlBot(),
+        confirmSessionCommand: confirm.fn,
+        supergroupChatId: "-100",
+        selfCheckSlug: "selfcheck",
+        launchSession: () => ({
+          worktreePath: "c:\\data\\worktrees\\fix-bug",
+          branch: "claude/fix-bug-1",
+          ptyProcess: fakePty() as unknown as LaunchedSession["ptyProcess"],
+          ready: Promise.resolve({ resumeFailed: false }),
+        }),
+      });
+
+      await supervisor.runStartupReconciliation();
+
+      expect(confirm.calls.some((c) => c.text.includes('Session "fix-bug" resumed.'))).toBe(true);
+    });
   });
 });

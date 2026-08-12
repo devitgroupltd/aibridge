@@ -218,6 +218,7 @@ async function main(): Promise<void> {
       ptyPid: 0,
       state: "starting",
       turnCardMsg: null,
+      thinkingPlaceholderMsg: null,
       paused: false,
       renamed: false,
       feedDetail: "compact",
@@ -437,6 +438,16 @@ async function main(): Promise<void> {
       return sent.message_id;
     },
     log: (level, message) => log(level, message),
+    // P0-5 (codebase-hardening-plan.md): persists each placeholder's message_id per-slug so a
+    // restart-orphaned one can be found and relabeled at the next boot instead of reading
+    // "🤔 Thinking..." forever - see `thinking-placeholder.ts`'s own `persist` doc comment.
+    // `resolveSlug` returning `undefined` for the control topic's own router-latency placeholder is
+    // exactly the no-op `persist`'s doc comment describes.
+    persist: {
+      resolveSlug: (topicId) => routing.getByTopicId(Number(topicId))?.slug,
+      save: (slug, messageId) => sessionStore.setThinkingPlaceholderMsg(slug, messageId),
+      clear: (slug) => sessionStore.setThinkingPlaceholderMsg(slug, null),
+    },
   });
 
   // The deterministic half of `/new`'s first-write race (§4.5's dev-channels dialog is the other
@@ -516,6 +527,24 @@ async function main(): Promise<void> {
         log,
         "index clearThinkingPlaceholder(crash)",
       );
+    },
+    // P0-5 (codebase-hardening-plan.md): the cross-restart counterpart to `clearThinkingPlaceholder`
+    // above - `runStartupReconciliation` calls this for whatever `thinkingPlaceholderMsg` a session's
+    // row still has recorded from the *previous* process, since there is no in-memory promise left to
+    // consume. Editing (not deleting) it is deliberate: an operator scrolling back should see what
+    // happened to that turn, not a silently vanished message. `editMessageText` on a bot's own
+    // message has no documented age limit (unlike the 48h *user*-edit window), but that's unverified
+    // from Telegram's docs either way (see the plan's own P0-5 note) - fall back to a fresh
+    // `sendMessage` into the same topic if the edit fails for any reason, rather than losing the
+    // notice entirely.
+    relabelStalePlaceholder: (topicId, messageId) => {
+      const text = "⚠️ Interrupted by a restart - resuming...";
+      const edited = controlBot.editMessageText
+        ? controlBot.editMessageText(config.supergroupChatId, messageId, text).catch(() =>
+            controlBot.sendMessage(config.supergroupChatId, topicId, text),
+          )
+        : controlBot.sendMessage(config.supergroupChatId, topicId, text);
+      fireAndForget(edited, log, "index relabelStalePlaceholder");
     },
   });
 

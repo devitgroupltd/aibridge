@@ -96,6 +96,17 @@ export interface SessionSupervisorOptions {
    * about to resume, not end). Optional so existing tests that never exercise this don't need to
    * supply one. */
   clearThinkingPlaceholder?: (topicId: number) => void;
+  /** P0-5 (codebase-hardening-plan.md): the cross-restart counterpart to `clearThinkingPlaceholder`
+   * above. That one only ever fires from `handleUnexpectedExit`, *inside the same process* the
+   * placeholder was created in - it has no way to reach one left behind by a process that's since
+   * exited entirely, which is exactly what happens when a second Bridge restart lands before a
+   * resume nudge's own turn gets a chance to reply (found live 2026-08-12, `unify-work-with-voice-and`).
+   * `runStartupReconciliation` calls this once per session whose persisted `thinkingPlaceholderMsg`
+   * (thinking-placeholder.ts's `persist` hook) is non-null at boot - the in-memory promise that would
+   * have resolved it is unrecoverable, but the message itself doesn't have to keep reading
+   * "🤔 Thinking..." forever. Optional for the same reason `clearThinkingPlaceholder` is: existing
+   * tests that never exercise this restart path don't need to supply one. */
+  relabelStalePlaceholder?: (topicId: number, messageId: number) => void;
   /** Sends a nudge into a resumed session whose pending permission prompt was lost - see
    * resume-nudge-on-lost-permission-plan.md §1/§2. Same shape as `PtyIo['sendChannelText']`
    * deliberately (Interface Segregation: `resumeSession` needs exactly this one function, not the
@@ -277,6 +288,17 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
         // function returns (index.ts), so there is no legitimate concurrent `/kill` this could be
         // racing, unlike `resumeSession`'s other callers.
         log("WARN", `session "${row.slug}" is marked dead but was live when this boot started (§4.5) - resuming anyway rather than orphaning it`);
+      }
+      // P0-5 (codebase-hardening-plan.md): `row` here is from the same pre-`startPipeServer`
+      // snapshot `bootLiveSlugs` itself relies on (see that set's own doc comment) - provably
+      // untouched by anything this boot has done, so a non-null `thinkingPlaceholderMsg` can only be
+      // a genuine leftover from the *previous* process, never a race with this one. Relabeled and
+      // cleared *before* `resumeSession` below, which is about to create a brand-new placeholder of
+      // its own via the resume nudge - closing out the stale one first keeps the two from being
+      // confused with each other in the topic's scrollback.
+      if (row.thinkingPlaceholderMsg != null) {
+        opts.relabelStalePlaceholder?.(row.topicId, row.thinkingPlaceholderMsg);
+        sessionStore.setThinkingPlaceholderMsg(row.slug, null);
       }
       log("INFO", `reconciling session "${row.slug}" after a Bridge restart`);
       await resumeSession(row, { bootReconciliation: true });
