@@ -58,7 +58,10 @@ function fakeSessionSupervisor() {
   const calls = { killAndUntrack: [] as string[], untrack: [] as string[] };
   return {
     isPidAlive: () => false,
-    reapRowsWithDeletedTopics: async () => [],
+    // Default: no topic is ever deleted, i.e. every row survives unchanged - matches every existing
+    // test's assumption that `/resume` reaches `resumeSession`. Tests exercising the deleted-topic
+    // path override this per-case.
+    reapRowsWithDeletedTopics: async (rows: SessionRow[]) => rows,
     reportOrphanProcesses: async () => {},
     runStartupReconciliation: async () => {},
     wireSession: () => {},
@@ -426,6 +429,54 @@ describe("createSessionLifecycleCommands", () => {
       await sessionLifecycle.handleResumeCommand({ kind: "resume", all: true }, 1, undefined);
       expect(resumed).toEqual([]);
       expect(confirmed[0]?.text).toBe("No dead sessions to resume.");
+    });
+
+    // Live-confirmed 2026-08-12: a Bridge restart followed by `/resume --all` tried to resume rows
+    // whose Telegram topics had been deleted - every send into them failed with "message thread not
+    // found", silently, so the control-topic summary claimed a resume that never actually reached
+    // Telegram. `reapRowsWithDeletedTopics` (already used by boot reconciliation) has to run first.
+    test("/resume --all reaps a row whose Telegram topic was deleted instead of trying (and silently failing) to resume it", async () => {
+      const { sessionLifecycle, sessionStore, sessionSupervisor, confirmed } = setup();
+      sessionStore.insert(row({ slug: "dead-one", state: "dead", topicId: 6, sessionId: "sess-dead-1" }));
+      sessionStore.insert(row({ slug: "gone-topic", state: "dead", topicId: 7, sessionId: "sess-gone" }));
+      sessionSupervisor.reapRowsWithDeletedTopics = async (rows: SessionRow[]) => rows.filter((r) => r.slug !== "gone-topic");
+      const calls: Array<{ slug: string; opts: unknown }> = [];
+      sessionSupervisor.resumeSession = async (r: SessionRow, opts?: unknown) => {
+        calls.push({ slug: r.slug, opts });
+      };
+      await sessionLifecycle.handleResumeCommand({ kind: "resume", all: true }, 1, undefined);
+      expect(calls).toEqual([{ slug: "dead-one", opts: { manuallyRequested: true } }]);
+      expect(confirmed[0]?.text).toContain("Resumed 1 dead session: dead-one");
+      expect(confirmed[0]?.text).toContain("1 more had a deleted topic");
+    });
+
+    test("/resume --all reports a clear failure, and calls resumeSession for nobody, when every dead session's topic was deleted", async () => {
+      const { sessionLifecycle, sessionStore, sessionSupervisor, confirmed } = setup();
+      sessionStore.insert(row({ slug: "gone-topic", state: "dead", topicId: 7, sessionId: "sess-gone" }));
+      sessionSupervisor.reapRowsWithDeletedTopics = async () => [];
+      const resumed: SessionRow[] = [];
+      sessionSupervisor.resumeSession = async (r: SessionRow) => {
+        resumed.push(r);
+      };
+      await sessionLifecycle.handleResumeCommand({ kind: "resume", all: true }, 1, undefined);
+      expect(resumed).toEqual([]);
+      expect(confirmed[0]?.text).toContain("1 dead session could not be resumed");
+      expect(confirmed[0]?.text).toContain("its Telegram topic no longer exists");
+    });
+
+    test("handleResumeCommand (single slug) does not call resumeSession when the row's own topic was deleted", async () => {
+      const { sessionLifecycle, sessionStore, sessionSupervisor, confirmed } = setup();
+      sessionStore.insert(row({ state: "dead" }));
+      sessionSupervisor.reapRowsWithDeletedTopics = async () => [];
+      const resumed: SessionRow[] = [];
+      sessionSupervisor.resumeSession = async (r: SessionRow) => {
+        resumed.push(r);
+      };
+      await sessionLifecycle.handleResumeCommand({ kind: "resume", slug: "fix-bug" }, 1, undefined);
+      expect(resumed).toEqual([]);
+      // `reapRowsWithDeletedTopics` itself is the one that posts the "topic no longer exists" notice
+      // (to the control topic, per its own doc comment) - this path deliberately posts nothing further.
+      expect(confirmed).toEqual([]);
     });
 
     test("handleDetailCommand reports a clear failure for an unknown slug", () => {

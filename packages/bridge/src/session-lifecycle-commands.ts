@@ -755,9 +755,25 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // branch below already no-ops on anything that isn't `dead`), so this executes immediately with
     // no confirm card, the same reasoning `/remove --dead`/`--prefix` already use.
     if (cmd.all) {
-      const targets = sessionStore.all().filter((r) => r.state === "dead" && r.slug !== selfCheckSlug);
-      if (targets.length === 0) {
+      const deadRows = sessionStore.all().filter((r) => r.state === "dead" && r.slug !== selfCheckSlug);
+      if (deadRows.length === 0) {
         confirmSessionCommand(topicId, "No dead sessions to resume.");
+        return;
+      }
+      // Reap before resuming (live-confirmed 2026-08-12): a row surviving from before a Telegram
+      // topic was deleted has nowhere to receive `resumeSession`'s own confirmation - every send
+      // into it fails with Telegram's "message thread not found", silently, and the operator sees
+      // no explanation for why that one slug never showed up. `reapRowsWithDeletedTopics` already
+      // does exactly this probe-and-notify (§4.5, shared with boot reconciliation) - reusing it here
+      // means a deleted topic gets the same "marked dead, worktree preserved" notice on the control
+      // topic instead of three retried sends nobody ever sees.
+      const targets = await sessionSupervisor.reapRowsWithDeletedTopics(deadRows);
+      const reapedCount = deadRows.length - targets.length;
+      if (targets.length === 0) {
+        confirmSessionCommand(
+          topicId,
+          `${reapedCount} dead session${reapedCount === 1 ? "" : "s"} could not be resumed - ${reapedCount === 1 ? "its" : "their"} Telegram topic no longer exists (see the notice${reapedCount === 1 ? "" : "s"} above).`,
+        );
         return;
       }
       for (const target of targets) {
@@ -767,9 +783,10 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         // own comment for why that guard doesn't apply here.
         await sessionSupervisor.resumeSession(target, { manuallyRequested: true });
       }
+      const reapedNote = reapedCount > 0 ? ` (${reapedCount} more had a deleted topic and couldn't be - see the notice${reapedCount === 1 ? "" : "s"} above)` : "";
       confirmSessionCommand(
         topicId,
-        `Resumed ${targets.length} dead session${targets.length === 1 ? "" : "s"}: ${targets.map((r) => r.slug).join(", ")}. Watch each one's own topic for a "couldn't resume" notice if its conversation transcript wasn't recoverable.`,
+        `Resumed ${targets.length} dead session${targets.length === 1 ? "" : "s"}: ${targets.map((r) => r.slug).join(", ")}${reapedNote}. Watch each one's own topic for a "couldn't resume" notice if its conversation transcript wasn't recoverable.`,
       );
       return;
     }
@@ -784,12 +801,17 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       confirmSessionCommand(topicId, `"${row.slug}" is still running - just send it a message to continue (a /stop interrupt leaves the process alive).`);
       return;
     }
+    // Same deleted-topic probe as the `--all` branch above, for the single-slug path - without it,
+    // `/resume <slug>` on a row whose topic is gone just silently fails to post anything into that
+    // (nonexistent) topic, leaving the operator watching a command that looks like it did nothing.
+    const [survivor] = await sessionSupervisor.reapRowsWithDeletedTopics([row]);
+    if (!survivor) return;
     // `manuallyRequested: true` - `row.state === "dead"` here is the whole reason /resume was
     // invoked, not a race for `resumeSession`'s own dead-guard to catch (see its doc comment: that
     // guard is for the crash-backoff/reconciliation callers, which capture a non-dead row before
     // doing async work). Omitting this silently no-ops every manual /resume (live-confirmed bug,
     // 2026-08-11).
-    await sessionSupervisor.resumeSession(row, { manuallyRequested: true });
+    await sessionSupervisor.resumeSession(survivor, { manuallyRequested: true });
   }
 
   /**
