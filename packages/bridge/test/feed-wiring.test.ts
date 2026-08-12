@@ -19,6 +19,7 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     ptyPid: 1234,
     state: "starting",
     turnCardMsg: null,
+    thinkingPlaceholderMsg: null,
     paused: false,
     renamed: false,
     feedDetail: "compact",

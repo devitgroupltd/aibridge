@@ -162,6 +162,7 @@ describe("createInboundMedia", () => {
         ptyPid: 0,
         state: "dead",
         turnCardMsg: null,
+        thinkingPlaceholderMsg: null,
         paused: false,
         renamed: false,
         feedDetail: "compact",

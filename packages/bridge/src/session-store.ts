@@ -58,6 +58,14 @@ export interface SessionRow {
   ptyPid: number;
   state: SessionState;
   turnCardMsg: number | null;
+  /** P0-5 (codebase-hardening-plan.md): the message_id of this session's currently-outstanding
+   * "🤔 Thinking..." placeholder (thinking-placeholder.ts), if any - written before the covered
+   * turn starts and cleared once it's consumed (a reply lands, or a same-process crash clears it).
+   * Unlike `turnCardMsg`, this one is actually read: `runStartupReconciliation` (session-supervisor.ts)
+   * checks it for every session live at boot and relabels a non-null leftover - the in-memory
+   * promise that would have resolved it died with the previous process, but the message itself
+   * doesn't have to keep reading "Thinking..." forever. */
+  thinkingPlaceholderMsg: number | null;
   paused: boolean;
   /** §4.4's rename-once cap: flips true the first time the topic is renamed off its provisional
    * `/new`-prompt title, so a later Bridge restart or a second reply doesn't re-trigger it. */
@@ -102,6 +110,7 @@ interface SessionRowSql {
   pty_pid: number;
   state: string;
   turn_card_msg: number | null;
+  thinking_placeholder_msg: number | null;
   paused: number;
   renamed: number;
   feed_detail: string;
@@ -125,6 +134,7 @@ function fromSql(row: SessionRowSql): SessionRow {
     ptyPid: row.pty_pid,
     state: row.state as SessionState,
     turnCardMsg: row.turn_card_msg,
+    thinkingPlaceholderMsg: row.thinking_placeholder_msg,
     paused: row.paused !== 0,
     renamed: row.renamed !== 0,
     feedDetail: row.feed_detail === "full" ? "full" : "compact",
@@ -175,6 +185,10 @@ const COLUMN_MIGRATIONS: readonly { column: string; ddl: string }[] = [
   // pre-2026-08-11 row predates per-session mode tracking entirely, so "manual" is the only value
   // that was ever actually true for it.
   { column: "mode", ddl: "ALTER TABLE sessions ADD COLUMN mode TEXT NOT NULL DEFAULT 'manual';" },
+  // P0-5 (codebase-hardening-plan.md): nullable, same shape as `turn_card_msg` above - an existing
+  // pre-2026-08-12 row has no outstanding placeholder to speak of, so NULL (not 0, which is a real
+  // message_id) is the only correct default.
+  { column: "thinking_placeholder_msg", ddl: "ALTER TABLE sessions ADD COLUMN thinking_placeholder_msg INTEGER;" },
 ];
 
 export class SessionStore {
@@ -203,6 +217,7 @@ export class SessionStore {
         pty_pid        INTEGER NOT NULL,
         state          TEXT NOT NULL,
         turn_card_msg  INTEGER,
+        thinking_placeholder_msg INTEGER,
         paused         INTEGER NOT NULL DEFAULT 0,
         renamed        INTEGER NOT NULL DEFAULT 0,
         feed_detail    TEXT NOT NULL DEFAULT 'compact',
@@ -246,8 +261,8 @@ export class SessionStore {
   insert(row: SessionRow): void {
     this.prepare(
       `INSERT INTO sessions
-       (slug, topic_id, session_id, worktree_path, branch, repo_path, model, pty_pid, state, turn_card_msg, paused, renamed, feed_detail, feed_verbose, bypass_permission, auto_answer, mode, created_utc, last_event_utc)
-       VALUES ($slug, $topic_id, $session_id, $worktree_path, $branch, $repo_path, $model, $pty_pid, $state, $turn_card_msg, $paused, $renamed, $feed_detail, $feed_verbose, $bypass_permission, $auto_answer, $mode, $created_utc, $last_event_utc)`,
+       (slug, topic_id, session_id, worktree_path, branch, repo_path, model, pty_pid, state, turn_card_msg, thinking_placeholder_msg, paused, renamed, feed_detail, feed_verbose, bypass_permission, auto_answer, mode, created_utc, last_event_utc)
+       VALUES ($slug, $topic_id, $session_id, $worktree_path, $branch, $repo_path, $model, $pty_pid, $state, $turn_card_msg, $thinking_placeholder_msg, $paused, $renamed, $feed_detail, $feed_verbose, $bypass_permission, $auto_answer, $mode, $created_utc, $last_event_utc)`,
     ).run({
         $slug: row.slug,
         $topic_id: row.topicId,
@@ -259,6 +274,7 @@ export class SessionStore {
         $pty_pid: row.ptyPid,
         $state: row.state,
         $turn_card_msg: row.turnCardMsg,
+        $thinking_placeholder_msg: row.thinkingPlaceholderMsg,
         $paused: row.paused ? 1 : 0,
         $renamed: row.renamed ? 1 : 0,
         $feed_detail: row.feedDetail,
@@ -314,54 +330,74 @@ export class SessionStore {
     this.prepare("UPDATE sessions SET state = $state, last_event_utc = $now WHERE slug = $slug").run({ $state: state, $now: nowIso, $slug: slug });
   }
 
+  /** P2-2 (codebase-hardening-plan.md): the shared body every single-column setter below now
+   * delegates to, replacing eight near-identical hand-written `UPDATE ... SET x = $x WHERE slug =
+   * $slug` statements (each its own copy-pasted method). `column` is always one of this file's own
+   * hardcoded SQL identifiers, never external input, so string interpolation here is safe the same
+   * way it already was in each of those statements individually - only the parameter *value* goes
+   * through a bound placeholder. `setState` is deliberately NOT one of the delegating setters below:
+   * unlike every other column it validates the transition first and touches a second column
+   * (`last_event_utc`) in the same statement, so folding it in here would just reintroduce the
+   * special case this helper exists to remove. */
+  private setColumn(slug: string, column: string, value: string | number | null): void {
+    this.prepare(`UPDATE sessions SET ${column} = $value WHERE slug = $slug`).run({ $value: value, $slug: slug });
+  }
+
   setModel(slug: string, model: string): void {
-    this.prepare("UPDATE sessions SET model = $model WHERE slug = $slug").run({ $model: model, $slug: slug });
+    this.setColumn(slug, "model", model);
   }
 
   setSessionId(slug: string, sessionId: string): void {
-    this.prepare("UPDATE sessions SET session_id = $session_id WHERE slug = $slug").run({ $session_id: sessionId, $slug: slug });
+    this.setColumn(slug, "session_id", sessionId);
   }
 
   setTurnCardMsg(slug: string, messageId: number | null): void {
-    this.prepare("UPDATE sessions SET turn_card_msg = $msg WHERE slug = $slug").run({ $msg: messageId, $slug: slug });
+    this.setColumn(slug, "turn_card_msg", messageId);
+  }
+
+  /** `thinking-placeholder.ts`'s persistence hook (P0-5, codebase-hardening-plan.md) - written via
+   * its `start`/`consume` calling this through the composition root's injected `persist` option,
+   * keyed by slug (resolved from the placeholder's topicId via `routing.getByTopicId`). */
+  setThinkingPlaceholderMsg(slug: string, messageId: number | null): void {
+    this.setColumn(slug, "thinking_placeholder_msg", messageId);
   }
 
   setPaused(slug: string, paused: boolean): void {
-    this.prepare("UPDATE sessions SET paused = $paused WHERE slug = $slug").run({ $paused: paused ? 1 : 0, $slug: slug });
+    this.setColumn(slug, "paused", paused ? 1 : 0);
   }
 
   setRenamed(slug: string): void {
-    this.prepare("UPDATE sessions SET renamed = 1 WHERE slug = $slug").run({ $slug: slug });
+    this.setColumn(slug, "renamed", 1);
   }
 
   setFeedDetail(slug: string, level: FeedDetailLevel): void {
-    this.prepare("UPDATE sessions SET feed_detail = $level WHERE slug = $slug").run({ $level: level, $slug: slug });
+    this.setColumn(slug, "feed_detail", level);
   }
 
   setFeedVerbose(slug: string, verbose: boolean): void {
-    this.prepare("UPDATE sessions SET feed_verbose = $verbose WHERE slug = $slug").run({ $verbose: verbose ? 1 : 0, $slug: slug });
+    this.setColumn(slug, "feed_verbose", verbose ? 1 : 0);
   }
 
   /** `routing.ts`'s `setBypass` write-through target - see that method's own doc comment for why
    * this is a mirror of the in-memory map, not the source of truth during a live process. */
   setBypassPermission(slug: string, on: boolean): void {
-    this.prepare("UPDATE sessions SET bypass_permission = $on WHERE slug = $slug").run({ $on: on ? 1 : 0, $slug: slug });
+    this.setColumn(slug, "bypass_permission", on ? 1 : 0);
   }
 
   /** `routing.ts`'s `setAutoAnswer` write-through target - same mirror relationship as
    * `setBypassPermission` above. */
   setAutoAnswer(slug: string, on: boolean): void {
-    this.prepare("UPDATE sessions SET auto_answer = $on WHERE slug = $slug").run({ $on: on ? 1 : 0, $slug: slug });
+    this.setColumn(slug, "auto_answer", on ? 1 : 0);
   }
 
   /** `routing.ts`'s `setMode` write-through target - same mirror relationship as the two above,
    * except this one backs a value `resumeSession` actually relaunches with, not just a display. */
   setMode(slug: string, mode: string): void {
-    this.prepare("UPDATE sessions SET mode = $mode WHERE slug = $slug").run({ $mode: mode, $slug: slug });
+    this.setColumn(slug, "mode", mode);
   }
 
   setPtyPid(slug: string, ptyPid: number): void {
-    this.prepare("UPDATE sessions SET pty_pid = $pty_pid WHERE slug = $slug").run({ $pty_pid: ptyPid, $slug: slug });
+    this.setColumn(slug, "pty_pid", ptyPid);
   }
 
   remove(slug: string): void {

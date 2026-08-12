@@ -2,10 +2,10 @@ import { appendFileSync } from "node:fs";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { CallToolRequestSchema, ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
-import { assertValidBehavior, buildMeta, PROTOCOL_VERSION } from "@aibridge/protocol";
-import type { InboundMessage, Message, PermissionRequestMessage, ReplyMessage, SendFileMessage, VerdictMessage } from "@aibridge/protocol";
+import type { Message } from "@aibridge/protocol";
 import { PipeClient } from "./pipe-client.ts";
 import { resolveSlug } from "./resolve-slug.ts";
+import { createChannelHandlers } from "./channel-handlers.ts";
 
 // This component only exists spawned either by the Bridge (§2.4) or by the aibridge-telegram
 // plugin (§10.1) - there is no meaningful way to run it standalone, so a missing var is a loud,
@@ -96,124 +96,24 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
   ],
 }));
 
-server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const args = request.params.arguments;
-
-  if (request.params.name === "reply") {
-    if (typeof args?.topic_id !== "string" || typeof args?.text !== "string") {
-      throw new Error("reply requires { topic_id: string, text: string }");
-    }
-    // §3.3: forwarding to the Bridge is independent of the pipe's own connection state - if
-    // disconnected, PipeClient queues it (reply is priority) rather than dropping it.
-    const msg: ReplyMessage = {
-      v: PROTOCOL_VERSION,
-      type: "reply",
-      slug,
-      topic_id: args.topic_id,
-      text: args.text,
-    };
-    pipe.send(msg);
-    return { content: [{ type: "text", text: "sent" }] };
-  }
-
-  if (request.params.name === "send_file") {
-    if (typeof args?.topic_id !== "string" || typeof args?.path !== "string") {
-      throw new Error("send_file requires { topic_id: string, path: string, caption?: string }");
-    }
-    if (args.caption !== undefined && typeof args.caption !== "string") {
-      throw new Error("send_file's caption, if given, must be a string");
-    }
-    // §5.8: the Bridge re-validates `path` against this session's own outbox - the channel server
-    // never decides that on its own, it only forwards what Claude asked for.
-    const msg: SendFileMessage = {
-      v: PROTOCOL_VERSION,
-      type: "send_file",
-      slug,
-      topic_id: args.topic_id,
-      path: args.path,
-      ...(args.caption !== undefined ? { caption: args.caption as string } : {}),
-    };
-    pipe.send(msg);
-    return { content: [{ type: "text", text: "sent" }] };
-  }
-
-  throw new Error(`unknown tool "${request.params.name}"`);
-});
-
-async function forwardInbound(msg: InboundMessage): Promise<void> {
-  const meta = buildMeta(msg.meta);
-  log("INFO", `forwarding inbound to Claude via notification: content=${JSON.stringify(msg.content)} meta=${JSON.stringify(meta)}`);
-  await server.notification({
-    method: "notifications/claude/channel",
-    params: { content: msg.content, meta },
-  });
-  log("INFO", "server.notification() resolved without error");
-}
-
-/** §6.3's send-side: relays a Bridge verdict back to Claude Code, closing the local dialog. */
-async function sendVerdictToClaude(msg: VerdictMessage): Promise<void> {
-  assertValidBehavior(msg.behavior);
-  await server.notification({
-    method: "notifications/claude/channel/permission",
-    params: { request_id: msg.request_id, behavior: msg.behavior },
-  });
-  log("INFO", `sent verdict for request_id=${msg.request_id}: ${msg.behavior}`);
-}
-
-function handleFromBridge(msg: Message): void {
-  log("INFO", `received from Bridge: type=${msg.type}`);
-  if (msg.type === "inbound") {
-    forwardInbound(msg).catch((err) => {
-      log("ERROR", `failed to deliver inbound notification: ${(err as Error).message}`);
-    });
-  } else if (msg.type === "verdict") {
-    sendVerdictToClaude(msg).catch((err) => {
-      log("ERROR", `failed to deliver verdict: ${(err as Error).message}`);
-    });
-  }
-  // hello_ack / ack: nothing to do with these.
-}
-
-/**
- * §6.3's receive-side: Claude Code emits this notification (not a request - there is no reply
- * expected inline) when a gated tool call raises a local permission prompt. Forwarded to the
- * Bridge over the pipe verbatim; `permission_request` is already priority-queued by
- * `pipe-client.ts`'s `isPriority()` if the pipe happens to be disconnected.
- */
-server.fallbackNotificationHandler = async (notification) => {
-  if (notification.method !== "notifications/claude/channel/permission_request") {
-    log("WARN", `unhandled notification from Claude Code: ${notification.method}`);
-    return;
-  }
-  const params = notification.params as
-    | { request_id?: unknown; tool_name?: unknown; description?: unknown; input_preview?: unknown }
-    | undefined;
-  if (
-    typeof params?.request_id !== "string" ||
-    typeof params.tool_name !== "string" ||
-    typeof params.description !== "string" ||
-    typeof params.input_preview !== "string"
-  ) {
-    log("ERROR", `malformed permission_request notification: ${JSON.stringify(notification)}`);
-    return;
-  }
-  const msg: PermissionRequestMessage = {
-    v: PROTOCOL_VERSION,
-    type: "permission_request",
-    slug,
-    request_id: params.request_id,
-    tool_name: params.tool_name,
-    description: params.description,
-    input_preview: params.input_preview,
-  };
-  log("INFO", `forwarding permission_request ${params.request_id} (${params.tool_name}) to Bridge`);
-  pipe.send(msg);
-};
+// The actual request/notification handling (P1-8, codebase-hardening-plan.md) lives in
+// channel-handlers.ts, unit-tested there against fake `pipe`/`server` - this file is now just
+// wiring. `pipe` is constructed with a forward-referenced `onMessage` (assigned right after
+// `handlers` exists) since `handlers.handleFromBridge` needs `pipe` for its own two handlers
+// (`callTool`/`handlePermissionRequestNotification`), a small circular dependency resolved the
+// same way `sendResumeNudge`/`LateBound` resolves the analogous one in the Bridge composition root.
+let handleFromBridge: (msg: Message) => void = () => {};
 
 // AIBRIDGE_PIPE_PATH overrides the default pipe path - used by integration tests to run several
 // isolated Bridge/channel-server pairs concurrently without colliding on \\.\pipe\aibridge.
-const pipe = new PipeClient({ slug, pipePath: process.env.AIBRIDGE_PIPE_PATH, onMessage: handleFromBridge, log });
+const pipe = new PipeClient({ slug, pipePath: process.env.AIBRIDGE_PIPE_PATH, onMessage: (msg) => handleFromBridge(msg), log });
 pipe.start();
+
+const handlers = createChannelHandlers({ slug, pipe, server, log });
+handleFromBridge = handlers.handleFromBridge;
+
+server.setRequestHandler(CallToolRequestSchema, handlers.callTool);
+server.fallbackNotificationHandler = handlers.handlePermissionRequestNotification;
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
