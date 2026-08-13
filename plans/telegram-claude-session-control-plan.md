@@ -4284,9 +4284,17 @@ Manual checks that automated tests cannot cover, run at the end of Phase 6a, and
 Status as of 2026-08-13: 1, 4, 6 and 7 are done; 5 is done for the only path that applies to a repo
 without its own guard hook; and 8's four fail-closed claims are automated and passing, leaving only its
 credential step. **What is left is 2, 3, 5(a)/(b)/(d) and 8's live revocation — and none of it is
-blocked on more automation.** 2 and 3 need a real 30-minute sleep, which no script can perform, and
-they share one lid-close: arm the stale command before sleeping and both are measured on the same
-resume. 8 needs a BotFather token revocation, but only to confirm the revocation *itself* behaves as
+blocked on more automation.** 3 is now **done and automated** (see check 3) - the "needs a real
+30-minute sleep, which no script can perform" claim previously here was simply false: staleness is
+measured against Telegram's `message.date`, so a *stopped Bridge* produces the same backlog as a
+sleeping host, and running it found a real defect in the confirm-replay path. 2 cannot be run from
+inside this host at all, for a reason that has nothing to do with automation: this is a VMware guest
+with no battery, `powercfg /a` reports S3/hibernate/S0-low-power-idle all unsupported (only S1), and
+`powercfg /q SCHEME_CURRENT SUB_BUTTONS` publishes no lid-close action, which Windows only does when
+a lid exists. The VM runs on a laptop, so closing the **host's** lid does suspend it - the check is
+triggerable, just not from in here, and what reaches the guest is a clock discontinuity rather than
+an S-state. Its scriptable half (a pending prompt must survive a large wall-clock jump) is
+`scripts/telegram-automation/clock-jump-check.js`. 8 needs a BotFather token revocation, but only to confirm the revocation *itself* behaves as
 assumed and that recovery works - everything it causes is now checked on every run (see check 8). 5's
 remaining paths need a second repo registered, which is itself a Phase 6b trigger (see check 5).
 Checks 4, 6, 7 and now most of 8 were all specified as manual and turned out to be automatable, so the
@@ -4301,8 +4309,39 @@ otherwise - and where one step is, the rest of the check usually is not.
    the task's own `Last Run Time`, not a manually-started process.
 2. **Sleep and resume.** Close the lid for 30 minutes with a session mid-turn. On resume, the topic
    shows an accurate state and no phantom pending prompts.
-3. **Stale command.** Send "push it" while the machine is asleep. On resume it is confirmed, not
-   executed.
+3. ~~**Stale command.** Send "push it" while the machine is asleep. On resume it is confirmed, not
+   executed.~~ **Done 2026-08-13, automated rather than manual, and it found a real defect** -
+   `scripts/telegram-automation/stale-command-check.js`.
+
+   The "needs a real sleep" premise was wrong. Staleness is `isStaleInbound(message.date,
+   Date.now())`, measured against Telegram's own server timestamp, and `stale-inbound.ts`'s own doc
+   comment already named the equivalent trigger: "while the Bridge is offline (laptop asleep,
+   **process down**)". A stopped Bridge produces the identical >30-minute-old backlog through the
+   identical path. The script stops the Bridge, sends, waits out the real 30 minutes, restarts, and
+   measures. No sleep, no lid, nobody present.
+
+   **Result: `card=true | inertBeforeTap=true | executedAfterTap=false`.** The two claims the check
+   is named for both hold - the card appeared reading "32m ago", and the command did *not* execute
+   while it was up. The third assertion failed, and it is the one that exists to tell "held" apart
+   from "lost":
+
+   **Tapping "Yes, still want this" can silently swallow the command.** The card was finalized to
+   "✅ Confirmed - processing now." (so the tap registered and `dispatchInboundMessage` ran), but the
+   message never reached the session. `callback-query-router.ts` deliberately replays through the
+   same path a live message takes, that path calls `nlDispatch.routeOrFallback` even for a topic with
+   a live session, `help` is an allowed router kind in *every* topic (`allowedKinds`), and the router
+   classified the replayed instruction as a help request. The operator got the help card; the command
+   was dropped. The card's own text promises processing that never happened, which makes this
+   silent-wrong in the §9 sense rather than a loud failure - and note the same swallow can happen to
+   any NL-routed message, the replay path is just where it is most damaging, because the operator has
+   already explicitly confirmed that specific text.
+
+   Not deterministic: the `--rehearse` control run forwarded the byte-identical text to the session
+   correctly, so this is a classifier outcome, not a structural mis-route. **Fix not yet chosen** - a
+   blanket "replay bypasses NL routing" is wrong, since a stale *fleet* command ("restart the
+   bridge") legitimately needs classifying; the narrower option is to drop `help`/`about` from
+   `allowedKinds` for an operator-confirmed replay, on the grounds that the operator has already been
+   shown the exact text and said yes, so re-interpreting it can only contradict them.
 4. ~~**Terminal race.** Trigger a permission prompt, answer it at the terminal, confirm the Telegram
    buttons resolve rather than hanging.~~ **Done (0.71.0), automated rather than manual** - see that
    changelog entry. Automating this found the §6.5 resolution heuristic itself had never been built

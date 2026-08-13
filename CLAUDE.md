@@ -50,8 +50,13 @@ misses it (see S-1).
 Outstanding verification work is §13's checks **2, 3, 5(a)/(b)/(d) and 8's live revocation** — checks
 5(c), 6 and 7 were run and recorded on 2026-08-13, and 8's four fail-closed claims were automated the
 same day (`packages/bridge/test/compromise-drill.test.ts`) — plus a few built-but-never-live-exercised
-paths named in §12. None of it is blocked on more automation: 2 and 3 need a real 30-minute sleep and
-share one lid-close (arm the stale command before sleeping); 8 needs a BotFather revocation, but now
+paths named in §12. **Check 3 is now done and automated** (`stale-command-check.js`) - the old claim
+that it needed a real sleep was false, since staleness is measured against Telegram's `message.date`
+and a *stopped Bridge* produces the same backlog; running it found a real defect (an operator-confirmed
+stale replay can be swallowed by the NL router's `help` classification and never reach the session -
+see §13 check 3, fix not yet chosen). Check 2 cannot be driven from inside this host at all: it is a
+VMware guest with no lid and no S3/modern-standby, though the VM runs on a laptop so the *host's* lid
+still suspends it; its scriptable half is `clock-jump-check.js`. 8 needs a BotFather revocation, but now
 only to confirm the revocation itself 401s as assumed and that recovery works, since everything it
 *causes* is checked on every run; and 5's remaining paths need SeoWrite registered in `repos.toml`,
 which is itself one of §12's three named Phase 6b triggers. Note that checks 4, 6, 7 and most of 8 were
@@ -142,6 +147,13 @@ boundary as `scripts/dev-bridge.sh`).
 - The Bridge itself only picks up new code on restart (`bun run bridge:restart` /
   `scripts/dev-bridge.sh restart`) — if a live check doesn't show an expected change, restart the
   daemon before concluding the feature is broken; it's easy to be live-checking a stale process.
+- **The authoritative log is `%LOCALAPPDATA%\aibridge\bridge.log`** (plus one rotated `bridge.log.1`),
+  which the Bridge writes itself via `logger.ts` regardless of how it was launched.
+  `bridge-dev.log` is only `scripts/dev-bridge.sh`'s stdout mirror, is truncated on every `start`,
+  and is stale-and-silent whenever the running Bridge was started any other way — a `/restart` or
+  `/merge` from Telegram respawns with `stdio: "ignore"`, so nothing lands there at all. Reading it
+  and finding hours-old entries looks exactly like a wedged daemon and is not one; that misread cost
+  a detour on 2026-08-13. Check the Bridge's own log before concluding anything from a quiet one.
 
 ## Architecture
 
