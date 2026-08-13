@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import os from "node:os";
+import path from "node:path";
 import { AskRegistry } from "../src/ask-registry.ts";
 import { CostTracker } from "../src/cost-tracker.ts";
 import { FleetConfirmRegistry } from "../src/fleet-confirm.ts";
@@ -934,6 +936,61 @@ describe("createSessionLifecycleCommands", () => {
       expect(result.note).toContain("couldn't save the attachment - disk full");
       expect(result.note).toContain("re-send it in this topic once it's open");
       expect(logs).toEqual([{ level: "WARN", message: 'failed to save the attachment for "slug-1" into its worktree: disk full' }]);
+    });
+  });
+
+  // codebase-hardening-plan.md P1-9. `launchSession` isn't injectable here (imported directly, see
+  // the comment above `handleNewCommand with a pendingAttachment`), so this drives the real one
+  // against a repo path that exists but isn't a git repo - `ensureWorktree` is the very first thing
+  // it does, so `git worktree add` fails with a genuine exit 128 and nothing is written to $STATE,
+  // `~/.claude.json`, or the worktrees root. That makes it the one launch-failure branch reachable
+  // from a unit test, and it is exactly the branch the 2026-08-12 incident went through.
+  describe("handleNewCommand when the launch itself fails (P1-9)", () => {
+    async function runFailingLaunch() {
+      const logs: Array<{ level: string; message: string }> = [];
+      const reposRegistry = new ReposRegistry([{ name: "demo-repo", path: os.tmpdir() }]);
+      const harness = setup({
+        getReposRegistry: () => reposRegistry,
+        fleetWorktreesRoot: path.join(os.tmpdir(), "aibridge-p1-9-never-created"),
+        log: (level, message) => logs.push({ level, message }),
+      });
+
+      await harness.sessionLifecycle.handleNewCommand({ kind: "new", repo: "demo-repo", prompt: "probe the launch failure path" }, 1);
+
+      return { ...harness, logs };
+    }
+
+    test("logs the failure at ERROR with the slug, the repo path and git's exit status", async () => {
+      const { logs } = await runFailingLaunch();
+
+      const error = logs.find((entry) => entry.level === "ERROR");
+      expect(error).toBeDefined();
+      expect(error!.message).toContain("launch failed for");
+      expect(error!.message).toContain(os.tmpdir());
+      // The whole point of the finding: an exit status where there used to be nothing at all.
+      expect(error!.message).toContain("status: 128");
+      // git's own reason survives, exactly once - Node already put it in `err.message`, so the
+      // separate `stderr:` field is deliberately suppressed rather than duplicating the sentence.
+      expect(error!.message).toContain("fatal: not a git repository");
+      expect(error!.message.match(/not a git repository/g)).toHaveLength(1);
+      // One line, or `grep ERROR bridge.log` shows the header without any of this.
+      expect(error!.message).not.toContain("\n");
+    });
+
+    test("tells the operator how it exited, not just that a command failed", async () => {
+      const { confirmed } = await runFailingLaunch();
+
+      const failure = confirmed.find((entry) => entry.text.includes("Failed to launch session"));
+      expect(failure).toBeDefined();
+      expect(failure!.text).toContain("(exit 128)");
+    });
+
+    test("still deletes the topic it had already created", async () => {
+      // Pre-existing behavior (2026-08-03's orphan-topic fix); asserted here because the P1-9 log
+      // call was inserted at the top of this same branch and must not have displaced it.
+      const { controlBot } = await runFailingLaunch();
+
+      expect(controlBot.forumTopicCalls.deleted).toEqual([999]);
     });
   });
 });

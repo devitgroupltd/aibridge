@@ -32,6 +32,30 @@ async function openTopic(page, topicNameSubstring) {
   await page.waitForTimeout(1500);
 }
 
+/**
+ * Opens a topic by matching its **title** only, unlike `openTopic` above which matches the whole
+ * row - including the last-message preview.
+ *
+ * That difference is load-bearing right after a `/new`: the control topic's own preview then reads
+ * `Created "<slug>" (...)`, so an `openTopic(page, slug)` matches the control topic *as well as* the
+ * session's topic, and `.first()` picks the control topic because it is the most recently active
+ * row. Two live runs of always-rule-check.js drove the control topic that way without failing -
+ * every command "sent" fine and simply did nothing, since `/mode` and a plain instruction mean
+ * nothing there.
+ *
+ * Note a session topic is titled from its **prompt**, not its slug (confirmed live 2026-08-12), so
+ * pass a distinctive fragment of the prompt here - passing the slug matches nothing.
+ */
+async function openTopicByTitle(page, titleSubstring) {
+  const row = page
+    .locator(".chatlist-chat")
+    .filter({ has: page.locator(".row-title", { hasText: titleSubstring }) })
+    .first();
+  await row.waitFor({ state: "visible", timeout: 15000 });
+  await row.click({ force: true }); // same ripple-overlay interception as openTopic
+  await page.waitForTimeout(1500);
+}
+
 async function sendMessage(page, text) {
   // The composer is `div[contenteditable="true"][data-peer-id]` - a second, unrelated
   // contenteditable "fake input" overlay exists in the DOM too (confirmed live 2026-08-04: `.last()`
@@ -58,6 +82,13 @@ async function sendMessage(page, text) {
   await page.waitForTimeout(1000);
 }
 
+/**
+ * Note for anyone writing a predicate against these strings: **a leading emoji is not in them.**
+ * Telegram Web K renders emoji as `<img>` elements, and `innerText` skips those - so a card the
+ * Bridge sent as "❓ slug asks:" comes back as "slug asks:", and "🔓 auto-approved ..." as
+ * "auto-approved ...". Match on the words. Confirmed live 2026-08-13, after an emoji-bearing
+ * predicate reported "no question card appeared" against a card that was plainly on screen.
+ */
 async function getMessageTexts(page, count = 10) {
   const bubbles = page.locator(".bubble-content .translatable-message, .bubble .message");
   const total = await bubbles.count();
@@ -77,4 +108,4 @@ async function getMessageCount(page) {
   return page.locator(".bubble-content .translatable-message, .bubble .message").count();
 }
 
-module.exports = { connect, openGroup, openTopic, sendMessage, getMessageTexts, getMessageCount };
+module.exports = { connect, openGroup, openTopic, openTopicByTitle, sendMessage, getMessageTexts, getMessageCount };

@@ -986,6 +986,52 @@ describe("renderAttach", () => {
     expect(text).not.toContain("<b>pwned</b>");
     expect(text).toContain("&lt;/pre&gt;&lt;b&gt;pwned&lt;/b&gt;");
   });
+
+  // Found live 2026-08-13, the first time /attach ran against a real multi-line PTY tail: the
+  // rendered card blew past Telegram's 4096-unit cap, the P1 send failed three times with "Bad
+  // Request: message is too long", and the operator saw *nothing at all* - a failed command
+  // confirmation is only a log line. The raw tail is capped at 4000 chars (routing.ts), which is
+  // not enough on its own, because escaping expands every < > & into a 4-5 character entity.
+  describe("Telegram's 4096-unit message cap", () => {
+    test("a full ring buffer of escape-heavy PTY output still fits", () => {
+      // The realistic shape: box-drawing/prompt characters, i.e. the ones that expand.
+      const tail = "<>&".repeat(1333); // ~4000 raw chars, ~13000 escaped
+      const text = renderAttach(row(), tail);
+      expect(text.length).toBeLessThanOrEqual(4096);
+      expect(text).toContain("earlier output trimmed to fit");
+    });
+
+    test("a worst-case all-ampersand tail (5x expansion) still fits", () => {
+      const text = renderAttach(row(), "&".repeat(4000));
+      expect(text.length).toBeLessThanOrEqual(4096);
+    });
+
+    test("keeps the *end* of the output - it is a tail, and the newest lines are the point", () => {
+      const tail = `${"x".repeat(5000)}THE-LAST-LINE`;
+      const text = renderAttach(row(), tail);
+      expect(text).toContain("THE-LAST-LINE");
+    });
+
+    test("never cuts an HTML entity in half", () => {
+      // A half-entity (`mp;`) makes Telegram reject the whole message with "can't parse entities" -
+      // swapping a too-long failure for a malformed-markup one. Every offset is exercised, because
+      // which one lands mid-entity depends on the wrapper's exact length.
+      for (let extra = 0; extra < 12; extra++) {
+        const tail = "&".repeat(4000) + "x".repeat(extra);
+        const text = renderAttach(row(), tail);
+        const body = text.slice(text.indexOf("<pre>") + 5, text.indexOf("</pre>"));
+        const withoutEntities = body.replace(/&(amp|lt|gt|quot|#39);/g, "");
+        expect(withoutEntities).not.toContain(";");
+        expect(withoutEntities).not.toContain("&");
+      }
+    });
+
+    test("a short tail is left exactly as it was, with no truncation note", () => {
+      const text = renderAttach(row(), "short output");
+      expect(text).toContain("<pre>short output</pre>");
+      expect(text).not.toContain("trimmed to fit");
+    });
+  });
 });
 
 /**

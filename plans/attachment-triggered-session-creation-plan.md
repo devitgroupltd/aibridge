@@ -1,12 +1,23 @@
 ---
-version: 0.4.0
-status: draft
-last_modified_utc: 2026-08-09T11:08:44Z
+version: 0.5.0
+status: implemented
+last_modified_utc: 2026-08-12T20:05:00Z
 changelog:
+  - "0.5.0 (2026-08-12): frontmatter-vs-body drift fix, found by a \"what's left to implement\" sweep across every plan in this folder. `status` was still `draft` while the body's own status block has read \"implemented and shipped\" (plus three live-verified follow-ups) since 2026-08-09 — corrected to `implemented`. Also cleared two stale citations of `codebase-hardening-plan.md` that this document carried from when those findings were open: P0-2's \"inbound-media.ts relies on an unenforced bare-`void` convention\" (that file now uses `fireAndForget` exclusively — 7 call sites, zero bare `void` on an async call) and P1-6's \"no CI workflow exists yet for this repo\" (`.github/workflows/ci.yml` and the `typecheck` script both exist). The hardening plan itself flagged both citations as stale in its own v1.1.0 pass but could not fix them from its side; this closes that pointer."
   - "0.4.0 (2026-08-09): Fixed a CRITICAL bug in the plan itself — handleNewCommand calls newSessionContent(cmd) twice (topic-creation confirmation, then PTY send); setting cmd.sourceText as soon as slug was known would have leaked the attachment's raw file path into the topic-creation confirmation. Corrected the timing to set sourceText only between those two calls. Added a new Module Ownership & Wiring section covering the LateBound DI pattern needed (inboundMedia is constructed before sessionLifecycle exists), that handleNewCommand takes positional args not an options bag, and that repo-resolution stays inside handleNewCommand rather than being duplicated. Added a kill switch (AIBRIDGE_DISABLE_CAPTION_NEW), an observability log line, a new failure-mode catch for the inbox write, a Documentation section (renderHelp/about), corrected the test-mock-convention claim (the two existing fakeControlBot doubles are disjoint), and added inbox-write-failure and kill-switch test cases"
   - "0.3.0 (2026-08-09): Fixed the plan's central gap — handleNewCommand cannot stay unchanged; specified the sourceText/newSessionContent mechanism to reuse instead of inventing a prompt-override path, and corrected the topic-before-worktree ordering. Added a new Concurrency section (slug race, git worktree collisions). Added album/media-group scoping (v1: single-attachment only), a caption length caveat, inherited-risk notes (crash-resume, stale replayed messages, ask-list parity), fuzzy-repo-match notice parity, rate-governor and fire-and-forget-try/catch notes, corrected orphaned-inbox-file cleanup, cited session-lifecycle-commands.test.ts, and fixed the CI-gate phrasing to match the no-CI-yet reality"
   - "0.2.0 (2026-08-09): Corrected /new parser citation to parseNew in fleet-commands.ts (was wrongly attributed to session-lifecycle-commands.ts and a hand-rolled regex); fixed grammar to require a non-empty prompt and support the --opus/--haiku/--fable/--sonnet flag; removed the invented '/new usage' error in favor of the real generic fallback; cited actual test files/mock conventions (inbound-media.test.ts, command-dispatch.test.ts); tightened the guard description to the real nested !route/isControl shape"
   - "0.1.0 (2026-08-09): Initial plan created"
+v050_touched_sections:
+  - section: "frontmatter"
+    type: modified
+    summary: "status draft → implemented, matching the body's own \"implemented and shipped\" status block."
+  - section: "§6 Error Handling"
+    type: modified
+    summary: "Dropped the stale P0-2 citation; inbound-media.ts uses fireAndForget exclusively now, so the note is about following that helper, not an unenforced convention."
+  - section: "§9 Testing"
+    type: modified
+    summary: "Dropped the stale P1-6 \"no CI workflow exists yet\" claim — ci.yml runs both gates on every push/PR."
 v040_touched_sections:
   - section: "§3 Module Ownership & Wiring"
     type: added
@@ -270,11 +281,14 @@ session in any respect; only how the session was *invoked* differs.
   an attachment-triggered flow is plausibly higher-frequency (e.g. forwarded/scripted sends) than a
   human typing `/new`; a burst could 429 with only the existing generic catch-and-report, no backoff.
   No new mitigation is in scope for this plan; call out as a known limitation.
-- Implementation note: any new fire-and-forget (`void asyncFn()`) work added in this path must carry
-  its own internal `try/catch` — `inbound-media.ts` is already named in
-  [`plans/codebase-hardening-plan.md`](codebase-hardening-plan.md) (P0-2) as relying on this
-  unenforced convention, backed by a fatal `unhandledRejection → process.exit(1)` handler; one missed
-  catch here takes down the whole fleet, not just this feature.
+- Implementation note: any new fire-and-forget work added in this path must go through
+  `fire-and-forget.ts`'s `fireAndForget()`, which `inbound-media.ts` now uses exclusively (7 call
+  sites, no bare `void` on an async call). The fatal `unhandledRejection → process.exit(1)` handler
+  is still what makes this load-bearing — one un-caught rejection here takes down the whole fleet,
+  not just this feature. *(Corrected 2026-08-12: this bullet used to cite
+  [`plans/codebase-hardening-plan.md`](codebase-hardening-plan.md)'s P0-2 as naming this file for
+  relying on an unenforced bare-`void` convention. P0-2 was fixed in `a511834`; the helper is the
+  convention now.)*
 - **Kill switch:** given this plan itself documents several risks it explicitly declines to fully
   close (the widened slug race and worktree-collision risk below, the rate-governor bypass above),
   and the trigger surface is a destructive, unconfirmed control-topic command, add an environment-
@@ -464,10 +478,12 @@ exit-code/protocol contract another component branches on):
     attachment+`/new` caption → assert today's unchanged §5.6 rejection reply is sent and no session
     is created, regardless of an otherwise-valid caption.
 
-Test gate: `bun test` and `bun run typecheck`, run locally before merge. Note: per
-[`plans/codebase-hardening-plan.md`](codebase-hardening-plan.md) (P1-6), no CI workflow exists yet for
-this repo — this is currently a manual/local gate, not an enforced automated one, despite the main
-plan's §9 describing it aspirationally as a CI job.
+Test gate: `bun test` and `bun run typecheck`. Both are enforced automatically — `.github/workflows/ci.yml`
+runs them on a `windows-latest` runner for every push to `main` and every pull request — as well as
+locally before merge. *(Corrected 2026-08-12: this paragraph used to cite
+[`plans/codebase-hardening-plan.md`](codebase-hardening-plan.md)'s P1-6 for "no CI workflow exists
+yet for this repo", which stopped being true when `a511834` added the workflow and the `typecheck`
+script; the main plan's §9 is no longer aspirational on this point.)*
 
 ## Documentation
 

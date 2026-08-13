@@ -1238,4 +1238,76 @@ describe("createSessionSupervisor", () => {
       expect(confirm.calls.some((c) => c.text.includes('Session "fix-bug" resumed.'))).toBe(true);
     });
   });
+
+  // codebase-hardening-plan.md P1-9, resume half. Worse than the `/new` half it shares a helper
+  // with: this branch marks the row `dead`, which is irreversible, so if the reason isn't recorded
+  // here it is gone. `ensureWorktree` runs on a resume too, so the `git worktree add` failure that
+  // motivated the finding can kill a live session, not just refuse a new one.
+  describe("resumeSession when the relaunch throws (P1-9)", () => {
+    async function runFailingResume(thrown: unknown) {
+      const sessionStore = new SessionStore(":memory:");
+      sessionStore.insert(row({ state: "idle" }));
+      const confirm = fakeConfirm();
+      const logs: Array<{ level: string; message: string }> = [];
+      const supervisor = createSessionSupervisor({
+        sessionStore,
+        routing: new Routing(),
+        controlBot: fakeControlBot(),
+        confirmSessionCommand: confirm.fn,
+        supergroupChatId: "-100",
+        selfCheckSlug: "selfcheck",
+        log: (level, message) => logs.push({ level, message }),
+        launchSession: () => {
+          throw thrown;
+        },
+      });
+
+      await supervisor.resumeSession(sessionStore.get("fix-bug")!);
+      return { sessionStore, confirm, logs };
+    }
+
+    test("logs the failure at ERROR with the slug, repo, worktree and the child's exit status", async () => {
+      const { logs } = await runFailingResume(
+        Object.assign(new Error("Command failed: git worktree add"), { status: 128, stderr: Buffer.from("fatal: not a git repository\n") }),
+      );
+
+      const error = logs.find((entry) => entry.level === "ERROR");
+      expect(error).toBeDefined();
+      expect(error!.message).toContain('resume failed for "fix-bug"');
+      // Both paths come off the persisted row (this file's `row()` fixture), and both are what a
+      // `git worktree add` failure is most likely to be about - neither appears in git's own message.
+      expect(error!.message).toContain("repo c:\\data\\projects\\seowrite");
+      expect(error!.message).toContain("worktree c:\\data\\worktrees\\fix-bug");
+      expect(error!.message).toContain("status: 128");
+      expect(error!.message).toContain("stderr: fatal: not a git repository");
+    });
+
+    test("records an empty stderr explicitly - the signature of the incident this exists for", async () => {
+      // A non-zero exit with nothing printed is the observation that would have short-cut the
+      // 2026-08-12 incident; it has to be distinguishable from "stderr was never captured".
+      const { logs } = await runFailingResume(Object.assign(new Error("Command failed: git worktree add"), { status: 128, stderr: "" }));
+
+      expect(logs.find((entry) => entry.level === "ERROR")!.message).toContain("stderr: (empty)");
+    });
+
+    test("tells the operator how it exited and still marks the row dead with the worktree preserved", async () => {
+      const { sessionStore, confirm } = await runFailingResume(Object.assign(new Error("Command failed: git worktree add"), { status: 128 }));
+
+      const failure = confirm.calls.find((c) => c.text.includes('Failed to resume "fix-bug"'));
+      expect(failure).toBeDefined();
+      expect(failure!.text).toContain("(exit 128)");
+      // Pre-existing behavior the new log call must not have displaced.
+      expect(failure!.text).toContain("Worktree preserved at");
+      expect(sessionStore.get("fix-bug")?.state).toBe("dead");
+    });
+
+    test("a plain Error still reports cleanly, with no invented exit status", async () => {
+      const { confirm, logs } = await runFailingResume(new Error("node-pty failed to spawn"));
+
+      expect(logs.find((entry) => entry.level === "ERROR")!.message).toContain("node-pty failed to spawn");
+      const failure = confirm.calls.find((c) => c.text.includes('Failed to resume "fix-bug"'));
+      expect(failure!.text).toContain("node-pty failed to spawn");
+      expect(failure!.text).not.toContain("exit");
+    });
+  });
 });

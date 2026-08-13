@@ -160,7 +160,7 @@ async function resolveAllPrompts(page, topicSubstring, { maxTaps = 5 } = {}) {
     if (!slug) continue;
     await sendMessage(page, `/kill ${slug}`);
     await page.waitForTimeout(2000);
-    await sendMessage(page, `/rm ${slug}`);
+    await sendMessage(page, `/remove ${slug}`);
     await page.waitForTimeout(2000);
   }
   log("cleanup sent (kill + rm for each throwaway session)");

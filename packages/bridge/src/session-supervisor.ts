@@ -1,5 +1,6 @@
 import path from "node:path";
 import type * as pty from "node-pty";
+import { describeExecFailure, formatExecFailureForLog, formatExitClause } from "./exec-failure.ts";
 import { fireAndForget } from "./fire-and-forget.ts";
 import type { LateBound } from "./late-bound.ts";
 import { findOrphanProcesses } from "./orphan-scan.ts";
@@ -640,8 +641,17 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
         finishResumeSuccess(slug, topicId);
       }
     } catch (err) {
+      // P1-9, same gap as `handleNewCommand`'s launch failure and worse here: this branch marks the
+      // row `dead`, which is irreversible, so the one chance to record *why* is now. `ensureWorktree`
+      // runs on a resume too, meaning the `git worktree add` failure mode that motivated this can
+      // kill an existing session, not just refuse a new one.
+      const failure = describeExecFailure(err);
+      log("ERROR", `resume failed for "${slug}" (repo ${current.repoPath}, worktree ${current.worktreePath}): ${formatExecFailureForLog(failure)}`);
       markDeadIfPresent(slug);
-      confirmSessionCommand(topicId, `Failed to resume "${slug}": ${(err as Error).message}. Worktree preserved at ${row.worktreePath}.`);
+      confirmSessionCommand(
+        topicId,
+        `Failed to resume "${slug}": ${failure.message}${formatExitClause(failure)}. Worktree preserved at ${row.worktreePath}.`,
+      );
     }
   }
 

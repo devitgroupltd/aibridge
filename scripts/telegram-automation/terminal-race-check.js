@@ -92,7 +92,7 @@ async function pollForText(page, topicSubstring, predicate, { rounds = 20, inter
     log("FAIL: no permission card appeared within timeout");
     await sendMessage(page, `/kill ${slug}`);
     await page.waitForTimeout(1500);
-    await sendMessage(page, `/rm ${slug}`);
+    await sendMessage(page, `/remove ${slug}`);
     await context.close();
     process.exit(1);
   }
@@ -134,7 +134,7 @@ async function pollForText(page, topicSubstring, predicate, { rounds = 20, inter
 
   await sendMessage(page, `/kill ${slug}`);
   await page.waitForTimeout(1500);
-  await sendMessage(page, `/rm ${slug}`);
+  await sendMessage(page, `/remove ${slug}`);
   await page.waitForTimeout(1500);
   log("cleanup sent (kill + rm)");
 
