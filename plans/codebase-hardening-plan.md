@@ -277,7 +277,8 @@ v140_touched_sections:
 
 # aibridge codebase hardening plan
 
-Audit date: 2026-08-09 · Baseline: `5f9795c` · Re-verified against current source: 2026-08-12.
+Audit date: 2026-08-09 · Baseline: `5f9795c` · Re-verified against current source: 2026-08-12 ·
+Second pass (SOLID/DRY/KISS, structural): 2026-08-13, filed as S-1…S-8 and fixed in `d9919be`.
 
 Scope: correctness/concurrency defects, leaks, hot-path performance, SOLID/DRY/KISS cleanups,
 test gaps, and tooling gaps.
@@ -368,6 +369,72 @@ records when it was fixed. A genuinely open finding goes directly under this par
 subheading, and stays there until its own text says **Fixed**.
 
 ### Recent findings, all fixed
+
+- **S-1 through S-8 — a SOLID/DRY/KISS read-through of the whole Bridge, 2026-08-13.** All eight
+  fixed the same day in `d9919be` (PR #27). Numbered `S-` rather than `P0/P1/P2` because only the
+  first is a defect; the rest are structural, and grading a DRY cleanup on a severity scale meant for
+  live bugs would misrepresent both. Suite went 1805 pass / 0 fail before and after, typecheck clean,
+  module graph still free of import cycles.
+
+  **S-1 (the one real defect) — `permission-registry.ts` was invisible to search.** Line 190 used two
+  *literal NUL bytes* as a join separator rather than the escape, so ripgrep classified the file as
+  binary and skipped it silently: a `grep` for `export class .*Registry` printed
+  `Binary file permission-registry.ts matches` instead of the match. In a workflow that finds code by
+  grepping, one file being unsearchable is a real cost and an invisible one — nothing errors, results
+  are just quietly missing. Git had also been treating it as binary, which is why it had never been
+  CRLF-normalized; fixing the escape triggered that normalization as a one-time reformat, so its diff
+  is 230 lines and `git diff --ignore-cr-at-eol` is the only useful way to read it.
+
+  **S-2 — one SQLite bootstrap, and a busy timeout.** `SqliteStatementLike`/`SqliteHandleLike`/
+  `loadDatabaseCtor()` plus the WAL-setting constructor preamble were verbatim in four stores, all
+  opening the same `aibridge.db`. Now `sqlite.ts`. It also sets `busy_timeout`, which neither had:
+  within one process every store call is synchronous so the event loop already serializes them, but
+  `respawnSelfAndExit` starts the successor *before* this process exits, so two Bridges hold the file
+  open for that moment, and a `SQLITE_BUSY` there would reach `uncaughtException` and kill the new
+  Bridge on the spot. Not observed — a one-line close on a window that provably exists.
+
+  **S-3 — the persisted fleet preferences own their own persistence now (`runtime-settings.ts`).**
+  Seven mutable `let`s in `index.ts`, each with a bespoke decode expression (four different shapes for
+  one rule), a get/set closure pair threaded into three or four modules (~110 references), and a
+  `settingsStore.set` at each write site that a caller had to remember *alongside* calling the setter.
+  All nine write sites were correct. That is the point worth recording: they were correct by
+  convention only, the encode and decode for a key lived in different files, and a setter called
+  without its persist would work perfectly until the next restart and then silently revert — which is
+  exactly the silent-wrong failure mode §9's testing bar is written against. Setting a value is now
+  the same call as persisting it. `voice-mode-commands.ts` shed 15 options fields.
+
+  **S-4 — the test suite had no shared helpers at all.** 94 files, 23k lines, fifteen hand-rolled
+  control-bot doubles, nine byte-identical. `packages/bridge/test/helpers.ts` now holds one. The
+  duplication had already cost something measurable: five assertions in `confirm-cards`/
+  `callback-query-router` named after stripping a keyboard were only ever checking message text,
+  because each local double discarded the keyboard argument. They check it now.
+
+  **S-5 — `dispatchFleetCommand` is a table, and its exhaustiveness is deliberate rather than
+  accidental.** The 291-line if-chain became `FLEET_COMMAND_HANDLERS`, a mapped type keyed by
+  `FleetCommand["kind"]`, so a newly-added kind is a missing-property compile error (verified by
+  deleting an entry and confirming `TS2741`). The old chain *did* have that guarantee, but only as a
+  side effect of its untagged tail call passing the residual union into
+  `handlePauseCommand(cmd: Extract<FleetCommand, { kind: "pause" }>)` — correct, and worth knowing it
+  was load-bearing, but it also made `pause` the silent destination of anything unaccounted for.
+
+  **S-6 — `LogFn` is exported once** from `logger.ts`, replacing 22 redeclarations (twelve verbatim
+  `type LogFn = ...` copies, ten inline on an options field). Structural typing meant the copies always
+  interoperated, so this was never a bug — just 22 places to keep in step for a type with one real
+  implementation.
+
+  **S-7 — four modules moved to where they belong.** `splitForTelegram` (a pure string function, whose
+  test file has been called `telegram-split.test.ts` since the day it was written) out of
+  `pipe-server.ts`; `createProcessRunner` out of `deploy-lifecycle-commands.ts`, which had forced
+  `index.ts` to import a *command* module at boot just to spawn a process, with a four-line comment
+  apologising for it; and the `/restart` and `/os` confirm protocols into `restart-confirm.ts` and
+  `os-confirm.ts`, so all seven confirm protocols now have the same shape instead of five-plus-two.
+
+  **S-8 — the long functions, and one piece of dead code.** `runNewCommand` 273 → 149 lines
+  (`resolveNewSessionTarget`, `reportLaunchFailure`, `newSessionRow`, `mirrorAttachmentIntoTopic`,
+  `startFirstTurn` split out); the `browse` callback handler 82 → 43. The dead `renamed` flag is gone
+  from the row type, the insert, the migration list and 16 test literals — the physical column is
+  deliberately left alone on existing databases, since nothing reads it and dropping it would need a
+  migration to no end.
 
 - **P1-13 — two concurrent `/new` commands that derive the same slug race past the uniqueness check,
   and the loser survives as an untracked `claude` process holding a worktree directory nothing can
