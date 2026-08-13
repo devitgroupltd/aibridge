@@ -11,8 +11,7 @@ import { randomUUID } from "node:crypto";
 import { appendFileSync, mkdirSync, promises as fsPromises, readFileSync } from "node:fs";
 import path from "node:path";
 import { gitCommonDir } from "./worktree.ts";
-
-type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+import type { LogFn } from "./logger.ts";
 
 /** The attachment inbox's own directory name, inside each session's worktree - exported so
  * `worktree-fs.ts`'s `/browse`/`/find` scan can exclude it by the same literal name instead of a

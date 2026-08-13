@@ -6,6 +6,7 @@ import type { FleetCommand } from "./fleet-commands.ts";
 import { renderBudget, renderReposList, renderSettings } from "./fleet-commands.ts";
 import type { SendMessageSource } from "./telegram.ts";
 import type { SessionStore } from "./session-store.ts";
+import type { LogFn } from "./logger.ts";
 
 /** Read-only fleet reporting (`/budget`, `/settings`, `/repos`) - split out from what would
  * otherwise be a single `fleet-admin-commands.ts` because bundling these with process/deploy
@@ -29,7 +30,7 @@ export interface FleetReportingCommandsOptions {
   setReposRegistry: (registry: ReposRegistry) => void;
   reposTomlPath: string;
   supergroupChatId: string;
-  log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  log: LogFn;
 }
 
 export interface FleetReportingCommands {

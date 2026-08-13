@@ -13,6 +13,7 @@ import type { LaunchedSession, SessionLaunchOptions } from "./session-launcher.t
 import type { Routing } from "./routing.ts";
 import type { SessionRow, SessionStore } from "./session-store.ts";
 import type { InlineKeyboardMarkup } from "./telegram.ts";
+import type { LogFn } from "./logger.ts";
 
 /** §4.5's backoff ladder for `handleUnexpectedExit`'s auto-resume: 1s, then 15s, then 60s, then
  * give up (`MAX_CONSECUTIVE_RESUME_ATTEMPTS`) - guards against a stale `session_id` causing
@@ -28,8 +29,6 @@ export const MAX_CONSECUTIVE_RESUME_ATTEMPTS = 3;
  * anything - so 20s is generous headroom past that, not a guess at how long a real retry attempt
  * takes to finish (that's unbounded and this check does not wait for it). */
 export const RESUME_NUDGE_FOLLOWUP_DELAY_MS = 20_000;
-
-type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
 
 /** §5.4's P1 lane: fleet-command echoes and session lifecycle notices this module posts on its
  * own initiative (crash/resume notices, orphan-process reports, reconciliation results) - never

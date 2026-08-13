@@ -15,8 +15,7 @@ import type { PendingPermissionRequest } from "./permission-registry.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
 import type { TypingIndicator } from "./typing-indicator.ts";
 import type { WedgedRecoveryMarks } from "./wedged-recovery.ts";
-
-type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+import type { LogFn } from "./logger.ts";
 
 // §10.4.1: this project's own choice of threshold, not a number the plan specifies - a
 // conservative "worth a look" signal for whether the allowlist has grown too broad on a host with

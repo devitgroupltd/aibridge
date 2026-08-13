@@ -187,7 +187,7 @@ export function toolInputMatches(inputPreview: string, toolInput: unknown): bool
   // superset of it match, which is a wrong card finalized and a wrong verdict sent.
   const expectedKeys = Object.keys(expected).sort();
   const actualKeys = Object.keys(actual).sort();
-  if (expectedKeys.length === 0 || expectedKeys.join(" ") !== actualKeys.join(" ")) return false;
+  if (expectedKeys.length === 0 || expectedKeys.join("\u0000") !== actualKeys.join("\u0000")) return false;
   return expectedKeys.every((key) => JSON.stringify(expected[key]) === JSON.stringify(actual[key]));
 }
 

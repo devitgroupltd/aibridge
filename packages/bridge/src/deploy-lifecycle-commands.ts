@@ -1,8 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { execFile } from "node:child_process";
 import path from "node:path";
 import { buildCreateArgs, buildDeleteArgs, buildFixTaskSettingsScript, buildQueryArgs, parseQueryOutput, renderAutostartStatus, TASK_NAME } from "./autostart.ts";
-import { ConfirmRegistry, type ConfirmRegistryOptions } from "./confirm-registry.ts";
+import { buildRestartConfirmKeyboard, RestartConfirmRegistry, type PendingRestartConfirm } from "./restart-confirm.ts";
+import type { ProcessRunner } from "./process-runner.ts";
 import {
   commitIfDirty as realCommitIfDirty,
   deployBranch as realDeployBranch,
@@ -21,6 +21,7 @@ import type { PtyIo } from "./pty-io.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
 import type { InlineKeyboardButton, SendMessageSource } from "./telegram.ts";
 import type { SessionRow, SessionStore } from "./session-store.ts";
+import type { LogFn } from "./logger.ts";
 
 /**
  * Renders a `DeployOutcome` (or any ok/failure notice built the same way) for Telegram: a bold
@@ -35,143 +36,6 @@ function formatOutcomeHtml(message: string, detail?: string): string {
   const head = `<b>${escapeForFeed(message)}</b>`;
   if (!detail || detail.trim().length === 0) return head;
   return `${head}\n<pre>${escapeForFeed(truncateForTelegram(detail))}</pre>`;
-}
-
-/** Result shape shared by `runSchtasks`/`runPowershell` - `/Query` against an unregistered task
- * exits non-zero, which is a valid "not registered" answer, not a transport failure, so both
- * always resolve rather than reject; callers that care about install/delete failing check
- * `failed` themselves. */
-export interface ProcessRunResult {
-  stdout: string;
-  stderr: string;
-  failed: boolean;
-}
-
-/** An injected `execFile`-shaped runner, so `runSchtasks`/`runPowershell` are fakeable in tests
- * rather than requiring a real Windows host with a real Task Scheduler - same dependency-inversion
- * treatment already applied to `confirmSessionCommand` elsewhere in this split. */
-export type ExecFileFn = (
-  command: string,
-  args: string[],
-  options: { windowsHide: boolean },
-  callback: (error: Error | null, stdout: string, stderr: string) => void,
-) => void;
-
-export interface ProcessRunner {
-  /** Wraps `schtasks.exe` (built into Windows, no extra dependency). */
-  runSchtasks(args: string[]): Promise<ProcessRunResult>;
-  /** Runs a PowerShell one-liner and reports success/failure the same shape as `runSchtasks` -
-   * `schtasks.exe` alone can't fix the two task-settings defaults `buildFixTaskSettingsScript`
-   * targets, so `/autostart install` needs this second tool as well. `stdout` was added for
-   * `os-power-commands.ts`'s `checkAutoLogonEnabled` (needs the actual registry value back, not
-   * just success/failure) - every existing caller only ever read `stderr`/`failed`, so this is a
-   * pure addition, not a behaviour change for them. */
-  runPowershell(script: string): Promise<{ stdout: string; stderr: string; failed: boolean }>;
-  /** Wraps `shutdown.exe` (built into Windows) - `/os shutdown|reboot|cancel` (os-power-commands.ts).
-   * A third method on this same interface rather than a separate injectable, so there's still only
-   * one process-runner shape to fake in tests. */
-  runShutdown(args: string[]): Promise<ProcessRunResult>;
-}
-
-/** Same spawn-level-failure gap as `deploy.ts`'s `defaultRunner` (found live 2026-08-11, same day):
- * a *real* run of `cmd` (task registered or not, script ran or not) reports through `stderr` as
- * `execFileFn` already hands it back, but a *spawn-level* failure - `cmd` not resolvable, a
- * permission error - never runs the child process at all, so `stderr` comes back empty and the
- * only diagnostic left is `err.message` (Node's "spawn schtasks ENOENT"-shaped text). Without this
- * fallback, callers built exactly the bare, undiagnosable failure the `deploy.ts` fix addressed -
- * `schtasks /Create failed` / `(unknown error)` with nothing else to go on. */
-function stderrOrMessage(err: Error | null, stderr: string): string {
-  return stderr || (err?.message ?? "");
-}
-
-/** Confirm gate for `/restart` (2026-08-12 operator request): with at least one non-`dead` session
- * in the fleet, a typed `/restart` is destructive enough - it kills every live session with the
- * process, per §4.5's own measurement - to get the same Yes/Cancel confirm card `/os shutdown|reboot`
- * already does, rather than executing on the same message the way it did before this. With zero
- * live sessions there is nothing to lose, so `handleRestartCommand` skips this registry entirely and
- * restarts immediately, same as always. Deliberately its own registry rather than piggybacking on
- * `fleet-confirm.ts`'s `FleetConfirmRegistry`: that one's `kind` discriminator exists because several
- * *different* destructive actions share one registry/namespace, which `/restart` has no need for -
- * one pending card, one action, same "own `Map`, own TTL, own `callback_data` namespace" shape as
- * `OsConfirmRegistry`. */
-export interface PendingRestartConfirm {
-  id: string;
-  topicId: number | undefined;
-  messageId: number;
-  createdAt: number;
-  /** Only set when this confirm originated from `/merge`'s or `/ship`'s self-repo restart tail
-   * (`restartIfSelfRepo`) rather than a direct `/restart` - `executeRestartConfirm` uses it to write
-   * the deploy marker at confirm time (not at merge time, since a Cancel tap must leave nothing
-   * written) and to log/notify with the right command label and outcome shas. */
-  selfRepoRestart?: {
-    commandLabel: string;
-    repoPath: string;
-    branch: string;
-    previousHeadSha: string;
-    newHeadSha: string;
-  };
-}
-
-const RESTART_CONFIRM_TTL_MS = 2 * 60 * 1000;
-
-/** TTL + clock injection, both from `ConfirmRegistry` - this registry adds nothing of its own. */
-export type RestartConfirmRegistryOptions = ConfirmRegistryOptions;
-
-export class RestartConfirmRegistry extends ConfirmRegistry<PendingRestartConfirm> {
-  constructor(opts: RestartConfirmRegistryOptions = {}) {
-    super(RESTART_CONFIRM_TTL_MS, opts);
-  }
-}
-
-export interface RestartConfirmCallback {
-  id: string;
-  confirmed: boolean;
-}
-
-/** `rs:<id>:<y|n>` - a fresh namespace alongside `fc:`/`os:`/`nc:`/`sc:`/`vc:`/`rp:`, well inside
- * Telegram's 64-byte `callback_data` cap. Re-validates the format rather than trusting the tap, same
- * defensive pattern as every other `resolve*Callback` in this codebase. */
-export function resolveRestartConfirmCallback(data: string): RestartConfirmCallback | null {
-  const match = data.match(/^rs:([A-Za-z0-9]{1,20}):(y|n)$/);
-  if (!match) return null;
-  return { id: match[1] ?? "", confirmed: match[2] === "y" };
-}
-
-export function buildRestartConfirmKeyboard(id: string): InlineKeyboardButton[][] {
-  return [
-    [
-      { text: "✅ Yes, restart", callback_data: `rs:${id}:y` },
-      { text: "⛔ Cancel", callback_data: `rs:${id}:n` },
-    ],
-  ];
-}
-
-export function createProcessRunner(execFileFn: ExecFileFn = execFile as unknown as ExecFileFn): ProcessRunner {
-  function runSchtasks(args: string[]): Promise<ProcessRunResult> {
-    return new Promise((resolve) => {
-      execFileFn("schtasks", args, { windowsHide: true }, (err, stdout, stderr) => {
-        resolve({ stdout: stdout ?? "", stderr: stderrOrMessage(err, stderr ?? ""), failed: err !== null });
-      });
-    });
-  }
-
-  function runPowershell(script: string): Promise<{ stdout: string; stderr: string; failed: boolean }> {
-    return new Promise((resolve) => {
-      execFileFn("powershell", ["-NoProfile", "-NonInteractive", "-Command", script], { windowsHide: true }, (err, stdout, stderr) => {
-        resolve({ stdout: stdout ?? "", stderr: stderrOrMessage(err, stderr ?? ""), failed: err !== null });
-      });
-    });
-  }
-
-  function runShutdown(args: string[]): Promise<ProcessRunResult> {
-    return new Promise((resolve) => {
-      execFileFn("shutdown", args, { windowsHide: true }, (err, stdout, stderr) => {
-        resolve({ stdout: stdout ?? "", stderr: stderrOrMessage(err, stderr ?? ""), failed: err !== null });
-      });
-    });
-  }
-
-  return { runSchtasks, runPowershell, runShutdown };
 }
 
 export interface DeployLifecycleCommandsOptions {
@@ -200,7 +64,7 @@ export interface DeployLifecycleCommandsOptions {
   stateDir: string;
   supergroupChatId: string;
   entryScriptDir: string;
-  log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  log: LogFn;
   /** Defaults to the real `deploy.ts` merge-and-gate implementation - injectable so
    * `handleMergeCommand`'s own control flow (topic gating, ack/failure/success messaging,
    * self-repo restart + deploy-marker sequencing) is unit-testable without a real git repo or a

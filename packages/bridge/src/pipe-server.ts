@@ -30,10 +30,10 @@ import { readSettingsFile, type PermissionSettings } from "./settings.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import type { Routing } from "./routing.ts";
 import type { SendMessageSource } from "./telegram.ts";
+import { splitForTelegram } from "./telegram-split.ts";
+import type { LogFn } from "./logger.ts";
 
 export { DEFAULT_PIPE_PATH };
-
-type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
 
 export interface PipeServerOptions {
   pipePath?: string;
@@ -136,10 +136,6 @@ export interface PipeServerHandle {
  * and `reply` (forward to the control bot in the session's topic); anything else is logged and
  * ignored rather than dropping the connection (§9 scenario 34 - version-skew tolerance).
  */
-/** Telegram's own limit is 4096 UTF-16 code units per message; the headroom absorbs the entity
- * expansion Telegram counts after parsing. */
-const TELEGRAM_TEXT_LIMIT = 3900;
-
 /** Telegram rejects a `sendDocument` over 50MB outright, so reading a larger file into memory only
  * to have the upload 400 (three times, once per retry) is pure waste. */
 const MAX_SEND_FILE_BYTES = 50 * 1024 * 1024;
@@ -180,44 +176,6 @@ const RECOMMENDED_SUFFIX = " (Recommended)";
  * and "first" while describing an option that commits to something.
  */
 const DEFER_OPTION_RE = /\b(first|before|investigat\w*|research\w*|clarif\w*|explain\w*|hold off|hold on|wait|not yet|verify|double-check|look into)\b/i;
-
-/** Splits at line boundaries where it can, mid-line only when a single line is itself too long.
- * Returns `[]` for text that is empty or whitespace-only - Telegram 400s on that too. */
-export function splitForTelegram(text: string, limit = TELEGRAM_TEXT_LIMIT): string[] {
-  if (text.trim().length === 0) return [];
-  if (text.length <= limit) return [text];
-  const chunks: string[] = [];
-  let current = "";
-  for (const line of text.split("\n")) {
-    let rest = line;
-    // A single line longer than the whole budget can't be kept intact - hard-split it.
-    while (rest.length > limit) {
-      if (current.length > 0) {
-        chunks.push(current);
-        current = "";
-      }
-      // Back off one code unit if the cut would land between a surrogate pair, which would otherwise
-      // send a lone surrogate (Telegram counts UTF-16 code units, so a limit boundary lands there for
-      // any emoji-heavy line).
-      const cut = isHighSurrogate(rest.charCodeAt(limit - 1)) ? limit - 1 : limit;
-      chunks.push(rest.slice(0, cut));
-      rest = rest.slice(cut);
-    }
-    const candidate = current.length === 0 ? rest : `${current}\n${rest}`;
-    if (candidate.length > limit) {
-      chunks.push(current);
-      current = rest;
-    } else {
-      current = candidate;
-    }
-  }
-  if (current.length > 0) chunks.push(current);
-  return chunks.filter((c) => c.length > 0);
-}
-
-function isHighSurrogate(code: number): boolean {
-  return code >= 0xd800 && code <= 0xdbff;
-}
 
 export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
   const pipePath = opts.pipePath ?? DEFAULT_PIPE_PATH;

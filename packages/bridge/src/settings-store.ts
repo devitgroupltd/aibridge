@@ -1,4 +1,4 @@
-import { createRequire } from "node:module";
+import { openDatabase, type SqliteHandleLike } from "./sqlite.ts";
 
 /**
  * Small global key/value store for fleet-wide preferences that need to survive a Bridge restart -
@@ -6,35 +6,14 @@ import { createRequire } from "node:module";
  * which is deliberately *not* a `session-store.ts` column: it isn't scoped to any one session, the
  * same reasoning `/budget`/`/settings` already use for staying control-topic-only rather than
  * per-session. Lives in the same `aibridge.db` file (not a second database) - one `CREATE TABLE IF
- * NOT EXISTS` alongside `sessions`, same runtime SQLite binding as `session-store.ts` (see that
- * file's own doc comment for why bun:sqlite/node:sqlite are chosen at runtime, not statically).
+ * NOT EXISTS` alongside `sessions`, same shared handle (`sqlite.ts`) as `session-store.ts` - see
+ * that module's own doc comment for why bun:sqlite/node:sqlite are chosen at runtime, not statically.
  */
-interface SqliteStatementLike {
-  run(params: Record<string, unknown>): unknown;
-  get(params: Record<string, unknown>): unknown;
-}
-interface SqliteHandleLike {
-  exec(sql: string): void;
-  prepare(sql: string): SqliteStatementLike;
-  close(): void;
-}
-type DatabaseCtor = new (path: string) => SqliteHandleLike;
-
-function loadDatabaseCtor(): DatabaseCtor {
-  const req = createRequire(import.meta.url);
-  if (typeof Bun !== "undefined") {
-    return (req("bun:sqlite") as { Database: DatabaseCtor }).Database;
-  }
-  return (req("node:sqlite") as { DatabaseSync: DatabaseCtor }).DatabaseSync;
-}
-
 export class SettingsStore {
   private readonly db: SqliteHandleLike;
 
   constructor(dbPath: string) {
-    const Database = loadDatabaseCtor();
-    this.db = new Database(dbPath);
-    this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db = openDatabase(dbPath);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS bridge_settings (
         key   TEXT PRIMARY KEY,

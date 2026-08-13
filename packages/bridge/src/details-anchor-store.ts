@@ -1,4 +1,4 @@
-import { createRequire } from "node:module";
+import { openDatabase, type SqliteHandleLike } from "./sqlite.ts";
 
 /**
  * §5.5's `details` button anchor - remembers which Telegram message_id carries which
@@ -7,21 +7,11 @@ import { createRequire } from "node:module";
  * in-memory map) on the operator's own explicit request: an in-memory-only map would lose every
  * pending anchor on a `/restart`/`/merge`, silently reverting to "send a new message" for every
  * button posted before that restart - correct as a *fallback*, but not as the normal case for a
- * Bridge that restarts far more often than an operator taps a two-day-old button. Same runtime
- * SQLite binding and same `aibridge.db` file as `session-store.ts`/`settings-store.ts`/
- * `cost-store.ts` - see `session-store.ts`'s own doc comment for why bun:sqlite/node:sqlite are
- * chosen at runtime, not statically.
+ * Bridge that restarts far more often than an operator taps a two-day-old button. Same shared
+ * handle (`sqlite.ts`) and same `aibridge.db` file as `session-store.ts`/`settings-store.ts`/
+ * `cost-store.ts` - see that module's own doc comment for why bun:sqlite/node:sqlite are chosen at
+ * runtime, not statically.
  */
-interface SqliteStatementLike {
-  run(params: Record<string, unknown>): unknown;
-  get(params: Record<string, unknown>): unknown;
-}
-interface SqliteHandleLike {
-  exec(sql: string): void;
-  prepare(sql: string): SqliteStatementLike;
-  close(): void;
-}
-type DatabaseCtor = new (path: string) => SqliteHandleLike;
 
 /** How long an untapped anchor stays edit-in-place-able before `deleteOlderThan` sweeps it - long
  * enough that "I'll check that later" genuinely still works, short enough the table doesn't grow
@@ -29,21 +19,11 @@ type DatabaseCtor = new (path: string) => SqliteHandleLike;
  * message instead of editing (`index.ts`'s "no anchor on record" branch), never a dead button. */
 export const DETAILS_ANCHOR_RETENTION_MS = 30 * 24 * 60 * 60 * 1000;
 
-function loadDatabaseCtor(): DatabaseCtor {
-  const req = createRequire(import.meta.url);
-  if (typeof Bun !== "undefined") {
-    return (req("bun:sqlite") as { Database: DatabaseCtor }).Database;
-  }
-  return (req("node:sqlite") as { DatabaseSync: DatabaseCtor }).DatabaseSync;
-}
-
 export class DetailsAnchorStore {
   private readonly db: SqliteHandleLike;
 
   constructor(dbPath: string) {
-    const Database = loadDatabaseCtor();
-    this.db = new Database(dbPath);
-    this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db = openDatabase(dbPath);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS details_anchors (
         slug       TEXT    NOT NULL,

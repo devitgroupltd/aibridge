@@ -11,10 +11,11 @@ import { AUTO_CATEGORIES, buildLsDetail, newSessionContent, renderAttach, render
 import { checkConcurrencyCap, WEIGHTED_CAP } from "./concurrency-cap.ts";
 import { monotonicNowMs } from "./monotonic-clock.ts";
 import { PermissionRegistry } from "./permission-registry.ts";
-import type { ReposRegistry } from "./repos-registry.ts";
+import type { ReposRegistry, RepoEntry } from "./repos-registry.ts";
 import { resolveRepoNameFuzzy } from "./repos-registry.ts";
 import type { Routing } from "./routing.ts";
 import { launchSession } from "./session-launcher.ts";
+import type { LaunchedSession } from "./session-launcher.ts";
 import { DEFAULT_EFFORT, ESCAPE, type Effort, type Mode } from "./session-commands.ts";
 import type { PtyIo } from "./pty-io.ts";
 import type { SessionSupervisor } from "./session-supervisor.ts";
@@ -24,8 +25,8 @@ import { buildTopicDeepLink, type ForumTopicSource, type InlineKeyboardMarkup, t
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import { removeWorktree } from "./worktree.ts";
 import type { VerdictBehavior } from "@aibridge/protocol";
-
-type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+import type { LogFn } from "./logger.ts";
+import type { RuntimeSettings } from "./runtime-settings.ts";
 
 /** Just the feed-wiring accessors this module actually calls - the full `FeedWiring` interface
  * carries a lot more that has nothing to do with session lifecycle. */
@@ -92,14 +93,12 @@ export interface SessionLifecycleCommandsOptions {
   getReposRegistry: () => ReposRegistry | undefined;
   /** Live getters, not snapshots: `/defaultmode`/`/defaulteffort` (voice-mode-commands.ts, item 10)
    * reassign these `let`s at runtime - `handleNewCommand` must see the current value on every call. */
-  getDefaultSessionMode: () => Mode;
-  getDefaultSessionEffort: () => Effort;
+  settings: Pick<RuntimeSettings, "defaultSessionMode" | "defaultSessionEffort" | "defaultBypassEnabled" | "defaultAutoAnswerEnabled">;
   /** Live getters for the same reason as the two above - `/default permission|answer`
    * (voice-mode-commands.ts) reassigns these `let`s at runtime. A construction-time `boolean` here
    * would compile, persist and confirm, and then every session for the rest of that Bridge's
    * lifetime would still start without the setting, looking correct again after the next restart. */
-  getDefaultBypassEnabled: () => boolean;
-  getDefaultAutoAnswerEnabled: () => boolean;
+
   supergroupChatId: string;
   selfCheckSlug: string;
   fleetWorktreesRoot: string | undefined;
@@ -321,10 +320,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     waitForPtyQuiet,
     isControlTopic,
     getReposRegistry,
-    getDefaultSessionMode,
-    getDefaultSessionEffort,
-    getDefaultBypassEnabled,
-    getDefaultAutoAnswerEnabled,
+    settings,
     supergroupChatId,
     selfCheckSlug,
     fleetWorktreesRoot,
@@ -497,6 +493,183 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     }
   }
 
+  /**
+   * Everything `/new` can refuse on *before* it creates a topic, a worktree or a process: an
+   * unregistered `repos.toml`, an unknown repo name, and §10.5's weighted concurrency cap. Split out
+   * of `runNewCommand` because it is the one part of that function with no side effects to unwind -
+   * it either names the repo and model to build with, or names the reason it won't.
+   *
+   * Returns the fuzzy-match `notice` rather than sending it, so this stays free of Telegram calls
+   * and every message `/new` can produce is sent from one place in `runNewCommand`.
+   */
+  function resolveNewSessionTarget(
+    cmd: Extract<FleetCommand, { kind: "new" }>,
+    attachmentLostNote: string,
+  ): { repo: RepoEntry; model: string; notice?: string } | { error: string } {
+    const reposRegistry = getReposRegistry();
+    if (!reposRegistry) return { error: `No repos.toml registered yet - see §7.5.${attachmentLostNote}` };
+
+    let repo = reposRegistry.get(cmd.repo);
+    let notice: string | undefined;
+    if (!repo) {
+      // Voice-transcribed /new commands routinely mangle the repo name ("aibridge" heard back as
+      // "eI-Bridge") before it ever reaches this codebase - fall back to the single unambiguous
+      // fuzzy match (see resolveRepoNameFuzzy's own doc comment) rather than failing outright.
+      const fuzzy = resolveRepoNameFuzzy(reposRegistry.all(), cmd.repo);
+      if (!fuzzy) {
+        return { error: `Unknown repo "${cmd.repo}". Registered: ${reposRegistry.names().join(", ") || "(none)"}${attachmentLostNote}` };
+      }
+      repo = fuzzy;
+      notice = `Unknown repo "${cmd.repo}" - using closest match "${fuzzy.name}".`;
+    }
+
+    const model = cmd.model ?? repo.model ?? "sonnet";
+    // §10.5 point 1: refuse before ever creating a topic/worktree, so a rejected /new leaves no
+    // debris the way a launch failure further down deliberately cleans up after itself.
+    const capCheck = checkConcurrencyCap(sessionStore.all(), model);
+    if (!capCheck.ok) {
+      return {
+        error: `Refused: the fleet is already at ${capCheck.current}/${WEIGHTED_CAP} weighted units - adding a ${model} session would bring it to ${capCheck.wouldBe}. Kill or /remove a session first.${attachmentLostNote}`,
+      };
+    }
+    return { repo, model, notice };
+  }
+
+  /**
+   * The purely-cosmetic mirror of a caption-triggered `/new`'s attachment into the session's own new
+   * topic. `applyPendingAttachment` only ever puts the file on disk and tells *Claude* where it is (a
+   * plain-text path typed into its terminal, never rendered as a Telegram message per §5.6), so
+   * without this the operator who just sent the file never sees it again anywhere in the new topic.
+   *
+   * Best-effort by design: a delivery failure here is a WARN, never a reason to touch the attachment
+   * note already finalized by the caller, to retry, or to fail session creation.
+   */
+  async function mirrorAttachmentIntoTopic(cmd: Extract<FleetCommand, { kind: "new" }>, topicId: number, slug: string): Promise<void> {
+    if (!cmd.pendingAttachment) return;
+    const { kind, name, bytes } = cmd.pendingAttachment;
+    try {
+      if (kind === "image" && controlBot.sendPhotoFile) {
+        await controlBot.sendPhotoFile(supergroupChatId, topicId, name, bytes);
+      } else if (controlBot.sendDocumentFile) {
+        await controlBot.sendDocumentFile(supergroupChatId, topicId, name, bytes);
+      }
+    } catch (err) {
+      log("WARN", `failed to forward the attachment for "${slug}" into its new topic: ${(err as Error).message}`);
+    }
+  }
+
+  /**
+   * The startup tail of `/new`: wait out the three gates a brand-new session needs before it can be
+   * written to at all, apply the fleet defaults, then deliver the first turn.
+   *
+   * Split out of `runNewCommand` because everything above it in that function is "build the session,
+   * unwinding whatever is half-built if a step fails" while this is "the session exists - now start
+   * it". It is also the only part with no failure path of its own: each gate degrades to a WARN and
+   * proceeds rather than aborting (see `waitForChannelConnected`/`waitForPtyQuiet`).
+   */
+  async function startFirstTurn(slug: string, topicId: number, cmd: Extract<FleetCommand, { kind: "new" }>, session: LaunchedSession, sessionMode: Mode): Promise<void> {
+    // Two independent gates, both real events rather than guessed delays: the dev-channels dialog
+    // must be confirmed (`session.ready` - otherwise the write lands on the still-open dialog and
+    // corrupts it, confirmed live 2026-08-04), and the channel server's own MCP handshake must have
+    // completed (`waitForChannelConnected` - otherwise the write's trailing Enter can be silently
+    // lost even with the dialog long since confirmed, also confirmed live 2026-08-04).
+    await session.ready;
+    await waitForChannelConnected(slug);
+    // A third gate, closing the race the two above don't (`pty-quiet-wait.ts`'s own doc comment has
+    // the full story, live-confirmed 2026-08-11): Claude Code can still be busy registering its
+    // *other* MCP servers (Playwright's cold `npx` spawn on this brand-new worktree path, in
+    // particular) even once the aibridge channel's own handshake above has resolved, and that
+    // startup chatter is enough real PTY output to fool `confirmSubmitted` below into reading a lost
+    // Enter as a landed one - leaving the very first message sitting typed but never submitted, with
+    // no error anywhere and no hook ever firing to say so.
+    await waitForPtyQuiet(slug);
+    // `/default effort`: applied before the initial prompt, not after, so the very first turn
+    // already runs under the configured default rather than starting at the CLI's own "medium" and
+    // switching mid-turn. Silent (no confirmSessionCommand) - a second "Switched..." message here
+    // would just be noise on top of the "Created ..." confirmation already sent above. Skipped when
+    // it's still at the CLI's own spawn default rather than relying on the write being a harmless
+    // no-op at that value, which is unverified for `/effort`.
+    //
+    // `/default mode` is NOT applied here any more - it's a `--permission-mode` launch flag now (see
+    // the `launchSession` call in `runNewCommand`). Only the Bridge's own tracked value is set, so a
+    // later live `/mode` switch cycles from where the session actually is; no keystroke is sent,
+    // because the session already started in that mode.
+    const defaultSessionEffort = settings.defaultSessionEffort;
+    routing.setMode(slug, sessionMode);
+    if (defaultSessionEffort !== DEFAULT_EFFORT) ptyIo.sendEffortCommand(slug, defaultSessionEffort);
+    // `/default permission`/`/default answer`: deliberately *not* the keystroke/typed-command
+    // machinery its two neighbours above need. This state lives in `routing.ts`, on the Bridge side
+    // of the relay - there is no CLI setting to drive and nothing to type into the PTY. `spec.set`
+    // rather than `applyAutoToggle` for the same reason the plan gives: a session created seconds ago
+    // has no already-posted permission card to drain.
+    if (settings.defaultBypassEnabled) autoCategorySpec("permission").set(slug, true);
+    if (settings.defaultAutoAnswerEnabled) autoCategorySpec("answer").set(slug, true);
+    ptyIo.sendChannelText(slug, topicId, newSessionContent(cmd), "new-1", "telegram");
+  }
+
+  /**
+   * P1-9: log before anything else. Until 2026-08-12 a failed launch was reported to Telegram and
+   * nowhere else, so `bridge.log` held no record that a launch had even been attempted - which is how
+   * a real incident (every `/new` failing at `git worktree add`, cleared by a restart) ended with the
+   * cause still unknown. Then clean up the topic: a failure this late still leaves the topic already
+   * created, and deleting it here is what keeps it from becoming an orphan with no session row and
+   * therefore no slug for `/rm` to ever find (confirmed live 2026-08-03, when a branch-name collision
+   * left exactly this kind of debris behind).
+   *
+   * Returns the operator-facing notice rather than sending it, so `runNewCommand` keeps one
+   * "clear the placeholder, then confirm" exit shape across every failure path it has.
+   */
+  async function reportLaunchFailure(err: unknown, slug: string, repo: RepoEntry, topicId: number, attachmentLostNote: string): Promise<string> {
+    const failure = describeExecFailure(err);
+    log(
+      "ERROR",
+      // The repo path and worktrees root are included because they are the two inputs a
+      // `git worktree add` failure is most likely to be about, and neither appears in the error
+      // message. `fleetWorktreesRoot` is genuinely optional (`launchSession` falls back to its own
+      // default), and a line reading "worktrees root undefined" invites a hunt for a config bug that
+      // isn't there - live-verified 2026-08-12, that is exactly what the first version printed.
+      `launch failed for "${slug}" (repo ${repo.path}, worktrees root ${fleetWorktreesRoot ?? "launcher default"}): ${formatExecFailureForLog(failure)}`,
+    );
+    try {
+      await controlBot.deleteForumTopic(supergroupChatId, topicId);
+    } catch (deleteErr) {
+      log("WARN", `failed to clean up topic for "${slug}" after a failed launch: ${(deleteErr as Error).message}`);
+    }
+    return `Failed to launch session "${slug}": ${failure.message}${formatExitClause(failure)}${attachmentLostNote}`;
+  }
+
+  /** The row a freshly-launched session starts life as. Separated from `runNewCommand` only so the
+   * 20-field literal doesn't sit in the middle of that function's build-and-unwind sequence. */
+  function newSessionRow(slug: string, topicId: number, session: LaunchedSession, repo: RepoEntry, model: string, sessionMode: Mode): SessionRow {
+    return {
+      slug,
+      topicId,
+      sessionId: null,
+      worktreePath: session.worktreePath,
+      branch: session.branch,
+      repoPath: repo.path,
+      model,
+      ptyPid: session.ptyProcess.pid ?? 0,
+      state: "starting",
+      turnCardMsg: null,
+      thinkingPlaceholderMsg: null,
+      paused: false,
+      feedDetail: "compact",
+      feedVerbose: false,
+      // Both false at insert time regardless of `/default permission`/`/default answer` - the
+      // `autoCategorySpec(...).set(...)` calls in `startFirstTurn` run after this row exists and go
+      // through `routing.setBypass`/`setAutoAnswer`, which write these columns through themselves.
+      bypassPermission: false,
+      autoAnswer: false,
+      // The same value the spawn flag actually used, not a re-read - see `sessionMode`'s own note in
+      // `runNewCommand` for why re-reading the live setting here would let the row disagree with the
+      // process it describes.
+      mode: sessionMode,
+      createdUtc: nowIso(),
+      lastEventUtc: nowIso(),
+    };
+  }
+
   async function runNewCommand(cmd0: Extract<FleetCommand, { kind: "new" }>, controlTopicId: number | undefined, attempt: NewSessionAttempt): Promise<void> {
     // Reassigned below, once the attachment (if any) is moved into the inbox and `sourceText` is
     // set - never before the topic-creation confirmation just under `topic` is created, which
@@ -526,40 +699,14 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       await controlBot.deleteMessage(supergroupChatId, messageId).catch((err: unknown) => log("WARN", `failed to delete /new thinking placeholder: ${(err as Error).message}`));
     }
 
-    const reposRegistry = getReposRegistry();
-    if (!reposRegistry) {
+    const target = resolveNewSessionTarget(cmd, attachmentLostNote);
+    if ("error" in target) {
       await clearThinkingPlaceholder();
-      confirmSessionCommand(controlTopicId, `No repos.toml registered yet - see §7.5.${attachmentLostNote}`);
+      confirmSessionCommand(controlTopicId, target.error);
       return;
     }
-    let repo = reposRegistry.get(cmd.repo);
-    if (!repo) {
-      // Voice-transcribed /new commands routinely mangle the repo name ("aibridge" heard back as
-      // "eI-Bridge") before it ever reaches this codebase - fall back to the single unambiguous
-      // fuzzy match (see resolveRepoNameFuzzy's own doc comment) rather than failing outright.
-      const fuzzy = resolveRepoNameFuzzy(reposRegistry.all(), cmd.repo);
-      if (fuzzy) {
-        repo = fuzzy;
-        confirmSessionCommand(controlTopicId, `Unknown repo "${cmd.repo}" - using closest match "${fuzzy.name}".`);
-      } else {
-        await clearThinkingPlaceholder();
-        confirmSessionCommand(controlTopicId, `Unknown repo "${cmd.repo}". Registered: ${reposRegistry.names().join(", ") || "(none)"}${attachmentLostNote}`);
-        return;
-      }
-    }
-    const model = cmd.model ?? repo.model ?? "sonnet";
-
-    // §10.5 point 1: refuse before ever creating a topic/worktree, so a rejected /new leaves no
-    // debris the way a launch failure further down deliberately cleans up after itself.
-    const capCheck = checkConcurrencyCap(sessionStore.all(), model);
-    if (!capCheck.ok) {
-      await clearThinkingPlaceholder();
-      confirmSessionCommand(
-        controlTopicId,
-        `Refused: the fleet is already at ${capCheck.current}/${WEIGHTED_CAP} weighted units - adding a ${model} session would bring it to ${capCheck.wouldBe}. Kill or /remove a session first.${attachmentLostNote}`,
-      );
-      return;
-    }
+    if (target.notice) confirmSessionCommand(controlTopicId, target.notice);
+    const { repo, model } = target;
 
     const base = slugFromPrompt(cmd.prompt);
     // P1-13: derived and claimed in one synchronous step, with no `await` between them, against the
@@ -590,7 +737,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // `/default mode`, applied as a launch flag instead of the post-launch Shift+Tab burst that never
     // actually landed (see `buildClaudeSpawnArgs`). Read exactly once, here, and reused for all three
     // places this value has to land (the launch flag below, the row's `mode` column, and
-    // `routing.setMode` after the startup gates) - `getDefaultSessionMode` is a *live* getter, and
+    // `routing.setMode` in `startFirstTurn`) - `settings.defaultSessionMode` is a *live* read, and
     // there are two `await`s between the insert and that `setMode`, so three separate reads let
     // `/default mode <x>` land in the control topic mid-startup and be recorded as this session's mode
     // while the session is actually running in whatever the launch flag captured. That divergence used
@@ -598,7 +745,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // which is what makes one read load-bearing rather than tidy. It also makes the code match what
     // the `routing.setMode` comment below already claims: the tracked value is what the session
     // actually started in.
-    const sessionMode = getDefaultSessionMode();
+    const sessionMode = settings.defaultSessionMode;
     let session: ReturnType<typeof launchSession>;
     try {
       session = launchSession({
@@ -612,34 +759,9 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         log,
       });
     } catch (err) {
-      // P1-9: log before anything else in this branch. Until 2026-08-12 a failed launch was
-      // reported to Telegram and nowhere else, so `bridge.log` held no record that a launch had
-      // even been attempted - which is how a real incident (every `/new` failing at
-      // `git worktree add`, cleared by a restart) ended with the cause still unknown. The repo path
-      // and worktrees root are included because they are the two inputs a `git worktree add`
-      // failure is most likely to be about, and neither appears in the error message.
-      const failure = describeExecFailure(err);
-      log(
-        "ERROR",
-        // `fleetWorktreesRoot` is genuinely optional (`launchSession` falls back to its own default),
-        // and a line reading "worktrees root undefined" invites a hunt for a config bug that isn't
-        // there - live-verified 2026-08-12, that is exactly what the first version printed.
-        `launch failed for "${slug}" (repo ${repo.path}, worktrees root ${fleetWorktreesRoot ?? "launcher default"}): ${formatExecFailureForLog(failure)}`,
-      );
-      // A launch failure this late still leaves the topic already created above (Telegram has no
-      // atomic "create topic + do the rest" call) - deleted here rather than left as an orphan with
-      // no session row and therefore no slug for `/rm` to ever find, confirmed live 2026-08-03 when
-      // a branch-name collision left exactly this kind of debris behind.
-      try {
-        await controlBot.deleteForumTopic(supergroupChatId, topic.message_thread_id);
-      } catch (deleteErr) {
-        log("WARN", `failed to clean up topic for "${slug}" after a failed launch: ${(deleteErr as Error).message}`);
-      }
+      const notice = await reportLaunchFailure(err, slug, repo, topic.message_thread_id, attachmentLostNote);
       await clearThinkingPlaceholder();
-      confirmSessionCommand(
-        controlTopicId,
-        `Failed to launch session "${slug}": ${failure.message}${formatExitClause(failure)}${attachmentLostNote}`,
-      );
+      confirmSessionCommand(controlTopicId, notice);
       return;
     }
     // P1-13: from here on a real `claude` process exists, so every remaining exit path other than a
@@ -669,49 +791,12 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // topic itself (not `controlTopicId` - it belongs with the session it was attached to), for the
     // operator's own visual reference. Never blocks or fails session creation - a delivery failure
     // here is a WARN, not a reason to touch `attachmentNote` (already finalized above) or retry.
-    if (applied.saved && cmd.pendingAttachment) {
-      const { kind, name, bytes } = cmd.pendingAttachment;
-      try {
-        if (kind === "image" && controlBot.sendPhotoFile) {
-          await controlBot.sendPhotoFile(supergroupChatId, topic.message_thread_id, name, bytes);
-        } else if (controlBot.sendDocumentFile) {
-          await controlBot.sendDocumentFile(supergroupChatId, topic.message_thread_id, name, bytes);
-        }
-      } catch (err) {
-        log("WARN", `failed to forward the attachment for "${slug}" into its new topic: ${(err as Error).message}`);
-      }
-    }
+    if (applied.saved) await mirrorAttachmentIntoTopic(cmd, topic.message_thread_id, slug);
 
     routing.add({ slug, topicId: topic.message_thread_id, worktreePath: session.worktreePath });
     sessionSupervisor.wireSession(slug, session.ptyProcess, topic.message_thread_id, session.ready);
 
-    sessionStore.insert({
-      slug,
-      topicId: topic.message_thread_id,
-      sessionId: null,
-      worktreePath: session.worktreePath,
-      branch: session.branch,
-      repoPath: repo.path,
-      model,
-      ptyPid: session.ptyProcess.pid ?? 0,
-      state: "starting",
-      turnCardMsg: null,
-      thinkingPlaceholderMsg: null,
-      paused: false,
-      renamed: false,
-      feedDetail: "compact",
-      feedVerbose: false,
-      // Both false at insert time regardless of `/default permission`/`/default answer` - the
-      // `autoCategorySpec(...).set(...)` calls a few lines below run after this row exists and go
-      // through `routing.setBypass`/`setAutoAnswer`, which write these columns through themselves.
-      bypassPermission: false,
-      autoAnswer: false,
-      // The same value the spawn flag above actually used, not a re-read - see `sessionMode`'s own
-      // note for why re-reading the live getter here would let the row disagree with the process.
-      mode: sessionMode,
-      createdUtc: nowIso(),
-      lastEventUtc: nowIso(),
-    });
+    sessionStore.insert(newSessionRow(slug, topic.message_thread_id, session, repo, model, sessionMode));
     // P1-13: the row now names the process, the worktree and the topic, so `/ls` sees it and
     // `removeSessionRow` can dismantle it - which is what teardown switches to from here.
     attempt.tracked = true;
@@ -731,43 +816,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       inline_keyboard: [[{ text: `↪️ Open "${slug}"`, url: buildTopicDeepLink(supergroupChatId, topic.message_thread_id) }]],
     });
 
-    // Two independent gates, both real events rather than guessed delays: the dev-channels dialog
-    // must be confirmed (`session.ready` - otherwise the write lands on the still-open dialog and
-    // corrupts it, confirmed live 2026-08-04), and the channel server's own MCP handshake must have
-    // completed (`waitForChannelConnected` - otherwise the write's trailing Enter can be silently
-    // lost even with the dialog long since confirmed, also confirmed live 2026-08-04).
-    await session.ready;
-    await waitForChannelConnected(slug);
-    // A third gate, closing the race the two above don't (`pty-quiet-wait.ts`'s own doc comment has
-    // the full story, live-confirmed 2026-08-11): Claude Code can still be busy registering its
-    // *other* MCP servers (Playwright's cold `npx` spawn on this brand-new worktree path, in
-    // particular) even once the aibridge channel's own handshake above has resolved, and that
-    // startup chatter is enough real PTY output to fool `confirmSubmitted` below into reading a lost
-    // Enter as a landed one - leaving the very first message sitting typed but never submitted, with
-    // no error anywhere and no hook ever firing to say so.
-    await waitForPtyQuiet(slug);
-    // `/default effort`: applied before the initial prompt, not after, so the very first turn
-    // already runs under the configured default rather than starting at the CLI's own "medium" and
-    // switching mid-turn. Silent (no confirmSessionCommand) - a second "Switched..." message here
-    // would just be noise on top of the "Created ..." confirmation already sent above. Skipped when
-    // it's still at the CLI's own spawn default rather than relying on the write being a harmless
-    // no-op at that value, which is unverified for `/effort`.
-    //
-    // `/default mode` is NOT applied here any more - it's a `--permission-mode` launch flag now (see
-    // the `launchSession` call above). Only the Bridge's own tracked value is set, so a later live
-    // `/mode` switch cycles from where the session actually is; no keystroke is sent, because the
-    // session already started in that mode.
-    const defaultSessionEffort = getDefaultSessionEffort();
-    routing.setMode(slug, sessionMode);
-    if (defaultSessionEffort !== DEFAULT_EFFORT) ptyIo.sendEffortCommand(slug, defaultSessionEffort);
-    // `/default permission`/`/default answer`: deliberately *not* the keystroke/typed-command
-    // machinery its two neighbours above need. This state lives in `routing.ts`, on the Bridge side
-    // of the relay - there is no CLI setting to drive and nothing to type into the PTY. `spec.set`
-    // rather than `applyAutoToggle` for the same reason the plan gives: a session created seconds ago
-    // has no already-posted permission card to drain.
-    if (getDefaultBypassEnabled()) autoCategorySpec("permission").set(slug, true);
-    if (getDefaultAutoAnswerEnabled()) autoCategorySpec("answer").set(slug, true);
-    ptyIo.sendChannelText(slug, topic.message_thread_id, newSessionContent(cmd), "new-1", "telegram");
+    await startFirstTurn(slug, topic.message_thread_id, cmd, session, sessionMode);
   }
 
   function handleLsCommand(topicId: number | undefined): void {

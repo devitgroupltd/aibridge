@@ -12,7 +12,8 @@ import { clearDeployMarker, isDeployMarkerStale, readDeployMarker, rollbackStale
 import { DetailsAnchorStore, DETAILS_ANCHOR_RETENTION_MS } from "./details-anchor-store.ts";
 import { BrowseRegistry } from "./browse-nav.ts";
 import { FleetConfirmRegistry } from "./fleet-confirm.ts";
-import { createOsPowerCommands, OsConfirmRegistry } from "./os-power-commands.ts";
+import { createOsPowerCommands } from "./os-power-commands.ts";
+import { OsConfirmRegistry } from "./os-confirm.ts";
 import { StaleConfirmRegistry } from "./stale-confirm.ts";
 import { VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { startWhisperServer } from "./voice-transcribe.ts";
@@ -25,6 +26,7 @@ import { ChannelConnectCoordinator } from "./channel-connect-coordinator.ts";
 import { waitForPtyQuiet as waitForPtyQuietImpl } from "./pty-quiet-wait.ts";
 import type { RouterAction } from "./nl-router.ts";
 import { SettingsStore } from "./settings-store.ts";
+import { RuntimeSettings } from "./runtime-settings.ts";
 import { botCommandList } from "./fleet-commands.ts";
 import { monotonicNowMs } from "./monotonic-clock.ts";
 import { CostTracker } from "./cost-tracker.ts";
@@ -36,8 +38,8 @@ import { launchSession, resolveNodeExecutable } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
 import { RateGovernor } from "./rate-governor.ts";
 import { Routing } from "./routing.ts";
-import { DEFAULT_EFFORT, DEFAULT_MODE, EFFORTS, MODES } from "./session-commands.ts";
-import type { Effort, Mode, SessionCommand } from "./session-commands.ts";
+import { DEFAULT_MODE } from "./session-commands.ts";
+import type { SessionCommand } from "./session-commands.ts";
 import { SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
 import { startPolling, TelegramClient, validateTokens } from "./telegram.ts";
 import type { InlineKeyboardMarkup } from "./telegram.ts";
@@ -55,7 +57,9 @@ import { createInboundMedia } from "./inbound-media.ts";
 import { createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE } from "./session-lifecycle-commands.ts";
 import type { SessionLifecycleCommands } from "./session-lifecycle-commands.ts";
 import { createFleetReportingCommands } from "./fleet-reporting-commands.ts";
-import { createDeployLifecycleCommands, createProcessRunner, RestartConfirmRegistry } from "./deploy-lifecycle-commands.ts";
+import { createDeployLifecycleCommands } from "./deploy-lifecycle-commands.ts";
+import { createProcessRunner } from "./process-runner.ts";
+import { RestartConfirmRegistry } from "./restart-confirm.ts";
 import { createVoiceModeCommands } from "./voice-mode-commands.ts";
 import { createConfirmSessionCommand, createFleetConfirmFlow, createStopIndicatorsForTopic } from "./fleet-confirm-flow.ts";
 import type { FleetConfirmFlow } from "./fleet-confirm-flow.ts";
@@ -100,7 +104,7 @@ async function main(): Promise<void> {
 
   // Constructed this early (ahead of sessionStore/routing/etc.) because `respawnSelfAndExit`
   // below can fire from the stale-deploy rollback check a few lines down, before any of that
-  // later state exists - `runSchtasks` is the one deploy-lifecycle-commands.ts export it needs.
+  // later state exists - `runSchtasks` (process-runner.ts) is the one piece of it needed that early.
   // `deployLifecycle` itself (constructed further down, once sessionStore exists) reuses this
   // same instance rather than building its own.
   const processRunner = createProcessRunner();
@@ -173,40 +177,15 @@ async function main(): Promise<void> {
   // §5.5's details-button edit-in-place (details-anchor-store.ts) - same aibridge.db file, same
   // reasoning as settingsStore above.
   const detailsAnchorStore = new DetailsAnchorStore(dbPath);
-  let assistEnabled = settingsStore.get("assist_enabled", "true") !== "false";
-  // Live override for config.ts's nlRouter.backend startup default - see that field's own doc
-  // comment for why an API key's mere presence must never switch this on its own. Falls back to
-  // the config default (always "cli" unless NL_ROUTER_BACKEND=api) when nothing's been switched
-  // live yet.
-  let nlRouterBackend: "api" | "cli" = settingsStore.get("nl_router_backend", config.nlRouter.backend) === "api" ? "api" : "cli";
-  // voice-confirm.ts's own confirm-before-send gate - same "fleet-wide, persisted, in-memory for
-  // reads" shape as assistEnabled above. Default on: Whisper's accuracy varies enough by language
-  // that skipping the review step should be an explicit opt-in, not the out-of-the-box behavior.
-  let voiceConfirmEnabled = settingsStore.get("voice_confirm_enabled", "true") !== "false";
-  // `/defaultmode` - the permission mode every *new* session starts in, before its own first turn
-  // (handleNewCommand below). Same in-memory-for-reads, persisted-on-write shape as the two above.
-  // Falls back to DEFAULT_MODE ("manual", the CLI's own real spawn default) if the stored value is
-  // ever something MODES no longer recognises (a downgrade after a value was added then removed,
-  // say) - same defensive re-validation `isModel`/`isMode`/`isEffort` already apply to callback data.
-  let defaultSessionMode: Mode = (() => {
-    const stored = settingsStore.get("default_session_mode", DEFAULT_MODE);
-    return (MODES as readonly string[]).includes(stored) ? (stored as Mode) : DEFAULT_MODE;
-  })();
-  // `/defaulteffort` - same in-memory-for-reads, persisted-on-write, re-validated-on-load shape as
-  // defaultSessionMode above.
-  let defaultSessionEffort: Effort = (() => {
-    const stored = settingsStore.get("default_session_effort", DEFAULT_EFFORT);
-    return (EFFORTS as readonly string[]).includes(stored) ? (stored as Effort) : DEFAULT_EFFORT;
-  })();
-  // `/default permission` / `/default answer` (bypass-and-autoanswer-plan.md §0.4) - the new-session
-  // default for `/auto`'s two toggles, same in-memory-for-reads, persisted-on-write shape as the two
-  // above. Both fall back to "false" - fail-closed, deliberately unlike `voice_confirm_enabled`'s
-  // "true" fallback, which defaults a confirmation *on*; these default a confirmation *away*.
-  // This is standing configuration for sessions that don't exist yet, distinct from a *live*
-  // session's own per-slug toggle (`routing.ts`'s `bypassBySlug`/`autoAnswerBySlug`, revised
-  // 2026-08-11 to survive a restart via `session-store.ts` instead of resetting to off).
-  let defaultBypassEnabled = settingsStore.get("default_bypass_enabled", "false") === "true";
-  let defaultAutoAnswerEnabled = settingsStore.get("default_autoanswer_enabled", "false") === "true";
+  // runtime-settings.ts: the seven fleet-wide preferences that are read from memory, written through
+  // to `bridge_settings`, and re-validated on load (`/assist`, `/voice confirm`, `/router`, and
+  // `/default`'s four categories). These were seven mutable `let`s here, each with its own decode
+  // expression and its own `get`/`set` closure pair threaded into three or four modules, with the
+  // matching `settingsStore.set` left to each write site to remember - see that module's own doc
+  // comment. `config.nlRouter.backend` is passed in because it's the one default that is itself
+  // configurable (NL_ROUTER_BACKEND); see that field's own doc comment for why an API key's mere
+  // presence must never switch it on its own.
+  const settings = new RuntimeSettings(settingsStore, config.nlRouter.backend);
   if (!sessionStore.get(config.selfCheck.slug)) {
     sessionStore.insert({
       slug: config.selfCheck.slug,
@@ -221,7 +200,6 @@ async function main(): Promise<void> {
       turnCardMsg: null,
       thinkingPlaceholderMsg: null,
       paused: false,
-      renamed: false,
       feedDetail: "compact",
       feedVerbose: false,
       bypassPermission: false,
@@ -307,7 +285,7 @@ async function main(): Promise<void> {
   // `/os shutdown|reboot` (os-power-commands.ts) - same confirm-button pattern as `/kill --all`
   // above, for a strictly more consequential action (kills the Bridge itself, not just a session).
   const osConfirmRegistry = new OsConfirmRegistry();
-  // `/restart` (deploy-lifecycle-commands.ts), confirm-gated 2026-08-12 whenever a live session
+  // `/restart` (restart-confirm.ts), confirm-gated 2026-08-12 whenever a live session
   // would be lost - same confirm-button pattern as `osConfirmRegistry` above, own registry since it
   // gates one action rather than several.
   const restartConfirmRegistry = new RestartConfirmRegistry();
@@ -386,10 +364,9 @@ async function main(): Promise<void> {
     // caption. Plain values/getters (not `LateBound`) - both already exist by this point in the
     // composition root, same as `nlDispatch`'s own construction further down uses.
     nlRouterConfig: config.nlRouter,
-    getNlRouterBackend: () => nlRouterBackend,
+    settings,
     getReposRegistry: () => reposRegistry,
     isControlTopic,
-    voiceConfirmEnabled: () => voiceConfirmEnabled,
     voice: config.voice,
     supergroupChatId: config.supergroupChatId,
     log,
@@ -629,13 +606,11 @@ async function main(): Promise<void> {
       // as answered before that hook arrives.
       const slug = routing.getByTopicId(Number(topicId))?.slug;
       if (slug) feedWiring.markReplied(slug);
-      // §4.4's rename-once (auto-upgrading the topic off its provisional `/new`-prompt title using
-      // the session's first real reply text) was removed 2026-08-09 at operator request: a topic
-      // name, once set - whether the provisional `/new`-derived one or a manual rename via
-      // Telegram's own topic-settings UI - should only ever change when the operator renames it
-      // themselves, never automatically from reply content. `sessionStore`'s `renamed` column/
-      // `setRenamed` are left in place (schema churn for a now-unused flag isn't worth it) but are
-      // no longer written from here.
+      // §4.4's rename-once (auto-upgrading the topic off its provisional `/new`-prompt title from
+      // the session's first real reply) was removed 2026-08-09 at operator request: a topic name,
+      // once set, should only ever change when the operator renames it themselves. Its `renamed`
+      // column and `setRenamed` setter went with it; the physical column is left alone on existing
+      // databases, since nothing reads it and dropping it would need a migration to no end.
     },
     onHookEvent: feedWiring.handleHookEvent,
     onAwaitingInput: (slug) => feedWiring.maybeSetState(slug, "awaiting_input"),
@@ -649,39 +624,11 @@ async function main(): Promise<void> {
     ptyIo,
     routing,
     sessionStore,
-    settingsStore,
+    settings,
     controlBot,
     confirmSessionCommand,
     voiceServer,
     voiceModelPath: config.voice.modelPath,
-    getAssistEnabled: () => assistEnabled,
-    setAssistEnabled: (value) => {
-      assistEnabled = value;
-    },
-    getVoiceConfirmEnabled: () => voiceConfirmEnabled,
-    setVoiceConfirmEnabled: (value) => {
-      voiceConfirmEnabled = value;
-    },
-    getDefaultSessionMode: () => defaultSessionMode,
-    setDefaultSessionMode: (mode) => {
-      defaultSessionMode = mode;
-    },
-    getDefaultSessionEffort: () => defaultSessionEffort,
-    setDefaultSessionEffort: (effort) => {
-      defaultSessionEffort = effort;
-    },
-    getDefaultBypassEnabled: () => defaultBypassEnabled,
-    setDefaultBypassEnabled: (value) => {
-      defaultBypassEnabled = value;
-    },
-    getDefaultAutoAnswerEnabled: () => defaultAutoAnswerEnabled,
-    setDefaultAutoAnswerEnabled: (value) => {
-      defaultAutoAnswerEnabled = value;
-    },
-    getNlRouterBackend: () => nlRouterBackend,
-    setNlRouterBackend: (backend) => {
-      nlRouterBackend = backend;
-    },
     nlRouterApiKeyConfigured: Boolean(config.nlRouter.apiKey),
     supergroupChatId: config.supergroupChatId,
     log,
@@ -734,10 +681,7 @@ async function main(): Promise<void> {
     waitForPtyQuiet,
     isControlTopic,
     getReposRegistry: () => reposRegistry,
-    getDefaultSessionMode: () => defaultSessionMode,
-    getDefaultSessionEffort: () => defaultSessionEffort,
-    getDefaultBypassEnabled: () => defaultBypassEnabled,
-    getDefaultAutoAnswerEnabled: () => defaultAutoAnswerEnabled,
+    settings,
     supergroupChatId: config.supergroupChatId,
     selfCheckSlug: config.selfCheck.slug,
     fleetWorktreesRoot,
@@ -831,8 +775,7 @@ async function main(): Promise<void> {
     repoPickRegistry,
     dispatchFleetCommand: (fleetCmd, threadId, isControl, currentSlug) => commandDispatch.get().dispatchFleetCommand(fleetCmd, threadId, isControl, currentSlug),
     nlRouterConfig: config.nlRouter,
-    getNlRouterBackend: () => nlRouterBackend,
-    getAssistEnabled: () => assistEnabled,
+    settings,
     supergroupChatId: config.supergroupChatId,
     log,
     history: controlTopicHistory,
@@ -1056,7 +999,7 @@ async function main(): Promise<void> {
       nlDispatch,
       getReposRegistry: () => reposRegistry,
       supergroupChatId: config.supergroupChatId,
-      getDefaultSessionMode: () => defaultSessionMode,
+      settings,
       log,
     }),
   );
@@ -1090,15 +1033,7 @@ async function main(): Promise<void> {
     voiceModeCommands,
     confirmSessionCommand,
     isControlTopic,
-    settingsStore,
-    setAssistEnabled: (value) => {
-      assistEnabled = value;
-    },
-    setVoiceConfirmEnabled: (value) => {
-      voiceConfirmEnabled = value;
-    },
-    getDefaultSessionMode: () => defaultSessionMode,
-    getDefaultSessionEffort: () => defaultSessionEffort,
+    settings,
     voiceServer,
     voiceModelPath: config.voice.modelPath,
     stateDir: STATE_DIR,

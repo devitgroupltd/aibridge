@@ -5,6 +5,7 @@ import type { PendingFleetConfirm } from "../src/fleet-confirm.ts";
 import { RateGovernor } from "../src/rate-governor.ts";
 import { Routing } from "../src/routing.ts";
 import { SessionStore, type SessionRow } from "../src/session-store.ts";
+import { fakeControlBot } from "./helpers.ts";
 
 function row(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
@@ -20,7 +21,6 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     turnCardMsg: null,
     thinkingPlaceholderMsg: null,
     paused: false,
-    renamed: false,
     feedDetail: "compact",
     feedVerbose: false,
     bypassPermission: false,
@@ -32,19 +32,13 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
   };
 }
 
-function fakeControlBot() {
-  const sent: Array<{ topicId: number | undefined; text: string; keyboard?: unknown }> = [];
-  const edited: Array<{ messageId: number; text: string }> = [];
+/** The shared double (helpers.ts) plus the forum-topic calls, and a switch for making the next
+ * `deleteForumTopic` fail - the orphan-topic path this module owns turns on that failure. */
+function fakeFleetBot() {
   const deletedTopics: number[] = [];
   let failDelete = false;
   return {
-    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string, replyMarkup?: unknown) => {
-      sent.push({ topicId, text, keyboard: replyMarkup });
-      return { message_id: sent.length };
-    },
-    editMessageText: async (_chatId: unknown, messageId: number, text: string) => {
-      edited.push({ messageId, text });
-    },
+    ...fakeControlBot(),
     deleteForumTopic: async (_chatId: unknown, messageThreadId: number) => {
       if (failDelete) throw new Error("Telegram rejected the delete");
       deletedTopics.push(messageThreadId);
@@ -52,8 +46,6 @@ function fakeControlBot() {
     createForumTopic: async () => ({ message_thread_id: 999 }),
     editForumTopic: async () => {},
     closeForumTopic: async () => {},
-    sent,
-    edited,
     deletedTopics,
     failDeleteNextTime() {
       failDelete = true;
@@ -63,7 +55,7 @@ function fakeControlBot() {
 
 describe("createConfirmSessionCommand", () => {
   test("schedules the send through the P1 lane and delivers text/keyboard/parseMode", async () => {
-    const controlBot = fakeControlBot();
+    const controlBot = fakeFleetBot();
     const feedGovernor = new RateGovernor({ log: () => {} });
     const confirmSessionCommand = createConfirmSessionCommand({ feedGovernor, controlBot, supergroupChatId: "-100", log: () => {} });
 
@@ -102,7 +94,7 @@ describe("createStopIndicatorsForTopic", () => {
   test("stops the typing indicator for the topic", () => {
     const typingIndicator = fakeTypingIndicator();
     const thinkingPlaceholder = fakeThinkingPlaceholder(undefined);
-    const controlBot = fakeControlBot();
+    const controlBot = fakeFleetBot();
     const feedGovernor = new RateGovernor({ log: () => {} });
     const stopIndicatorsForTopic = createStopIndicatorsForTopic({ typingIndicator, thinkingPlaceholder, controlBot, feedGovernor, supergroupChatId: "-100", log: () => {} });
 
@@ -114,7 +106,7 @@ describe("createStopIndicatorsForTopic", () => {
   test("edits the thinking placeholder to 'Session ended.' when one was pending", async () => {
     const typingIndicator = fakeTypingIndicator();
     const thinkingPlaceholder = fakeThinkingPlaceholder(42);
-    const controlBot = fakeControlBot();
+    const controlBot = fakeFleetBot();
     const feedGovernor = new RateGovernor({ log: () => {} });
     const stopIndicatorsForTopic = createStopIndicatorsForTopic({ typingIndicator, thinkingPlaceholder, controlBot, feedGovernor, supergroupChatId: "-100", log: () => {} });
 
@@ -129,7 +121,7 @@ describe("createStopIndicatorsForTopic", () => {
   test("does nothing when there was no pending placeholder", async () => {
     const typingIndicator = fakeTypingIndicator();
     const thinkingPlaceholder = fakeThinkingPlaceholder(undefined);
-    const controlBot = fakeControlBot();
+    const controlBot = fakeFleetBot();
     const feedGovernor = new RateGovernor({ log: () => {} });
     const stopIndicatorsForTopic = createStopIndicatorsForTopic({ typingIndicator, thinkingPlaceholder, controlBot, feedGovernor, supergroupChatId: "-100", log: () => {} });
 
@@ -142,7 +134,7 @@ describe("createStopIndicatorsForTopic", () => {
 });
 
 function setup(overrides: { killSessionRow?: (row: SessionRow) => Promise<void>; removeSessionRow?: (row: SessionRow) => Promise<boolean>; resolveTargetSlug?: (explicit: string | undefined, currentSlug: string | undefined) => { slug: string } | { error: string } } = {}) {
-  const controlBot = fakeControlBot();
+  const controlBot = fakeFleetBot();
   const routing = new Routing();
   const sessionStore = new SessionStore(":memory:");
   const fleetConfirmRegistry = new FleetConfirmRegistry();

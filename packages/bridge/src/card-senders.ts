@@ -4,10 +4,11 @@ import { renderHelp } from "./fleet-commands.ts";
 import { buildDiffReview, renderFilesChangedSummary } from "./diff-review.ts";
 import { buildDirKeyboard, buildHitsKeyboard, BrowseRegistry, renderDirText, renderHitsText } from "./browse-nav.ts";
 import { listDirectory, searchWorktree } from "./worktree-fs.ts";
-import { splitForTelegram } from "./pipe-server.ts";
+import { splitForTelegram } from "./telegram-split.ts";
 import type { SessionRoute } from "./routing.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
 import type { SendMessageSource } from "./telegram.ts";
+import type { LogFn } from "./logger.ts";
 
 /** `/about`, `/help`, `/commands`, `/skills`, `/browse`, `/find`, `/diff` - each reached by both an
  * exact-syntax command and its NL-matched (nl-router.ts) equivalent, extracted here so there's one
@@ -19,7 +20,7 @@ export interface CardSendersOptions {
   confirmSessionCommand: ConfirmSessionCommand;
   browseRegistry: BrowseRegistry;
   supergroupChatId: string;
-  log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  log: LogFn;
 }
 
 export interface CardSenders {

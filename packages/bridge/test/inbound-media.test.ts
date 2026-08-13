@@ -10,18 +10,14 @@ import { SessionStore } from "../src/session-store.ts";
 import { StaleConfirmRegistry } from "../src/stale-confirm.ts";
 import { VoiceConfirmRegistry } from "../src/voice-confirm.ts";
 import type { TelegramMessage } from "../src/telegram.ts";
+import { fakeControlBot, testRuntimeSettings } from "./helpers.ts";
 
-function fakeControlBot() {
-  const sent: Array<{ topicId: number | undefined; text: string; keyboard?: unknown }> = [];
+/** The shared double plus the two file-download calls a voice note goes through. */
+function fakeMediaBot() {
   return {
-    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string, replyMarkup?: unknown) => {
-      sent.push({ topicId, text, keyboard: replyMarkup });
-      return { message_id: sent.length };
-    },
-    editMessageText: async () => {},
+    ...fakeControlBot(),
     getFile: async () => ({ file_path: "voice.ogg" }),
     downloadFile: async () => new Uint8Array([1, 2, 3]),
-    sent,
   };
 }
 
@@ -34,8 +30,8 @@ function message(overrides: Partial<TelegramMessage> = {}): TelegramMessage {
   };
 }
 
-async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]> = {}) {
-  const controlBot = fakeControlBot();
+async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]> & { voiceConfirmEnabled?: boolean } = {}) {
+  const controlBot = fakeMediaBot();
   const feedGovernor = new RateGovernor({ log: () => {} });
   const routing = new Routing();
   const sessionStore = new SessionStore(":memory:");
@@ -66,10 +62,9 @@ async function setup(overrides: Partial<Parameters<typeof createInboundMedia>[0]
     // NL routing disabled by default in tests - `nlRouterConfig.enabled: false` short-circuits
     // `routeCaptionToNewCommand` before it would ever call the real `routeText`/an LLM backend.
     nlRouterConfig: { enabled: false, apiKey: undefined, model: "" },
-    getNlRouterBackend: () => "cli",
+    settings: testRuntimeSettings({ voiceConfirmEnabled: overrides.voiceConfirmEnabled ?? true }).settings,
     getReposRegistry: () => undefined,
     isControlTopic: (threadId) => threadId === undefined || threadId === 1,
-    voiceConfirmEnabled: () => true,
     voice: { enabled: true, ffmpegPath: "ffmpeg", port: 8123 },
     supergroupChatId: "-100",
     ...overrides,
@@ -164,7 +159,6 @@ describe("createInboundMedia", () => {
         turnCardMsg: null,
         thinkingPlaceholderMsg: null,
         paused: false,
-        renamed: false,
         feedDetail: "compact",
         feedVerbose: false,
         bypassPermission: false,
@@ -653,7 +647,7 @@ describe("createInboundMedia", () => {
 
   describe("handleVoiceMessage", () => {
     test("posts a confirm card carrying the transcript when voiceConfirmEnabled is true", async () => {
-      const { inboundMedia, controlBot } = await setup({ voiceConfirmEnabled: () => true });
+      const { inboundMedia, controlBot } = await setup({ voiceConfirmEnabled: true });
 
       await inboundMedia.handleVoiceMessage({ file_id: "v1", duration: 2 }, 5, 1, "op", Math.floor(Date.now() / 1000), message());
 

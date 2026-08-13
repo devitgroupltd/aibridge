@@ -4,6 +4,7 @@ import { Routing } from "../src/routing.ts";
 import { RetryStore } from "../src/retry-store.ts";
 import { SessionStore, type SessionRow } from "../src/session-store.ts";
 import type { Mode } from "../src/session-commands.ts";
+import { fakeControlBot, testRuntimeSettings } from "./helpers.ts";
 
 function row(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
@@ -19,7 +20,6 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     turnCardMsg: null,
     thinkingPlaceholderMsg: null,
     paused: false,
-    renamed: false,
     feedDetail: "compact",
     feedVerbose: false,
     bypassPermission: false,
@@ -28,17 +28,6 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     createdUtc: "2026-08-08T00:00:00.000Z",
     lastEventUtc: "2026-08-08T00:00:00.000Z",
     ...overrides,
-  };
-}
-
-function fakeControlBot() {
-  const sent: Array<{ topicId: number | undefined; text: string; keyboard?: unknown }> = [];
-  return {
-    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string, replyMarkup?: unknown) => {
-      sent.push({ topicId, text, keyboard: replyMarkup });
-      return { message_id: sent.length };
-    },
-    sent,
   };
 }
 
@@ -228,7 +217,7 @@ function setup(overrides: Partial<{ sessionStore: SessionStore; defaultSessionMo
     nlDispatch: nlDispatch as never,
     getReposRegistry: () => undefined,
     supergroupChatId: "-100",
-    getDefaultSessionMode: () => overrides.defaultSessionMode ?? "manual",
+    settings: testRuntimeSettings({ defaultSessionMode: overrides.defaultSessionMode ?? "manual" }).settings,
     log: () => {},
   });
 

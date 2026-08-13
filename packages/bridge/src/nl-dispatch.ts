@@ -15,6 +15,8 @@ import type { Routing } from "./routing.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import type { TypingIndicator } from "./typing-indicator.ts";
 import type { SendMessageSource } from "./telegram.ts";
+import type { LogFn } from "./logger.ts";
+import type { RuntimeSettings } from "./runtime-settings.ts";
 
 /** §10's natural-language command routing: matching plain text against `nl-router.ts`, confirming
  * a destructive match before it runs, and executing a matched command through the exact same
@@ -38,10 +40,10 @@ export interface NlDispatchOptions {
   repoPickRegistry: RepoPickRegistry;
   dispatchFleetCommand: (fleetCmd: FleetCommand, threadId: number | undefined, isControl: boolean, currentSlug: string | undefined) => void;
   nlRouterConfig: { enabled: boolean; apiKey: string | undefined; model: string; historyTurns?: number };
-  getNlRouterBackend: () => "api" | "cli";
-  getAssistEnabled: () => boolean;
+  /** Read live, never snapshotted: `/router` and `/assist` both flip under this module at runtime. */
+  settings: Pick<RuntimeSettings, "nlRouterBackend" | "assistEnabled">;
   supergroupChatId: string;
-  log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  log: LogFn;
   /** Defaults to the real `nl-router.ts` implementation - injectable so `routeOrFallback`'s own
    * control flow (indicator start/stop, the destructive-confirm gate, dispatch to
    * `executeMatchedCommand`) is unit-testable without a real CLI/API backend call. */
@@ -92,8 +94,7 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     repoPickRegistry,
     dispatchFleetCommand,
     nlRouterConfig,
-    getNlRouterBackend,
-    getAssistEnabled,
+    settings,
     supergroupChatId,
     log,
     history,
@@ -263,7 +264,7 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     if (topicIdStr) typingIndicator.start(topicIdStr);
     if (usePlaceholder) thinkingPlaceholder.start(topicIdStr!);
 
-    const result = await routeText(contextedText, ctx, { ...nlRouterConfig, backend: getNlRouterBackend() }, log);
+    const result = await routeText(contextedText, ctx, { ...nlRouterConfig, backend: settings.nlRouterBackend }, log);
 
     if (topicIdStr) typingIndicator.stop(topicIdStr);
     // `kind === "new"` is the one outcome whose own latency (topic creation, worktree, PTY spawn -
@@ -342,7 +343,7 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
     // topic's announcement and the session's actual first turn, instead of leaving Claude to guess
     // what "this alarm" refers to.
     if (result.command.kind === "new") result.command = { ...result.command, sourceText: contextedText };
-    if (result.destructive && getAssistEnabled()) {
+    if (result.destructive && settings.assistEnabled) {
       fireAndForget(postNlConfirm(result.command, threadId, currentSlug), log, "nl-dispatch postNlConfirm");
       return;
     }

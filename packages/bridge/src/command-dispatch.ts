@@ -39,6 +39,8 @@ import type { CardSenders } from "./card-senders.ts";
 import type { FeedWiring } from "./feed-wiring.ts";
 import type { NlDispatch } from "./nl-dispatch.ts";
 import type { ReposRegistry } from "./repos-registry.ts";
+import type { LogFn } from "./logger.ts";
+import type { RuntimeSettings } from "./runtime-settings.ts";
 
 export interface CommandDispatchOptions {
   controlBot: SendMessageSource;
@@ -78,8 +80,8 @@ export interface CommandDispatchOptions {
    * of - shows the fleet-wide `/default` value instead of a contextless blank picker (2026-08-10
    * follow-up; `/effort` still has the same gap, left alone for now since only `/mode` was asked
    * for). */
-  getDefaultSessionMode: () => Mode;
-  log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  settings: Pick<RuntimeSettings, "defaultSessionMode">;
+  log: LogFn;
 }
 
 export interface CommandDispatch {
@@ -116,6 +118,21 @@ interface DispatchCtx {
 /** The three bare (no-argument) level commands `bareLevelCommand` below recognises - checked as a
  * cheap `Set.has` before that rule's `match` does any store/routing lookup. */
 const BARE_LEVEL_COMMANDS = new Set(["/model", "/mode", "/effort"]);
+
+/** The three already-computed values every fleet-command handler needs beyond the command itself -
+ * the same "bundle the ambient context" shape `DispatchCtx` below already uses for the exact-syntax
+ * table. */
+interface FleetCommandCtx {
+  threadId: number | undefined;
+  isControl: boolean;
+  currentSlug: string | undefined;
+}
+
+/** One handler per `FleetCommand` kind, each receiving that kind's own narrowed member. Keyed by
+ * `FleetCommand["kind"]`, so the table below can't omit a kind or invent one. */
+type FleetCommandHandlers = {
+  [K in FleetCommand["kind"]]: (cmd: Extract<FleetCommand, { kind: K }>, ctx: FleetCommandCtx) => void;
+};
 
 interface ExactSyntaxRule {
   name: string;
@@ -166,127 +183,83 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     nlDispatch,
     getReposRegistry,
     supergroupChatId,
-    getDefaultSessionMode,
+    settings,
     log,
   } = opts;
+
+  /** Three commands are control-topic-only. An NL match can never produce one outside the control
+   * topic anyway (`nl-router.ts`'s `allowedKinds`), but the check stays here as defense in depth
+   * rather than trusting upstream filtering - it is the one piece of policy in the table below that
+   * isn't just "call the owning handler". */
+  function controlTopicOnly(command: string, ctx: FleetCommandCtx, run: () => void): void {
+    if (!ctx.isControl) {
+      confirmSessionCommand(ctx.threadId, `${command} only works from the control topic.`);
+      return;
+    }
+    run();
+  }
+
+  /**
+   * One entry per `FleetCommand` kind, replacing the 25-branch if-chain this used to be. The
+   * `FleetCommandHandlers` mapped type is what makes it worth doing rather than cosmetic: it is
+   * keyed by `FleetCommand["kind"]`, so a newly-added kind is a compile error here (a missing
+   * property) instead of a command that parses fine and then silently does nothing - and each
+   * entry's `cmd` arrives already narrowed to its own member, so no handler has to re-narrow.
+   *
+   * The old chain got that same exhaustiveness by accident, from its untagged tail call passing the
+   * residual union into `handlePauseCommand(cmd: Extract<FleetCommand, { kind: "pause" }>)`. That
+   * worked, but it made `pause` the silent destination of anything unaccounted for, which is the
+   * wrong default for a dispatch table: here `pause` is an ordinary entry like every other kind.
+   */
+  const FLEET_COMMAND_HANDLERS: FleetCommandHandlers = {
+    new: (cmd, ctx) =>
+      controlTopicOnly("/new", ctx, () => fireAndForget(sessionLifecycle.handleNewCommand(cmd, ctx.threadId), log, "command-dispatch handleNewCommand")),
+    budget: (_cmd, ctx) => controlTopicOnly("/budget", ctx, () => fleetReporting.handleBudgetCommand(ctx.threadId)),
+    default: (cmd, ctx) => controlTopicOnly("/default", ctx, () => voiceModeCommands.handleDefaultCommand(cmd, ctx.threadId)),
+    ls: (_cmd, ctx) => sessionLifecycle.handleLsCommand(ctx.threadId),
+    attach: (cmd, ctx) => sessionLifecycle.handleAttachCommand(cmd, ctx.threadId, ctx.currentSlug),
+    pause: (cmd, ctx) => sessionLifecycle.handlePauseCommand(cmd, ctx.threadId, ctx.currentSlug),
+    stop: (cmd, ctx) => sessionLifecycle.handleStopCommand(cmd, ctx.threadId, ctx.currentSlug),
+    detail: (cmd, ctx) => sessionLifecycle.handleDetailCommand(cmd, ctx.threadId, ctx.currentSlug),
+    verbose: (cmd, ctx) => sessionLifecycle.handleVerboseCommand(cmd, ctx.threadId, ctx.currentSlug),
+    kill: (cmd, ctx) => fireAndForget(sessionLifecycle.handleKillCommand(cmd, ctx.threadId, ctx.currentSlug), log, "command-dispatch handleKillCommand"),
+    rm: (cmd, ctx) => fireAndForget(sessionLifecycle.handleRmCommand(cmd, ctx.threadId, ctx.currentSlug), log, "command-dispatch handleRmCommand"),
+    resume: (cmd, ctx) => fireAndForget(sessionLifecycle.handleResumeCommand(cmd, ctx.threadId, ctx.currentSlug), log, "command-dispatch handleResumeCommand"),
+    // `fireAndForget`, like kill/rm and unlike the neighbouring `verbose` - `handleAutoCommand`'s
+    // `--all` scope posts a confirm card, so it's `Promise<void>`, and a bare call would drop a
+    // rejected post silently.
+    auto: (cmd, ctx) => fireAndForget(sessionLifecycle.handleAutoCommand(cmd, ctx.threadId, ctx.currentSlug), log, "command-dispatch handleAutoCommand"),
+
+    settings: (_cmd, ctx) => fleetReporting.handleSettingsCommand(ctx.threadId),
+    repos: (cmd, ctx) => fleetReporting.handleReposCommand(cmd, ctx.threadId),
+
+    usage: (cmd, ctx) => fireAndForget(fleetConfirmFlow.handleUsageCommand(cmd, ctx.threadId, ctx.currentSlug), log, "command-dispatch handleUsageCommand"),
+
+    restart: (_cmd, ctx) => fireAndForget(deployLifecycle.handleRestartCommand(ctx.threadId), log, "command-dispatch handleRestartCommand"),
+    merge: (cmd, ctx) => fireAndForget(deployLifecycle.handleMergeCommand(ctx.threadId, cmd.slug), log, "command-dispatch handleMergeCommand"),
+    ship: (cmd, ctx) => fireAndForget(deployLifecycle.handleShipCommand(ctx.threadId, cmd.slug, ctx.currentSlug), log, "command-dispatch handleShipCommand"),
+    autostart: (cmd, ctx) => fireAndForget(deployLifecycle.handleAutostartCommand(cmd, ctx.threadId), log, "command-dispatch handleAutostartCommand"),
+
+    os: (cmd, ctx) => fireAndForget(osPowerCommands.handleOsCommand(cmd, ctx.threadId), log, "command-dispatch handleOsCommand"),
+
+    voice: (cmd, ctx) => voiceModeCommands.handleVoiceCommand(cmd, ctx.threadId),
+    assist: (cmd, ctx) => voiceModeCommands.handleAssistCommand(cmd, ctx.threadId),
+    router: (cmd, ctx) => voiceModeCommands.handleRouterBackendCommand(cmd, ctx.threadId),
+  };
 
   /**
    * The exact-syntax `/command` switch, extracted so both a typed `/command` (`parseFleetCommand`,
    * fleet-commands.ts) and an NL-matched command (nl-router.ts, via `nl-dispatch.ts`) execute
-   * through the exact same code path - no separate copy to keep in sync. `isControl` mirrors the
-   * same two inline checks (`/new`, `/budget`) `dispatchInboundMessage` always ran; an NL match can
-   * never produce either kind outside the control topic anyway (`nl-router.ts`'s `allowedKinds`),
-   * but the check stays here too as defense in depth rather than trusting upstream filtering.
+   * through the exact same code path - no separate copy to keep in sync.
    */
   function dispatchFleetCommand(fleetCmd: FleetCommand, threadId: number | undefined, isControl: boolean, currentSlug: string | undefined): void {
-    if (fleetCmd.kind === "new") {
-      if (!isControl) {
-        confirmSessionCommand(threadId, "/new only works from the control topic.");
-        return;
-      }
-      fireAndForget(sessionLifecycle.handleNewCommand(fleetCmd, threadId), log, "command-dispatch handleNewCommand");
-      return;
-    }
-    if (fleetCmd.kind === "ls") {
-      sessionLifecycle.handleLsCommand(threadId);
-      return;
-    }
-    if (fleetCmd.kind === "budget") {
-      if (!isControl) {
-        confirmSessionCommand(threadId, "/budget only works from the control topic.");
-        return;
-      }
-      fleetReporting.handleBudgetCommand(threadId);
-      return;
-    }
-    if (fleetCmd.kind === "kill") {
-      fireAndForget(sessionLifecycle.handleKillCommand(fleetCmd, threadId, currentSlug), log, "command-dispatch handleKillCommand");
-      return;
-    }
-    if (fleetCmd.kind === "rm") {
-      fireAndForget(sessionLifecycle.handleRmCommand(fleetCmd, threadId, currentSlug), log, "command-dispatch handleRmCommand");
-      return;
-    }
-    if (fleetCmd.kind === "attach") {
-      sessionLifecycle.handleAttachCommand(fleetCmd, threadId, currentSlug);
-      return;
-    }
-    if (fleetCmd.kind === "usage") {
-      fireAndForget(fleetConfirmFlow.handleUsageCommand(fleetCmd, threadId, currentSlug), log, "command-dispatch handleUsageCommand");
-      return;
-    }
-    if (fleetCmd.kind === "restart") {
-      fireAndForget(deployLifecycle.handleRestartCommand(threadId), log, "command-dispatch handleRestartCommand");
-      return;
-    }
-    if (fleetCmd.kind === "os") {
-      fireAndForget(osPowerCommands.handleOsCommand(fleetCmd, threadId), log, "command-dispatch handleOsCommand");
-      return;
-    }
-    if (fleetCmd.kind === "merge") {
-      fireAndForget(deployLifecycle.handleMergeCommand(threadId, fleetCmd.slug), log, "command-dispatch handleMergeCommand");
-      return;
-    }
-    if (fleetCmd.kind === "ship") {
-      fireAndForget(deployLifecycle.handleShipCommand(threadId, fleetCmd.slug, currentSlug), log, "command-dispatch handleShipCommand");
-      return;
-    }
-    if (fleetCmd.kind === "detail") {
-      sessionLifecycle.handleDetailCommand(fleetCmd, threadId, currentSlug);
-      return;
-    }
-    if (fleetCmd.kind === "verbose") {
-      sessionLifecycle.handleVerboseCommand(fleetCmd, threadId, currentSlug);
-      return;
-    }
-    if (fleetCmd.kind === "auto") {
-      // `fireAndForget`, like kill/rm and unlike the neighbouring `verbose` - `handleAutoCommand`'s
-      // `--all` scope posts a confirm card, so it's `Promise<void>`, and a bare call would drop a
-      // rejected post silently.
-      fireAndForget(sessionLifecycle.handleAutoCommand(fleetCmd, threadId, currentSlug), log, "command-dispatch handleAutoCommand");
-      return;
-    }
-    if (fleetCmd.kind === "settings") {
-      fleetReporting.handleSettingsCommand(threadId);
-      return;
-    }
-    if (fleetCmd.kind === "autostart") {
-      fireAndForget(deployLifecycle.handleAutostartCommand(fleetCmd, threadId), log, "command-dispatch handleAutostartCommand");
-      return;
-    }
-    if (fleetCmd.kind === "repos") {
-      fleetReporting.handleReposCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "voice") {
-      voiceModeCommands.handleVoiceCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "assist") {
-      voiceModeCommands.handleAssistCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "router") {
-      voiceModeCommands.handleRouterBackendCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "default") {
-      if (!isControl) {
-        confirmSessionCommand(threadId, "/default only works from the control topic.");
-        return;
-      }
-      voiceModeCommands.handleDefaultCommand(fleetCmd, threadId);
-      return;
-    }
-    if (fleetCmd.kind === "stop") {
-      sessionLifecycle.handleStopCommand(fleetCmd, threadId, currentSlug);
-      return;
-    }
-    if (fleetCmd.kind === "resume") {
-      fireAndForget(sessionLifecycle.handleResumeCommand(fleetCmd, threadId, currentSlug), log, "command-dispatch handleResumeCommand");
-      return;
-    }
-    sessionLifecycle.handlePauseCommand(fleetCmd, threadId, currentSlug);
+    // The one cast in this file. TypeScript checks each table entry against its own narrowed member
+    // (that is what `FleetCommandHandlers` is for), but it can't correlate `fleetCmd`'s type with
+    // the key read out of it here - indexing a mapped type with a union key yields a union of
+    // handlers whose parameters intersect to `never`. The table's own per-entry checking is what
+    // makes this safe; nothing about the value is being reinterpreted.
+    const handle = FLEET_COMMAND_HANDLERS[fleetCmd.kind] as (cmd: FleetCommand, ctx: FleetCommandCtx) => void;
+    handle(fleetCmd, { threadId, isControl, currentSlug });
   }
 
   // §10's ordered exact-syntax table: `/about` through the builtin-passthrough check, i.e. every
@@ -396,8 +369,8 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
             // session's own).
             prompt: ctx.currentSlug
               ? `Choose a permission mode (current: ${routing.getMode(ctx.currentSlug)}):`
-              : `Choose a permission mode (fleet default: ${getDefaultSessionMode()}):`,
-            keyboard: () => buildModeKeyboard(ctx.currentSlug ? routing.getMode(ctx.currentSlug) : getDefaultSessionMode()),
+              : `Choose a permission mode (fleet default: ${settings.defaultSessionMode}):`,
+            keyboard: () => buildModeKeyboard(ctx.currentSlug ? routing.getMode(ctx.currentSlug) : settings.defaultSessionMode),
           },
           "/effort": {
             prompt: ctx.currentSlug ? `Choose an effort level (current: ${routing.getEffort(ctx.currentSlug)}):` : "Choose an effort level:",

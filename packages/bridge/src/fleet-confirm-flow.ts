@@ -13,6 +13,7 @@ import type { TypingIndicator } from "./typing-indicator.ts";
 import type { ForumTopicSource, SendMessageSource } from "./telegram.ts";
 import { formatUsagePanel } from "./usage-panel.ts";
 import { stripAnsi } from "./session-launcher.ts";
+import type { LogFn } from "./logger.ts";
 
 /** `/kill --all`/`/rm --all`'s Yes/No confirm-card flow, `/kill --all --force`/`/rm --all --force`'s
  * same teardown without the round-trip, `/usage`, and the `confirmSessionCommand` primitive nearly
@@ -33,7 +34,7 @@ export interface ConfirmSessionCommandOptions {
   feedGovernor: RateGovernor;
   controlBot: SendMessageSource;
   supergroupChatId: string;
-  log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  log: LogFn;
 }
 
 export function createConfirmSessionCommand(opts: ConfirmSessionCommandOptions): ConfirmSessionCommand {
@@ -56,7 +57,7 @@ export interface StopIndicatorsForTopicOptions {
   controlBot: SendMessageSource;
   feedGovernor: RateGovernor;
   supergroupChatId: string;
-  log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  log: LogFn;
 }
 
 /** §4.2's `/kill`/`/rm`: no `reply` will ever land for this topic again, so the two "Claude is
@@ -99,7 +100,7 @@ export interface FleetConfirmFlowOptions {
   usageWaiters: Map<string, { buffer: string; check: () => void }>;
   orphanTopicNote: string;
   supergroupChatId: string;
-  log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  log: LogFn;
 }
 
 export interface FleetConfirmFlow {

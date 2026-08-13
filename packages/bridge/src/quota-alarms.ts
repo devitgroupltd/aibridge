@@ -3,8 +3,7 @@ import { FIVE_HOURS_MS } from "./cost-tracker.ts";
 import type { RateGovernor } from "./rate-governor.ts";
 import { isValidTransition, type SessionStore } from "./session-store.ts";
 import type { SendMessageSource } from "./telegram.ts";
-
-type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+import type { LogFn } from "./logger.ts";
 
 /** §10.5 point 2's burn-rate alarm - this project's own choice of threshold, not a number the plan
  * specifies (same convention as §10.4.1's prompts-per-hour warning), overridable for a laptop that

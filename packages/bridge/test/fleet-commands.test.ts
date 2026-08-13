@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { splitForTelegram } from "../src/pipe-server.ts";
+import { splitForTelegram } from "../src/telegram-split.ts";
 import {
   botCommandList,
   buildLsDetail,
@@ -796,7 +796,6 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     turnCardMsg: null,
     thinkingPlaceholderMsg: null,
     paused: false,
-    renamed: false,
     feedDetail: "compact",
     feedVerbose: false,
     bypassPermission: false,

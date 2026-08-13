@@ -6,23 +6,21 @@ import { retryTopicKey, RetryStore } from "../src/retry-store.ts";
 import type { PendingNlConfirm } from "../src/nl-confirm.ts";
 import type { PendingStaleConfirm } from "../src/stale-confirm.ts";
 import type { PendingVoiceConfirm } from "../src/voice-confirm.ts";
+import { fakeControlBot } from "./helpers.ts";
 
-function fakeControlBot(overrides: { editMessageText?: boolean } = {}) {
-  const edits: Array<{ messageId: number; text: string }> = [];
+/** The shared double, plus the one variant this module needs: a control bot with *no*
+ * `editMessageText` at all, which is the degraded-client path `confirm-cards.ts` guards for. */
+function fakeConfirmCardsBot(overrides: { editMessageText?: boolean } = {}) {
+  const base = fakeControlBot();
   return {
-    sendMessage: async () => ({ message_id: 1 }),
-    editMessageText:
-      overrides.editMessageText === false
-        ? undefined
-        : async (_chatId: unknown, messageId: number, text: string) => {
-            edits.push({ messageId, text });
-          },
-    edits,
+    ...base,
+    editMessageText: overrides.editMessageText === false ? undefined : base.editMessageText,
+    edits: base.edited,
   };
 }
 
 function setup(overrides: Partial<Parameters<typeof createConfirmCards>[0]> = {}) {
-  const controlBot = fakeControlBot();
+  const controlBot = fakeConfirmCardsBot();
   const feedGovernor = new RateGovernor({ log: () => {} });
   const retryStore = new RetryStore();
   const confirmCards = createConfirmCards({
@@ -39,11 +37,13 @@ describe("createConfirmCards", () => {
   test("finalizeCard edits the message and strips its keyboard", async () => {
     const { confirmCards, controlBot } = setup();
     await confirmCards.finalizeCard(42, "done");
-    expect(controlBot.edits).toEqual([{ messageId: 42, text: "done" }]);
+    // The stripped keyboard is asserted, not just the text - this test's own name is about the
+    // keyboard, and the shared double (helpers.ts) records it where the local one used to drop it.
+    expect(controlBot.edits).toEqual([{ messageId: 42, text: "done", keyboard: { inline_keyboard: [] } }]);
   });
 
   test("finalizeCard is a no-op when the control bot has no editMessageText", async () => {
-    const controlBot = fakeControlBot({ editMessageText: false });
+    const controlBot = fakeConfirmCardsBot({ editMessageText: false });
     const { confirmCards } = setup({ controlBot });
     await expect(confirmCards.finalizeCard(42, "done")).resolves.toBeUndefined();
   });
@@ -115,10 +115,10 @@ describe("createConfirmCards", () => {
     );
 
     expect(controlBot.edits).toEqual([
-      { messageId: 1, text: "fleet done" },
-      { messageId: 20, text: "stale done" },
-      { messageId: 30, text: "🎤 hello\n\n✅ Sent." },
-      { messageId: 4, text: "nl done" },
+      { messageId: 1, text: "fleet done", keyboard: { inline_keyboard: [] } },
+      { messageId: 20, text: "stale done", keyboard: { inline_keyboard: [] } },
+      { messageId: 30, text: "🎤 hello\n\n✅ Sent.", keyboard: { inline_keyboard: [] } },
+      { messageId: 4, text: "nl done", keyboard: { inline_keyboard: [] } },
     ]);
   });
 

@@ -1,4 +1,4 @@
-import { createRequire } from "node:module";
+import { openDatabase, type SqliteHandleLike, type SqliteStatementLike } from "./sqlite.ts";
 
 /**
  * §4.3's routing table, persisted so the fleet survives a Bridge restart - `slug` is the primary
@@ -8,37 +8,10 @@ import { createRequire } from "node:module";
  * not scope creep - deferred fields (session cost/tokens, §5.7) are left out entirely rather than
  * stubbed.
  *
- * The SQLite binding is chosen at runtime rather than statically importing `bun:sqlite`: a
- * node-pty (Windows ConPTY) write that succeeds against a perfectly healthy child process still
- * throws an unhandled "Socket is closed" from node-pty's internal stream on the very next tick
- * when the Bridge itself runs under Bun (confirmed live, 2026-08-03, with a minimal repro outside
- * this codebase) - so production keeps running under plain Node (`node:sqlite`), while `bun test`
- * (§9's test runner) picks up `bun:sqlite` instead. Both expose the same `.exec`/`.prepare(sql)
- * .run/.get/.all`/`.close` shape, confirmed live against this exact Bun version.
+ * The handle itself (runtime binding choice, WAL, busy timeout) comes from `sqlite.ts`, shared with
+ * the three other stores that open this same `aibridge.db` file - see that module's doc comment for
+ * why the binding is picked at runtime rather than statically imported.
  */
-interface SqliteStatementLike {
-  run(params?: Record<string, unknown>): unknown;
-  get(params?: Record<string, unknown>): unknown;
-  all(params?: Record<string, unknown>): unknown[];
-}
-interface SqliteHandleLike {
-  exec(sql: string): void;
-  prepare(sql: string): SqliteStatementLike;
-  close(): void;
-}
-type DatabaseCtor = new (path: string) => SqliteHandleLike;
-
-// `createRequire` rather than a dynamic `import()` so this stays a synchronous constructor -
-// both `bun:sqlite` and `node:sqlite` are built-ins reachable through either runtime's CJS
-// interop, so there's no need to make `SessionStore` construction (and every caller of `new
-// SessionStore(...)`) async just to pick one of two built-in modules.
-function loadDatabaseCtor(): DatabaseCtor {
-  const req = createRequire(import.meta.url);
-  if (typeof Bun !== "undefined") {
-    return (req("bun:sqlite") as { Database: DatabaseCtor }).Database;
-  }
-  return (req("node:sqlite") as { DatabaseSync: DatabaseCtor }).DatabaseSync;
-}
 export type SessionState = "starting" | "idle" | "working" | "awaiting_input" | "quota_stopped" | "dead";
 
 /** §5.9's `/detail`: "compact" is today's 80-char one-liner/8-line-cap card; "full" wraps each
@@ -67,9 +40,6 @@ export interface SessionRow {
    * doesn't have to keep reading "Thinking..." forever. */
   thinkingPlaceholderMsg: number | null;
   paused: boolean;
-  /** §4.4's rename-once cap: flips true the first time the topic is renamed off its provisional
-   * `/new`-prompt title, so a later Bridge restart or a second reply doesn't re-trigger it. */
-  renamed: boolean;
   /** §5.9's `/detail <compact|full>` - per session, defaults to "compact". */
   feedDetail: FeedDetailLevel;
   /** §5.9's `/verbose <on|off>` - independent of `feedDetail`: whether a tool's actual output
@@ -112,7 +82,6 @@ interface SessionRowSql {
   turn_card_msg: number | null;
   thinking_placeholder_msg: number | null;
   paused: number;
-  renamed: number;
   feed_detail: string;
   feed_verbose: number;
   bypass_permission: number;
@@ -136,7 +105,6 @@ function fromSql(row: SessionRowSql): SessionRow {
     turnCardMsg: row.turn_card_msg,
     thinkingPlaceholderMsg: row.thinking_placeholder_msg,
     paused: row.paused !== 0,
-    renamed: row.renamed !== 0,
     feedDetail: row.feed_detail === "full" ? "full" : "compact",
     feedVerbose: row.feed_verbose !== 0,
     bypassPermission: row.bypass_permission !== 0,
@@ -180,7 +148,6 @@ export function isValidTransition(from: SessionState, to: SessionState): boolean
  * `SessionStore.migrate`'s own doc comment. Order doesn't matter (each is independently guarded),
  * but is kept in the order the columns were actually added. */
 const COLUMN_MIGRATIONS: readonly { column: string; ddl: string }[] = [
-  { column: "renamed", ddl: "ALTER TABLE sessions ADD COLUMN renamed INTEGER NOT NULL DEFAULT 0;" },
   { column: "feed_detail", ddl: "ALTER TABLE sessions ADD COLUMN feed_detail TEXT NOT NULL DEFAULT 'compact';" },
   { column: "feed_verbose", ddl: "ALTER TABLE sessions ADD COLUMN feed_verbose INTEGER NOT NULL DEFAULT 0;" },
   // Both default 0/off on an existing pre-2026-08-11 row, same fail-closed default the toggles
@@ -209,9 +176,7 @@ export class SessionStore {
   private readonly preparedCache = new Map<string, SqliteStatementLike>();
 
   constructor(dbPath: string) {
-    const Database = loadDatabaseCtor();
-    this.db = new Database(dbPath);
-    this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db = openDatabase(dbPath);
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS sessions (
         slug           TEXT PRIMARY KEY,
@@ -226,7 +191,6 @@ export class SessionStore {
         turn_card_msg  INTEGER,
         thinking_placeholder_msg INTEGER,
         paused         INTEGER NOT NULL DEFAULT 0,
-        renamed        INTEGER NOT NULL DEFAULT 0,
         feed_detail    TEXT NOT NULL DEFAULT 'compact',
         feed_verbose   INTEGER NOT NULL DEFAULT 0,
         bypass_permission INTEGER NOT NULL DEFAULT 0,
@@ -268,8 +232,8 @@ export class SessionStore {
   insert(row: SessionRow): void {
     this.prepare(
       `INSERT INTO sessions
-       (slug, topic_id, session_id, worktree_path, branch, repo_path, model, pty_pid, state, turn_card_msg, thinking_placeholder_msg, paused, renamed, feed_detail, feed_verbose, bypass_permission, auto_answer, mode, created_utc, last_event_utc)
-       VALUES ($slug, $topic_id, $session_id, $worktree_path, $branch, $repo_path, $model, $pty_pid, $state, $turn_card_msg, $thinking_placeholder_msg, $paused, $renamed, $feed_detail, $feed_verbose, $bypass_permission, $auto_answer, $mode, $created_utc, $last_event_utc)`,
+       (slug, topic_id, session_id, worktree_path, branch, repo_path, model, pty_pid, state, turn_card_msg, thinking_placeholder_msg, paused, feed_detail, feed_verbose, bypass_permission, auto_answer, mode, created_utc, last_event_utc)
+       VALUES ($slug, $topic_id, $session_id, $worktree_path, $branch, $repo_path, $model, $pty_pid, $state, $turn_card_msg, $thinking_placeholder_msg, $paused, $feed_detail, $feed_verbose, $bypass_permission, $auto_answer, $mode, $created_utc, $last_event_utc)`,
     ).run({
         $slug: row.slug,
         $topic_id: row.topicId,
@@ -283,7 +247,6 @@ export class SessionStore {
         $turn_card_msg: row.turnCardMsg,
         $thinking_placeholder_msg: row.thinkingPlaceholderMsg,
         $paused: row.paused ? 1 : 0,
-        $renamed: row.renamed ? 1 : 0,
         $feed_detail: row.feedDetail,
         $feed_verbose: row.feedVerbose ? 1 : 0,
         $bypass_permission: row.bypassPermission ? 1 : 0,
@@ -371,10 +334,6 @@ export class SessionStore {
 
   setPaused(slug: string, paused: boolean): void {
     this.setColumn(slug, "paused", paused ? 1 : 0);
-  }
-
-  setRenamed(slug: string): void {
-    this.setColumn(slug, "renamed", 1);
   }
 
   setFeedDetail(slug: string, level: FeedDetailLevel): void {
