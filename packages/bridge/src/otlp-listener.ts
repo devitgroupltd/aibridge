@@ -1,4 +1,5 @@
 import http from "node:http";
+import type { LogFn } from "./logger.ts";
 
 /**
  * §5.7's OTLP/HTTP listener. Ingests Claude Code's own telemetry export (`CLAUDE_CODE_ENABLE_TELEMETRY`
@@ -116,7 +117,7 @@ export interface OtlpListenerOptions {
   port: number;
   onApiRequest: (event: ApiRequestEvent) => void;
   onApiError: (event: ApiErrorEvent) => void;
-  log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  log: LogFn;
 }
 
 /** Binds to `127.0.0.1:<port>` only - never on a fleet-wide interface, matching every other

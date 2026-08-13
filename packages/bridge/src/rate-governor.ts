@@ -8,9 +8,9 @@
  * scenario 15) - that independence is the entire reason the design uses two bot tokens.
  */
 
-export type Lane = "P0" | "P1" | "P2";
+import type { LogFn } from "./logger.ts";
 
-type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+export type Lane = "P0" | "P1" | "P2";
 
 /** Thrown by a `schedule()` callback to report a real Telegram 429 - `retryAfterSec` should come
  * straight from the response body's `retry_after` (§5.4: "honour `retry_after` ... exactly"). */

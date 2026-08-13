@@ -4,8 +4,7 @@ import { recoverWedgedPty, type PtyLookup, type WedgedRecoveryMarks } from "./we
 import type { Routing } from "./routing.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import type { TypingIndicator } from "./typing-indicator.ts";
-
-type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+import type { LogFn } from "./logger.ts";
 
 /** `sendChannelText`'s lost-Enter detector (found 2026-08-04) - real activity (spinner frames etc.)
  * redraws well within a couple of seconds, confirmed live, so this is generous rather than tight. */

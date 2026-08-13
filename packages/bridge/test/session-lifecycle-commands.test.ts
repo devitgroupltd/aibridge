@@ -9,6 +9,7 @@ import { ReposRegistry } from "../src/repos-registry.ts";
 import { Routing } from "../src/routing.ts";
 import { abandonHalfBuiltSession, applyPendingAttachment, createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE, type NewSessionTeardownDeps } from "../src/session-lifecycle-commands.ts";
 import { isValidTransition, SessionStore, type SessionRow, type SessionState } from "../src/session-store.ts";
+import { fakeControlBot, testRuntimeSettings } from "./helpers.ts";
 
 function row(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
@@ -24,7 +25,6 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     turnCardMsg: null,
     thinkingPlaceholderMsg: null,
     paused: false,
-    renamed: false,
     feedDetail: "compact",
     feedVerbose: false,
     bypassPermission: false,
@@ -36,14 +36,11 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
   };
 }
 
-function fakeControlBot() {
-  const sent: Array<{ topicId: number | undefined; text: string; keyboard?: unknown }> = [];
+/** The shared double (helpers.ts) plus the forum-topic calls `/new` and `/rm` make. */
+function fakeLifecycleBot() {
   const forumTopicCalls = { closed: [] as number[], deleted: [] as number[] };
   return {
-    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string, replyMarkup?: unknown) => {
-      sent.push({ topicId, text, keyboard: replyMarkup });
-      return { message_id: sent.length };
-    },
+    ...fakeControlBot(),
     createForumTopic: async () => ({ message_thread_id: 999 }),
     editForumTopic: async () => {},
     closeForumTopic: async (_chatId: unknown, topicId: number) => {
@@ -52,7 +49,6 @@ function fakeControlBot() {
     deleteForumTopic: async (_chatId: unknown, topicId: number) => {
       forumTopicCalls.deleted.push(topicId);
     },
-    sent,
     forumTopicCalls,
   };
 }
@@ -96,7 +92,7 @@ function fakePtyIo() {
 function setup(overrides: Partial<Parameters<typeof createSessionLifecycleCommands>[0]> = {}) {
   const sessionStore = new SessionStore(":memory:");
   const routing = new Routing();
-  const controlBot = fakeControlBot();
+  const controlBot = fakeLifecycleBot();
   const sessionSupervisor = fakeSessionSupervisor();
   const ptyIo = fakePtyIo();
   const stoppedIndicatorTopics: number[] = [];
@@ -160,10 +156,7 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
     waitForPtyQuiet: async () => {},
     isControlTopic: (topicId) => topicId === undefined || topicId === 1,
     getReposRegistry: () => undefined,
-    getDefaultSessionMode: () => "manual",
-    getDefaultSessionEffort: () => "medium",
-    getDefaultBypassEnabled: () => false,
-    getDefaultAutoAnswerEnabled: () => false,
+    settings: testRuntimeSettings({ defaultSessionMode: "manual", defaultSessionEffort: "medium" }).settings,
     supergroupChatId: "-100",
     selfCheckSlug: "self-check",
     fleetWorktreesRoot: undefined,
@@ -917,7 +910,7 @@ describe("createSessionLifecycleCommands", () => {
     test("removeSessionRow reports a failed topic delete without leaving the row behind", async () => {
       const { sessionLifecycle, sessionStore } = setup({
         controlBot: {
-          ...fakeControlBot(),
+          ...fakeLifecycleBot(),
           deleteForumTopic: async () => {
             throw new Error("TOPIC_ID_INVALID");
           },

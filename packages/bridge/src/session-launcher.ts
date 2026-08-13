@@ -10,6 +10,7 @@ import { attachPtyErrorSuppression } from "./pty-write-guard.ts";
 import type { PtyLike } from "./pty-write-guard.ts";
 import { generateSettings, writeSettingsFile } from "./settings.ts";
 import { ensureWorktree } from "./worktree.ts";
+import type { LogFn } from "./logger.ts";
 
 /**
  * `where.exe` prints one match per line (CRLF), and - live-observed - a blank trailing line, or
@@ -208,8 +209,6 @@ function resolveHookClientBinary(log?: LogFn): string {
   if (!degraded) cachedHookClientPath = resolved;
   return resolved;
 }
-
-type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
 
 export interface SessionLaunchOptions {
   slug: string;

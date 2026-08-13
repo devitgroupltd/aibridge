@@ -19,8 +19,8 @@ import {
 } from "./browse-nav.ts";
 import { listDirectory, MAX_SEND_BYTES, prepareFileForSend, readForPreview, resolveGithubLink } from "./worktree-fs.ts";
 import { FleetConfirmRegistry, resolveFleetConfirmCallback } from "./fleet-confirm.ts";
-import { RestartConfirmRegistry, resolveRestartConfirmCallback } from "./deploy-lifecycle-commands.ts";
-import { OsConfirmRegistry, resolveOsConfirmCallback } from "./os-power-commands.ts";
+import { RestartConfirmRegistry, resolveRestartConfirmCallback } from "./restart-confirm.ts";
+import { OsConfirmRegistry, resolveOsConfirmCallback } from "./os-confirm.ts";
 import { resolveStaleConfirmCallback, StaleConfirmRegistry } from "./stale-confirm.ts";
 import { resolveVoiceConfirmCallback, VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { NlConfirmRegistry, resolveNlConfirmCallback } from "./nl-confirm.ts";
@@ -63,7 +63,9 @@ import type { ConfirmSessionCommand } from "./session-supervisor.ts";
 import type { SettingsStore } from "./settings-store.ts";
 import type { WhisperServerHandle } from "./voice-transcribe.ts";
 import type { Effort, Mode } from "./session-commands.ts";
-import type { SendMessageSource, TelegramCallbackQuery } from "./telegram.ts";
+import type { InlineKeyboardButton, SendMessageSource, TelegramCallbackQuery } from "./telegram.ts";
+import type { LogFn } from "./logger.ts";
+import type { RuntimeSettings } from "./runtime-settings.ts";
 
 /** `controlBot` here needs a few methods beyond the plain `SendMessageSource` every other module
  * gets away with: `answerCallbackQuery` (every callback query needs its spinner cleared, the very
@@ -106,16 +108,12 @@ export interface CallbackQueryRouterOptions {
   >;
   confirmSessionCommand: ConfirmSessionCommand;
   isControlTopic: (threadId: number | undefined) => boolean;
-  settingsStore: Pick<SettingsStore, "set">;
-  setAssistEnabled: (value: boolean) => void;
-  setVoiceConfirmEnabled: (value: boolean) => void;
-  getDefaultSessionMode: () => Mode;
-  getDefaultSessionEffort: () => Effort;
+  settings: Pick<RuntimeSettings, "setAssistEnabled" | "setVoiceConfirmEnabled" | "defaultSessionMode" | "defaultSessionEffort">;
   voiceServer: WhisperServerHandle | null;
   voiceModelPath: string;
   stateDir: string;
   supergroupChatId: string;
-  log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  log: LogFn;
 }
 
 export interface CallbackQueryRouter {
@@ -185,11 +183,7 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
     voiceModeCommands,
     confirmSessionCommand,
     isControlTopic,
-    settingsStore,
-    setAssistEnabled,
-    setVoiceConfirmEnabled,
-    getDefaultSessionMode,
-    getDefaultSessionEffort,
+    settings,
     voiceServer,
     voiceModelPath,
     stateDir,
@@ -223,6 +217,60 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
       return;
     }
     fireAndForget(execute(pending), log, `callback-query-router execute(${logLabel})`);
+  }
+
+  /** Edits the message a browse tap came from, logging (never throwing) on failure - every one of
+   * `/browse`'s four sub-actions below ends in exactly this call, and `editMessageText` is optional on
+   * the client interface, so each one otherwise repeated the same optional-call-plus-catch dance. */
+  function editBrowseMessage(messageId: number, text: string, keyboard: InlineKeyboardButton[][], what: string): void {
+    controlBot
+      .editMessageText?.(supergroupChatId, messageId, text, { inline_keyboard: keyboard })
+      .catch((err) => log("WARN", `editMessageText (browse ${what}) failed: ${(err as Error).message}`));
+  }
+
+  /** A folder page: re-list at the requested page and redraw. A folder that has since been deleted
+   * redraws as a note with no keyboard rather than leaving the stale listing tappable. */
+  function browseDir(messageId: number, slug: string, worktreePath: string, relPath: string, page: number): void {
+    const listing = listDirectory(worktreePath, relPath, page);
+    editBrowseMessage(messageId, listing ? renderDirText(listing) : "That folder no longer exists.", listing ? buildDirKeyboard(browseRegistry, slug, listing) : [], "dir");
+  }
+
+  /** The per-file action menu (View / Send file / Open on GitHub). */
+  function browseFileMenu(messageId: number, id: string, worktreePath: string, relPath: string): void {
+    editBrowseMessage(messageId, `📄 /${relPath}`, buildFileActionKeyboard(id, resolveGithubLink(worktreePath, relPath)), "file menu");
+  }
+
+  /** The "View" action: an inline preview, in place of the menu, with the menu's keyboard kept so the
+   * other actions stay reachable.
+   *
+   * No `parse_mode` anywhere in here - `preview.text` is arbitrary, unescaped file content, and both
+   * Telegram's Markdown and HTML modes would try to interpret stray backticks/`<`/`&` in it as real
+   * formatting (feed-escape.ts exists precisely because that's unsafe without escaping first). */
+  function browseViewFile(messageId: number, id: string, worktreePath: string, relPath: string, matchLine: number | undefined): void {
+    const preview = readForPreview(worktreePath, relPath, matchLine);
+    const text = !preview
+      ? "That file no longer exists."
+      : preview.tooLarge
+        ? "That file is too large to preview here - try Send file instead."
+        : preview.binary
+          ? "That looks like a binary file - use Send file instead."
+          : `${preview.text}${preview.truncated ? "\n(truncated)" : ""}`;
+    editBrowseMessage(messageId, text, buildFileActionKeyboard(id, resolveGithubLink(worktreePath, relPath)), "view");
+  }
+
+  /** The "Send file" action: the file itself as a document, or an explanation of why it can't be. */
+  function browseSendFile(threadId: number | undefined, worktreePath: string, relPath: string): void {
+    const prep = prepareFileForSend(worktreePath, relPath);
+    if (!prep) {
+      confirmSessionCommand(threadId, "That file no longer exists.");
+      return;
+    }
+    if (prep.tooLarge) {
+      confirmSessionCommand(threadId, `"${prep.filename}" is too large to send here (over ${Math.round(MAX_SEND_BYTES / (1024 * 1024))}MB).`);
+      return;
+    }
+    if (!controlBot.sendDocumentFile) return;
+    controlBot.sendDocumentFile(supergroupChatId, threadId, prep.filename, prep.bytes).catch((err) => log("WARN", `sendDocumentFile (browse send) failed: ${(err as Error).message}`));
   }
 
   const NAMESPACE_RULES: NamespaceRule[] = [
@@ -376,7 +424,7 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
       },
     ),
 
-    // `/restart`'s own confirm keyboard (deploy-lifecycle-commands.ts) - "rs:", a fresh namespace
+    // `/restart`'s own confirm keyboard (restart-confirm.ts) - "rs:", a fresh namespace
     // alongside "fc:"/"os:". Not routed through `handleSimpleConfirm` like "fleetConfirm"/"osConfirm"
     // above - both of those share one registry across several distinct actions, which is what the
     // discriminator check exists for; `restartConfirmRegistry` only ever holds one kind of pending
@@ -406,74 +454,35 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
       "browse",
       (data) => (data ? resolveBrowseCallback(data) : null),
       (browseAction, ctx) => {
-        const browseMessageId = ctx.callbackQuery.message?.message_id;
-        if (browseMessageId === undefined) return;
+        const messageId = ctx.callbackQuery.message?.message_id;
+        if (messageId === undefined) return;
         browseRegistry.sweep();
         const stored = browseRegistry.get(browseAction.id);
         if (!stored) {
-          controlBot
-            .editMessageText?.(supergroupChatId, browseMessageId, "This browse session has expired - run /browse or /find again.", { inline_keyboard: [] })
-            .catch((err) => log("WARN", `failed to finalize expired browse message: ${(err as Error).message}`));
+          editBrowseMessage(messageId, "This browse session has expired - run /browse or /find again.", [], "expired");
           return;
         }
         const worktreePath = routing.get(stored.slug)?.worktreePath;
         if (!worktreePath) return; // the session behind this id is gone
 
-        if (browseAction.kind === "dir" && stored.entry.kind === "dir") {
-          const listing = listDirectory(worktreePath, stored.entry.relPath, browseAction.page);
-          const text = listing ? renderDirText(listing) : "That folder no longer exists.";
-          const keyboard = listing ? buildDirKeyboard(browseRegistry, stored.slug, listing) : [];
-          controlBot
-            .editMessageText?.(supergroupChatId, browseMessageId, text, { inline_keyboard: keyboard })
-            .catch((err) => log("WARN", `editMessageText (browse dir) failed: ${(err as Error).message}`));
-          return;
-        }
-
-        if (browseAction.kind === "file_menu" && stored.entry.kind === "file") {
-          const githubUrl = resolveGithubLink(worktreePath, stored.entry.relPath);
-          controlBot
-            .editMessageText?.(supergroupChatId, browseMessageId, `📄 /${stored.entry.relPath}`, { inline_keyboard: buildFileActionKeyboard(browseAction.id, githubUrl) })
-            .catch((err) => log("WARN", `editMessageText (browse file menu) failed: ${(err as Error).message}`));
-          return;
-        }
-
-        if (browseAction.kind === "file_action" && stored.entry.kind === "file") {
-          if (browseAction.action === "view") {
-            const preview = readForPreview(worktreePath, stored.entry.relPath, stored.entry.matchLine);
-            // No parse_mode here - preview.text is arbitrary, unescaped file content, and both
-            // Telegram's Markdown and HTML modes would try to interpret stray backticks/`<`/`&` in
-            // it as real formatting (feed-escape.ts exists precisely because that's unsafe without
-            // escaping first). Plain text only.
-            const text = !preview
-              ? "That file no longer exists."
-              : preview.tooLarge
-                ? "That file is too large to preview here - try Send file instead."
-                : preview.binary
-                  ? "That looks like a binary file - use Send file instead."
-                  : `${preview.text}${preview.truncated ? "\n(truncated)" : ""}`;
-            const githubUrl = resolveGithubLink(worktreePath, stored.entry.relPath);
-            controlBot
-              .editMessageText?.(supergroupChatId, browseMessageId, text, { inline_keyboard: buildFileActionKeyboard(browseAction.id, githubUrl) })
-              .catch((err) => log("WARN", `editMessageText (browse view) failed: ${(err as Error).message}`));
-          } else {
-            const prep = prepareFileForSend(worktreePath, stored.entry.relPath);
-            if (!prep) {
-              confirmSessionCommand(ctx.threadId, "That file no longer exists.");
-            } else if (prep.tooLarge) {
-              confirmSessionCommand(ctx.threadId, `"${prep.filename}" is too large to send here (over ${Math.round(MAX_SEND_BYTES / (1024 * 1024))}MB).`);
-            } else if (controlBot.sendDocumentFile) {
-              controlBot.sendDocumentFile(supergroupChatId, ctx.threadId, prep.filename, prep.bytes).catch((err) => log("WARN", `sendDocumentFile (browse send) failed: ${(err as Error).message}`));
-            }
-          }
-          return;
-        }
-
-        if (browseAction.kind === "hits" && stored.entry.kind === "hitset") {
-          controlBot
-            .editMessageText?.(supergroupChatId, browseMessageId, renderHitsText(stored.entry.query, stored.entry, browseAction.page), {
-              inline_keyboard: buildHitsKeyboard(browseRegistry, stored.slug, browseAction.id, stored.entry.hits, browseAction.page),
-            })
-            .catch((err) => log("WARN", `editMessageText (browse hits) failed: ${(err as Error).message}`));
+        // Each arm re-checks the *stored entry's* kind as well as the action's: the two travel
+        // separately (one in `callback_data`, one in the registry), so a tap can name an action the
+        // entry it points at can't satisfy. A mismatch is a silent no-op, not an error.
+        const { entry } = stored;
+        if (browseAction.kind === "dir" && entry.kind === "dir") {
+          browseDir(messageId, stored.slug, worktreePath, entry.relPath, browseAction.page);
+        } else if (browseAction.kind === "file_menu" && entry.kind === "file") {
+          browseFileMenu(messageId, browseAction.id, worktreePath, entry.relPath);
+        } else if (browseAction.kind === "file_action" && entry.kind === "file") {
+          if (browseAction.action === "view") browseViewFile(messageId, browseAction.id, worktreePath, entry.relPath, entry.matchLine);
+          else browseSendFile(ctx.threadId, worktreePath, entry.relPath);
+        } else if (browseAction.kind === "hits" && entry.kind === "hitset") {
+          editBrowseMessage(
+            messageId,
+            renderHitsText(entry.query, entry, browseAction.page),
+            buildHitsKeyboard(browseRegistry, stored.slug, browseAction.id, entry.hits, browseAction.page),
+            "hits",
+          );
         }
       },
     ),
@@ -497,8 +506,7 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
           return;
         }
         if (nlConfirmAction.action === "run_and_stop_asking") {
-          setAssistEnabled(false);
-          settingsStore.set("assist_enabled", "false");
+          settings.setAssistEnabled(false);
         }
         fireAndForget(
           confirmCards.finalizeNlConfirmMessage(
@@ -586,8 +594,7 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
         if (!pending) return;
         if (voiceConfirmAction.action === "send" || voiceConfirmAction.action === "send_and_stop_asking") {
           if (voiceConfirmAction.action === "send_and_stop_asking") {
-            setVoiceConfirmEnabled(false);
-            settingsStore.set("voice_confirm_enabled", "false");
+            settings.setVoiceConfirmEnabled(false);
           }
           fireAndForget(
             confirmCards.finalizeVoiceConfirmMessage(pending, voiceConfirmAction.action === "send_and_stop_asking" ? "✅ Sent (confirmation now off - /voice confirm on to re-enable)." : "✅ Sent."),
@@ -710,8 +717,8 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
           // whichever arm happens to be last.
           const [prompt, keyboard] =
             action.category === "mode"
-              ? [`Choose the default permission mode for new sessions (current: ${getDefaultSessionMode()}):`, buildDefaultModeKeyboard(getDefaultSessionMode())]
-              : [`Choose the default effort level for new sessions (current: ${getDefaultSessionEffort()}):`, buildDefaultEffortKeyboard(getDefaultSessionEffort())];
+              ? [`Choose the default permission mode for new sessions (current: ${settings.defaultSessionMode}):`, buildDefaultModeKeyboard(settings.defaultSessionMode)]
+              : [`Choose the default effort level for new sessions (current: ${settings.defaultSessionEffort}):`, buildDefaultEffortKeyboard(settings.defaultSessionEffort)];
           controlBot
             .editMessageText!(supergroupChatId, defaultMsgId, prompt, { inline_keyboard: keyboard })
             .catch((err) => log("WARN", `editMessageText (/default category) failed: ${(err as Error).message}`));

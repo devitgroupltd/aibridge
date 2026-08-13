@@ -7,6 +7,7 @@ import { SHIFT_TAB } from "../src/session-commands.ts";
 import { Routing } from "../src/routing.ts";
 import { SessionStore } from "../src/session-store.ts";
 import { SettingsStore } from "../src/settings-store.ts";
+import { fakeControlBot, testRuntimeSettings } from "./helpers.ts";
 
 function fakePtyIo() {
   const sendRawCalls: Array<{ slug: string; text: string }> = [];
@@ -23,17 +24,6 @@ function fakePtyIo() {
     sendChannelText: () => {},
     sendRawCalls,
     sendEffortCalls,
-  };
-}
-
-function fakeControlBot() {
-  const sent: Array<{ topicId: number | undefined; text: string; keyboard?: unknown }> = [];
-  return {
-    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string, replyMarkup?: unknown) => {
-      sent.push({ topicId, text, keyboard: replyMarkup });
-      return { message_id: sent.length };
-    },
-    sent,
   };
 }
 
@@ -64,55 +54,20 @@ async function setup(overrides: Partial<Parameters<typeof createVoiceModeCommand
   const ptyIo = fakePtyIo();
   const routing = new Routing();
   const sessionStore = new SessionStore(":memory:");
-  const settingsStore = new SettingsStore(":memory:");
+  const { settings, store: settingsStore } = testRuntimeSettings();
   const controlBot = fakeControlBot();
   const confirmed: Array<{ topicId: number | undefined; text: string }> = [];
-  let assistEnabled = true;
-  let voiceConfirmEnabled = true;
-  let defaultSessionMode: "manual" | "auto" | "plan" | "acceptEdits" = "manual" as never;
-  let defaultSessionEffort: "low" | "medium" | "high" | "xhigh" | "max" = "medium" as never;
-  let nlRouterBackend: "api" | "cli" = "cli";
-  let defaultBypassEnabled = false;
-  let defaultAutoAnswerEnabled = false;
   const voiceModeCommands = createVoiceModeCommands({
     ptyIo,
     routing,
     sessionStore,
-    settingsStore,
+    settings,
     controlBot,
     confirmSessionCommand: (topicId, text) => {
       confirmed.push({ topicId, text });
     },
     voiceServer: null,
     voiceModelPath: "c:\\voice\\ggml-base.bin",
-    getAssistEnabled: () => assistEnabled,
-    setAssistEnabled: (v) => {
-      assistEnabled = v;
-    },
-    getVoiceConfirmEnabled: () => voiceConfirmEnabled,
-    setVoiceConfirmEnabled: (v) => {
-      voiceConfirmEnabled = v;
-    },
-    getDefaultSessionMode: () => defaultSessionMode,
-    setDefaultSessionMode: (m) => {
-      defaultSessionMode = m;
-    },
-    getDefaultSessionEffort: () => defaultSessionEffort,
-    setDefaultSessionEffort: (e) => {
-      defaultSessionEffort = e;
-    },
-    getDefaultBypassEnabled: () => defaultBypassEnabled,
-    setDefaultBypassEnabled: (v) => {
-      defaultBypassEnabled = v;
-    },
-    getDefaultAutoAnswerEnabled: () => defaultAutoAnswerEnabled,
-    setDefaultAutoAnswerEnabled: (v) => {
-      defaultAutoAnswerEnabled = v;
-    },
-    getNlRouterBackend: () => nlRouterBackend,
-    setNlRouterBackend: (b) => {
-      nlRouterBackend = b;
-    },
     nlRouterApiKeyConfigured: false,
     supergroupChatId: "-100",
     log: () => {},
@@ -126,13 +81,16 @@ async function setup(overrides: Partial<Parameters<typeof createVoiceModeCommand
     settingsStore,
     controlBot,
     confirmed,
-    getAssistEnabled: () => assistEnabled,
-    getVoiceConfirmEnabled: () => voiceConfirmEnabled,
-    getDefaultSessionMode: () => defaultSessionMode,
-    getDefaultSessionEffort: () => defaultSessionEffort,
-    getDefaultBypassEnabled: () => defaultBypassEnabled,
-    getDefaultAutoAnswerEnabled: () => defaultAutoAnswerEnabled,
-    getNlRouterBackend: () => nlRouterBackend,
+    settings,
+    // Kept as accessor functions rather than switching ~30 assertion sites to `settings.x`: these
+    // now read straight off the one `RuntimeSettings` the module under test writes to.
+    getAssistEnabled: () => settings.assistEnabled,
+    getVoiceConfirmEnabled: () => settings.voiceConfirmEnabled,
+    getDefaultSessionMode: () => settings.defaultSessionMode,
+    getDefaultSessionEffort: () => settings.defaultSessionEffort,
+    getDefaultBypassEnabled: () => settings.defaultBypassEnabled,
+    getDefaultAutoAnswerEnabled: () => settings.defaultAutoAnswerEnabled,
+    getNlRouterBackend: () => settings.nlRouterBackend,
   };
 }
 

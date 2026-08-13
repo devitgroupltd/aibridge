@@ -15,7 +15,7 @@
  * beyond whatever (if any) the callee itself chose to log internally.
  */
 
-type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+import type { LogFn } from "./logger.ts";
 
 /** `context` should name the call site (e.g. `"pipe-server handleReply"`), not the error - it's
  * what makes the log line useful when several fire-and-forget calls could plausibly be the

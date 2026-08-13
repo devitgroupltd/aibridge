@@ -6,6 +6,7 @@ import path from "node:path";
 import { createCardSenders } from "../src/card-senders.ts";
 import { BrowseRegistry } from "../src/browse-nav.ts";
 import type { SessionRoute } from "../src/routing.ts";
+import { fakeControlBot } from "./helpers.ts";
 
 /** P1-8 (codebase-hardening-plan.md): card-senders.ts previously had no test file at all - its own
  * doc comment argues this is low-risk (thin wrappers around already-tested renderers), which these
@@ -13,19 +14,15 @@ import type { SessionRoute } from "../src/routing.ts";
  * (session-scoping guards, chunking, branching on a renderer's result kind), not re-testing
  * about.ts/commands.ts/browse-nav.ts/worktree-fs.ts/diff-review.ts's own already-tested internals. */
 
-function fakeControlBot() {
-  const sent: Array<{ topicId: number | undefined; text: string; keyboard?: unknown }> = [];
+/** The shared double plus `sendDocumentFile`, which `/browse`'s "Send file" action uses. */
+function fakeCardBot() {
   const documentsSent: Array<{ topicId: number | undefined; filename: string; text: string; caption?: string }> = [];
   return {
-    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string, replyMarkup?: unknown) => {
-      sent.push({ topicId, text, keyboard: replyMarkup });
-      return { message_id: sent.length };
-    },
+    ...fakeControlBot(),
     sendDocumentFile: async (_chatId: unknown, topicId: number | undefined, filename: string, bytes: Uint8Array, caption?: string) => {
       documentsSent.push({ topicId, filename, text: new TextDecoder().decode(bytes), caption });
       return { message_id: 1 };
     },
-    sent,
     documentsSent,
   };
 }
@@ -41,7 +38,7 @@ function fakeConfirm() {
 }
 
 function setup(overrides: Partial<Parameters<typeof createCardSenders>[0]> = {}) {
-  const controlBot = fakeControlBot();
+  const controlBot = fakeCardBot();
   const confirm = fakeConfirm();
   const browseRegistry = new BrowseRegistry();
   const cardSenders = createCardSenders({

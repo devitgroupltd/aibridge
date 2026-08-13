@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { splitForTelegram } from "../src/pipe-server.ts";
+import { splitForTelegram } from "../src/telegram-split.ts";
 import { isPermanentEditFailure } from "../src/telegram.ts";
 
 // §9's silent-wrong bar: Telegram rejects both an empty message and one over 4096 UTF-16 code units

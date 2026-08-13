@@ -6,8 +6,8 @@ import { createCallbackQueryRouter } from "../src/callback-query-router.ts";
 import { RateGovernor } from "../src/rate-governor.ts";
 import { Routing } from "../src/routing.ts";
 import { FleetConfirmRegistry } from "../src/fleet-confirm.ts";
-import { RestartConfirmRegistry } from "../src/deploy-lifecycle-commands.ts";
-import { OsConfirmRegistry } from "../src/os-power-commands.ts";
+import { RestartConfirmRegistry } from "../src/restart-confirm.ts";
+import { OsConfirmRegistry } from "../src/os-confirm.ts";
 import { StaleConfirmRegistry } from "../src/stale-confirm.ts";
 import { VoiceConfirmRegistry } from "../src/voice-confirm.ts";
 import { NlConfirmRegistry } from "../src/nl-confirm.ts";
@@ -16,27 +16,11 @@ import { BrowseRegistry } from "../src/browse-nav.ts";
 import { DetailsAnchorStore } from "../src/details-anchor-store.ts";
 import { readSettingsFile } from "../src/settings.ts";
 import type { TelegramCallbackQuery } from "../src/telegram.ts";
+import { fakeControlBot, testRuntimeSettings } from "./helpers.ts";
 
-function fakeControlBot() {
-  const sent: Array<{ topicId: number | undefined; text: string }> = [];
-  const edited: Array<{ messageId: number; text: string }> = [];
-  const answered: string[] = [];
-  return {
-    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string) => {
-      sent.push({ topicId, text });
-      return { message_id: sent.length };
-    },
-    editMessageText: async (_chatId: unknown, messageId: number, text: string) => {
-      edited.push({ messageId, text });
-    },
-    sendDocument: async () => ({ message_id: 1 }),
-    answerCallbackQuery: async (id: string) => {
-      answered.push(id);
-    },
-    sent,
-    edited,
-    answered,
-  };
+/** The shared double plus `sendDocument`, the `/detail` button's oversized-log fallback. */
+function fakeRouterBot() {
+  return { ...fakeControlBot(), sendDocument: async () => ({ message_id: 1 }) };
 }
 
 function fakePipeHandle() {
@@ -185,7 +169,7 @@ function cq(data: string | undefined, messageId = 1, threadId: number | undefine
 
 function setup() {
   const stateDir = mkdtempSync(path.join(tmpdir(), "aibridge-callback-router-test-"));
-  const controlBot = fakeControlBot();
+  const controlBot = fakeRouterBot();
   const feedGovernor = new RateGovernor({ log: () => {} });
   const routing = new Routing();
   const pipeHandle = fakePipeHandle();
@@ -207,10 +191,7 @@ function setup() {
   const commandDispatch = fakeCommandDispatch();
   const voiceModeCommands = fakeVoiceModeCommands();
   const confirmSessionCommand = fakeConfirmSessionCommand();
-  const settingsStoreCalls: Array<{ key: string; value: string }> = [];
-
-  let assistEnabled = true;
-  let voiceConfirmEnabled = true;
+  const { settings, store: settingsStore } = testRuntimeSettings({ defaultSessionMode: "acceptEdits", defaultSessionEffort: "medium" });
 
   const router = createCallbackQueryRouter({
     controlBot: controlBot as never,
@@ -238,15 +219,7 @@ function setup() {
     voiceModeCommands: voiceModeCommands as never,
     confirmSessionCommand: confirmSessionCommand as never,
     isControlTopic: (threadId) => threadId === undefined,
-    settingsStore: { set: (key: string, value: string) => settingsStoreCalls.push({ key, value }) },
-    setAssistEnabled: (v) => {
-      assistEnabled = v;
-    },
-    setVoiceConfirmEnabled: (v) => {
-      voiceConfirmEnabled = v;
-    },
-    getDefaultSessionMode: () => "acceptEdits",
-    getDefaultSessionEffort: () => "medium",
+    settings,
     voiceServer: null,
     voiceModelPath: "c:\\does\\not\\exist\\ggml-base.bin",
     stateDir,
@@ -275,9 +248,8 @@ function setup() {
     commandDispatch,
     voiceModeCommands,
     confirmSessionCommand,
-    settingsStoreCalls,
-    getAssistEnabled: () => assistEnabled,
-    getVoiceConfirmEnabled: () => voiceConfirmEnabled,
+    settings,
+    settingsStoreCalls: settingsStore.writes,
     stateDir,
   };
 }
@@ -390,7 +362,7 @@ describe("createCallbackQueryRouter - every documented namespace resolves to its
     const s = setup();
     s.nlConfirmRegistry.add({ id: "n2", command: { kind: "restart" } as never, threadId: 5, currentSlug: undefined, messageId: 11 });
     s.router.routeCallbackQuery(cq("nc:n2:s"));
-    expect(s.getAssistEnabled()).toBe(false);
+    expect(s.settings.assistEnabled).toBe(false);
     expect(s.settingsStoreCalls).toContainEqual({ key: "assist_enabled", value: "false" });
   });
 
@@ -450,14 +422,14 @@ describe("createCallbackQueryRouter - every documented namespace resolves to its
     const s = setup();
     s.voiceConfirmRegistry.add({ id: "vc2", threadId: 5, messageId: 1, transcript: "hi", from: "op", confirmCardMessageId: 2, origin: {} });
     s.router.routeCallbackQuery(cq("vc:vc2:a"));
-    expect(s.getVoiceConfirmEnabled()).toBe(false);
+    expect(s.settings.voiceConfirmEnabled).toBe(false);
     expect(s.settingsStoreCalls).toContainEqual({ key: "voice_confirm_enabled", value: "false" });
   });
 
   test('a bare level cancel ("model:cancel") edits the card to "Cancelled."', () => {
     const s = setup();
     s.router.routeCallbackQuery(cq("model:cancel"));
-    expect(s.controlBot.edited).toEqual([{ messageId: 1, text: "Cancelled." }]);
+    expect(s.controlBot.edited).toEqual([{ messageId: 1, text: "Cancelled.", keyboard: { inline_keyboard: [] } }]);
   });
 
   test('"model:<value>" applies the switch for the current session topic', () => {
@@ -478,7 +450,7 @@ describe("createCallbackQueryRouter - every documented namespace resolves to its
   test('"defmode:<value>" applies the default mode and edits to a confirmation', () => {
     const s = setup();
     s.router.routeCallbackQuery(cq("defmode:plan"));
-    expect(s.controlBot.edited).toEqual([{ messageId: 1, text: "default mode is now plan" }]);
+    expect(s.controlBot.edited).toEqual([{ messageId: 1, text: "default mode is now plan", keyboard: { inline_keyboard: [] } }]);
   });
 
   // A resolver-only test can't catch a dead button: without a fifth `match` branch these strings
@@ -488,7 +460,7 @@ describe("createCallbackQueryRouter - every documented namespace resolves to its
     const s = setup();
     s.router.routeCallbackQuery(cq("default:permission:on"));
     expect(s.voiceModeCommands.calls).toEqual([{ fn: "applyDefaultAutoToggle", args: ["permission", true] }]);
-    expect(s.controlBot.edited).toEqual([{ messageId: 1, text: "default permission is now on" }]);
+    expect(s.controlBot.edited).toEqual([{ messageId: 1, text: "default permission is now on", keyboard: { inline_keyboard: [] } }]);
   });
 
   test('"default:answer:off" carries its own category and value, not the permission arm\'s', () => {

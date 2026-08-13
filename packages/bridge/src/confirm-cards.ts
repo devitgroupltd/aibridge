@@ -7,8 +7,7 @@ import type { RateGovernor } from "./rate-governor.ts";
 import type { PendingStaleConfirm } from "./stale-confirm.ts";
 import { isPermanentEditFailure, type SendMessageSource } from "./telegram.ts";
 import type { PendingVoiceConfirm } from "./voice-confirm.ts";
-
-type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+import type { LogFn } from "./logger.ts";
 
 export interface ConfirmCardsOptions {
   controlBot: SendMessageSource;

@@ -6,6 +6,7 @@ import { createFleetReportingCommands } from "../src/fleet-reporting-commands.ts
 import { CostTracker } from "../src/cost-tracker.ts";
 import { SessionStore, type SessionRow } from "../src/session-store.ts";
 import type { ReposRegistry } from "../src/repos-registry.ts";
+import { fakeControlBot } from "./helpers.ts";
 
 /** P1-8 (codebase-hardening-plan.md): fleet-reporting-commands.ts previously had no test file at
  * all - its own doc comment argues this is a thin, low-risk, read-only wrapper. These tests confirm
@@ -28,7 +29,6 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     turnCardMsg: null,
     thinkingPlaceholderMsg: null,
     paused: false,
-    renamed: false,
     feedDetail: "compact",
     feedVerbose: false,
     bypassPermission: false,
@@ -37,17 +37,6 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     createdUtc: "2026-08-03T00:00:00.000Z",
     lastEventUtc: "2026-08-03T00:00:00.000Z",
     ...overrides,
-  };
-}
-
-function fakeControlBot() {
-  const sent: Array<{ topicId: number | undefined; text: string }> = [];
-  return {
-    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string) => {
-      sent.push({ topicId, text });
-      return { message_id: sent.length };
-    },
-    sent,
   };
 }
 

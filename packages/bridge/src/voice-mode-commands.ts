@@ -14,9 +14,10 @@ import type { FleetCommand } from "./fleet-commands.ts";
 import type { PtyIo } from "./pty-io.ts";
 import type { Routing } from "./routing.ts";
 import type { SessionStore } from "./session-store.ts";
-import type { SettingsStore } from "./settings-store.ts";
+import type { RuntimeSettings } from "./runtime-settings.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
 import type { SendMessageSource } from "./telegram.ts";
+import type { LogFn } from "./logger.ts";
 
 /** §4.2's `/model`/`/mode`/`/effort`/`/voice` (including its `/voice confirm` sub-route and the
  * `/voiceconfirm` alias)/`/assist`/`/default`/`/router` fleet
@@ -25,41 +26,23 @@ import type { SendMessageSource } from "./telegram.ts";
  * fleet-wide in-memory state - a distinct responsibility from process/deploy lifecycle (item 9) or
  * read-only reporting (item 8), even though all three used to sit side by side in `index.ts`.
  *
- * `assistEnabled`/`voiceConfirmEnabled`/`defaultSessionMode`/`defaultSessionEffort`/
- * `nlRouterBackend` are all `let`s still read and written from several not-yet-extracted spots in
- * `index.ts` (nl-dispatch.ts/command-dispatch.ts/callback-query-router.ts territory, items 13-15) -
- * each gets a getter/setter pair here rather than a live-getter-only injection, the same treatment
- * `reposRegistry` got in fleet-reporting-commands.ts (item 8), because this module also needs to
- * write them, not just read them. */
+ * This module is the main *writer* of the fleet-wide persisted preferences, so it takes
+ * `runtime-settings.ts`'s `RuntimeSettings` directly rather than the fourteen getter/setter closures
+ * plus a `settingsStore` it used to - a setter there already persists, so there is no second call to
+ * forget. `sendDefaultStatusCard` reads the same object live, which is what it needs: these values
+ * change under it whenever a `/default` tap lands. */
 export interface VoiceModeCommandsOptions {
   ptyIo: PtyIo;
   routing: Routing;
   sessionStore: SessionStore;
-  settingsStore: SettingsStore;
+  settings: RuntimeSettings;
   controlBot: SendMessageSource;
   confirmSessionCommand: ConfirmSessionCommand;
   voiceServer: WhisperServerHandle | null;
   voiceModelPath: string;
-  getAssistEnabled: () => boolean;
-  setAssistEnabled: (value: boolean) => void;
-  getVoiceConfirmEnabled: () => boolean;
-  setVoiceConfirmEnabled: (value: boolean) => void;
-  getDefaultSessionMode: () => Mode;
-  setDefaultSessionMode: (mode: Mode) => void;
-  getDefaultSessionEffort: () => Effort;
-  setDefaultSessionEffort: (effort: Effort) => void;
-  /** `/default permission|answer` (bypass-and-autoanswer-plan.md §0.4). Both halves, like mode/effort
-   * above: this module writes them, and `sendDefaultStatusCard` needs to *read* them live to render
-   * each toggle row's label and its inverse-valued `callback_data`. */
-  getDefaultBypassEnabled: () => boolean;
-  setDefaultBypassEnabled: (value: boolean) => void;
-  getDefaultAutoAnswerEnabled: () => boolean;
-  setDefaultAutoAnswerEnabled: (value: boolean) => void;
-  getNlRouterBackend: () => "api" | "cli";
-  setNlRouterBackend: (backend: "api" | "cli") => void;
   nlRouterApiKeyConfigured: boolean;
   supergroupChatId: string;
-  log: (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+  log: LogFn;
   /** Injectable in place of the real `setTimeout`, same convention as `pty-io.ts` - lets
    * `writeModeKeystrokes`' spaced presses be asserted without real waits. */
   setTimeoutFn?: (fn: () => void, ms: number) => unknown;
@@ -95,25 +78,11 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
     ptyIo,
     routing,
     sessionStore,
-    settingsStore,
+    settings,
     controlBot,
     confirmSessionCommand,
     voiceServer,
     voiceModelPath,
-    getAssistEnabled,
-    setAssistEnabled,
-    getVoiceConfirmEnabled,
-    setVoiceConfirmEnabled,
-    getDefaultSessionMode,
-    setDefaultSessionMode,
-    getDefaultSessionEffort,
-    setDefaultSessionEffort,
-    getDefaultBypassEnabled,
-    setDefaultBypassEnabled,
-    getDefaultAutoAnswerEnabled,
-    setDefaultAutoAnswerEnabled,
-    getNlRouterBackend,
-    setNlRouterBackend,
     nlRouterApiKeyConfigured,
     supergroupChatId,
     log,
@@ -213,17 +182,16 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
   }
 
   /** `/assist [on|off]` - whether an NL-matched destructive command shows a confirm card first
-   * (nl-confirm.ts). `assistEnabled` is the in-memory copy every confirm-gate check reads;
-   * `settingsStore` is only touched on an actual change, matching `feed_detail`/`feed_verbose`'s
-   * own "in-memory for reads, persisted on write" shape (session-store.ts). */
+   * (nl-confirm.ts). `runtime-settings.ts` keeps the in-memory copy every confirm-gate check reads
+   * and touches the store only on an actual change, matching `feed_detail`/`feed_verbose`'s own
+   * "in-memory for reads, persisted on write" shape (session-store.ts). */
   function handleAssistCommand(cmd: Extract<FleetCommand, { kind: "assist" }>, topicId: number | undefined): void {
     if (cmd.action === "status") {
-      confirmSessionCommand(topicId, `Natural-language destructive-command confirmation is ${getAssistEnabled() ? "on" : "off"}.`);
+      confirmSessionCommand(topicId, `Natural-language destructive-command confirmation is ${settings.assistEnabled ? "on" : "off"}.`);
       return;
     }
     const assistEnabled = cmd.action === "on";
-    setAssistEnabled(assistEnabled);
-    settingsStore.set("assist_enabled", assistEnabled ? "true" : "false");
+    settings.setAssistEnabled(assistEnabled);
     confirmSessionCommand(
       topicId,
       assistEnabled
@@ -237,12 +205,11 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
    * straight through. Same in-memory-for-reads, persisted-on-write shape as `handleAssistCommand`. */
   function handleVoiceConfirmCommand(cmd: Extract<FleetCommand, { kind: "voice"; category: "confirm" }>, topicId: number | undefined): void {
     if (cmd.action === "status") {
-      confirmSessionCommand(topicId, `Voice-note send confirmation is ${getVoiceConfirmEnabled() ? "on" : "off"}.`);
+      confirmSessionCommand(topicId, `Voice-note send confirmation is ${settings.voiceConfirmEnabled ? "on" : "off"}.`);
       return;
     }
     const voiceConfirmEnabled = cmd.action === "on";
-    setVoiceConfirmEnabled(voiceConfirmEnabled);
-    settingsStore.set("voice_confirm_enabled", voiceConfirmEnabled ? "true" : "false");
+    settings.setVoiceConfirmEnabled(voiceConfirmEnabled);
     confirmSessionCommand(
       topicId,
       voiceConfirmEnabled
@@ -294,10 +261,10 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
    * `controlBot`, not `confirmSessionCommand`, so the keyboard actually attaches - same reasoning as
    * the bare `/model`/`/mode`/`/effort` keyboards further down. */
   function sendDefaultStatusCard(topicId: number | undefined): void {
-    const defaultSessionMode = getDefaultSessionMode();
-    const defaultSessionEffort = getDefaultSessionEffort();
-    const defaultBypass = getDefaultBypassEnabled();
-    const defaultAutoAnswer = getDefaultAutoAnswerEnabled();
+    const defaultSessionMode = settings.defaultSessionMode;
+    const defaultSessionEffort = settings.defaultSessionEffort;
+    const defaultBypass = settings.defaultBypassEnabled;
+    const defaultAutoAnswer = settings.defaultAutoAnswerEnabled;
     const autoNote = defaultBypass || defaultAutoAnswer ? ` Auto-permission ${defaultBypass ? "on" : "off"}, auto-answer ${defaultAutoAnswer ? "on" : "off"}.` : "";
     controlBot
       .sendMessage(
@@ -320,9 +287,9 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
     const [prompt, keyboard] = ((): [string, InlineKeyboardButton[][]] => {
       switch (category) {
         case "mode":
-          return [`Choose the default permission mode for new sessions (current: ${getDefaultSessionMode()}):`, buildDefaultModeKeyboard(getDefaultSessionMode())];
+          return [`Choose the default permission mode for new sessions (current: ${settings.defaultSessionMode}):`, buildDefaultModeKeyboard(settings.defaultSessionMode)];
         case "effort":
-          return [`Choose the default effort level for new sessions (current: ${getDefaultSessionEffort()}):`, buildDefaultEffortKeyboard(getDefaultSessionEffort())];
+          return [`Choose the default effort level for new sessions (current: ${settings.defaultSessionEffort}):`, buildDefaultEffortKeyboard(settings.defaultSessionEffort)];
         default: {
           const _exhaustive: never = category;
           throw new Error(`unhandled /default picker category: ${_exhaustive}`);
@@ -345,14 +312,12 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
    * prompts at all, not just the one the operator is looking at right now, until this is explicitly
    * changed back. `effort` has no such warning - it's a cost/latency choice, not a safety one. */
   function applyDefaultMode(mode: Mode): string {
-    setDefaultSessionMode(mode);
-    settingsStore.set("default_session_mode", mode);
+    settings.setDefaultSessionMode(mode);
     return renderDefaultModeConfirmation(mode);
   }
 
   function applyDefaultEffort(effort: Effort): string {
-    setDefaultSessionEffort(effort);
-    settingsStore.set("default_session_effort", effort);
+    settings.setDefaultSessionEffort(effort);
     return `New sessions will now start at ${effort} effort.`;
   }
 
@@ -360,14 +325,13 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
    * arm - same descriptor discipline as `session-lifecycle-commands.ts`'s `autoCategorySpec`, and
    * for the same reason: every consumer here (`handleDefaultCommand`'s status form, its set form,
    * and the callback router's tap) reads this rather than switching again. */
-  function defaultToggleSpec(category: DefaultToggleCategory): { label: string; get: () => boolean; set: (value: boolean) => void; settingsKey: string; confirmation: (value: boolean) => string } {
+  function defaultToggleSpec(category: DefaultToggleCategory): { label: string; get: () => boolean; set: (value: boolean) => void; confirmation: (value: boolean) => string } {
     switch (category) {
       case "permission":
         return {
           label: "auto-permission",
-          get: getDefaultBypassEnabled,
-          set: setDefaultBypassEnabled,
-          settingsKey: "default_bypass_enabled",
+          get: () => settings.defaultBypassEnabled,
+          set: (value: boolean) => settings.setDefaultBypassEnabled(value),
           confirmation: (value) =>
             value
               ? "New sessions will now start with auto-permission ON - every permission prompt they'd otherwise raise, including git commit/push, is auto-allowed from their very first turn. /default permission off to revert (only affects sessions created after that point - see /auto permission --all off to also flip already-running ones)."
@@ -376,9 +340,8 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
       case "answer":
         return {
           label: "auto-answer",
-          get: getDefaultAutoAnswerEnabled,
-          set: setDefaultAutoAnswerEnabled,
-          settingsKey: "default_autoanswer_enabled",
+          get: () => settings.defaultAutoAnswerEnabled,
+          set: (value: boolean) => settings.setDefaultAutoAnswerEnabled(value),
           confirmation: (value) =>
             value
               ? "New sessions will now start with auto-answer ON - from their first turn, a question where Claude marked exactly one option as recommended is answered automatically, with no card posted. Anything less clear still shows you the real buttons. /default answer off to revert (only affects sessions created after that point)."
@@ -391,14 +354,12 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
     }
   }
 
-  /** Shared by the typed `/default permission on` path and the status card's own toggle-row taps,
-   * so the two can't drift - and doing the three-part write-through the persisted fleet defaults all
-   * need: the in-memory `let` (via the injected setter, which is what `handleNewCommand` reads) *and*
-   * the settings row that rehydrates it on the next Bridge start. */
+  /** Shared by the typed `/default permission on` path and the status card's own toggle-row taps, so
+   * the two can't drift. `spec.set` is a `RuntimeSettings` setter, so the in-memory value `handleNewCommand`
+   * reads and the settings row that rehydrates it at the next Bridge start are written together. */
   function applyDefaultAutoToggle(category: DefaultToggleCategory, value: boolean): string {
     const spec = defaultToggleSpec(category);
     spec.set(value);
-    settingsStore.set(spec.settingsKey, String(value));
     return spec.confirmation(value);
   }
 
@@ -449,7 +410,7 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
    * be more confusing than telling them what's missing. */
   function handleRouterBackendCommand(cmd: Extract<FleetCommand, { kind: "router" }>, topicId: number | undefined): void {
     if (cmd.action === "status") {
-      const nlRouterBackend = getNlRouterBackend();
+      const nlRouterBackend = settings.nlRouterBackend;
       confirmSessionCommand(
         topicId,
         `Natural-language routing backend: ${nlRouterBackend}${nlRouterBackend === "cli" ? " (your Claude Code subscription)" : " (funded ANTHROPIC_API_KEY)"}.`,
@@ -460,8 +421,7 @@ export function createVoiceModeCommands(opts: VoiceModeCommandsOptions): VoiceMo
       confirmSessionCommand(topicId, "No ANTHROPIC_API_KEY configured in .env - add one first, then /router api.");
       return;
     }
-    setNlRouterBackend(cmd.action);
-    settingsStore.set("nl_router_backend", cmd.action);
+    settings.setNlRouterBackend(cmd.action);
     confirmSessionCommand(
       topicId,
       cmd.action === "api"

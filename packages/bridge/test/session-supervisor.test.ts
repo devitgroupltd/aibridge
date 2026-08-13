@@ -25,7 +25,6 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     turnCardMsg: null,
     thinkingPlaceholderMsg: null,
     paused: false,
-    renamed: false,
     feedDetail: "compact",
     feedVerbose: false,
     bypassPermission: false,
@@ -69,7 +68,9 @@ function fakePty() {
   };
 }
 
-function fakeControlBot() {
+/** Not a general control-bot double (helpers.ts has that one) - `session-supervisor.ts` only ever
+ * reaches for `sendChatAction` off this. */
+function fakeChatActionBot() {
   return { sendChatAction: async () => {} };
 }
 
@@ -105,7 +106,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -128,7 +129,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -149,7 +150,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -180,7 +181,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -201,7 +202,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -226,7 +227,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -280,7 +281,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -310,7 +311,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -355,7 +356,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -390,7 +391,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -417,7 +418,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -460,7 +461,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -495,7 +496,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -530,7 +531,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -565,7 +566,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -604,7 +605,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -638,7 +639,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -672,7 +673,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -713,7 +714,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -743,7 +744,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -770,7 +771,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -794,7 +795,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -819,7 +820,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -845,7 +846,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -876,7 +877,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -913,7 +914,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -950,7 +951,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -981,7 +982,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -1012,7 +1013,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -1046,7 +1047,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -1071,7 +1072,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -1106,7 +1107,7 @@ describe("createSessionSupervisor", () => {
     const supervisor = createSessionSupervisor({
       sessionStore,
       routing,
-      controlBot: fakeControlBot(),
+      controlBot: fakeChatActionBot(),
       confirmSessionCommand: confirm.fn,
       supergroupChatId: "-100",
       selfCheckSlug: "selfcheck",
@@ -1161,7 +1162,7 @@ describe("createSessionSupervisor", () => {
       const supervisor = createSessionSupervisor({
         sessionStore,
         routing,
-        controlBot: fakeControlBot(),
+        controlBot: fakeChatActionBot(),
         confirmSessionCommand: confirm.fn,
         supergroupChatId: "-100",
         selfCheckSlug: "selfcheck",
@@ -1193,7 +1194,7 @@ describe("createSessionSupervisor", () => {
       const supervisor = createSessionSupervisor({
         sessionStore,
         routing,
-        controlBot: fakeControlBot(),
+        controlBot: fakeChatActionBot(),
         confirmSessionCommand: confirm.fn,
         supergroupChatId: "-100",
         selfCheckSlug: "selfcheck",
@@ -1221,7 +1222,7 @@ describe("createSessionSupervisor", () => {
       const supervisor = createSessionSupervisor({
         sessionStore,
         routing,
-        controlBot: fakeControlBot(),
+        controlBot: fakeChatActionBot(),
         confirmSessionCommand: confirm.fn,
         supergroupChatId: "-100",
         selfCheckSlug: "selfcheck",
@@ -1252,7 +1253,7 @@ describe("createSessionSupervisor", () => {
       const supervisor = createSessionSupervisor({
         sessionStore,
         routing: new Routing(),
-        controlBot: fakeControlBot(),
+        controlBot: fakeChatActionBot(),
         confirmSessionCommand: confirm.fn,
         supergroupChatId: "-100",
         selfCheckSlug: "selfcheck",

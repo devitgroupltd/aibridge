@@ -18,8 +18,8 @@ import { formatStaleAge, hasAttachment, isStaleInbound } from "./stale-inbound.t
 import type { SendMessageSource, TelegramMediaFields, TelegramMessage, TelegramReplyTarget } from "./telegram.ts";
 import { buildVoiceConfirmKeyboard, type VoiceConfirmRegistry } from "./voice-confirm.ts";
 import { transcribeVoiceNote } from "./voice-transcribe.ts";
-
-type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
+import type { LogFn } from "./logger.ts";
+import type { RuntimeSettings } from "./runtime-settings.ts";
 
 /** `SendMessageSource` plus the two file-download methods the voice/attachment paths need -
  * narrower than the full `TelegramClient` class, so a test double doesn't have to fake every
@@ -84,7 +84,11 @@ export interface InboundMediaOptions {
    * `nlRouterBackend` are both already-constructed values by the time `index.ts` builds this
    * module, same as `session-lifecycle-commands.ts`'s own `getReposRegistry` option. */
   nlRouterConfig: { enabled: boolean; apiKey: string | undefined; model: string };
-  getNlRouterBackend: () => "api" | "cli";
+  /** Read live off the object, never snapshotted into a local: `/voice confirm` and `/router` both
+   * flip at runtime, and `handleVoiceMessage` must see the current value on every call - the same
+   * reason feed-coalescer.ts's `quietMode` option is a live read rather than a construction-time
+   * boolean. */
+  settings: Pick<RuntimeSettings, "nlRouterBackend" | "voiceConfirmEnabled">;
   getReposRegistry: () => ReposRegistry | undefined;
   /** Defaults to the real `nl-router.ts` implementation - injectable so `handleControlTopicAttachment`'s
    * own control flow (the literal-vs-NL branch, the pendingAttachment shape) is unit-testable
@@ -94,10 +98,6 @@ export interface InboundMediaOptions {
   /** §4.1's control-topic predicate - injected rather than imported since it's index.ts's one free
    * top-level function today, with call sites remaining in not-yet-extracted modules too. */
   isControlTopic: (threadId: number | undefined) => boolean;
-  /** Getter, not a snapshot boolean: `/voice confirm` flips this at runtime and `handleVoiceMessage`
-   * must see the current value on every call, the same "live getter" shape feed-coalescer.ts's
-   * `quietMode` option already uses for the same reason. */
-  voiceConfirmEnabled: () => boolean;
   voice: { enabled: boolean; ffmpegPath: string; port: number };
   supergroupChatId: string;
   log?: LogFn;
@@ -150,10 +150,9 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     disableCaptionNew,
     repoPickRegistry,
     nlRouterConfig,
-    getNlRouterBackend,
+    settings,
     getReposRegistry,
     isControlTopic,
-    voiceConfirmEnabled,
     voice,
     supergroupChatId,
   } = opts;
@@ -225,7 +224,7 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
       // card is itself the review step, so with confirmation off that justification disappears and
       // a note recorded hours ago would otherwise auto-send into a live session.
       const staleNote = isStaleInbound(messageDate, Date.now());
-      if (voiceConfirmEnabled() || text.length === 0 || staleNote) {
+      if (settings.voiceConfirmEnabled || text.length === 0 || staleNote) {
         const id = randomUUID().slice(0, 8);
         if (controlBot.editMessageText) {
           await feedGovernor.scheduleAsync("P1", () =>
@@ -317,7 +316,7 @@ export function createInboundMedia(opts: InboundMediaOptions): InboundMedia {
     const result = await routeText(
       caption,
       { isControl: true, hasSession: false, repoNames: getReposRegistry()?.names() },
-      { ...nlRouterConfig, backend: getNlRouterBackend() },
+      { ...nlRouterConfig, backend: settings.nlRouterBackend },
       log,
     );
     if (!result.matched) return null;

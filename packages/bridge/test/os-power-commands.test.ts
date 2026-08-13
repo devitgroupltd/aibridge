@@ -1,23 +1,7 @@
 import { describe, expect, test } from "bun:test";
-import {
-  buildOsConfirmKeyboard,
-  checkAutoLogonEnabled,
-  createOsPowerCommands,
-  OsConfirmRegistry,
-  resolveOsConfirmCallback,
-  type PendingOsConfirm,
-} from "../src/os-power-commands.ts";
-
-function fakeControlBot() {
-  const sent: Array<{ topicId: number | undefined; text: string; keyboard?: unknown }> = [];
-  return {
-    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string, replyMarkup?: unknown) => {
-      sent.push({ topicId, text, keyboard: replyMarkup });
-      return { message_id: sent.length };
-    },
-    sent,
-  };
-}
+import { checkAutoLogonEnabled, createOsPowerCommands } from "../src/os-power-commands.ts";
+import { buildOsConfirmKeyboard, OsConfirmRegistry, resolveOsConfirmCallback, type PendingOsConfirm } from "../src/os-confirm.ts";
+import { fakeControlBot } from "./helpers.ts";
 
 function setup(overrides: { runShutdown?: (args: string[]) => Promise<{ stdout: string; stderr: string; failed: boolean }>; runPowershell?: (script: string) => Promise<{ stdout: string; stderr: string; failed: boolean }>; isControlTopic?: (threadId: number | undefined) => boolean } = {}) {
   const controlBot = fakeControlBot();

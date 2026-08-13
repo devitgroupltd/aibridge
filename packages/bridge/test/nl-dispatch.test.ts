@@ -3,22 +3,7 @@ import { createNlDispatch } from "../src/nl-dispatch.ts";
 import { NlConfirmRegistry } from "../src/nl-confirm.ts";
 import { RepoPickRegistry } from "../src/repo-picker.ts";
 import { Routing } from "../src/routing.ts";
-
-function fakeControlBot() {
-  const sent: Array<{ topicId: number | undefined; text: string; keyboard?: unknown }> = [];
-  const deleted: number[] = [];
-  return {
-    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string, replyMarkup?: unknown) => {
-      sent.push({ topicId, text, keyboard: replyMarkup });
-      return { message_id: sent.length };
-    },
-    deleteMessage: async (_chatId: unknown, messageId: number) => {
-      deleted.push(messageId);
-    },
-    sent,
-    deleted,
-  };
-}
+import { fakeControlBot, testRuntimeSettings } from "./helpers.ts";
 
 function fakeTypingIndicator() {
   const started: string[] = [];
@@ -74,8 +59,7 @@ async function setup(overrides: Partial<Parameters<typeof createNlDispatch>[0]> 
   const nlConfirmRegistry = new NlConfirmRegistry();
   const repoPickRegistry = new RepoPickRegistry();
   const dispatchFleetCommandCalls: unknown[] = [];
-  let assistEnabled = true;
-  let nlRouterBackend: "api" | "cli" = "cli";
+  const { settings } = testRuntimeSettings();
   const nlDispatch = createNlDispatch({
     controlBot,
     routing,
@@ -90,8 +74,7 @@ async function setup(overrides: Partial<Parameters<typeof createNlDispatch>[0]> 
     repoPickRegistry,
     dispatchFleetCommand: (...args) => dispatchFleetCommandCalls.push(args),
     nlRouterConfig: { enabled: true, apiKey: undefined, model: "test-model" },
-    getNlRouterBackend: () => nlRouterBackend,
-    getAssistEnabled: () => assistEnabled,
+    settings,
     supergroupChatId: "-100",
     log: () => {},
     // Default no-op: existing no-match tests expect `onNoMatch` to still fire even with
@@ -114,10 +97,7 @@ async function setup(overrides: Partial<Parameters<typeof createNlDispatch>[0]> 
     nlConfirmRegistry,
     repoPickRegistry,
     dispatchFleetCommandCalls,
-    getAssistEnabled: () => assistEnabled,
-    setAssistEnabled: (v: boolean) => {
-      assistEnabled = v;
-    },
+    settings,
   };
 }
 
@@ -331,8 +311,8 @@ describe("createNlDispatch", () => {
     test("a matched destructive command executes immediately when assist is off", async () => {
       const command = { kind: "restart" } as never;
       const routeText = async () => ({ matched: true as const, command, destructive: true });
-      const { nlDispatch, controlBot, dispatchFleetCommandCalls, setAssistEnabled } = await setup({ routeText });
-      setAssistEnabled(false);
+      const { nlDispatch, controlBot, dispatchFleetCommandCalls, settings } = await setup({ routeText });
+      settings.setAssistEnabled(false);
 
       await nlDispatch.routeOrFallback("restart the bridge", { isControl: true, hasSession: false }, 1, true, undefined, () => {}, () => {});
 

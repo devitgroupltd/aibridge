@@ -21,6 +21,15 @@ import path from "node:path";
 
 export type LogLevel = "INFO" | "WARN" | "ERROR";
 
+/** The shape every module takes as its injected `log` dependency - i.e. this module's own `log`
+ * export, named once here instead of being restated at each injection site. Twenty-two modules
+ * previously declared this signature themselves (twelve as a verbatim `type LogFn = ...` copy, ten
+ * inline on an options field), which is a lot of places to keep in step for a type whose one real
+ * implementation lives right below it. Structural typing meant the copies always interoperated, so
+ * this is a maintenance fix rather than a bug fix: adding a level, or a third parameter, previously
+ * meant finding all twenty-two by hand. */
+export type LogFn = (level: LogLevel, message: string) => void;
+
 /** A generous cap, not a tight one - this is a diagnostic log for an unattended daemon, not a
  * high-volume trace; 10MB holds days of normal `log()` volume before rotation ever fires. */
 const MAX_LOG_BYTES = 10 * 1024 * 1024;

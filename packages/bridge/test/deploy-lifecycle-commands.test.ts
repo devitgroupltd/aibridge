@@ -2,10 +2,13 @@ import { describe, expect, test } from "bun:test";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { createDeployLifecycleCommands, createProcessRunner, RestartConfirmRegistry, resolveRestartConfirmCallback, buildRestartConfirmKeyboard } from "../src/deploy-lifecycle-commands.ts";
+import { createDeployLifecycleCommands } from "../src/deploy-lifecycle-commands.ts";
+import { createProcessRunner } from "../src/process-runner.ts";
+import { RestartConfirmRegistry, resolveRestartConfirmCallback, buildRestartConfirmKeyboard } from "../src/restart-confirm.ts";
 import { readDeployMarker } from "../src/deploy.ts";
 import { SessionStore, type SessionRow } from "../src/session-store.ts";
 import type { DeployOutcome } from "../src/deploy.ts";
+import { fakeControlBot } from "./helpers.ts";
 
 function row(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
@@ -21,7 +24,6 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     turnCardMsg: null,
     thinkingPlaceholderMsg: null,
     paused: false,
-    renamed: false,
     feedDetail: "compact",
     feedVerbose: false,
     bypassPermission: false,
@@ -30,17 +32,6 @@ function row(overrides: Partial<SessionRow> = {}): SessionRow {
     createdUtc: "2026-08-08T00:00:00.000Z",
     lastEventUtc: "2026-08-08T00:00:00.000Z",
     ...overrides,
-  };
-}
-
-function fakeControlBot() {
-  const sent: Array<{ topicId: number | undefined; text: string; keyboard?: unknown }> = [];
-  return {
-    sendMessage: async (_chatId: unknown, topicId: number | undefined, text: string, replyMarkup?: unknown) => {
-      sent.push({ topicId, text, keyboard: replyMarkup });
-      return { message_id: sent.length };
-    },
-    sent,
   };
 }
 
