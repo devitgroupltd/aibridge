@@ -1,8 +1,13 @@
 ---
-version: 1.12.0
+version: 1.12.1
 status: solid
-last_modified_utc: 2026-08-13T14:05:00Z
+last_modified_utc: 2026-08-13T15:20:00Z
 changelog:
+  - "1.12.1 (2026-08-13): documentation only - `## Open findings` said `Open` while holding two
+    entries that both say **Fixed**, which contradicted CLAUDE.md's `Nothing in it is open` for
+    anyone who grepped the heading instead of reading to the end of each entry. The section now
+    opens with an explicit `**None.**` and keeps the recent fixed findings under a subheading, since
+    they are kept at full length on purpose - the reasoning, not the status, is why they are here."
   - "1.12.0 (2026-08-13): both findings 1.11.0 opened are now fixed, and diagnosing the second one
     turned it into something much larger than the single anecdote it was filed as. **P1-13**: the slug
     is claimed synchronously now, in the same tick it is derived, against the union of
@@ -353,6 +358,16 @@ thing it exists to measure stayed untested.
 ---
 
 ## Open findings
+
+**None.** Every finding filed to date is fixed.
+
+The most recent ones are kept below at full length rather than compressed into **## Resolved**,
+because in each case the reasoning is the point: what the first diagnosis got wrong, what the fix
+deliberately does *not* do, and which measurement would have to change to revisit it. Every entry
+records when it was fixed. A genuinely open finding goes directly under this paragraph, above the
+subheading, and stays there until its own text says **Fixed**.
+
+### Recent findings, all fixed
 
 - **P1-13 — two concurrent `/new` commands that derive the same slug race past the uniqueness check,
   and the loser survives as an untracked `claude` process holding a worktree directory nothing can
