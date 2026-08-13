@@ -47,13 +47,16 @@ One genuine defect came out of it too, worth knowing because its failure mode is
 NUL bytes in a source file make ripgrep skip that file silently, so a grep-driven search quietly
 misses it (see S-1).
 
-Outstanding verification work is §13's checks **2, 3, 5(a)/(b)/(d) and 8** — checks 5(c), 6 and 7 were
-run and recorded on 2026-08-13 — plus a few built-but-never-live-exercised paths named in §12. None of
-those four is blocked on more automation: 2 and 3 need a real 30-minute sleep, 8 needs a BotFather
-token revocation, and 5's remaining paths need SeoWrite registered in `repos.toml`, which is itself one
-of §12's three named Phase 6b triggers. Note that checks 4, 6 and 7 were all specified as manual and
-turned out to be scriptable, so assume a check *is* automatable until a physical or credential-level
-step proves otherwise.
+Outstanding verification work is §13's checks **2, 3, 5(a)/(b)/(d) and 8's live revocation** — checks
+5(c), 6 and 7 were run and recorded on 2026-08-13, and 8's four fail-closed claims were automated the
+same day (`packages/bridge/test/compromise-drill.test.ts`) — plus a few built-but-never-live-exercised
+paths named in §12. None of it is blocked on more automation: 2 and 3 need a real 30-minute sleep and
+share one lid-close (arm the stale command before sleeping); 8 needs a BotFather revocation, but now
+only to confirm the revocation itself 401s as assumed and that recovery works, since everything it
+*causes* is checked on every run; and 5's remaining paths need SeoWrite registered in `repos.toml`,
+which is itself one of §12's three named Phase 6b triggers. Note that checks 4, 6, 7 and most of 8 were
+all specified as manual and turned out to be scriptable, so assume a check *is* automatable until a
+physical or credential-level step proves otherwise — and when one step is, the rest usually is not.
 
 ## What this project is
 
