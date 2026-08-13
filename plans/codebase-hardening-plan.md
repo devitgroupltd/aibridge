@@ -1,8 +1,9 @@
 ---
-version: 1.9.0
+version: 1.10.0
 status: solid
-last_modified_utc: 2026-08-13T08:00:00Z
+last_modified_utc: 2026-08-13T09:30:00Z
 changelog:
+  - "1.10.0 (2026-08-13): P1-12, found by live-verifying P1-11's own fix hours after shipping it, and fixed the same day. `/stop` deliberately wrote no state, on the documented reasoning that `Stop`/`StopFailure` would move the row once Claude aborted the turn. Measured against two real sessions: **an operator interrupt emits no `Stop`/`StopFailure` hook at all** - a `/stop` mid-turn left the row `working` with no subsequent hook of any kind, and a `/stop` on a permission card left it `awaiting_input` for the ~3 minutes between the interrupt clearing the last pending prompt and an unrelated operator message happening to arrive (`/ls` reporting \"waiting: reply\" throughout, for a session waiting on nothing). So every `/stop` stranded its session in whatever state it was interrupted from, on the most routine intervention the operator has. P1-11's new `awaiting_input -> idle` edge did not help alone - an edge only helps if something crosses it, and this fix is its first real caller. `handleStopCommand` now asserts the resting state, gated on `working`/`awaiting_input` so a stray `/stop` can't erase a `quota_stopped` row's rate-limit signal or claim a `starting` session is idle, and calls `stopIndicatorsForTopic` for the same root cause (the abandoned turn's \"Thinking...\" placeholder was left spinning indefinitely, observed live). 9 new tests (1778/1778), each verified to fail against a re-broken copy in both directions - write removed, then gate removed - and the harness's `maybeSetState` fake was made to write through `isValidTransition` rather than record calls, since a record-only spy would have passed throughout the period the edge was missing. Second half of the same finding: `/stop` also cleared pending *permission* entries without a verdict, on a 2026-08-09 note that generalized from the ask path (where an Escape really does release the blocked hook client) to the permission path (where the block is inside the session's own channel server and only a verdict releases it) - and since `/stop` removes the registry entry, `sweepExpiredPermissions` could never fire for it either, reaching exactly the \"no recovery path at all\" outcome `drainPendingPermissions`' comment warns about via the one caller it exempted. Measured: a session `/stop`ped over a permission card and then sent nothing stayed silent for 8 minutes. `/stop` now sends `deny`; asks stay verdict-free and that asymmetry is stated in both comments. **Both halves live-verified against the real Bridge after the fix**, in the same daemon that had stranded three sessions an hour earlier: `awaiting_input -> idle` with the deny releasing the blocked call 685ms later (against 8 minutes of silence pre-fix), and `working -> idle` (against 39 minutes stranded pre-fix). Records the general rule this pass earned: **verify the traversal, not just the path** - a unit test proving an edge works supplies the traversal itself, so it cannot notice that nothing real ever crosses it."
   - "1.9.0 (2026-08-13): P0-8 fixed, and a second finding (P1-11) found and fixed alongside it - both the same shape, *the Bridge acted and did not tell the state machine*. **P0-8**: `recoverWedgedPty` now records a TTL-bounded per-slug recovery mark immediately before `kill()` (never after - the dying process's `SessionEnd` reached the pipe 33ms behind the kill live, so a mark written afterwards loses that race just as reliably as no mark), and `feed-wiring.ts` skips *only the state write* for a `SessionEnd` inside that window; the event still renders, because it is true - the process did exit - and what was wrong was the conclusion \"therefore this session is over\", not the report. Suppressed rather than undone, since `dead` is terminal and a row allowed to reach it cannot be walked back. The mark clears on the successor's `SessionStart`, and otherwise expires at 30s so a recovery that quietly never happened cannot leave a dead session showing as live forever. **P1-11**, found while confirming §6.4's one-hour ceiling (which itself passed - card edited in place, hook genuinely unblocked): the row sat at `awaiting_input` an hour past the cancel, because §4.3's table had no `awaiting_input -> idle` edge, so the turn-ending `Stop` was rejected *silently* (`maybeSetState` only logs writes that land), and because three of the four Bridge-side resolution paths never made the `maybeSetState(..., \"working\")` call the button-tap path always has. Both halves fixed: three misses out of four paths is the argument for a backstop, not just for patching the sites. 22 new tests (1769/1769), every one of them run against a deliberately re-broken copy of its own fix first - six reversions, six confirmed failures - because both findings are ordering bugs whose tests are otherwise free to pass for the wrong reason."
   - "1.8.0 (2026-08-13): two findings from running the last of §12's never-live-exercised checks. **P1-10 (found and fixed)**: `/attach` produced nothing at all the first time it ran against a real multi-line PTY tail - the rendered card passed Telegram's 4096-unit cap, the P1 send failed three times with \"message is too long\", and a failed command confirmation is only a log line, so the operator saw silence. The raw ring buffer is bounded at 4000 chars but `renderAttach` HTML-escapes it afterwards and PTY output is dense in `<`, `>` and `&`, each expanding 4-5x; the fix bounds the *rendered* message instead, trimming the escaped tail from the front and never through an entity (a half-cut `&amp;` would swap the error for \"can't parse entities\"), with a visible trimmed-to-fit marker. 5 new tests. **P0-8 (found, not fixed - see ## Open findings)**: `wedged-recovery.ts` kills a wedged session expecting the crash-resume path to relaunch it, but the killed process runs its own `SessionEnd` hook on the way out, which marks the row `dead` 33ms later, and `resumeSession` then correctly refuses to resume a dead row - the session stays dead and the operator's next messages are dropped with only a WARN. That module's doc comment reasons carefully about not untracking the PTY and misses that a deliberate kill runs hooks a real crash never gets to run. Recorded in the main plan rather than here: quiet mode and `quota_stopped` both live-exercised for the first time, plus the structural reason a tool-heavy storm does not trip quiet mode while a turn-heavy one does - the coalescer's interval scaling holds card edits at the feed budget by design, so it is per-turn card creates and details anchors that exceed it."
   - "1.7.0 (2026-08-12): implemented P0-7, closing the last open finding the same evening it was filed. New `isCoveredByBareToolRule` in `rule-derivation.ts` - placed next to `deriveAlwaysRule` as its exact counterpart (what one writes for a non-Bash tool, the other recognises; a test pins that round trip), and wired into `pipe-server.ts`'s `handlePermissionRequest`, which now reads the session settings file once per request and runs either the Bash compound path or this one. Deliberately conservative: it refuses unless the tool is allow-listed *and* no deny/ask entry mentions that tool in any form, so `♾️ Always` on `Edit`/`Read` still re-prompts (the baseline's `Edit(.env)`/`Edit(~/**)`/`Read(~/**)` rules would have to be matched per-call, i.e. Claude Code's own path globs reimplemented, where a subtle mistake silently auto-approves reads of the secrets those rules protect) while `Write`, `NotebookEdit`, `WebFetch` and MCP tools are fixed; `containsSensitivePath` guards the input preview as a second layer. One self-inflicted regression caught and closed in the same pass: the settings read moved onto every permission request, so a truncated file could have thrown and swallowed the operator's card - now try/caught, falling through to the card, never toward an approval. 17 new tests (precedence cases first, plus pipe-server wiring), 1742/1742, `tsc --noEmit` clean. Live-verified both directions with `always-rule-check.js`: the `write` variant that recorded the bug hours earlier now reports no second card with the file on disk and `auto-approved Write ... already allow-listed for this session` in the log, and the `bash` variant still passes, confirming the shared restructure left the compound path alone. `## Open findings` is empty again and the sequencing table is back to empty by design."
@@ -18,6 +19,22 @@ changelog:
   - "1.2.1 (2026-08-12): P0-5 live-verified against the real Bridge, per operator request. Two real restarts against a throwaway session (`p0-5-check`), reproducing the `unify-work-with-voice-and` scenario exactly: both placeholders got correctly relabeled to \"Interrupted by a restart - resuming...\", none left stuck; the pre-existing lost-pending-question mechanism fired correctly alongside it with no interference. Throwaway session killed and removed afterward. Removed stage 1 (P0-5 live-verify) from Suggested sequencing - only the P1-8 test-gap stage remains."
   - "1.4.0 (2026-08-12): new finding P0-6, found and fixed the same evening from a real incident - `resolveHookClientBinary`'s stale-binary rebuild threw out of `execFileSync` on the launch path (Windows `EPERM`: `bun build --compile` can't replace a mapped `.exe`, and a blocked `--ask` hook client keeps the old one mapped indefinitely), surfacing as an uncaught exception that killed the daemon seconds after a `/restart` and took the whole fleet down over a merely-stale binary. Extracted `ensureHookBinary` (fresh/stale/missing state + degrade-to-existing-binary-with-WARN on failure, rethrowing only when there is no binary at all), stopped caching a degraded resolution so the next launch retries, and threaded the launch `log` through. Second half of the same incident: bun orphans a ~94MB `.<hash>-NNNNNNNN.bun-build` temp file in the *package* dir (not `dist/`) when the rename fails, so it showed up as untracked in `git status` - `*.bun-build` added to `.gitignore`, with the sweep-on-failure alternative deliberately rejected (a concurrent launch's in-progress build writes an indistinguishable temp file). 7 new tests; `tsc --noEmit` clean across all 5 packages; 1704/1704 passing; live-verified by a real restart."
   - "1.3.0 (2026-08-12): closed out the last open item - P1-8's remaining test gaps - for real, not just documented. card-senders.ts/fleet-reporting-commands.ts got real wiring/guard coverage (their own doc comments' low-risk claim confirmed, not assumed). channel-server/src/index.ts and hook-client/src/index.ts were both genuinely untestable as entry-point scripts, so each got a small, behavior-preserving extraction (channel-handlers.ts, run-hook.ts) making the real dispatch logic injectable. send-once.ts got real socket-level tests despite its own doc comment arguing against them, surfacing a real bun-vs-Node socket-backpressure difference worth recording. protocol/src/types.ts (no runtime behavior beyond assertValidBehavior, already covered elsewhere) got a compile-time exhaustiveness check locking the Message union's own completeness. 61 new tests; tsc --noEmit clean across all 5 packages; 1697/1697 passing monorepo-wide. Nothing remains open in this document - Suggested sequencing is now empty by design."
+v1100_touched_sections:
+  - section: "Open findings"
+    type: modified
+    summary: "Still empty; the note now names P1-12 alongside P0-8 and P1-11 as found-and-fixed on 2026-08-13."
+  - section: "Resolved (verified against current code, 2026-08-12)"
+    type: modified
+    summary: "Added P1-12 - /stop asserting its own resting state because an interrupt emits no Stop hook, gated so a quota_stopped or starting row is left alone, plus the indicator stop."
+  - section: "Overall read"
+    type: modified
+    summary: "Four 2026-08-13 findings, not three; adds the sharper lesson that P1-12 came out of live-verifying P1-11's fix - restoring a path is only verified when something is seen taking it."
+  - section: "Suggested sequencing"
+    type: modified
+    summary: "Still empty by design; generalises the re-break discipline to nine reversions and adds the verify-the-traversal rule."
+  - section: "Verification per stage"
+    type: modified
+    summary: "Test total to 1778; adds P1-11's and P1-12's live verification against the real Bridge, records P1-12's four reversions and why its gate was reverted in both directions."
 v190_touched_sections:
   - section: "Open findings"
     type: modified
@@ -224,27 +241,37 @@ rather than reasoning about it — which is also how P0-6 was found earlier the 
 logged nothing) were both implemented, tested and live-verified the same evening; both are in
 **## Resolved**.
 
-**Three more landed on 2026-08-13**, all three out of running §12's remaining never-live-exercised
+**Four more landed on 2026-08-13**, all out of running §12's remaining never-live-exercised
 checks — which is now four separate days running where the live rig found what reading the code did
 not. **P1-10** (`/attach` silently exceeded Telegram's message cap), **P0-8** (a wedged-recovery
-kill defeated by the killed process's own `SessionEnd` hook) and **P1-11** (a resolved prompt left
-the row stranded at `awaiting_input`) are all in **## Resolved**, and **## Open findings** is empty
-again. The suite is at 1769/1769, `tsc --noEmit` clean across all 5 packages.
+kill defeated by the killed process's own `SessionEnd` hook), **P1-11** (a resolved prompt left
+the row stranded at `awaiting_input`) and **P1-12** (`/stop` waiting for a hook that an interrupt
+never sends) are all in **## Resolved**, and **## Open findings** is empty again. The suite is at
+1778/1778, `tsc --noEmit` clean across all 5 packages.
 
-Both 2026-08-13 state-machine findings share one shape worth naming, since it is the thing to look
-for next: **the Bridge acted, and did not tell the state machine.** P0-8 killed a process without
-saying the kill was a recovery, so the `SessionEnd` it provoked read as the session ending. P1-11
-resolved a prompt without saying the session was unblocked, so the row kept claiming it was waiting.
-Both were invisible in `bridge.log` for the same reason — `maybeSetState` logs successful writes and
-says nothing about rejected ones — and both were found by watching a real session's row, not by
-reading the code that writes it.
+All three 2026-08-13 state-machine findings share one shape worth naming, since it is the thing to
+look for next: **the Bridge acted, and did not tell the state machine.** P0-8 killed a process
+without saying the kill was a recovery, so the `SessionEnd` it provoked read as the session ending.
+P1-11 resolved a prompt without saying the session was unblocked, so the row kept claiming it was
+waiting. P1-12 interrupted a turn and left the row to a `Stop` hook that an interrupt does not emit.
+All three were invisible in `bridge.log` for the same reason — `maybeSetState` logs successful writes
+and says nothing about rejected ones — and all three were found by watching a real session's row, not
+by reading the code that writes it.
+
+**P1-12 is also the sharper lesson of the three, because it was found by live-verifying P1-11's own
+fix hours after shipping it.** P1-11 added the missing `awaiting_input -> idle` edge and concluded,
+in `handleStopCommand`'s doc comment, that `/stop` could therefore "stay hands-off as designed" —
+correct about the edge, wrong about there being anything to cross it. An edge is only worth adding if
+some event actually traverses it, and no event does here. The general form: **a fix that restores a
+path is only verified when something is observed taking that path**, which a unit test asserting the
+edge exists cannot show, because it supplies the traversal itself.
 
 ---
 
 ## Open findings
 
-_(None. **P0-8** and **P1-11**, both found live on 2026-08-13, were fixed the same day — see
-**## Resolved**. P0-8 as originally filed is kept below for its reasoning.)_
+_(None. **P0-8**, **P1-11** and **P1-12**, all found live on 2026-08-13, were fixed the same day —
+see **## Resolved**. P0-8 as originally filed is kept below for its reasoning.)_
 
 <details>
 <summary>P0-8 as originally filed (kept for the reasoning; see ## Resolved for what shipped)</summary>
@@ -282,7 +309,7 @@ _(None. **P0-8** and **P1-11**, both found live on 2026-08-13, were fixed the sa
 </details>
 
 _(P0-7 and P1-9, both filed on the evening of 2026-08-12, were implemented the same evening - see
-**## Resolved**, along with P1-10, P0-8 and P1-11 from 2026-08-13.)_
+**## Resolved**, along with P1-10, P0-8, P1-11 and P1-12 from 2026-08-13.)_
 
 <details>
 <summary>P0-7 as originally filed (kept for the reasoning; see ## Resolved for what shipped)</summary>
@@ -361,6 +388,55 @@ implementation detail.
   was lost" notice. The two sweeps were lifted out of `index.ts`'s 60s interval to get an
   `onResolved` contract that a test can hold. 10 new tests, each verified to fail against the
   unfixed code.
+- **P1-12** (`/stop` waited for a hook an interrupt never sends) — found live 2026-08-13 while
+  live-verifying P1-11's own fix, hours after shipping it, and fixed the same day. `handleStopCommand`
+  deliberately wrote no state, on the documented reasoning that `working -> idle` is
+  `Stop`/`StopFailure`'s job once Claude aborts the turn and that asserting it directly would race
+  the hook. Measured against two real sessions: **an operator interrupt emits no `Stop`/`StopFailure`
+  hook at all.** A `/stop` mid-turn left the row `working` with no subsequent hook event of any kind;
+  a `/stop` on a session `awaiting_input` on a permission card left it there for the ~3 minutes
+  between the interrupt clearing the last pending prompt and an unrelated operator message happening
+  to arrive — `/ls` reporting "waiting: reply" throughout, for a session waiting on nothing. So every `/stop` stranded its session in
+  whatever state it was interrupted from, on the most routine intervention the operator has.
+  P1-11's new `awaiting_input -> idle` edge did not help on its own: an edge only helps if something
+  crosses it, and this fix is its first actual caller. Fixed by asserting the resting state in
+  `handleStopCommand` — gated on `working`/`awaiting_input` rather than unconditional, because
+  `quota_stopped -> idle` is also a legal edge and a stray `/stop` must not erase the one signal
+  §10.5's alarms key on, and because a `starting` session would otherwise be claimed idle before its
+  `SessionStart` landed. `stopIndicatorsForTopic` joined it for the same root cause: with no `Stop`
+  coming, the abandoned turn's "Thinking..." placeholder was left spinning indefinitely, observed
+  live alongside the stranded row. Same call `/kill` and `/rm` already make. Took widening
+  `SessionLifecycleFeedWiring` by one member (`maybeSetState`) — taken guarded rather than as a raw
+  `sessionStore.setState` so `/stop` cannot write an edge §4.3 forbids. 9 new tests; the test
+  harness's own `maybeSetState` fake was made to write through `isValidTransition` rather than merely
+  record the call, since a record-only spy would have passed for the entire period the
+  `awaiting_input -> idle` edge was missing. Each verified to fail against the unfixed code, in both
+  directions — with the write removed, and with the gate removed.
+  **Second half of the same finding, same root cause:** `/stop` cleared its pending *permission*
+  entries without sending a verdict, on a 2026-08-09 note claiming the Escape had already unblocked
+  "the waiting hook client". That generalized from the ask path, where it is true, to the permission
+  path, where it is not — an ask blocks a hook client, but a permission blocks inside the session's
+  own channel server, which only a verdict over the pipe releases. Since `/stop` also removes the
+  registry entry, `sweepExpiredPermissions` (the only other thing that ever sends a compensating
+  deny) could never fire for it either — precisely the "no recovery path at all" outcome
+  `drainPendingPermissions`' own doc comment warns about, reached by the one caller that comment
+  exempted. Measured: a session `/stop`ped over a permission card and then sent *nothing* stayed
+  totally silent for 8 minutes; a sibling `/stop`ped the same way only emitted its abandoned call's
+  `PostToolUse` once an unrelated message arrived ~3 minutes later. `/stop` now sends `deny` — the
+  one verdict that cannot surprise an operator who just asked the session to stop. Asks are
+  deliberately left verdict-free, and that asymmetry is now stated in both doc comments; confirmed by
+  the fact that no `aibridge-hook` process survives a `/stop` over a live question card.
+  **Live-verified after the fix, same daemon, same session:** `/stop` over a permission card wrote
+  `awaiting_input -> idle` and the deny released the blocked call 685ms later with nothing sent to
+  the session, against 8 minutes of silence pre-fix; `/stop` mid-turn wrote `working -> idle`,
+  against 39 minutes stranded pre-fix.
+  One knock-on, deliberately left as-is: a `/stop` landing inside `RESUME_NUDGE_FOLLOWUP_DELAY_MS`
+  of a resume nudge will now let `sendFollowUpNudgeIfStillIdle` fire, where the stranded `working`
+  state used to suppress it. That suppression was an accident of the bug, not a design — this
+  document's own P1-11 entry lists the skipped nudge as one of the *harms* of the stale state — and
+  the nudge's text ("nothing happened after my last message — you're still idle") is accurate in
+  that case. Recorded rather than guarded, since suppressing it would mean re-introducing a lie
+  about the row to get a cosmetic benefit.
 - **P1-10** (`/attach` produced no output at all against a real PTY tail) — found and fixed
   2026-08-13, the first time §12 Phase 5's never-live-exercised `/attach` was run against a real
   multi-line tail. The rendered card exceeded Telegram's 4096-unit cap, so the P1 send failed three
@@ -591,7 +667,7 @@ priority.**
 ## Suggested sequencing
 
 The 2026-08-09 audit (P0-1 through P0-6, P1-1 through P1-8, P2-1 through P2-6) is fully closed, as
-are P0-7 and P1-9 (2026-08-12) and P1-10, P0-8 and P1-11 (2026-08-13). Nothing is queued.
+are P0-7 and P1-9 (2026-08-12) and P1-10, P0-8, P1-11 and P1-12 (2026-08-13). Nothing is queued.
 
 | Stage | Contents | Risk |
 |---|---|---|
@@ -599,10 +675,16 @@ are P0-7 and P1-9 (2026-08-12) and P1-10, P0-8 and P1-11 (2026-08-13). Nothing i
 
 The P0-8 stage this table used to hold warned that its risk sat in the *test*, not the change: a
 test firing `SessionEnd` and the exit callback in the convenient order passes against the broken
-code. That warning generalised. Every one of the 22 tests added for P0-8 and P1-11 was run against
-a deliberately re-broken copy of its own fix before being trusted — six separate reversions, each
-confirmed to fail — because both findings are ordering bugs whose tests are otherwise free to pass
-for the wrong reason.
+code. That warning generalised. Every one of the 31 tests added for P0-8, P1-11 and P1-12 was run
+against a deliberately re-broken copy of its own fix before being trusted — ten separate reversions,
+each confirmed to fail — because these are ordering bugs whose tests are otherwise free to pass for
+the wrong reason.
+
+P1-12 adds a second rule to that one, and it is the more general of the two: **verify the traversal,
+not just the path.** P1-11 added a missing state-table edge and its tests proved the edge worked —
+by supplying the traversal themselves. No real event ever crossed it, and nothing in the suite could
+have noticed, because the thing that was missing was outside the code under test. When a fix restores
+a route, the check that matters is watching real traffic take it.
 
 One thing this document deliberately does **not** carry forward as a finding: P0-7's fix leaves
 `♾️ Always` re-prompting for `Edit` and `Read`, because the baseline's scoped deny rules for those
@@ -613,17 +695,28 @@ list.
 
 ## Verification per stage
 
-- `bun test` — 1769/1769 passing as of P0-8/P1-11 (2026-08-13; 1704 at P0-6 on 2026-08-12, 1697 at
-  the P1-8 test-gap closeout earlier that day). The plan's original "1255 baseline" predates
-  `a511834`'s own test additions and was already stale even at the time this document was first
-  written.
+- `bun test` — 1778/1778 passing as of P1-12 (2026-08-13; 1769 at P0-8/P1-11 the same day, 1704 at
+  P0-6 on 2026-08-12, 1697 at the P1-8 test-gap closeout earlier that day). The plan's original
+  "1255 baseline" predates `a511834`'s own test additions and was already stale even at the time this
+  document was first written.
 - `tsc --noEmit` per package — clean across all 5 packages as of the same commit.
-- **P0-8 and P1-11's tests were each verified to fail against a deliberately re-broken copy of their
-  own fix** before being trusted — six separate reversions (the state-table edge, the `SessionEnd`
-  suppression, the terminal-race state write, the mark-before-kill ordering, and both sweeps'
-  `onResolved` calls), six confirmed failures. Both findings are ordering bugs, and this document's
-  own P0-8 entry warned that a test firing the events in the convenient order passes against the
-  broken code; the only way to know it doesn't is to break the code and watch.
+- **P1-11 and P1-12 were both live-verified against the real Bridge on 2026-08-13**, after the unit
+  tests passed — which is the only reason P1-12 exists at all. P1-11: a permission card left to its
+  30-minute TTL produced `awaiting_input -> working` from the sweep's new `onResolved`, the
+  compensating deny reached the session, and it ran to a normal `Stop`. P1-12, measured in the same
+  daemon within the same hour, before and after: `/stop` mid-turn left a row `working` for 39 minutes
+  pre-fix and wrote `working -> idle` post-fix; `/stop` over a permission card left a row
+  `awaiting_input` pre-fix with 8 minutes of total silence from the session, and post-fix wrote
+  `awaiting_input -> idle` with the deny releasing the blocked call 685ms later.
+- **P0-8, P1-11 and P1-12's tests were each verified to fail against a deliberately re-broken copy of
+  their own fix** before being trusted — ten separate reversions (the state-table edge, the
+  `SessionEnd` suppression, the terminal-race state write, the mark-before-kill ordering, both sweeps'
+  `onResolved` calls, and P1-12's state write, its gate, its indicator stop and its deny verdict), ten
+  confirmed failures. These are ordering bugs, and this document's own P0-8 entry warned that a test firing the
+  events in the convenient order passes against the broken code; the only way to know it doesn't is to
+  break the code and watch. P1-12's gate was reverted in *both* directions — removing the write, then
+  removing the gate — since a one-directional check would not have caught an unconditional write
+  erasing a `quota_stopped` row.
 - **P0-6 live-verified 2026-08-12** against the real dev Bridge, which was dead at the time from the
   very exception this finding is about: killed the two wedged `--ask` hook clients that had been
   holding `dist/aibridge-hook.exe` mapped, deleted the orphaned 94MB `.bun-build` temp, rebuilt the
