@@ -36,6 +36,17 @@ overruns the PTY's input buffer and silently drops the *middle* of the message. 
 was 105 of 145 inbound messages needing a retry to submit at all, and anything past ~3KB arriving
 corrupted or not at all).
 
+A second pass over the same plan (**S-1–S-8**, 2026-08-13, structural rather than defect-hunting) is
+also closed. Four of its results change how you write code here rather than just what the code looks
+like: **`runtime-settings.ts`** owns the seven persisted fleet preferences and a setter there *is* the
+persist, so never pair one with a `settingsStore.set` again; **`sqlite.ts`** is the only place a DB
+handle is opened (WAL and a busy timeout come with it); **`command-dispatch.ts`**'s
+`FLEET_COMMAND_HANDLERS` is exhaustive by construction, so adding a `FleetCommand` kind is a compile
+error until it is handled; and **`packages/bridge/test/helpers.ts`** holds the shared test doubles.
+One genuine defect came out of it too, worth knowing because its failure mode is invisible: literal
+NUL bytes in a source file make ripgrep skip that file silently, so a grep-driven search quietly
+misses it (see S-1).
+
 Outstanding verification work is §13's checks **2, 3, 5(a)/(b)/(d) and 8** — checks 5(c), 6 and 7 were
 run and recorded on 2026-08-13 — plus a few built-but-never-live-exercised paths named in §12. None of
 those four is blocked on more automation: 2 and 3 need a real 30-minute sleep, 8 needs a BotFather
@@ -59,7 +70,7 @@ Per §9 (the only place aibridge's own conventions are specified rather than def
 - Runtime/tooling: **Bun** (TypeScript). The hook client is compiled to a single-file binary via
   `bun build --compile` (startup latency is load-bearing there, §2.2); the Bridge and channel server
   run from source under `bun`.
-- `bun test` — the full suite (all packages, ~1250+ tests). Test framework: `bun test`.
+- `bun test` — the full suite (all packages, ~1800+ tests). Test framework: `bun test`.
 - `bun run typecheck` — `tsc --noEmit` across every package's own `tsconfig.json`. Type gate: both
   this and `bun test` are meant to run in CI per package.
 - Testing convention: unit-test any helper whose failure mode is **silent-wrong** (produces a
@@ -67,6 +78,13 @@ Per §9 (the only place aibridge's own conventions are specified rather than def
   contract another component branches on. §9 lists 41 concrete scenarios this covers (protocol
   contract, permission-rule derivation, rate-limit governors, reconciliation, session-state
   transitions, send-failure retries) — treat these as the initial test plan, not just documentation.
+- Shared test doubles live in **`packages/bridge/test/helpers.ts`** (`fakeControlBot`,
+  `recordingSettingsStore`, `testRuntimeSettings`). Reach for it before hand-rolling another one: the
+  suite had fifteen separate control-bot doubles before this existed, nine of them byte-identical, and
+  the drift was not free - five assertions that claimed to check a stripped keyboard were only ever
+  checking the message text, because their local double silently discarded the keyboard argument. A
+  file needing a method the base lacks spreads it in (`{ ...fakeControlBot(), sendDocument: ... }`)
+  rather than starting over.
 
 ## Live-verifying against the real Telegram client
 
