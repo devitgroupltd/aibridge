@@ -109,7 +109,10 @@ async function verify(page, slug) {
   const total = await getMessageCount(page);
   const texts = await getMessageTexts(page, Math.min(total, 25));
   const cancelled = texts.find((t) => t.includes(CANCEL_TEXT));
-  const stillTappable = texts.find((t) => t.includes("❓") && t.includes("asks") && !t.includes(CANCEL_TEXT));
+  // Match on words, never on the card's leading ❓: Telegram Web K renders emoji as <img>, so
+  // `innerText` drops them entirely (see client.js) and an emoji predicate is silently always
+  // false - which would make this half of the check pass vacuously, the worst kind of green.
+  const stillTappable = texts.find((t) => t.includes(" asks") && !t.includes(CANCEL_TEXT));
 
   const result = {
     phase: "verify",
