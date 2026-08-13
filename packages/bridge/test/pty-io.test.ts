@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { createPtyIo } from "../src/pty-io.ts";
+import { createWedgedRecoveryMarks } from "../src/wedged-recovery.ts";
 import { Routing } from "../src/routing.ts";
 import { createTypingIndicator } from "../src/typing-indicator.ts";
 import { createThinkingPlaceholder } from "../src/thinking-placeholder.ts";
@@ -49,6 +50,7 @@ describe("createPtyIo", () => {
       thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
       lastActivityAt: () => undefined,
       ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
     });
 
     ptyIo.sendRaw("fix-bug", "/model opus");
@@ -64,6 +66,7 @@ describe("createPtyIo", () => {
       thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
       lastActivityAt: () => undefined,
       ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
       log: (level, msg) => logs.push(`${level}: ${msg}`),
     });
 
@@ -80,6 +83,7 @@ describe("createPtyIo", () => {
       thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
       lastActivityAt: () => undefined,
       ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
       setTimeoutFn: scheduler.setTimeoutFn,
     });
 
@@ -100,6 +104,7 @@ describe("createPtyIo", () => {
       thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
       lastActivityAt: () => activity,
       ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
       setTimeoutFn: scheduler.setTimeoutFn,
       echoSettleMs: 500,
       submitConfirmWindowMs: 2500,
@@ -117,6 +122,7 @@ describe("createPtyIo", () => {
     const scheduler = makeScheduler();
     const writes: string[] = [];
     let recovered = 0;
+    const marks = createWedgedRecoveryMarks();
     const ptyIo = createPtyIo({
       routing,
       typingIndicator: createTypingIndicator({ send: async () => {} }),
@@ -129,6 +135,7 @@ describe("createPtyIo", () => {
           },
         }),
       },
+      wedgedRecoveryMarks: marks,
       setTimeoutFn: scheduler.setTimeoutFn,
       echoSettleMs: 500,
       submitConfirmWindowMs: 2500,
@@ -144,6 +151,9 @@ describe("createPtyIo", () => {
     scheduler.advance(2500); // second submit-confirm window - gives up and auto-recovers
     expect(writes).toEqual(["\r"]); // never a third \r - "gives up loudly instead"
     expect(recovered).toBe(1);
+    // P0-8: the kill is only half the recovery - without the mark, the dying process's own
+    // `SessionEnd` marks the row dead and `handleUnexpectedExit` refuses to resume it.
+    expect(marks.isRecovering("fix-bug")).toBe(true);
   });
 
   test("sendChannelText wraps the content in a channel tag with an incrementing seq, starts the indicators, and arms confirmSubmitted", () => {
@@ -157,6 +167,7 @@ describe("createPtyIo", () => {
       thinkingPlaceholder: { start: (t) => thinkingStarts.push(t), consume: async () => undefined },
       lastActivityAt: () => Date.now(), // real activity - confirmSubmitted's own retry path stays quiet
       ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
       setTimeoutFn: scheduler.setTimeoutFn,
     });
 
@@ -181,6 +192,7 @@ describe("createPtyIo", () => {
       thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
       lastActivityAt: () => undefined,
       ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
       log: (level, msg) => logs.push(`${level}: ${msg}`),
     });
 
@@ -196,6 +208,7 @@ describe("createPtyIo", () => {
       thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
       lastActivityAt: () => undefined,
       ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
       log: (level, msg) => logs.push(`${level}: ${msg}`),
     });
 

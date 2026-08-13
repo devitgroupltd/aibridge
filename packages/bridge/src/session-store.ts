@@ -156,7 +156,14 @@ const ALLOWED_TRANSITIONS: Record<SessionState, SessionState[]> = {
   starting: ["idle", "dead"],
   idle: ["working", "quota_stopped", "dead"],
   working: ["awaiting_input", "idle", "quota_stopped", "dead"],
-  awaiting_input: ["working", "quota_stopped", "dead"],
+  // `awaiting_input -> idle` was missing until 2026-08-13, on the reasoning that a blocked session
+  // can only ever leave `awaiting_input` through the Bridge resolving the prompt. Found live: a
+  // turn-ending `Stop` arriving here was silently rejected (`maybeSetState` only logs *successful*
+  // writes, so nothing said so), stranding the row at `awaiting_input` an hour past a cancelled
+  // ask - `/ls` misreported it, and two supervisor paths read the stale value. A `Stop` is the
+  // stronger fact of the two: the turn is over, so whatever the session was waiting on is moot,
+  // whichever resolution path did or didn't announce itself first.
+  awaiting_input: ["working", "idle", "quota_stopped", "dead"],
   // §10.5 point 3: a quota stop can hit mid-turn from either signal (the OTLP `api_error` log event
   // or a `StopFailure` hook carrying a rate-limit error) - recoverable back to `working` once the
   // window resets and the operator (or a retried turn) picks the session back up, same as any other

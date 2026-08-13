@@ -695,6 +695,13 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
    * `/model`/`/mode`), so this only confirms that the keystroke was sent, not that a turn was
    * actually in flight to interrupt - sending Escape to an idle session is a harmless no-op.
    *
+   * That "the hook pipeline's job" was only true for a session that was `working`. Interrupting one
+   * that was `awaiting_input` (the case this function's registry-clearing below exists for) left
+   * the row stranded there, because §4.3's table had no `awaiting_input -> idle` edge and
+   * `maybeSetState` rejects silently - so the aborting `Stop` landed and did nothing, and `/ls`
+   * misreported the session for the rest of its life rather than just until the interrupt took
+   * effect. The edge exists now (`session-store.ts`); this function stays hands-off as designed.
+   *
    * DOES clear `permissionRegistry`/`askRegistry` entries for this slug, unlike `sessionStore`
    * above - live-verified 2026-08-09: interrupting a session mid-tool-call abandons the call
    * outright, so a still-pending permission/ask for it never resolves through either registry's

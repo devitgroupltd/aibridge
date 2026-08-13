@@ -120,6 +120,7 @@ describe("PermissionRegistry", () => {
       async (messageId, text) => {
         finalized.push({ messageId, text });
       },
+      () => {},
       () => {
         throw new Error("finalizeMessage should not reject in this test");
       },
@@ -151,10 +152,46 @@ describe("PermissionRegistry", () => {
       },
       async () => {},
       () => {},
+      () => {},
     );
 
     expect(verdictSent).toBe(false);
     expect(registry.get("aaaaa")).toBeDefined();
+  });
+
+  // 2026-08-13, same finding as `sweepExpiredAsks`'s own `onResolved` test: the deny above unblocks
+  // the session, but nothing moved the row off `awaiting_input`, because the only place that did was
+  // the button-tap path. `/ls` then reported a session as blocked on a prompt that had already been
+  // resolved on its behalf.
+  test("sweepExpiredPermissions reports each resolved slug so the row can leave awaiting_input", () => {
+    let now = 0;
+    const registry = new PermissionRegistry({ now: () => now, ttlMs: 1000 });
+    registry.add(entry({ requestId: "aaaaa", slug: "session-a" }));
+    registry.add(entry({ requestId: "bbbbb", slug: "session-b" }));
+
+    const resolved: string[] = [];
+    now = 1500;
+    sweepExpiredPermissions(
+      registry,
+      () => {},
+      async () => {},
+      (slug) => resolved.push(slug),
+      () => {},
+    );
+
+    expect(resolved.sort()).toEqual(["session-a", "session-b"]);
+  });
+
+  test("sweepExpiredPermissions reports no resolved slug when nothing expired", () => {
+    let now = 0;
+    const registry = new PermissionRegistry({ now: () => now, ttlMs: 1000 });
+    registry.add(entry({ requestId: "aaaaa" }));
+
+    const resolved: string[] = [];
+    now = 500;
+    sweepExpiredPermissions(registry, () => {}, async () => {}, (slug) => resolved.push(slug), () => {});
+
+    expect(resolved).toEqual([]);
   });
 
   // §13 check 4 / §6.5's "answered at the terminal" heuristic: no protocol event says a pending
