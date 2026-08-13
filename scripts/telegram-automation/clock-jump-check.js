@@ -57,6 +57,16 @@ const SWEEP_WAIT_MS = 150 * 1000;
 const DEV_BRIDGE = path.join(__dirname, "..", "dev-bridge.sh").replace(/\\/g, "/");
 const log = (m) => console.error(`[${new Date().toISOString()}] ${m}`);
 const ps = (cmd) => execFileSync("powershell", ["-NoProfile", "-Command", cmd], { encoding: "utf8" }).trim();
+/** `VMwareToolboxCmd timesync status` prints its answer and *then* exits nonzero when sync is off,
+ * so a plain `ps()` throws on exactly the healthy case this check wants to see. Reads stdout either
+ * way rather than treating the exit code as the answer. */
+const psAllowFail = (cmd) => {
+  try {
+    return ps(cmd);
+  } catch (err) {
+    return String(err.stdout ?? "").trim();
+  }
+};
 const bridgeRunning = () => execFileSync("bash", [DEV_BRIDGE, "status"], { encoding: "utf8" }).trim().startsWith("running");
 
 /** Relative, never absolute: `-Adjust` preserves the elapsed time of the test itself, so restoring
@@ -67,10 +77,13 @@ const shiftClock = (hours) => ps(`Set-Date -Adjust (New-TimeSpan -Hours ${hours}
   const hoursArg = process.argv.indexOf("--hours");
   const HOURS = hoursArg >= 0 ? Number(process.argv[hoursArg + 1]) : 2;
 
-  if (ps("[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('Administrator')") !== "True") {
+  // `S-1-5-32-544` (the builtin Administrators SID), never `IsInRole('Administrator')` - the string
+  // form is not the builtin role name and returns False even in an elevated shell, which had this
+  // check refusing to run on a session that was in fact elevated.
+  if (ps("[Security.Principal.WindowsPrincipal]::new([Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole('S-1-5-32-544')") !== "True") {
     throw new Error("Set-Date needs an elevated shell - rerun as administrator");
   }
-  if (ps(`$c="C:\\Program Files\\VMware\\VMware Tools\\VMwareToolboxCmd.exe"; if (Test-Path $c) { & $c timesync status } else { "absent" }`) === "Enabled") {
+  if (psAllowFail(`$c="C:\\Program Files\\VMware\\VMware Tools\\VMwareToolboxCmd.exe"; if (Test-Path $c) { & $c timesync status } else { "absent" }`) === "Enabled") {
     throw new Error("VMware Tools time sync is Enabled - it would snap the clock back mid-measurement; disable it or this check proves nothing");
   }
   if (!bridgeRunning()) throw new Error("the Bridge is not running - start it first");

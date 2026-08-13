@@ -4294,7 +4294,9 @@ with no battery, `powercfg /a` reports S3/hibernate/S0-low-power-idle all unsupp
 a lid exists. The VM runs on a laptop, so closing the **host's** lid does suspend it - the check is
 triggerable, just not from in here, and what reaches the guest is a clock discontinuity rather than
 an S-state. Its scriptable half (a pending prompt must survive a large wall-clock jump) is
-`scripts/telegram-automation/clock-jump-check.js`. 8 needs a BotFather token revocation, but only to confirm the revocation *itself* behaves as
+`scripts/telegram-automation/clock-jump-check.js`, **run 2026-08-13 and passing**; what remains
+unmeasured there is the *backward* direction a suspend actually produces, which breaks stale-inbound
+rather than the TTL registries (see check 2). 8 needs a BotFather token revocation, but only to confirm the revocation *itself* behaves as
 assumed and that recovery works - everything it causes is now checked on every run (see check 8). 5's
 remaining paths need a second repo registered, which is itself a Phase 6b trigger (see check 5).
 Checks 4, 6, 7 and now most of 8 were all specified as manual and turned out to be automatable, so the
@@ -4308,7 +4310,43 @@ otherwise - and where one step is, the rest of the check usually is not.
    minute after desktop login - process-level cross-check confirmed the Bridge PID's start time matched
    the task's own `Last Run Time`, not a manually-started process.
 2. **Sleep and resume.** Close the lid for 30 minutes with a session mid-turn. On resume, the topic
-   shows an accurate state and no phantom pending prompts.
+   shows an accurate state and no phantom pending prompts. **Scriptable half done 2026-08-13 and
+   passing** - `scripts/telegram-automation/clock-jump-check.js`; the suspend itself stays manual,
+   for a hardware reason rather than an automation one.
+
+   This host cannot enter the state the check describes: a VMware guest, no battery, `powercfg /a`
+   reporting S3, hibernation and S0 Low Power Idle all unsupported (only S1), and no lid-close action
+   published in the buttons/lid power subgroup, which Windows only publishes when a lid exists. The
+   VM does run on a laptop, so closing the **host's** lid suspends it - the check is triggerable, just
+   never from inside the guest, and no script living in here can cause it.
+
+   What actually reaches the guest is not an S-state transition but a **clock discontinuity**, which
+   is the only part of a suspend the Bridge is exposed to - `monotonic-clock.ts` names "a laptop
+   sleep/resume, an NTP correction, or a manual clock change" as one hazard with three causes. So the
+   check's real content is testable without any power transition, and is:
+   `RESULT|cardBefore=true|survivedJump=true|resolvable=true|PASS`. A real `ask` permission card was
+   raised, the clock jumped +2h, two full 60s sweeps ran, and the card was still live with no
+   "expired" text - then tapping Allow still resolved it and the commit went through, which is what
+   proves the registry *entry* survived rather than just the rendered message. Feasible here because
+   this guest's clock is free-running (`VMwareToolboxCmd timesync status` **Disabled**, `w32time`
+   **Stopped**), so nothing snaps the jump back mid-measurement; re-check that before running it
+   anywhere else.
+
+   Verified to fail for the right reason: mutating `permission-registry.ts`'s
+   `opts.now ?? monotonicNowMs` to `?? Date.now` is caught by this check and by nothing else - all 118
+   permission-registry and session-lifecycle tests still pass with the mutation in place, because ten
+   of them do use the default clock but none spans a wall-clock jump, where the two are
+   indistinguishable.
+
+   **Still unmeasured, and it points the opposite way.** A suspended VM's clock stops, so on resume
+   guest wall time is *behind* real time by the suspend duration unless something resyncs it. §7.4
+   only reasons about a **forward** jump mass-expiring prompts (what the above covers). A guest clock
+   running **slow** breaks `stale-inbound.ts` instead, which compares Telegram's server-set
+   `message.date` against local wall time: genuinely old commands then look fresh and execute - the
+   exact surprise §7.4 exists to prevent, by a route §7.4 does not describe, and check 3 cannot catch
+   it because check 3 keeps the clock honest. Whether the lag survives resume depends on VMware's
+   one-shot resume sync, a host-side `.vmx` setting this guest cannot read. Measure guest clock
+   against real time on the next real lid close.
 3. ~~**Stale command.** Send "push it" while the machine is asleep. On resume it is confirmed, not
    executed.~~ **Done 2026-08-13, automated rather than manual, and it found a real defect** -
    `scripts/telegram-automation/stale-command-check.js`.

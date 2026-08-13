@@ -56,7 +56,10 @@ and a *stopped Bridge* produces the same backlog; running it found a real defect
 stale replay can be swallowed by the NL router's `help` classification and never reach the session -
 see §13 check 3, fix not yet chosen). Check 2 cannot be driven from inside this host at all: it is a
 VMware guest with no lid and no S3/modern-standby, though the VM runs on a laptop so the *host's* lid
-still suspends it; its scriptable half is `clock-jump-check.js`. 8 needs a BotFather revocation, but now
+still suspends it; its scriptable half (`clock-jump-check.js`) **passes** - a pending permission card
+survives a +2h wall-clock jump and still resolves. What no automation covers is the *backward* skew a
+real suspend leaves behind, which would break stale-inbound rather than the TTL registries (§13 check
+2). 8 needs a BotFather revocation, but now
 only to confirm the revocation itself 401s as assumed and that recovery works, since everything it
 *causes* is checked on every run; and 5's remaining paths need SeoWrite registered in `repos.toml`,
 which is itself one of §12's three named Phase 6b triggers. Note that checks 4, 6, 7 and most of 8 were
