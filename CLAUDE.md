@@ -24,9 +24,19 @@ prompts-per-hour showing an uncomfortably broad allowlist, or registering a repo
 Do not treat it as an open task on a calendar; re-read §12's 6b section when a trigger actually fires.
 [`plans/codebase-hardening-plan.md`](plans/codebase-hardening-plan.md) has its whole 2026-08-09 audit
 closed out (P0-1–P0-6, P1-1–P1-8, P2-1–P2-6), plus P0-7/P1-9 (2026-08-12) and
-P1-10/P0-8/P1-11/P1-12 (2026-08-13); its **## Open findings** section is currently empty. Outstanding work is therefore
-§13's manual verification checks 2, 3, 5, 7 and 8 — the ones automated tests cannot cover — plus a
-few built-but-never-live-exercised paths named in §12.
+P1-10/P0-8/P1-11/P1-12 (2026-08-13). Its **## Open findings** section holds two unfixed items, both
+found on 2026-08-13 while running §13's manual checks: **P1-13** (two concurrent `/new` deriving the
+same slug race past the uniqueness check, leaving an untracked `claude` process holding a worktree
+that `/remove` then cannot delete) and **P2-7** (a long `/new` prompt delivered with its middle
+missing — observed once, undiagnosed).
+
+Outstanding verification work is §13's checks **2, 3, 5(a)/(b)/(d) and 8** — checks 5(c), 6 and 7 were
+run and recorded on 2026-08-13 — plus a few built-but-never-live-exercised paths named in §12. None of
+those four is blocked on more automation: 2 and 3 need a real 30-minute sleep, 8 needs a BotFather
+token revocation, and 5's remaining paths need SeoWrite registered in `repos.toml`, which is itself one
+of §12's three named Phase 6b triggers. Note that checks 4, 6 and 7 were all specified as manual and
+turned out to be scriptable, so assume a check *is* automatable until a physical or credential-level
+step proves otherwise.
 
 ## What this project is
 
@@ -71,9 +81,25 @@ boundary as `scripts/dev-bridge.sh`).
 - `check-topic.js "<substring>" [count]` — reads the last N messages from a session's own topic.
 - `send-to-topic.js "<substring>" "<message>"` — sends into a session's own topic (not the control
   topic) and prints what comes back; `send-command.js` only covers the control topic.
+- `guardrail-check.js` — §13 check 5(c): a normal feature-branch commit must raise a real button
+  rather than just committing. Also the quickest way to see what is genuinely in a session's topic,
+  buttons included.
+- `sandbox-check.js` — §13 check 7, and the acceptance test Phase 6b must flip. Currently records an
+  **expected** failure: the permission layer refuses `cat`, a script the session writes itself reads
+  the file anyway, proven by a digest matching one computed on the host beforehand.
 - `list-topics.js`, `inspect-last-message.js`, `inspect-topic.js`, `tap-button.js`,
   `tap-topic-button.js` — narrower inspection/interaction helpers; read before writing a new one-off
   script, most needs are already covered.
+- **Three traps this rig has now hit repeatedly — read `client.js`'s doc comments before writing a
+  check, they are all recorded there.** (1) `openTopic` matches a chatlist row *including its
+  last-message preview*, so it will happily open the control topic when you meant a session's; use
+  `openTopicByTitle`. (2) Web K renders emoji as `<img>` sprites, so neither message text nor button
+  labels contain them — matching `"✅ Allow"` finds nothing, ever; use `buttonByLabel` with the bare
+  word. (3) Never use `getMessageCount` as a "did a reply arrive" baseline: Web K prunes bubbles that
+  scroll out of view, so the count can *fall* while a reply lands (measured 35 → 36 → 32). Use
+  `getMaxMessageId` + `waitForMessagesAfter`. Each of these silently converted a real result into a
+  confident wrong one, and (1) and (2) together had left check 6's permission half measuring nothing
+  at all while printing `FAIL` on every run.
 - For anything not covered by an existing script (e.g. checking Telegram's native command-autocomplete
   popup), write a small one-off script in this folder that reuses `client.js` rather than declaring the
   check impossible — a real, already-logged-in browser profile is sitting right there.

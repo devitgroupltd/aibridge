@@ -1,8 +1,30 @@
 ---
-version: 1.10.0
+version: 1.11.0
 status: solid
-last_modified_utc: 2026-08-13T09:30:00Z
+last_modified_utc: 2026-08-13T11:15:00Z
 changelog:
+  - "1.11.0 (2026-08-13): reopens with two findings, both surfaced while running §13's remaining
+    manual checks rather than by reading code. **P1-13**: `handleNewCommand` computes
+    `uniqueSlug(base, sessionStore.slugs())` at `session-lifecycle-commands.ts:381` but inserts the row
+    at 493, with `createForumTopic` and all of `launchSession` awaited in between - so two concurrent
+    `/new` deriving the same base slug both pass a uniqueness check against state neither has written
+    yet, both cut a worktree and spawn `claude`, and the loser's `insert` throws
+    `UNIQUE constraint failed: sessions.slug` as an unhandled rejection the operator never sees.
+    Measured consequences: two processes and two channel servers on one slug, `routing.add`/
+    `wireSession` called twice, the untracked process surviving `/kill` for 18 minutes and needing a
+    PID-level kill, and - because it held its directory open - `removeWorktree` failing
+    (`is not a working tree`) and every later `/new` for that slug failing at launch, poisoning the slug
+    until hand cleanup. Fix direction is a synchronous in-flight slug reservation before the first
+    `await`, plus a `try/catch` that tells the operator and tears down the half-built session. Reached
+    by an ordinary double-tap on send, not just by the multi-line-paste accident that found it.
+    **P2-7**: a ~1200-character `/new` prompt reached its session with the middle missing (beginning
+    and end intact - the shape of a dropped chunk, not a length cap); the same prompt at ~450
+    characters was delivered intact. One observation, not diagnosed, recorded with the next
+    instrumentation step rather than chased. Neither is fixed here. Also records what the same session
+    established on the verification side, in the main plan: §13 check 7 is now an expected-FAIL with a
+    host-computed digest as proof, check 5(c) passes, and check 6's permission half - plus a
+    count-based arrival baseline shared by the whole Telegram rig - had been reporting verdicts it never
+    earned since the day each was written."
   - "1.10.0 (2026-08-13): P1-12, found by live-verifying P1-11's own fix hours after shipping it, and fixed the same day. `/stop` deliberately wrote no state, on the documented reasoning that `Stop`/`StopFailure` would move the row once Claude aborted the turn. Measured against two real sessions: **an operator interrupt emits no `Stop`/`StopFailure` hook at all** - a `/stop` mid-turn left the row `working` with no subsequent hook of any kind, and a `/stop` on a permission card left it `awaiting_input` for the ~3 minutes between the interrupt clearing the last pending prompt and an unrelated operator message happening to arrive (`/ls` reporting \"waiting: reply\" throughout, for a session waiting on nothing). So every `/stop` stranded its session in whatever state it was interrupted from, on the most routine intervention the operator has. P1-11's new `awaiting_input -> idle` edge did not help alone - an edge only helps if something crosses it, and this fix is its first real caller. `handleStopCommand` now asserts the resting state, gated on `working`/`awaiting_input` so a stray `/stop` can't erase a `quota_stopped` row's rate-limit signal or claim a `starting` session is idle, and calls `stopIndicatorsForTopic` for the same root cause (the abandoned turn's \"Thinking...\" placeholder was left spinning indefinitely, observed live). 9 new tests (1778/1778), each verified to fail against a re-broken copy in both directions - write removed, then gate removed - and the harness's `maybeSetState` fake was made to write through `isValidTransition` rather than record calls, since a record-only spy would have passed throughout the period the edge was missing. Second half of the same finding: `/stop` also cleared pending *permission* entries without a verdict, on a 2026-08-09 note that generalized from the ask path (where an Escape really does release the blocked hook client) to the permission path (where the block is inside the session's own channel server and only a verdict releases it) - and since `/stop` removes the registry entry, `sweepExpiredPermissions` could never fire for it either, reaching exactly the \"no recovery path at all\" outcome `drainPendingPermissions`' comment warns about via the one caller it exempted. Measured: a session `/stop`ped over a permission card and then sent nothing stayed silent for 8 minutes. `/stop` now sends `deny`; asks stay verdict-free and that asymmetry is stated in both comments. **Both halves live-verified against the real Bridge after the fix**, in the same daemon that had stranded three sessions an hour earlier: `awaiting_input -> idle` with the deny releasing the blocked call 685ms later (against 8 minutes of silence pre-fix), and `working -> idle` (against 39 minutes stranded pre-fix). Records the general rule this pass earned: **verify the traversal, not just the path** - a unit test proving an edge works supplies the traversal itself, so it cannot notice that nothing real ever crosses it."
   - "1.9.0 (2026-08-13): P0-8 fixed, and a second finding (P1-11) found and fixed alongside it - both the same shape, *the Bridge acted and did not tell the state machine*. **P0-8**: `recoverWedgedPty` now records a TTL-bounded per-slug recovery mark immediately before `kill()` (never after - the dying process's `SessionEnd` reached the pipe 33ms behind the kill live, so a mark written afterwards loses that race just as reliably as no mark), and `feed-wiring.ts` skips *only the state write* for a `SessionEnd` inside that window; the event still renders, because it is true - the process did exit - and what was wrong was the conclusion \"therefore this session is over\", not the report. Suppressed rather than undone, since `dead` is terminal and a row allowed to reach it cannot be walked back. The mark clears on the successor's `SessionStart`, and otherwise expires at 30s so a recovery that quietly never happened cannot leave a dead session showing as live forever. **P1-11**, found while confirming §6.4's one-hour ceiling (which itself passed - card edited in place, hook genuinely unblocked): the row sat at `awaiting_input` an hour past the cancel, because §4.3's table had no `awaiting_input -> idle` edge, so the turn-ending `Stop` was rejected *silently* (`maybeSetState` only logs writes that land), and because three of the four Bridge-side resolution paths never made the `maybeSetState(..., \"working\")` call the button-tap path always has. Both halves fixed: three misses out of four paths is the argument for a backstop, not just for patching the sites. 22 new tests (1769/1769), every one of them run against a deliberately re-broken copy of its own fix first - six reversions, six confirmed failures - because both findings are ordering bugs whose tests are otherwise free to pass for the wrong reason."
   - "1.8.0 (2026-08-13): two findings from running the last of §12's never-live-exercised checks. **P1-10 (found and fixed)**: `/attach` produced nothing at all the first time it ran against a real multi-line PTY tail - the rendered card passed Telegram's 4096-unit cap, the P1 send failed three times with \"message is too long\", and a failed command confirmation is only a log line, so the operator saw silence. The raw ring buffer is bounded at 4000 chars but `renderAttach` HTML-escapes it afterwards and PTY output is dense in `<`, `>` and `&`, each expanding 4-5x; the fix bounds the *rendered* message instead, trimming the escaped tail from the front and never through an entity (a half-cut `&amp;` would swap the error for \"can't parse entities\"), with a visible trimmed-to-fit marker. 5 new tests. **P0-8 (found, not fixed - see ## Open findings)**: `wedged-recovery.ts` kills a wedged session expecting the crash-resume path to relaunch it, but the killed process runs its own `SessionEnd` hook on the way out, which marks the row `dead` 33ms later, and `resumeSession` then correctly refuses to resume a dead row - the session stays dead and the operator's next messages are dropped with only a WARN. That module's doc comment reasons carefully about not untracking the PTY and misses that a deliberate kill runs hooks a real crash never gets to run. Recorded in the main plan rather than here: quiet mode and `quota_stopped` both live-exercised for the first time, plus the structural reason a tool-heavy storm does not trip quiet mode while a turn-heavy one does - the coalescer's interval scaling holds card edits at the feed budget by design, so it is per-turn card creates and details anchors that exceed it."
@@ -266,11 +288,80 @@ some event actually traverses it, and no event does here. The general form: **a 
 path is only verified when something is observed taking that path**, which a unit test asserting the
 edge exists cannot show, because it supplies the traversal itself.
 
+Later the same day, running §13's remaining manual checks reopened this document with **P1-13** and
+**P2-7**, and produced a companion lesson about the checks themselves rather than about the Bridge.
+Four separate defects were found in the Telegram-automation rig, and every one of them had been
+reporting a verdict it had not earned since the day it was written: check 6's permission half printed
+`FAIL: no permission card appeared` against cards that were on screen (three independent causes, none
+in the Bridge), and `getMessageCount` — used as the arrival baseline by every script in the folder —
+went 35 → 36 → **32** while a reply landed, because Web K prunes bubbles it has scrolled past. That
+last one briefly read as a wedged daemon and was only settled by proving the Bridge had *executed* a
+command whose reply the rig claimed never arrived.
+
+So the shape to look for on the verification side is the mirror of the Bridge-side one above: **the
+check ran, and measured nothing.** It is strictly more dangerous than a check that is missing, because
+a red result looks like a finding and a green one looks like coverage. The discipline that catches it
+is the same one this document already applies to fixes — deliberately break the thing under test and
+confirm the check notices — and it is worth applying to the rig, not just to `bun test`. Check 7's own
+run is the case in point: it first returned `refused|failed|none`, which reads exactly like the Phase
+6b acceptance criterion, and was in fact Claude Code's safety classifier declining to run the script
+before it ever reached the filesystem. Scoring that as a pass would have retired the check while the
+thing it exists to measure stayed untested.
+
 ---
 
 ## Open findings
 
-_(None. **P0-8**, **P1-11** and **P1-12**, all found live on 2026-08-13, were fixed the same day —
+- **P1-13 — two concurrent `/new` commands that derive the same slug race past the uniqueness check,
+  and the loser survives as an untracked `claude` process holding a worktree directory nothing can
+  clean up.** Found live 2026-08-13, accidentally: a multi-line prompt typed into Telegram's composer
+  posts one message per line (newline is Enter, Enter sends), two of those lines each parsed as their
+  own `/new`, and both derived the same base slug from the same opening words.
+
+  `handleNewCommand` computes `uniqueSlug(base, sessionStore.slugs())` at
+  `session-lifecycle-commands.ts:381` but only inserts the row at line 493 — with
+  `createForumTopic` and the whole of `launchSession` awaited in between. The uniqueness check is
+  therefore a read against state that the winner has not written yet, so both callers pass it and
+  both proceed to cut a worktree and spawn a `claude` process under the same slug. The second
+  `sessionStore.insert` then throws `UNIQUE constraint failed: sessions.slug` as an **unhandled
+  rejection** — logged, but never surfaced to the operator, who sees one confirmation and assumes one
+  session.
+
+  What it actually left behind, measured: two `claude` processes and two channel servers on one slug;
+  `routing.add`/`wireSession` called twice so the routing table points at whichever PTY ran second;
+  the tracked process killed by `/kill` while **the untracked one stayed alive for 18 minutes** and
+  had to be found by `CommandLine` match and killed by PID; and — because that orphan held its
+  directory open — `/remove`'s `removeWorktree` failing with
+  `fatal: '...' is not a working tree`, then every later `/new` for that slug failing at launch
+  (`ERROR launch failed for "sbx-..."`) because the directory still existed. So one racing pair
+  poisons that slug until someone cleans up by hand.
+
+  Fix direction: reserve the slug synchronously, before the first `await`. An in-memory
+  `Set<string>` of in-flight slugs, added to immediately after `uniqueSlug` and cleared in a
+  `finally`, passed to `uniqueSlug` as additional taken names, closes the window without a schema
+  change — the insert stays as the durable record, this just stops two callers agreeing on a name.
+  Independently, `handleNewCommand`'s body wants a `try/catch` that tells the operator and tears down
+  the half-built session, since an unhandled rejection here is how a live orphan becomes invisible.
+  Worth a test that drives two concurrent `handleNewCommand` calls with the same prompt and asserts
+  one confirmation, one row, one PTY.
+
+  Not urgent for a single operator sending one command at a time, which is why it has survived — but
+  it is reachable from an ordinary double-tap on send, or a retry after a slow confirmation, and its
+  failure mode is a live process nothing is tracking.
+
+- **P2-7 — a long single-line prompt reached a session with its middle missing.** Observed once,
+  2026-08-13, not diagnosed. A ~1200-character `/new` prompt produced a session that replied "Your
+  message came through truncated — I'm missing step 1 entirely and the source of the bytes for step
+  2": it had the beginning and the end but not the middle, which is the shape of a dropped chunk
+  rather than a length cap. The same prompt cut to ~450 characters was delivered intact and the
+  session completed the task. Recorded rather than chased because it is a single observation and the
+  delivery path (a PTY keystroke write, not a Telegram send) has several plausible chunking points;
+  the next step is to instrument `pty-io.ts`'s write path and re-send a long prompt with a
+  position-marked body so a gap can be located exactly rather than inferred from Claude noticing it.
+  Until then, treat prompt length as a live constraint — `scripts/telegram-automation/sandbox-check.js`
+  carries a comment saying so.
+
+_(**P0-8**, **P1-11** and **P1-12**, all found live on 2026-08-13, were fixed the same day —
 see **## Resolved**. P0-8 as originally filed is kept below for its reasoning.)_
 
 <details>
