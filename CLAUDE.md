@@ -2,7 +2,7 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
-## Status: implemented through Phase 5, hardening ongoing
+## Status: implemented through Phase 6a; only the WSL2 migration (6b) is unbuilt
 
 The full design document,
 [`plans/telegram-claude-session-control-plan.md`](plans/telegram-claude-session-control-plan.md), is
@@ -11,13 +11,24 @@ Overview, §2 Architecture, §7.5, §9, and §12 Phases) before touching related
 summarizes it; it does not replace it. When the plan and this file disagree, the plan wins and this
 file is stale.
 
-Current position in the roadmap (§12): Phases 1-5 are implemented (`packages/bridge`,
-`packages/channel-server`, `packages/hook-client`, `packages/protocol`, `packages/stub-telegram`) —
-the `getUpdates` loop, the pipe protocol, fleet commands, the session supervisor with crash-resume,
-deploy/voice/NL-router support, and the Telegram-automation live-verification rig are all real and
-covered by `bun test` (see `Commands` below). Phase 6 (WSL2 migration) has not been started. See
-[`plans/codebase-hardening-plan.md`](plans/codebase-hardening-plan.md) for the current
-cleanup/hardening backlog against this implementation.
+Current position in the roadmap (§12): Phases 1-5 **and 6a** are implemented and live-verified
+(`packages/bridge`, `packages/channel-server`, `packages/hook-client`, `packages/protocol`,
+`packages/stub-telegram`) — the `getUpdates` loop, the pipe protocol, fleet commands, the session
+supervisor with crash-resume, deploy/voice/NL-router support, the full §4.5 reconciliation matrix,
+autostart, stale-inbound/monotonic timers, quiet mode, and the Telegram-automation live-verification
+rig are all real and covered by `bun test` (see `Commands` below).
+
+**Phase 6b, the WSL2 migration, is the only unbuilt phase**, and it is deferred deliberately (§12,
+0.56.0) until one of its three named triggers fires — wanting unattended overnight runs,
+prompts-per-hour showing an uncomfortably broad allowlist, or registering a repo other than this one.
+Do not treat it as an open task on a calendar; re-read §12's 6b section when a trigger actually fires.
+[`plans/codebase-hardening-plan.md`](plans/codebase-hardening-plan.md) has its whole 2026-08-09 audit
+closed out (P0-1–P0-6, P1-1–P1-8, P2-1–P2-6), plus P0-7/P1-9 (2026-08-12) and P1-10 (2026-08-13);
+its **## Open findings** section currently holds one item, **P0-8** — a wedged session is killed for
+a crash-resume that never happens, because the killed process's own `SessionEnd` hook marks the row
+dead first. Outstanding work is therefore that, plus §13's manual
+verification checks 2, 3, 5, 7 and 8 — the ones automated tests cannot cover — plus a few
+built-but-never-live-exercised paths named in §12.
 
 ## What this project is
 

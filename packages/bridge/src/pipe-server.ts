@@ -24,9 +24,9 @@ import { isImagePath, resolveOutboxPath } from "./outbox.ts";
 import { buildPermissionKeyboard, renderPermissionCard } from "./permission-callback.ts";
 import { PermissionRegistry, type PendingPermissionRequest } from "./permission-registry.ts";
 import type { RateGovernor } from "./rate-governor.ts";
-import { extractBashCommand } from "./rule-derivation.ts";
+import { extractBashCommand, isCoveredByBareToolRule } from "./rule-derivation.ts";
 import { scrubSecrets } from "./secret-scrub.ts";
-import { readSettingsFile } from "./settings.ts";
+import { readSettingsFile, type PermissionSettings } from "./settings.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import type { Routing } from "./routing.ts";
 import type { SendMessageSource } from "./telegram.ts";
@@ -579,16 +579,41 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
     // touches Claude Code's own evaluation, and never fires for anything the decomposer can't
     // fully account for (metacharacters it refuses to guess through, a sensitive path anywhere in
     // the raw string, or a sub-command not already covered by this session's own allow list).
-    if (opts.stateDir && msg.tool_name === "Bash") {
-      const command = extractBashCommand(msg.input_preview);
-      if (command) {
-        const settings = readSettingsFile(opts.stateDir, msg.slug);
-        if (isCompoundCommandFullyAllowed(command, settings, WIDENED_AUTO_APPROVE_PREFIXES)) {
+    if (opts.stateDir) {
+      // One read serving both shortcuts below. Re-read per request on purpose: it is what makes an
+      // `♾️ Always` tap take effect at all, since the running Claude Code process does not act on a
+      // rule appended to its `--settings` mid-conversation (measured live 2026-08-12, §12 Phase 2).
+      //
+      // Guarded because this read moved onto *every* permission request when the non-Bash branch
+      // was added (it used to run only for a Bash call with a parseable preview): a settings file
+      // truncated mid-write would otherwise throw here and take the operator's card with it, on a
+      // path whose entire job is to make sure a card appears. Failing to read means falling through
+      // to the normal card - never toward an auto-approval.
+      let settings: PermissionSettings | null = null;
+      try {
+        settings = readSettingsFile(opts.stateDir, msg.slug);
+      } catch (err) {
+        log("WARN", `could not read settings for slug "${msg.slug}" - posting the permission card unshortcut: ${(err as Error).message}`);
+      }
+      if (settings !== null) {
+        const command = msg.tool_name === "Bash" ? extractBashCommand(msg.input_preview) : null;
+        if (command !== null && isCompoundCommandFullyAllowed(command, settings, WIDENED_AUTO_APPROVE_PREFIXES)) {
           log("INFO", `auto-approved compound Bash for slug "${msg.slug}" - every sub-command already allowed: ${command}`);
           // Brought up to the same observability standard as the toggle above while in this
           // function: this shortcut has always been server-log-only, with no Telegram-visible trace
           // of what the Bridge approved on the operator's behalf.
           postAutoApprovedNote(route.topicId, `🔓 auto-approved (every sub-command already allowed): ${describeCall(msg.tool_name, msg.input_preview)}`);
+          sendVerdict(msg.slug, msg.request_id, "allow");
+          return;
+        }
+        // P0-7, the non-Bash half of the same idea: this session's allow list already carries this
+        // tool's bare name - almost always because the operator tapped `♾️ Always` on an earlier card
+        // for it - so re-asking is the bug, not the safety. `isCoveredByBareToolRule` refuses whenever
+        // any deny/ask entry mentions the tool at all, so this cannot outrank either list; see its
+        // doc comment for why that conservatism leaves `Edit`/`Read` still prompting.
+        if (isCoveredByBareToolRule(msg.tool_name, msg.input_preview, settings)) {
+          log("INFO", `auto-approved ${msg.tool_name} for slug "${msg.slug}" - already allow-listed for this session: ${msg.input_preview}`);
+          postAutoApprovedNote(route.topicId, `🔓 auto-approved (already allowed for this session): ${describeCall(msg.tool_name, msg.input_preview)}`);
           sendVerdict(msg.slug, msg.request_id, "allow");
           return;
         }

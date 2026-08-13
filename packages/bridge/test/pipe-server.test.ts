@@ -1282,6 +1282,120 @@ describe("startPipeServer", () => {
     });
   });
 
+  // codebase-hardening-plan.md P0-7, the non-Bash half of the same shortcut. Measured live
+  // 2026-08-12: a running session does not act on a rule appended to its `--settings` file
+  // mid-conversation, so an `♾️ Always` tap on a `Write` card wrote the rule and then raised a fresh
+  // card on the very next `Write`. `Bash` never showed the bug only because the compound path above
+  // re-reads that file per request; this branch gives every other tool the same treatment.
+  describe("bare tool-name auto-approval (P0-7)", () => {
+    async function runPermissionRequest(opts: { extraAllow?: string[]; toolName: string; inputPreview: string; withStateDir?: boolean }) {
+      const { writeSettingsFile, generateSettings } = await import("../src/settings.ts");
+      const path_ = pipePath();
+      const routing = new Routing();
+      routing.add({ slug: "test-session", topicId: 3, worktreePath: "x" });
+      const stateDir = await fsPromises.mkdtemp(path.join(os.tmpdir(), "aibridge-pipe-bare-"));
+      const settings = generateSettings();
+      writeSettingsFile(stateDir, "test-session", {
+        ...settings,
+        permissions: { ...settings.permissions, allow: [...settings.permissions.allow, ...(opts.extraAllow ?? [])] },
+      });
+      const sendMessageCalls: string[] = [];
+      const controlBot: SendMessageSource = {
+        sendMessage: async (_chatId, _threadId, text) => {
+          sendMessageCalls.push(text);
+          return { message_id: 1 };
+        },
+      };
+
+      const handle = startPipeServer({
+        pipePath: path_,
+        routing,
+        controlBot,
+        chatId: "-1",
+        ...(opts.withStateDir === false ? {} : { stateDir }),
+      });
+      servers.push(handle.server);
+      await waitFor(() => handle.server.listening);
+
+      const { socket, received } = connectClient(path_);
+      await waitFor(() => socket.readyState === "open");
+      socket.write(encodeMessage({ v: PROTOCOL_VERSION, type: "hello", role: "channel", slug: "test-session", pid: 1 } satisfies HelloFromChannel));
+      await waitFor(() => received.some((m) => m.type === "hello_ack"));
+
+      socket.write(
+        encodeMessage({
+          v: PROTOCOL_VERSION,
+          type: "permission_request",
+          slug: "test-session",
+          request_id: "req-bare",
+          tool_name: opts.toolName,
+          description: "do a thing",
+          input_preview: opts.inputPreview,
+        } satisfies PermissionRequestMessage),
+      );
+
+      await waitFor(() => received.some((m) => m.type === "verdict") || sendMessageCalls.length >= 1);
+      return { received, sendMessageCalls };
+    }
+
+    test("a Write already allow-listed for this session is auto-approved - a verdict, not a second card", async () => {
+      const { received, sendMessageCalls } = await runPermissionRequest({
+        extraAllow: ["Write"],
+        toolName: "Write",
+        inputPreview: JSON.stringify({ file_path: "c:\\data\\worktrees\\x\\notes.txt", content: "hi" }),
+      });
+
+      expect(received.find((m) => m.type === "verdict")).toMatchObject({ request_id: "req-bare", behavior: "allow" });
+      // Same observability contract as the two shortcuts above: no card, but a visible one-liner
+      // recording what the Bridge approved on the operator's behalf.
+      expect(sendMessageCalls.length).toBe(1);
+      expect(sendMessageCalls[0]).toContain("auto-approved");
+      expect(sendMessageCalls[0]).toContain("already allowed for this session");
+    });
+
+    test("a Write that was never allow-listed still posts a normal card", async () => {
+      const { received, sendMessageCalls } = await runPermissionRequest({
+        toolName: "Write",
+        inputPreview: JSON.stringify({ file_path: "c:\\data\\worktrees\\x\\notes.txt" }),
+      });
+
+      expect(received.some((m) => m.type === "verdict")).toBe(false);
+      expect(sendMessageCalls.length).toBe(1);
+      expect(sendMessageCalls[0]).toContain("wants to run");
+    });
+
+    test("an Edit still posts a card even once allow-listed - the baseline's scoped Edit deny rules win", async () => {
+      const { received } = await runPermissionRequest({
+        extraAllow: ["Edit"],
+        toolName: "Edit",
+        inputPreview: JSON.stringify({ file_path: "c:\\data\\worktrees\\x\\src\\a.ts" }),
+      });
+
+      expect(received.some((m) => m.type === "verdict")).toBe(false);
+    });
+
+    test("a sensitive path is never auto-approved, even for an allow-listed tool", async () => {
+      const { received } = await runPermissionRequest({
+        extraAllow: ["Write"],
+        toolName: "Write",
+        inputPreview: JSON.stringify({ file_path: "~/.ssh/authorized_keys" }),
+      });
+
+      expect(received.some((m) => m.type === "verdict")).toBe(false);
+    });
+
+    test("with no stateDir configured it falls through to a normal card, same as the Bash shortcut", async () => {
+      const { received } = await runPermissionRequest({
+        extraAllow: ["Write"],
+        toolName: "Write",
+        inputPreview: JSON.stringify({ file_path: "c:\\data\\worktrees\\x\\notes.txt" }),
+        withStateDir: false,
+      });
+
+      expect(received.some((m) => m.type === "verdict")).toBe(false);
+    });
+  });
+
   // §13 check 4, found live 2026-08-06: the §6.5 terminal-answer heuristic can call
   // finalizePermissionMessage under a second after the card's own sendMessage, and the real
   // Telegram Bot API intermittently 400s that fast an edit with "message to edit not found"

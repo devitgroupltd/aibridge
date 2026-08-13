@@ -1,7 +1,7 @@
 ---
-version: 0.107.0
+version: 0.110.0
 status: solid
-last_modified_utc: 2026-08-12T12:16:36Z
+last_modified_utc: 2026-08-13T06:30:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,70 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.110.0 (2026-08-13): ran the four remaining never-live-exercised paths named in §12, on the
+    operator's instruction to close them all out. Two passed as designed and are now recorded as
+    live-verified: **quiet mode** (`⚠️ feed throttled, 5 sessions active` posted mid-storm, behind
+    ~130 real P2 drops) and **`quota_stopped`** (driven end to end by a synthetic
+    `claude_code.api_error` OTLP record against the real listener - only the upstream source was
+    faked, and the one thing that substitution still cannot establish is called out). Two turned up
+    defects. **`/attach` was broken**: against a real PTY tail the rendered card passed Telegram's
+    4096-unit cap, the send failed three times and the operator saw nothing at all - fixed by
+    bounding the rendered message instead of the raw buffer (`codebase-hardening-plan.md` P1-10).
+    And forcing the feed storm surfaced **P0-8**, unrelated to the storm itself: a wedged session is
+    killed for a crash-resume that never comes, because the killed process's own `SessionEnd` hook
+    marks the row dead 33ms first - filed with its measured sequence, not yet fixed. §9's scenario
+    list gained **29a** (inbound arrives by PTY injection, not notification) and scenario 29's
+    wording now names that asymmetry instead of assuming the abandoned path; §10.1.2's item (a) is
+    struck as moot since the 0.55.0 plugin cutover deleted the `.mcp.json` path it described.
+    Recorded in §12 alongside the quiet-mode result: the structural reason a tool-heavy storm does
+    *not* trip quiet mode while a turn-heavy one does, since that is the non-obvious half anyone
+    reasoning about feed load will need."
+  - "0.109.0 (2026-08-12): the §12 Phase 2 defect measured in 0.108.0 is fixed, same evening
+    (`codebase-hardening-plan.md` P0-7). `rule-derivation.ts` gained `isCoveredByBareToolRule` -
+    `deriveAlwaysRule`'s exact counterpart, recognising the bare tool name that function writes for a
+    non-Bash tool - and `pipe-server.ts`'s `handlePermissionRequest` now reads the session settings
+    once per request and runs either the Bash compound path or this one, so an `♾️ Always` tap is
+    honoured for the rest of the conversation instead of sitting unused on disk. §6.6 rewritten around
+    what is actually load-bearing: the promise holds because the *Bridge* re-reads that file per
+    request, not because Claude Code re-reads anything, so a future change that stops re-reading
+    silently makes the confirmation false again. `Edit`/`Read` deliberately still re-prompt, recorded
+    as an accepted limit with its reasoning - honouring a bare grant there would mean matching the
+    baseline's scoped `Edit(~/**)`-style deny globs per call, i.e. reimplementing Claude Code's path
+    semantics, where a subtle mistake auto-approves reads of the secrets those rules protect (a
+    repeated prompt is a worse day, a wrong glob is a breach). 17 new tests, 1742/1742, `tsc --noEmit`
+    clean; live-verified in both directions - the `write` variant that recorded the bug now records
+    the fix, and the `bash` variant still passes, confirming the shared restructure left the compound
+    path alone."
+  - "0.108.0 (2026-08-12): closed §12 Phase 2's last open question - whether a running session picks
+    up an `♾️ Always` tap's derived rule mid-conversation - by measuring it live rather than
+    reasoning about it (`scripts/telegram-automation/always-rule-check.js`, new, two variants against
+    real throwaway sessions). Answer: no, and the reason it *appears* to work is itself the finding.
+    A `Bash` retry after the tap still escalates (its `PermissionRequest` hook fires) and only avoids
+    a second card because `pipe-server.ts` re-reads the session settings file per request and
+    auto-approves via its compound-decomposition path - which is gated on `tool_name === \"Bash\"`.
+    The `Write` variant, where nothing re-reads the file, raised a second card for the very next
+    matching call, so for every non-Bash tool `♾️ Always` currently promises a session-wide grant it
+    does not deliver until relaunch. Recorded in §6.6 (where the contract is specified) and §12
+    Phase 2 (with the two-variant result table and the one thing the measurement cannot
+    distinguish). No code changed - the fix direction (extend the same re-read to non-Bash tools) is
+    named, not implemented. Three incidental findings from the same sitting are recorded alongside:
+    a daemon instance that failed every `/new` at `git worktree add` with an operator-visible message
+    carrying no reason at all (git's stderr was genuinely empty; a restart cleared it), the fleet
+    defaults (`mode=auto`, `bypass_permission=1` inherited by every new session) that make any live
+    permission check meaningless unless explicitly disabled per session, and `scripts/telegram-
+    automation/client.js`'s `openTopic` matching a row's message *preview*, which silently drove the
+    control topic instead of a session's own topic for two runs (fixed with a new `openTopicByTitle`;
+    `/rm` cleanups in the rig also updated to `/remove`, which replaced it)."
+  - "0.107.1 (2026-08-12): stale-text fix only, no design change, from a \"what's left to implement\"
+    sweep across this folder. §12 Phase 6a's Task Scheduler bullet still ended \"a Task Scheduler
+    launch captures no stdout/stderr, so there is no production log file today\" - true when 0.34.0
+    wrote it, but 0.74.0 closed exactly that gap with `logger.ts`'s own file sink
+    (`%LOCALAPPDATA%\\aibridge\\bridge.log`, 10MB cap, one rotated backup, independent of launch
+    method) and the entry recording the fix sat 30-odd versions below the line still asserting the
+    gap. Corrected in place with a pointer to 0.74.0, so a reader scanning Phase 6a for open work
+    doesn't re-open a closed item. Three sibling plans got the same treatment in the same pass
+    (attachment 0.5.0, bypass 0.25.1, index-split 1.0.0); no code changed, so `bun test`/`tsc` are
+    untouched."
   - "0.107.0 (2026-08-12): operator asked to unify `/voice` and `/voiceconfirm` into one command,
     suggesting `/voice model ...`/`/voice confirm on|off` - the same \"category first\" shape
     `/auto`/`/default` already use. `FleetCommand`'s `voice` member gained a `category: \"model\" |
@@ -2596,6 +2660,22 @@ Rules:
   metacharacter (`|`, `;`, `&`, `$(`, backtick) - in that case fall back to allow-once and say so.
 - The derived rule is echoed back in the confirmation message so the operator can see what they just
   granted: "♾️ allowed, and added `Bash(git commit *)` for this session".
+- **"For this session" is true because the Bridge makes it true, not because Claude Code re-reads
+  anything** (measured live 2026-08-12, §12 Phase 2). The running process does *not* act on a rule
+  appended mid-conversation - the next matching call escalates to the relay anyway. What honours the
+  tap is `pipe-server.ts`'s `handlePermissionRequest` re-reading this session's settings file on
+  every permission request and short-circuiting the card itself: `compound-permission.ts` for
+  `Bash`, `rule-derivation.ts`'s `isCoveredByBareToolRule` for every other tool (added 2026-08-12 to
+  close exactly this gap - until then an `♾️ Always` on a `Write` was a no-op for the rest of the
+  conversation, while still confirming otherwise). **If a future change stops re-reading per
+  request, that confirmation silently becomes false again** - the re-read, not the file write, is
+  the load-bearing half.
+- **`Edit` and `Read` are a deliberate exception to the above.** The baseline's own scoped deny
+  rules (`Edit(.env)`, `Edit(~/**)`, `Read(~/**)`, ...) mean a bare `Edit` grant could only be
+  honoured by deciding whether *this call's* path matches those globs - i.e. by reimplementing
+  Claude Code's path-glob semantics, where a subtle mistake auto-approves access to the very secrets
+  those rules exist to protect. The Bridge refuses instead, so an `♾️ Always` on an `Edit` still
+  re-prompts. Accepted: a repeated prompt is a worse day, a wrong glob is a breach.
 - Session-scoped by default. `/persist <slug>` promotes a session's accumulated rules into the
   user-level settings, as a separate deliberate act.
 - An `♾️ Always` tap can never add a rule that a `deny` or `ask` entry already covers. Deny wins by
@@ -3184,7 +3264,19 @@ mis-parsed verdict all produce a system that appears to work.
 
 29. **Walking skeleton, end to end.** Against a stub Telegram server: `/new` creates a topic, launches a
     session, an inbound message reaches Claude, and a `reply` lands in the right topic. This is the
-    Phase 1 exit criterion.
+    Phase 1 exit criterion. **Note the delivery direction is asymmetric, and this scenario's original
+    wording assumed otherwise:** inbound does *not* travel over the channel notification path
+    (`notifications/claude/channel`), which §10.1.2 abandoned live on 2026-08-03 - it is written
+    straight into the PTY as a `<channel>`-tagged prompt. Outbound still goes through the channel's
+    own `reply` MCP tool. Scenario 29a below is the piece that assumption was hiding.
+29a. **Inbound arrives by PTY injection, not notification** (§10.1.2). `renderChannelTag(content,
+    meta)` produces the tag Claude actually receives, and `index.ts` writes it and its trailing `\r`
+    as **two separate** PTY writes - one write carrying both leaves the text sitting unsubmitted in
+    the input box, since the TUI's bracketed-paste handling swallows an embedded Enter (found live,
+    the same sitting). Assert both halves: the rendered tag's shape/escaping, and that the submit is
+    a distinct write rather than part of the payload. The `\r`-as-separate-write rule is the kind of
+    thing a future refactor "tidies" into one call, and the failure is silent - Claude simply never
+    sees the message.
 30. **Permission round trip, end to end.** A gated `Bash` call raises a prompt, a simulated tap sends
     the verdict, and the tool proceeds. Phase 2 exit criterion.
 
@@ -3513,15 +3605,27 @@ injection, keeping the `reply` MCP tool for outbound exactly as designed.** Conc
   `renderChannelTag` (protocol) deliberately omits the trailing `\r` now, with a doc comment
   explaining why, and `index.ts`'s inbound handler calls `write(renderChannelTag(...))` then
   `write("\r")` as two distinct writes.
-- Still open, not yet done: (a) the "New MCP server found" consent dialog `.mcp.json` registration
+- ~~Still open, not yet done: (a) the "New MCP server found" consent dialog `.mcp.json` registration
   (the §2.4 correction above) now raises on every `/new` needs the same treatment correction 3 already
-  gives the dev-channels warning - i.e. it's Phase 5 supervisor work, not a new Phase 1 gap, and today
-  it was answered by hand through the dev control server exactly like the existing dev-channels
-  keystroke. (b) the §9 test scenario list needs a scenario for "inbound delivered via PTY injection,
-  not notification" replacing the assumption baked into the existing scenario 29 language. (c) file our
-  own comment on #36431 with this plan's specific repro (`getClientCapabilities()` returning `undefined`
-  for a raw `server:` dev-flag registration, not just marketplace plugins) - the existing thread's
-  evidence table is missing this exact configuration.
+  gives the dev-channels warning.~~ **Moot since 0.55.0** (struck 2026-08-13). That dialog was a
+  property of the `.mcp.json` + `--dangerously-load-development-channels` launch path, which the
+  plugin cutover deleted outright - `session-launcher.ts` only knows how to launch the plugin form
+  now, and a plugin's own registration raises no per-worktree consent dialog. There is nothing left
+  to give "the same treatment" to.
+- ~~(b) the §9 test scenario list needs a scenario for "inbound delivered via PTY injection, not
+  notification" replacing the assumption baked into the existing scenario 29 language.~~ **Done
+  2026-08-13**: scenario 29's wording now names the asymmetry explicitly (inbound by PTY injection,
+  outbound by the `reply` tool), and new **scenario 29a** covers `renderChannelTag` plus the
+  two-separate-writes submit rule that a refactor would otherwise silently collapse.
+- (c) **Still open**: file our own comment on
+  [#36431](https://github.com/anthropics/claude-code/issues/36431) with this plan's specific repro
+  (`getClientCapabilities()` returning `undefined` for a raw `server:` dev-flag registration, not
+  just marketplace plugins) - the existing thread's evidence table is missing this exact
+  configuration. Deliberately not posted unprompted: it is a public comment under the operator's own
+  GitHub identity, so it needs their explicit go rather than being done on their behalf. Draft text
+  is ready (2026-08-13) and lives with whoever is running this pass; the content is the two facts
+  already recorded in §10.1.2 above - the exact configuration probed, and that inbound had to be
+  switched to PTY injection as a result.
 
 ### 10.2 Feed volume exceeds the rate budget
 
@@ -3788,9 +3892,41 @@ item 3 is moot until §7.6.
   aibridge's own `test-session` (this repo, no such hook). Still open for the first real registered
   target repo that has one.
 - ~~`♾️ Always` with rule derivation and the metacharacter guard.~~ **Done**
-  (`rule-derivation.ts`). One open question flagged rather than solved: whether a running session
+  (`rule-derivation.ts`). ~~One open question flagged rather than solved: whether a running session
   hot-reloads its `--settings` file mid-conversation, so an `Always` tap's derived rule is
-  confirmed *written*, not confirmed *effective on the very next matching call* - unverified.
+  confirmed *written*, not confirmed *effective on the very next matching call* - unverified.~~
+  **Measured live 2026-08-12** (`scripts/telegram-automation/always-rule-check.js`, both variants,
+  against real throwaway sessions). The answer is "no, and it only looks like yes for `Bash`":
+
+  | Variant | Tap `♾️ Always` on | Next matching call | Second card? |
+  |---|---|---|---|
+  | `bash` | `mkdir -p archeck-probe-a` → writes `Bash(mkdir -p *)` | `mkdir -p archeck-probe-b` | **No** |
+  | `write` | a `Write` → writes `Write` | a second `Write` | **Yes** → **No** *(fixed same evening)* |
+
+  The `bash` row is not evidence of a hot-reload. That second call **still escalated** - it reached
+  the relay and its `PermissionRequest` observer hook fired - so the running Claude Code process did
+  not act on the rule that had just been written. No card appeared only because `pipe-server.ts`'s
+  own compound-decomposition path (§6.2) re-reads the session's settings file *per request* and
+  short-circuited it, logging `auto-approved compound Bash for slug "..." - every sub-command
+  already allowed: mkdir -p archeck-probe-b`. That path is gated on `msg.tool_name === "Bash"`,
+  which is exactly why the `write` row behaves differently: nothing re-reads the file for a non-Bash
+  tool, so the rule sits on disk unused until the session is relaunched.
+
+  **This was a real defect rather than a documentation nit** - for every non-`Bash` tool the tap
+  told the operator "allowed, and added `Write` for this session" and then prompted again on the
+  very next `Write`, for the rest of that conversation - **and it was fixed the same evening**
+  (`codebase-hardening-plan.md` P0-7): `rule-derivation.ts`'s new `isCoveredByBareToolRule` gives
+  the non-Bash case the same treatment `Bash` already had, checking the freshly-read allow list for
+  the bare tool name before a card is posted. The message was not weakened; the behavior was made to
+  match it. Re-running the `write` variant against the fix flipped it to "no second card", with the
+  file written and `auto-approved Write ... already allow-listed for this session` in `bridge.log`;
+  the `bash` variant still passes. `Edit`/`Read` deliberately still prompt - see §6.6 for why a
+  scoped deny rule makes a bare grant unsafe to honour there.
+
+  One honest limit of this measurement: it establishes that the escalation still happened, which is
+  enough for the conclusion above, but it cannot distinguish "Claude Code never re-reads
+  `--settings`" from "it re-read the file and declined to match the new rule". Distinguishing those
+  needs a session *launched* with the rule already in its settings file, which neither variant does.
 - **Exit:** scenario 30 passes (automated, and live-verified twice against the real Telegram group -
   a Write card and the resulting `git commit` ask-card, both tapped from the operator's actual
   phone, the second one landing a real commit), plus scenarios 4-13. **Phase 2 is complete.**
@@ -3864,7 +4000,16 @@ item 3 is moot until §7.6.
   concurrent sessions (Phase 1's hardcoded one plus a real `/new`), `/ls`'s aligned table, `/pause`
   toggling feed suppression, `/kill` closing a topic and stopping the process, `/rm` removing the
   worktree/topic/row. `/attach` is implemented and unit-tested (PTY ring-buffer tail plus a
-  `claude --resume` hint) but not yet exercised live against a real multi-line PTY tail.
+  `claude --resume` hint) ~~but not yet exercised live against a real multi-line PTY tail~~ - **and
+  the first time it was, on 2026-08-13, it turned out to be broken.** Against a real session's tail
+  the rendered card exceeded Telegram's 4096-unit cap, the P1 send failed three times with
+  "Bad Request: message is too long", and the operator saw **nothing at all** - no output, no error,
+  because a failed command confirmation is only a log line. The arithmetic was hiding in plain
+  sight: `routing.ts` bounds the raw ring buffer at 4000 chars, then `renderAttach` HTML-escapes it,
+  and PTY output is full of `<`, `>` and `&`, each expanding to a 4-5 character entity. Fixed by
+  bounding the *rendered* message instead (trimming the escaped tail from the front, never through
+  an HTML entity - a half-cut `&amp;` would swap "too long" for "can't parse entities") with an
+  explicit "earlier output trimmed to fit" marker. See `codebase-hardening-plan.md` P1-10.
 - ~~Topic lifecycle including create, rename-once and delete.~~ **Create, delete and rename-once all
   done** (2026-08-04). Rename-once fires off a session's first real `reply` (a new `renamed` column,
   capped at one edit per session); the `SessionStart`-reported-title path §4.4 also named was retired in
@@ -3901,8 +4046,17 @@ item 3 is moot until §7.6.
   changelog entry for the live-spike-driven design deviation (cost sourced from `/v1/logs`'
   `claude_code.api_request`, not `/v1/metrics`' delta-temporality `cost.usage`; `http/json`, not
   `http/protobuf`). Live-verified end to end against the real Telegram group with a genuine tracked
-  spend; the `quota_stopped` state itself is unit-tested but never live-triggered (no real rate limit
-  was forced this sitting).
+  spend; ~~the `quota_stopped` state itself is unit-tested but never live-triggered (no real rate limit
+  was forced this sitting)~~ **live-exercised 2026-08-13**, end to end against the running Bridge: a
+  synthetic `claude_code.api_error` OTLP/JSON record POSTed to the real listener on
+  `127.0.0.1:4318/v1/logs` for a real throwaway session's `session.id` drove the whole path -
+  `parseOtlpLogsBody` → `slugForSessionId` → `markQuotaStopped` → the row moving to `quota_stopped`
+  → the operator-visible notice landing in that session's own topic ("stopped on a usage limit
+  (§10.5) - this looks frozen but isn't wedged"). Only the *upstream source* was synthetic; every
+  line of Bridge code on the path was the real one. A genuine rate-limit stop still hasn't been
+  observed, and that remains the one thing this substitution can't establish: that Claude Code
+  actually emits `claude_code.api_error` in that shape when a real limit is hit (§10.5's own
+  never-independently-observed caveat, unchanged).
 - ~~Per-session model routing: Sonnet default, `--opus` and `--haiku` overrides~~ **Done** and
   live-verified (`/new --opus <repo> <prompt>` launches with `--model opus`). ~~The weighted unit
   budget that admits them (§10.5) is not done~~ **done** (2026-08-04): `concurrency-cap.ts` refuses
@@ -3997,7 +4151,13 @@ unattended running defensible, and **should not be skipped just because Phases 1
 - ~~The Task Scheduler task itself (`autostart.ts`, `/autostart`); the README half (setup, recovery,
   VPS escape hatch).~~ **Both done.** The task/command is built and live-verified (0.32.0/0.33.0); the
   README half landed in 0.34.0, including one real gap found while writing it - a Task Scheduler
-  launch captures no stdout/stderr, so there is no production log file today.
+  launch captures no stdout/stderr, so there was no production log file. ~~That gap is still open.~~
+  **Closed in 0.74.0**: `logger.ts` gives the Bridge its own file sink
+  (`%LOCALAPPDATA%\aibridge\bridge.log`, 10MB cap, one rotated `.1` backup) independent of launch
+  method, so an autostarted Bridge logs exactly like a dev-launched one instead of depending on
+  `scripts/dev-bridge.sh`'s shell redirect; `uncaughtException`/`unhandledRejection` are logged
+  before exit. Live-verified there and re-confirmed 2026-08-12 (P0-6's own WARN path is threaded
+  into this same log).
 - ~~Stale-inbound handling and monotonic timers (§7.4).~~ **Done (0.35.0).** `stale-inbound.ts`/
   `stale-confirm.ts` gate any inbound message older than 30 minutes behind a Yes/No confirm card
   instead of dispatching it; `monotonic-clock.ts` is now the default clock for every TTL/expiry
@@ -4009,7 +4169,19 @@ unattended running defensible, and **should not be skipped just because Phases 1
 - ~~Quiet mode.~~ **Done (0.35.0).** `RateGovernor.p2PressureExceeded()` (60s window, minimum
   4-sample guard against false-triggering on ordinary low-volume traffic) drives both
   `FeedCoalescer`'s doubled interval and a one-time "feed throttled" notice. Unit-tested with a
-  fake clock; not yet live-forced with a real four-session feed storm.
+  fake clock; ~~not yet live-forced with a real four-session feed storm~~ **live-forced and
+  confirmed 2026-08-13** (`scripts/telegram-automation/quiet-mode-check.js`): the notice
+  `⚠️ feed throttled, 5 sessions active` posted to the control topic mid-storm, with ~130 real
+  `P2 feed edit dropped - feed bucket empty` warnings behind it.
+
+  **What it took is worth recording, because the first attempt failed and the reason is structural.**
+  Three sessions each running one long list of tool calls produced almost no drops at all:
+  `FeedCoalescer.interval()` is `3000 * activeSessionCount`, so coalesced card edits are held at
+  roughly the feed bucket's own 20/minute budget *no matter how tool-heavy a single turn is* - the
+  coalescer is doing exactly its job. The pressure that trips quiet mode is **per-turn** overhead
+  (a card create and a details anchor for every turn), so the storm has to maximise turn *count*,
+  not tool count: 10 short messages round-robined into each of 3 sessions did it immediately. Anyone
+  re-running this check, or reasoning about feed load generally, should start from that distinction.
 - **Exit:** scenarios 24 and 37 pass under a real restart - kill the Bridge mid-turn with a permission
   prompt open, restart it, and the system converges to a correct state with no dead buttons.
   **Done (0.36.0), live.** Killed the dev Bridge alone with a real Bash-commit permission prompt

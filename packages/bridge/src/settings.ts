@@ -267,10 +267,15 @@ export function readSettingsFile(stateDir: string, slug: string): PermissionSett
 }
 
 /**
- * §6.6: session-scoped accumulation of an `Always`-derived rule. Whether a running session
- * re-reads its `--settings` file mid-conversation is unverified - this is honestly a known gap,
- * not a solved one, so the confirmation text (§7 index.ts) never claims more than "added for this
- * session" without implying it takes effect on the very next call with certainty.
+ * §6.6: session-scoped accumulation of an `Always`-derived rule.
+ *
+ * Measured live 2026-08-12 (§12 Phase 2), replacing this comment's former "unverified": a running
+ * session does **not** act on a rule appended here mid-conversation - the next matching call
+ * escalates to the relay anyway. What makes the tap mean something is the Bridge re-reading this
+ * file on every permission request and short-circuiting the card itself: `compound-permission.ts`
+ * for `Bash`, `rule-derivation.ts`'s `isCoveredByBareToolRule` for every other tool. Both live in
+ * `pipe-server.ts`'s `handlePermissionRequest`; if a future change stops re-reading per request,
+ * "added for this session" silently becomes false again.
  */
 export function addAlwaysRule(settings: PermissionSettings, rule: string): PermissionSettings {
   if (settings.permissions.allow.includes(rule)) {

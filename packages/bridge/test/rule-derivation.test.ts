@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { deriveAlwaysRule, extractBashCommand, ruleAlreadyCovered } from "../src/rule-derivation.ts";
-import type { PermissionSettings } from "../src/settings.ts";
+import { deriveAlwaysRule, extractBashCommand, isCoveredByBareToolRule, ruleAlreadyCovered } from "../src/rule-derivation.ts";
+import { generateSettings, type PermissionSettings } from "../src/settings.ts";
 
 function bashPreview(command: string): string {
   return JSON.stringify({ command });
@@ -107,5 +107,102 @@ describe("ruleAlreadyCovered", () => {
 
   test("a genuinely new rule is not covered", () => {
     expect(ruleAlreadyCovered("Bash(npm test *)", settings)).toBe(false);
+  });
+});
+
+/**
+ * `codebase-hardening-plan.md` P0-7. This is the function that decides to auto-approve a real tool
+ * call without showing the operator anything, so the cases that matter most here are the ones where
+ * it must say **no** - `deny`/`ask` precedence and the sensitive-path guard. A silent-wrong here is
+ * a permission prompt that never appears.
+ */
+describe("isCoveredByBareToolRule", () => {
+  /** Mirrors what an `♾️ Always` tap on a `Write` card leaves behind: `deriveAlwaysRule` returns the
+   * bare tool name for a non-Bash tool, and `addAlwaysRule` appends it to `allow`. */
+  function settingsWithAllowed(tool: string): PermissionSettings {
+    const base = generateSettings();
+    return { ...base, permissions: { ...base.permissions, allow: [...base.permissions.allow, tool] } };
+  }
+
+  test("honours a bare tool rule the operator's own Always tap added", () => {
+    expect(isCoveredByBareToolRule("Write", '{"file_path":"c:\\data\\worktrees\\x\\a.txt"}', settingsWithAllowed("Write"))).toBe(true);
+  });
+
+  test("round-trips deriveAlwaysRule's own output - what one writes, the other must recognise", () => {
+    // The two functions are counterparts; this pins that invariant rather than restating the string.
+    const rule = deriveAlwaysRule("NotebookEdit", '{"notebook_path":"nb.ipynb"}');
+    expect(rule).toBe("NotebookEdit");
+    const base = generateSettings();
+    const settings = { ...base, permissions: { ...base.permissions, allow: [...base.permissions.allow, rule!] } };
+    expect(isCoveredByBareToolRule("NotebookEdit", '{"notebook_path":"nb.ipynb"}', settings)).toBe(true);
+  });
+
+  test("refuses a tool that was never allow-listed", () => {
+    expect(isCoveredByBareToolRule("Write", '{"file_path":"a.txt"}', generateSettings())).toBe(false);
+  });
+
+  test("refuses Bash outright - compound-permission.ts owns that path", () => {
+    // A bare `Bash` allow rule isn't something deriveAlwaysRule can produce, and honouring one here
+    // would auto-approve *any* command; the guard is unconditional rather than trusting that.
+    const base = generateSettings();
+    const settings = { ...base, permissions: { ...base.permissions, allow: [...base.permissions.allow, "Bash"] } };
+    expect(isCoveredByBareToolRule("Bash", '{"command":"rm -rf /"}', settings)).toBe(false);
+  });
+
+  describe("precedence - deny and ask always win", () => {
+    test("refuses when a scoped deny entry mentions the tool (the real Edit case)", () => {
+      // The generated baseline carries Edit(.env), Edit(.env.*) and Edit(~/**). Deciding whether
+      // *this* call matches one means reimplementing Claude Code's path globs, so it refuses instead
+      // - Edit keeps prompting, exactly as it does today, rather than risking a wrong match.
+      expect(isCoveredByBareToolRule("Edit", '{"file_path":"c:\\data\\worktrees\\x\\src\\a.ts"}', settingsWithAllowed("Edit"))).toBe(false);
+    });
+
+    test("refuses when a scoped deny entry mentions the tool, even for an obviously harmless path", () => {
+      expect(isCoveredByBareToolRule("Read", '{"file_path":"README.md"}', settingsWithAllowed("Read"))).toBe(false);
+    });
+
+    test("refuses when a bare deny entry names the tool", () => {
+      const base = generateSettings();
+      const settings = {
+        ...base,
+        permissions: { ...base.permissions, deny: [...base.permissions.deny, "Write"], allow: [...base.permissions.allow, "Write"] },
+      };
+      expect(isCoveredByBareToolRule("Write", '{"file_path":"a.txt"}', settings)).toBe(false);
+    });
+
+    test("refuses when an ask entry mentions the tool, bare or scoped", () => {
+      const base = generateSettings();
+      const bare = { ...base, permissions: { ...base.permissions, ask: [...base.permissions.ask, "Write"], allow: [...base.permissions.allow, "Write"] } };
+      const scoped = { ...base, permissions: { ...base.permissions, ask: [...base.permissions.ask, "Write(*.prod)"], allow: [...base.permissions.allow, "Write"] } };
+      expect(isCoveredByBareToolRule("Write", '{"file_path":"a.txt"}', bare)).toBe(false);
+      expect(isCoveredByBareToolRule("Write", '{"file_path":"a.txt"}', scoped)).toBe(false);
+    });
+
+    test("a tool whose name merely prefixes a denied one is unaffected", () => {
+      // `Read(...)` must not gate `ReadNotebook`: the prefix check is deliberately `Tool(`, not a
+      // bare startsWith on the name, or one deny rule would silently freeze unrelated tools.
+      const settings = settingsWithAllowed("ReadNotebook");
+      expect(isCoveredByBareToolRule("ReadNotebook", '{"path":"nb.ipynb"}', settings)).toBe(true);
+    });
+  });
+
+  test("refuses a sensitive path even when nothing in deny/ask mentions the tool", () => {
+    // Belt-and-braces, mirroring the Bash path: nothing in the baseline mentions `Write`, so only
+    // this guard stands between an Always-tapped Write and ~/.ssh.
+    const settings = settingsWithAllowed("Write");
+    expect(isCoveredByBareToolRule("Write", '{"file_path":"~/.ssh/config"}', settings)).toBe(false);
+    expect(isCoveredByBareToolRule("Write", '{"file_path":"c:\\x\\.env"}', settings)).toBe(false);
+    expect(isCoveredByBareToolRule("Write", '{"file_path":"c:\\x\\id_rsa"}', settings)).toBe(false);
+  });
+
+  test("refuses an empty tool name rather than matching an empty allow entry", () => {
+    const base = generateSettings();
+    const settings = { ...base, permissions: { ...base.permissions, allow: [...base.permissions.allow, ""] } };
+    expect(isCoveredByBareToolRule("", "{}", settings)).toBe(false);
+  });
+
+  test("honours an MCP tool's own fully-qualified name", () => {
+    // Nothing special about the dunder form - it just has to survive the `Tool(` prefix check.
+    expect(isCoveredByBareToolRule("mcp__plugin_x__do", '{"arg":1}', settingsWithAllowed("mcp__plugin_x__do"))).toBe(true);
   });
 });

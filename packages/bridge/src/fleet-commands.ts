@@ -1016,7 +1016,51 @@ export function botCommandList(): { command: string; description: string }[] {
  * on faith" convention as `/model`'s confirmation (§4.2.1). Markdown-style triple backticks render
  * as literal text without a matching `parse_mode`, so this uses the same HTML `<pre>` convention as
  * `renderLsTable` - callers must pass `parseMode: "HTML"`. */
+/** Telegram's hard cap is 4096 UTF-16 code units; the headroom absorbs the surrounding wrapper and
+ * leaves room to be wrong about an edge case rather than 400-ing on it. */
+const ATTACH_MESSAGE_LIMIT = 3900;
+const ATTACH_TRUNCATION_NOTE = "... (earlier output trimmed to fit)\n";
+
+/**
+ * Trims an **already-escaped** tail from the front so the rendered card fits, without ever cutting
+ * an HTML entity in half - `&amp;` sliced into `mp;` makes Telegram reject the whole message with
+ * "can't parse entities", turning a too-long failure into a malformed-HTML one.
+ *
+ * The repair rule: if a `;` appears within the first few characters *before* any `&`, the slice
+ * began inside an entity, so drop through that `;`. Bounded to `MAX_ENTITY_LEN` because the longest
+ * thing `escapeForFeed` emits is `&quot;` - a legitimate semicolon further in is real text and must
+ * survive.
+ */
+function trimEscapedTail(escaped: string, budget: number): string {
+  if (escaped.length <= budget) return escaped;
+  const MAX_ENTITY_LEN = 6;
+  const slice = escaped.slice(-budget);
+  const semicolon = slice.indexOf(";");
+  const ampersand = slice.indexOf("&");
+  if (semicolon !== -1 && semicolon < MAX_ENTITY_LEN && (ampersand === -1 || semicolon < ampersand)) {
+    return slice.slice(semicolon + 1);
+  }
+  return slice;
+}
+
+/**
+ * §4.2's `/attach`. The tail is bounded at the source (`routing.ts`'s `RING_BUFFER_MAX_CHARS`, 4000
+ * raw chars), which is **not** enough on its own: `escapeForFeed` expands `<`, `>` and `&` into
+ * 4-to-5-character entities, and raw PTY output is full of all three (box drawing, prompts, ANSI
+ * remnants), so a full buffer plus this function's own wrapper reliably lands past Telegram's 4096
+ * limit. Found live 2026-08-13, the first time `/attach` was ever run against a real multi-line PTY
+ * tail: the send failed three times with "Bad Request: message is too long" and the operator got
+ * **nothing at all** - no output, no error, silence, since a failed command confirmation is only a
+ * log line. Bounding the raw buffer harder would not fix it (worst case a tail of all `&` expands
+ * 5x); the rendered message is what has to fit, so that is what this measures.
+ */
 export function renderAttach(row: SessionRow, tail: string): string {
   const resumeHint = row.sessionId ? `claude --resume ${row.sessionId}` : "(no session_id recorded yet)";
-  return `${escapeForFeed(row.slug)} - last output:\n<pre>${escapeForFeed(tail)}</pre>\nLocal pickup: <code>${escapeForFeed(resumeHint)}</code>`;
+  const header = `${escapeForFeed(row.slug)} - last output:\n`;
+  const footer = `</pre>\nLocal pickup: <code>${escapeForFeed(resumeHint)}</code>`;
+  const budget = ATTACH_MESSAGE_LIMIT - header.length - footer.length - "<pre>".length - ATTACH_TRUNCATION_NOTE.length;
+  const escaped = escapeForFeed(tail);
+  const trimmed = trimEscapedTail(escaped, budget);
+  const body = trimmed.length < escaped.length ? `${ATTACH_TRUNCATION_NOTE}${trimmed}` : trimmed;
+  return `${header}<pre>${body}${footer}`;
 }

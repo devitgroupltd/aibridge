@@ -1,3 +1,4 @@
+import { containsSensitivePath } from "./compound-permission.ts";
 import type { PermissionSettings } from "./settings.ts";
 import { containsUnsafeSubshellOrBackground } from "./shell-metacharacters.ts";
 
@@ -72,4 +73,50 @@ export function ruleAlreadyCovered(rule: string, settings: PermissionSettings): 
     settings.permissions.ask.includes(rule) ||
     settings.permissions.allow.includes(rule)
   );
+}
+
+/** True when any rule in `rules` targets `toolName` at all - bare (`Write`) or scoped
+ * (`Write(...)`). Not "does this rule match this call": the caller uses it to *refuse* to decide,
+ * so it deliberately over-matches. */
+function rulesMentionTool(rules: readonly string[], toolName: string): boolean {
+  return rules.some((rule) => rule === toolName || rule.startsWith(`${toolName}(`));
+}
+
+/**
+ * `codebase-hardening-plan.md` P0-7: the non-`Bash` counterpart to
+ * `compound-permission.ts`'s `isCompoundCommandFullyAllowed`, and the exact mirror of
+ * `deriveAlwaysRule` above - what that function *writes* for a non-Bash tool (the bare tool name),
+ * this function *recognises*.
+ *
+ * It exists because measuring §12 Phase 2's open question live (2026-08-12) showed the running
+ * Claude Code process does not act on a rule appended to its `--settings` file mid-conversation: the
+ * next matching call escalates anyway. `Bash` never looked broken only because the compound path
+ * above re-reads that file per request and short-circuits it; every other tool had nothing in front
+ * of it, so an `♾️ Always` tap on a `Write` promised a session-wide grant and then raised a fresh
+ * card on the very next `Write`.
+ *
+ * **Why this is deliberately conservative, and what it therefore does not fix.** It refuses unless
+ * the tool is allow-listed *and* no `deny`/`ask` entry mentions that tool in any form. So an
+ * `♾️ Always` on `Edit` still re-prompts, because the generated baseline carries `Edit(.env)`,
+ * `Edit(.env.*)` and `Edit(~/**)`. Honouring those correctly would mean deciding whether *this
+ * call's* path matches a scoped glob - i.e. reimplementing Claude Code's own path-glob semantics
+ * (`~` expansion, `**`, Windows case-insensitivity and separator quirks) - and a subtle mistake
+ * there silently auto-approves a read of the very secrets those deny rules exist to protect. That
+ * trade is not worth taking for a prompt: refusing leaves `Edit`/`Read` exactly as they behave
+ * today, while `Write`, `NotebookEdit`, `WebFetch`, MCP tools and everything else with no scoped
+ * entry get the grant the operator was already told they had.
+ *
+ * `containsSensitivePath` is applied to the raw input preview as well - the same belt-and-braces
+ * guard the Bash path uses, and the reason a `Write` to `~/.ssh/config` is refused even though
+ * nothing in `deny` mentions `Write`.
+ */
+export function isCoveredByBareToolRule(toolName: string, inputPreview: string, settings: PermissionSettings): boolean {
+  // Bash has its own, richer path (`isCompoundCommandFullyAllowed`), which understands command
+  // decomposition; a bare `Bash` allow rule is not something `deriveAlwaysRule` can even produce.
+  if (toolName === "Bash") return false;
+  if (toolName.length === 0) return false;
+  if (!settings.permissions.allow.includes(toolName)) return false;
+  if (rulesMentionTool(settings.permissions.deny, toolName)) return false;
+  if (rulesMentionTool(settings.permissions.ask, toolName)) return false;
+  return !containsSensitivePath(inputPreview);
 }

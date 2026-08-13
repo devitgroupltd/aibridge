@@ -1,12 +1,20 @@
 ---
-version: 0.3.0
-status: draft
-last_modified_utc: 2026-08-08T07:40:00Z
+version: 1.0.0
+status: implemented
+last_modified_utc: 2026-08-12T20:05:00Z
 changelog:
+  - "1.0.0 (2026-08-12): status draft -> implemented, recording the outcome against the plan rather than restating it. Found by a \"what's left to implement\" sweep across this folder: all 15 extractions (items 1-15) are in the tree and the split finished in `3e547c2` (\"extract callback-query-router.ts from index.ts (module 15/15)\"), one commit per module as the migration approach specified, so this document had been describing work already done for four days. Verified item by item rather than assumed - all 15 module files exist, all 15 have their own test file (405 tests between them; `card-senders.ts` and `fleet-reporting-commands.ts` got theirs later, via `codebase-hardening-plan.md`'s P1-8 closeout, having been deliberately proposed without one here), and both DRY fixes landed as specified: `confirm-cards.ts` exports the unified `finalizeCard` *and* `takeOrNotifyGone` (item 5's two halves), and `session-lifecycle-commands.ts`'s `resolveSessionOrBail`/`getRowOrReportMissing` pair has 12 call sites with zero surviving `sessionStore.get(slug) as NonNullable<...>` casts - the partial-migration failure item 7 warned about did not happen. One real deviation recorded honestly instead of quietly: `index.ts` is 1,152 lines, not the 300-400 this plan estimated. It is a composition root by content (62 store/registry constructions, 23 `create*`/`start*` factory calls, the dev-control debug server item 1 always meant to keep there, and 3 wiring closures) - the estimate simply underestimated how much room 23 multi-line dependency-injection literals take, which is a KISS-shaped cost the pattern buys deliberately, not leftover business logic. See ## Outcome."
   - "0.3.0 (2026-08-08): Deep SOLID/DRY/KISS adversarial pass — fixed the state-variable count (~25 -> ~31) and confirm-registry count (five -> four); found and assigned a home for the previously-orphaned onUpdate plain-message routing/stale-gating logic (folded into inbound-media.ts); corrected the resolveTargetSlug DRY-fix count (was missing handleRmCommand, missed a second cast site in handleVerboseCommand); split fleet-admin-commands.ts into fleet-reporting-commands.ts and deploy-lifecycle-commands.ts to fix its own SRP violation; expanded callback-query-router.ts's description to name its actual inline handler bodies and dependencies instead of undersеlling it as pure dispatch; found and assigned a third DRY fix (the four confirm-registries' take/notify-gone/mark-expired preamble, one layer above the finalize-call duplication already caught); flattened the nested module list (old item 7's four sub-bullets) into a single flat 1-16 numbering to remove the ambiguity that caused the 'all 12 modules' stale-count bug in the previous pass; added two new Risks (resumeAttempts cross-module write access, and a real main()-construction-order dependency introduced by converting quota-alarms.ts's closure-based forward reference to constructor injection); added a dev-control debug-server accessor note to session-supervisor.ts; added 4 new test files (deploy-lifecycle-commands.test.ts, quota-alarms.test.ts, nl-dispatch.test.ts, inbound-media.test.ts) and expanded 2 existing ones (confirm-cards.test.ts, callback-query-router.test.ts) to close test-coverage gaps flagged against the plan's own stated risk severity"
   - "0.2.1 (2026-08-08): Pass 2 review — fixed a stale 'all 12 modules extracted' figure in Verification to match the module list's actual count (14 new modules, item 12 being index.ts itself); no other findings, plan is solid"
   - "0.2.0 (2026-08-08): Pass 1 review — corrected stale sibling-file line counts and import count, tightened the /commands dispatch-order bug description to match the actual code comment, added a Bun test-runner note (injectable scheduler + setSystemTime afterEach reset) to the two timing-sensitive test files, flagged CLAUDE.md's stale Phase-1 roadmap framing in the Overview, and fixed a stale 'see Test plan below' cross-reference in Migration approach to point at the actual Testing heading"
   - "0.1.0 (2026-08-08): Initial plan created"
+v100_touched_sections:
+  - section: "Outcome"
+    type: added
+    summary: "New section recording what actually shipped: 15/15 modules, both DRY fixes verified present, per-module test counts, and the one deviation (index.ts at 1,152 lines vs the 300-400 estimate) with its cause."
+  - section: "Verification"
+    type: modified
+    summary: "Each check marked done/not-done against the real tree rather than left as an instruction; the post-split live confirm-card sweep is recorded as never run as one deliberate pass."
 v020_touched_sections:
   - section: "§Overview"
     type: modified
@@ -49,6 +57,13 @@ v030_touched_sections:
 ---
 
 # Split `packages/bridge/src/index.ts` into modules
+
+> **Status: implemented.** All 15 extractions landed one commit per module, finishing at `3e547c2`
+> ("extract callback-query-router.ts from index.ts (module 15/15)"). `index.ts` went 3,690 → 1,152
+> lines and holds no business logic. The sections below are kept in their original
+> *plan* voice (present/future tense, "will extract") rather than rewritten past-tense — see
+> **## Outcome** at the bottom for what actually shipped, including the one deviation from this
+> plan's own estimate.
 
 ## Overview
 
@@ -467,25 +482,67 @@ and renderers; this is a deliberate, stated decision, not a silent gap.
 Each new test file lands in the same commit as the module extraction it covers, per the Migration
 approach above — extraction and test-writing are not separated into a later pass.
 
+## Outcome
+
+Recorded 2026-08-12, verified item by item against the tree rather than from the commit messages.
+
+**All 15 modules exist and all 15 have their own test file** — 405 tests between them:
+`session-supervisor` (35), `pty-io` (8), `feed-wiring` (21), `quota-alarms` (9), `confirm-cards` (11),
+`inbound-media` (35), `session-lifecycle-commands` (64), `fleet-reporting-commands` (11),
+`deploy-lifecycle-commands` (47), `voice-mode-commands` (32), `fleet-confirm-flow` (25),
+`card-senders` (18), `nl-dispatch` (26), `command-dispatch` (29), `callback-query-router` (34).
+Two of those (`card-senders`, `fleet-reporting-commands`) were deliberately proposed here *without*
+a test file as thin read-only wrappers; they got one anyway later, via
+[`codebase-hardening-plan.md`](codebase-hardening-plan.md)'s P1-8 closeout, which confirmed rather
+than assumed that low-risk claim.
+
+**Both DRY fixes landed as specified, not half-migrated:**
+
+- Item 5 — `confirm-cards.ts` exports the unified `finalizeCard` *and* `takeOrNotifyGone`, i.e. both
+  the finalize-call layer and the take/notify-gone/mark-expired preamble one layer above it, with the
+  four `finalize*ConfirmMessage` wrappers delegating down to `finalizeCard`.
+- Item 7 — `session-lifecycle-commands.ts` has `resolveSessionOrBail` plus the `getRowOrReportMissing`
+  half factored out for `handleRmCommand`'s orphan-topic special case, 12 call sites between them, and
+  **zero** surviving `sessionStore.get(slug) as NonNullable<...>` casts (the only textual match left in
+  the file is the doc comment explaining what the helper replaced). The specific partial-migration
+  failure this item warned about — skipping `handleRmCommand` or fixing only one of
+  `handleVerboseCommand`'s two occurrences — did not happen.
+
+**Construction order holds:** `feedGovernor` is built at `index.ts:249`, before `createQuotaAlarms`
+(261) and `startOtlpListener` (279). `feedCoalescer` no longer appears in the composition root at all
+— module 3 took ownership of it, as item 3 intended, so that half of the ordering constraint is now
+internal to `feed-wiring.ts` rather than something the root can get wrong.
+
+**The one deviation: `index.ts` is 1,152 lines, not the 300–400 estimated here.** It is nonetheless a
+composition root by content, not by label — 62 store/registry constructions, 23 `create*`/`start*`
+factory calls, the dev-control debug HTTP server item 1 always meant to leave in place, and 3 wiring
+closures (`waitForChannelConnected`, `waitForPtyQuiet`, `respawnSelfAndExit`). What the estimate
+missed is that 23 factories with 10–40 injected dependencies each cost far more lines as
+multi-line object literals than the code they replaced did as closures, before counting the
+why-this-order comments that injection makes necessary and closures made implicit. That is a cost the
+pattern buys deliberately; it is not leftover business logic, and no further extraction is proposed
+on the strength of the line count alone.
+
 ## Verification
 
-- After each extraction commit: `bun test` and `tsc --noEmit` both pass in `packages/bridge`.
-- After the full split (all 15 new modules extracted, item 16 being `index.ts` itself as the
-  composition root that remains): manually exercise, via
-  `scripts/telegram-automation/`, at least one flow per confirm-card family (fleet/stale/voice/nl) and
-  one callback-query namespace end-to-end against the live Telegram client, to confirm the refactor
-  didn't change observable behavior — restart the Bridge (`bun run bridge:restart` /
-  `scripts/dev-bridge.sh restart`) before this check, since it only picks up new code on restart.
-- Confirm `index.ts` is reduced to roughly 300–400 lines and contains no business logic — a quick
-  `wc -l` and a read-through checking every remaining top-level statement is either config/store
-  construction or a factory-wiring call.
-- Confirm all three DRY fixes (confirm-card finalize unification and the take/notify-gone/mark-expired
-  preamble unification, both in module 5; the resolve-slug-or-bail helper in module 7) each have exactly
-  one implementation referenced from all former call sites — grep for the old duplicated patterns to
-  confirm they're gone, not just supplemented. For module 7 specifically, confirm all six former call
-  sites (including `handleRmCommand`, and both of `handleVerboseCommand`'s former cast occurrences) were
-  migrated, not just the five originally identified.
-- Confirm the composition root constructs `feedGovernor`/`feedCoalescer` (module 3's state) before
-  building `quota-alarms.ts`'s factory and before calling `startOtlpListener()` — the construction-order
-  dependency introduced by converting a closure-based forward reference into constructor injection (see
-  Risks).
+- ~~After each extraction commit: `bun test` and `tsc --noEmit` both pass in `packages/bridge`.~~
+  **Done** — held per commit through the whole sequence, and both gates are now enforced in CI
+  (`.github/workflows/ci.yml`) as well as locally.
+- **Never run as one deliberate pass:** the post-split live sweep (one flow per confirm-card family —
+  fleet/stale/voice/nl — plus one callback-query namespace, via `scripts/telegram-automation/` after a
+  Bridge restart). Recorded honestly rather than marked done. Three of the four families have been hit
+  live since, incidentally rather than as this sweep: fleet-confirm (the `/kill --all` tap, and again
+  in `/stop`'s card-clearing work at 0.101.1), nl-confirm (a real destructive-NL confirm card the
+  operator hit, which is what produced `retry-store.ts`), and voice-confirm. The fourth, **stale-confirm,
+  has never fired live for a genuinely >30-minute-old message** — that is not a gap this refactor
+  introduced, it is the main plan's own §13 check 3, still outstanding there for the same reason
+  (producing a real 30-minute-old backlog message means actually suspending the host).
+- ~~Confirm `index.ts` is reduced to roughly 300–400 lines and contains no business logic.~~ **Half
+  done:** no business logic (confirmed by read-through — every remaining top-level statement is
+  config/store construction or factory wiring), but 1,152 lines rather than 300–400. See ## Outcome
+  for why the estimate was wrong and why that is not treated as remaining work.
+- ~~Confirm all three DRY fixes each have exactly one implementation referenced from all former call
+  sites.~~ **Done**, both items, including item 7's six former call sites and `handleVerboseCommand`'s
+  two cast occurrences — see ## Outcome.
+- ~~Confirm the composition root constructs `feedGovernor`/`feedCoalescer` before building
+  `quota-alarms.ts`'s factory and before calling `startOtlpListener()`.~~ **Done** — see ## Outcome.

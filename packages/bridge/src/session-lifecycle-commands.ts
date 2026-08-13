@@ -4,6 +4,7 @@ import { AskRegistry } from "./ask-registry.ts";
 import { buildAttachmentAnnouncement, forgetInboxGitignoreCache, writeAttachmentToInbox } from "./attachment-inbox.ts";
 import { CostTracker } from "./cost-tracker.ts";
 import { cleanupDiffRefs } from "./diff-review.ts";
+import { describeExecFailure, formatExecFailureForLog, formatExitClause } from "./exec-failure.ts";
 import { autoConfirmKind, buildFleetConfirmKeyboard, FleetConfirmRegistry, type FleetBulkKind } from "./fleet-confirm.ts";
 import type { AutoCategory, FleetCommand } from "./fleet-commands.ts";
 import { AUTO_CATEGORIES, buildLsDetail, newSessionContent, renderAttach, renderLsTable } from "./fleet-commands.ts";
@@ -415,6 +416,20 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         log,
       });
     } catch (err) {
+      // P1-9: log before anything else in this branch. Until 2026-08-12 a failed launch was
+      // reported to Telegram and nowhere else, so `bridge.log` held no record that a launch had
+      // even been attempted - which is how a real incident (every `/new` failing at
+      // `git worktree add`, cleared by a restart) ended with the cause still unknown. The repo path
+      // and worktrees root are included because they are the two inputs a `git worktree add`
+      // failure is most likely to be about, and neither appears in the error message.
+      const failure = describeExecFailure(err);
+      log(
+        "ERROR",
+        // `fleetWorktreesRoot` is genuinely optional (`launchSession` falls back to its own default),
+        // and a line reading "worktrees root undefined" invites a hunt for a config bug that isn't
+        // there - live-verified 2026-08-12, that is exactly what the first version printed.
+        `launch failed for "${slug}" (repo ${repo.path}, worktrees root ${fleetWorktreesRoot ?? "launcher default"}): ${formatExecFailureForLog(failure)}`,
+      );
       // A launch failure this late still leaves the topic already created above (Telegram has no
       // atomic "create topic + do the rest" call) - deleted here rather than left as an orphan with
       // no session row and therefore no slug for `/rm` to ever find, confirmed live 2026-08-03 when
@@ -425,7 +440,10 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         log("WARN", `failed to clean up topic for "${slug}" after a failed launch: ${(deleteErr as Error).message}`);
       }
       await clearThinkingPlaceholder();
-      confirmSessionCommand(controlTopicId, `Failed to launch session "${slug}": ${(err as Error).message}${attachmentLostNote}`);
+      confirmSessionCommand(
+        controlTopicId,
+        `Failed to launch session "${slug}": ${failure.message}${formatExitClause(failure)}${attachmentLostNote}`,
+      );
       return;
     }
 
