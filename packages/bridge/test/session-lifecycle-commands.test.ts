@@ -8,7 +8,7 @@ import { PermissionRegistry } from "../src/permission-registry.ts";
 import { ReposRegistry } from "../src/repos-registry.ts";
 import { Routing } from "../src/routing.ts";
 import { applyPendingAttachment, createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE } from "../src/session-lifecycle-commands.ts";
-import { SessionStore, type SessionRow } from "../src/session-store.ts";
+import { isValidTransition, SessionStore, type SessionRow, type SessionState } from "../src/session-store.ts";
 
 function row(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
@@ -99,9 +99,18 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
   const controlBot = fakeControlBot();
   const sessionSupervisor = fakeSessionSupervisor();
   const ptyIo = fakePtyIo();
+  const stoppedIndicatorTopics: number[] = [];
   const feedWiring = {
     allFeedStates: () => new Map(),
     forgetSession: () => {},
+    // Mirrors feed-wiring.ts's real `maybeSetState` rather than just recording the call: it writes
+    // through `isValidTransition`, so a test asserting `/stop` moved a row is also asserting §4.3
+    // actually permits that edge. A record-only spy would have happily "passed" for the whole period
+    // `awaiting_input -> idle` was missing from the table.
+    maybeSetState: (slug: string, next: SessionState) => {
+      const current = sessionStore.get(slug);
+      if (current && current.state !== next && isValidTransition(current.state, next)) sessionStore.setState(slug, next, new Date().toISOString());
+    },
   };
   const permissionRegistry = new PermissionRegistry();
   const askRegistry = new AskRegistry();
@@ -137,7 +146,9 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
       verdicts.push({ slug, requestId, behavior });
       return verdictDelivered;
     },
-    stopIndicatorsForTopic: () => {},
+    stopIndicatorsForTopic: (topicId: number) => {
+      stoppedIndicatorTopics.push(topicId);
+    },
     thinkingPlaceholder: { start: () => {}, consume: async () => undefined },
     postFleetConfirm: async (kind, topicId, targets) => {
       postFleetConfirmCalls.push({ kind, topicId, targets: targets.map((r) => r.slug) });
@@ -172,6 +183,7 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
     confirmed,
     finalizedMessages,
     verdicts,
+    stoppedIndicatorTopics,
     setVerdictDelivered: (delivered: boolean) => {
       verdictDelivered = delivered;
     },
@@ -260,6 +272,60 @@ describe("createSessionLifecycleCommands", () => {
       expect(confirmed[0]?.text).toContain('Sent stop to "fix-bug"');
     });
 
+    // Live-verified 2026-08-13: an operator interrupt emits no `Stop`/`StopFailure` hook at all, so
+    // the "let the hook pipeline move the row" design this command was built on had nothing to wait
+    // for and stranded every interrupted session in whatever state it was interrupted from. Measured
+    // on two real sessions - `working` for minutes after a mid-turn `/stop`, and `awaiting_input` for
+    // 3.5 minutes after a `/stop` on a permission card, until an unrelated message dragged it out.
+    test("handleStopCommand moves an interrupted working session to idle itself, with no Stop hook", () => {
+      const { sessionLifecycle, sessionStore } = setup();
+      sessionStore.insert(row({ state: "working" }));
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+      expect(sessionStore.get("fix-bug")?.state).toBe("idle");
+    });
+
+    // The first real caller of P1-11's `awaiting_input -> idle` edge: that fix added the edge, but an
+    // edge only helps if something crosses it, and no hook event ever did.
+    test("handleStopCommand moves an interrupted awaiting_input session to idle", () => {
+      const { sessionLifecycle, sessionStore } = setup();
+      sessionStore.insert(row({ state: "awaiting_input" }));
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+      expect(sessionStore.get("fix-bug")?.state).toBe("idle");
+    });
+
+    // The reason the write is gated on the two interruptible states instead of unconditional:
+    // §4.3 permits `quota_stopped -> idle`, so an unconditional write would let a stray `/stop`
+    // erase the one signal §10.5's alarms and `/ls`'s "stopped on a usage limit" line key on.
+    test("handleStopCommand does not erase a quota_stopped session's rate-limit signal", () => {
+      const { sessionLifecycle, sessionStore } = setup();
+      sessionStore.insert(row({ state: "quota_stopped" }));
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+      expect(sessionStore.get("fix-bug")?.state).toBe("quota_stopped");
+    });
+
+    test("handleStopCommand does not claim a still-starting session is idle", () => {
+      const { sessionLifecycle, sessionStore } = setup();
+      sessionStore.insert(row({ state: "starting" }));
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+      expect(sessionStore.get("fix-bug")?.state).toBe("starting");
+    });
+
+    test("handleStopCommand leaves a dead row dead", () => {
+      const { sessionLifecycle, sessionStore } = setup();
+      sessionStore.insert(row({ state: "dead" }));
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+      expect(sessionStore.get("fix-bug")?.state).toBe("dead");
+    });
+
+    // Observed live alongside the stranded row: with no `Stop` hook coming, the abandoned turn's
+    // "Thinking..." placeholder was left spinning indefinitely on a turn that had been interrupted.
+    test("handleStopCommand clears the abandoned turn's typing/thinking indicators", () => {
+      const { sessionLifecycle, sessionStore, stoppedIndicatorTopics } = setup();
+      sessionStore.insert(row({ topicId: 7 }));
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+      expect(stoppedIndicatorTopics).toEqual([7]);
+    });
+
     // Live-verified 2026-08-09: interrupting a session mid-tool-call abandons a still-pending
     // permission/ask outright, leaving it stuck in permissionRegistry/askRegistry forever (never
     // resolved by an operator tap or an at-terminal answer) - /ls kept misreporting the session as
@@ -283,6 +349,63 @@ describe("createSessionLifecycleCommands", () => {
       expect(confirmed[0]?.text).toContain('Sent stop to "fix-bug"');
       expect(confirmed[0]?.text).toContain("cleared 1 stale pending prompt");
       expect(finalizedMessages).toEqual([{ messageId: 10, text: "🛑 interrupted: Bash (session was stopped before this was answered)" }]);
+    });
+
+    // Measured 2026-08-13: a permission request blocks inside the session's own channel server, not
+    // in a hook client, and an Escape does not release it - a `/stop` over a permission card
+    // followed by nothing at all left the session silent for 8 minutes. Removing the registry entry
+    // without a verdict leaves nothing able to answer it ever again, since `sweepExpiredPermissions`
+    // iterates the registry `/stop` just emptied.
+    test("handleStopCommand denies a cleared pending permission rather than leaving it unanswered", () => {
+      const { sessionLifecycle, sessionStore, permissionRegistry, verdicts } = setup();
+      sessionStore.insert(row());
+      permissionRegistry.add({
+        requestId: "req-1",
+        slug: "fix-bug",
+        toolName: "Bash",
+        description: "run a command",
+        inputPreview: '{ "command": "echo hi" }',
+        topicId: 1,
+        messageId: 10,
+      });
+
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+
+      expect(verdicts).toEqual([{ slug: "fix-bug", requestId: "req-1", behavior: "deny" }]);
+    });
+
+    // An ask is the asymmetric case: it blocks a hook client, which Claude's own interrupt handling
+    // does release, so sending a verdict for one would be answering a question nobody is waiting on.
+    test("handleStopCommand sends no verdict for a cleared ask", () => {
+      const { sessionLifecycle, sessionStore, askRegistry, verdicts } = setup();
+      sessionStore.insert(row());
+      askRegistry.add({
+        id: "toolu_ask1",
+        slug: "fix-bug",
+        questions: [{ question: "A or B?", header: "Plan", options: [{ label: "A" }, { label: "B" }], topicId: 1, messageId: 11 }],
+      });
+
+      sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined);
+
+      expect(verdicts).toEqual([]);
+    });
+
+    test("handleStopCommand warns rather than throwing when the channel is already gone", () => {
+      const { sessionLifecycle, sessionStore, permissionRegistry, setVerdictDelivered, confirmed } = setup();
+      setVerdictDelivered(false);
+      sessionStore.insert(row());
+      permissionRegistry.add({
+        requestId: "req-1",
+        slug: "fix-bug",
+        toolName: "Bash",
+        description: "run a command",
+        inputPreview: '{ "command": "echo hi" }',
+        topicId: 1,
+        messageId: 10,
+      });
+
+      expect(() => sessionLifecycle.handleStopCommand({ kind: "stop", slug: "fix-bug" }, 1, undefined)).not.toThrow();
+      expect(confirmed[0]?.text).toContain('Sent stop to "fix-bug"');
     });
 
     test("handleStopCommand clears a stale pending ask for that slug, mentions it, and edits its card in place", () => {

@@ -18,7 +18,7 @@ import { launchSession } from "./session-launcher.ts";
 import { DEFAULT_EFFORT, ESCAPE, type Effort, type Mode } from "./session-commands.ts";
 import type { PtyIo } from "./pty-io.ts";
 import type { SessionSupervisor } from "./session-supervisor.ts";
-import { SessionStore, type SessionRow } from "./session-store.ts";
+import { SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
 import { slugFromPrompt, uniqueSlug } from "./slug.ts";
 import { buildTopicDeepLink, type ForumTopicSource, type InlineKeyboardMarkup, type SendMessageSource } from "./telegram.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
@@ -27,11 +27,16 @@ import type { VerdictBehavior } from "@aibridge/protocol";
 
 type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
 
-/** Just the two feed-wiring accessors this module actually calls - the full `FeedWiring` interface
+/** Just the feed-wiring accessors this module actually calls - the full `FeedWiring` interface
  * carries a lot more that has nothing to do with session lifecycle. */
 export interface SessionLifecycleFeedWiring {
   allFeedStates(): ReadonlyMap<string, { turnActive: boolean; turnStartedAtMs: number | null; lines: readonly { summary: string; status: string }[] }>;
   forgetSession(slug: string): void;
+  /** `feed-wiring.ts`'s state write, guarded by §4.3's transition table. Needed here because
+   * `/stop` has no hook event of its own to ride (see `handleStopCommand`) - and taken as the
+   * guarded `maybeSetState` rather than `sessionStore.setState` specifically so `/stop` can't
+   * write an edge §4.3 forbids, which is the one thing a direct write would let it do. */
+  maybeSetState(slug: string, next: SessionState): void;
 }
 
 export interface SessionLifecycleCommandsOptions {
@@ -689,18 +694,43 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
    * mechanism `/model`/`/mode` already use (§4.2.1/§4.2.2), just without the trailing `\r` since
    * Escape is a control byte the TUI consumes immediately rather than a typed+submitted line.
    *
-   * Deliberately does not touch `sessionStore.setState` - the `working -> idle` transition is the
-   * hook pipeline's job once Claude actually aborts the turn (`Stop`/`StopFailure`), and asserting
-   * it directly here would race that. No ack comes back from the PTY either (same as
-   * `/model`/`/mode`), so this only confirms that the keystroke was sent, not that a turn was
-   * actually in flight to interrupt - sending Escape to an idle session is a harmless no-op.
+   * No ack comes back from the PTY (same as `/model`/`/mode`), so the keystroke write only confirms
+   * that Escape was sent, not that a turn was actually in flight to interrupt - sending Escape to an
+   * idle session is a harmless no-op.
    *
-   * That "the hook pipeline's job" was only true for a session that was `working`. Interrupting one
-   * that was `awaiting_input` (the case this function's registry-clearing below exists for) left
-   * the row stranded there, because §4.3's table had no `awaiting_input -> idle` edge and
-   * `maybeSetState` rejects silently - so the aborting `Stop` landed and did nothing, and `/ls`
-   * misreported the session for the rest of its life rather than just until the interrupt took
-   * effect. The edge exists now (`session-store.ts`); this function stays hands-off as designed.
+   * **This used to leave the state write to the hook pipeline**, on the reasoning that the
+   * `working -> idle` transition is `Stop`/`StopFailure`'s job once Claude aborts the turn, and that
+   * asserting it here would race that. Live-verified false on 2026-08-13, and the reason it survived
+   * so long is that the premise is unfalsifiable from `bridge.log` alone (`maybeSetState` logs only
+   * *successful* writes, so "no transition" and "rejected transition" look identical): **an
+   * operator interrupt produces no `Stop`/`StopFailure` hook at all.** Two real sessions, both
+   * measured:
+   *   - `/stop` mid-turn (state `working`) - no hook event of any kind followed, and the row was
+   *     still `working` minutes later.
+   *   - `/stop` while `awaiting_input` on a permission card - the row stayed `awaiting_input` for
+   *     the ~3 minutes between the interrupt clearing the last pending prompt and an unrelated
+   *     operator message happening to arrive and drag it to `working`. `/ls` reported
+   *     "waiting: reply" throughout, for a session waiting on nothing.
+   *
+   * So there was never a hook to wait for, and P1-11's new `awaiting_input -> idle` edge alone
+   * didn't help: an edge is only reachable if something crosses it. The resting state is asserted
+   * here instead, which is also what finally gives that edge a caller. Same class of fix as P1-11's
+   * three `onResolved` call sites - when the Bridge is the one that acted, the Bridge says so
+   * rather than hoping a hook will infer it.
+   *
+   * Gated on the two states an interrupt can actually be interrupting rather than written
+   * unconditionally: `quota_stopped -> idle` is a legal edge, so an Escape sent to a rate-limited
+   * session would otherwise erase the one signal §10.5's alarms and `/ls` key on, and a `starting`
+   * session would be claimed idle before its `SessionStart` ever landed.
+   *
+   * The old comment's "asserting it here would race the hook" concern is real but points the other
+   * way once measured. There is no hook to race; the only race left is an Escape that fails to
+   * interrupt (no PTY write registered, or a turn already past the interruptible point), which
+   * leaves the row claiming `idle` while the turn runs on. That lie is bounded by the turn - the
+   * turn's own `Stop` writes `idle` again, a no-op - and self-corrects, where the behavior it
+   * replaces was a wrong state that persisted until the operator happened to send another message.
+   * It is also the same case in which `/stop` did nothing at all, so the row is wrong about a
+   * command that was already a no-op.
    *
    * DOES clear `permissionRegistry`/`askRegistry` entries for this slug, unlike `sessionStore`
    * above - live-verified 2026-08-09: interrupting a session mid-tool-call abandons the call
@@ -714,20 +744,45 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
    * Also edits each cleared entry's own Telegram card in place (added 2026-08-09) - §6.5's "a
    * stale button must never look tappable and silently do nothing" rule, already applied to the
    * TTL sweep's naturally-expired cards and to a cancelled ask's ceiling; leaving a `/stop`-cleared
-   * card's live Allow/Deny/question buttons up would be the one inconsistent exception. No verdict
-   * is sent back over the pipe the way `sweepExpiredPermissions`/`cancelAsk` do for their own
-   * cases - live-verified 2026-08-09 that Claude's own interrupt handling already unblocks the
-   * hook client that was waiting on the answer, so there is nothing left on the other end for a
-   * verdict to reach; this is a display-only fix; `finalizePermissionMessage` failures are logged,
-   * not thrown - a Telegram edit failing must never stop the stop from having happened.
+   * card's live Allow/Deny/question buttons up would be the one inconsistent exception.
+   * `finalizePermissionMessage` failures are logged, not thrown - a Telegram edit failing must never
+   * stop the stop from having happened.
+   *
+   * The two registries are **not** symmetric about verdicts, which the 2026-08-09 "no verdict is
+   * needed" note got wrong by generalizing from one to the other. An **ask** blocks a hook client,
+   * and Claude's own interrupt handling does release it - confirmed 2026-08-13, no `aibridge-hook`
+   * process survives a `/stop` over a live question card - so clearing the ask registry is genuinely
+   * display-only. A **permission** blocks inside the session's own channel server instead, which
+   * only a verdict over the pipe can release, so that half sends one (below).
    */
   function handleStopCommand(cmd: Extract<FleetCommand, { kind: "stop" }>, topicId: number | undefined, currentSlug: string | undefined): void {
     const row = resolveSessionOrBail(cmd.slug, currentSlug, topicId);
     if (!row) return;
     routing.getPtyWrite(row.slug)?.(ESCAPE);
 
+    // The abandoned turn's typing indicator and "Thinking..." placeholder are the operator's only
+    // visual cue that something is still in flight, and with no `Stop` hook coming (see above)
+    // nothing else ever clears them - live-observed alongside the stranded row, a placeholder left
+    // spinning on a turn that had already been interrupted. Same call `/kill` and `/rm` make for the
+    // same reason. Unconditional, unlike the state write below: this is display-only cleanup, and a
+    // stale indicator on an already-idle session is exactly as worth clearing.
+    stopIndicatorsForTopic(row.topicId);
+
     const clearedPermissions = permissionRegistry.removeForSlug(row.slug);
     for (const entry of clearedPermissions) {
+      // Send the same `deny` the TTL sweep sends, for the same reason it sends one (§6.5): removing
+      // the entry without a verdict leaves *nothing* able to answer that request ever again -
+      // `sweepExpiredPermissions` iterates the registry this just emptied, and the card's buttons
+      // are about to be stripped. Escape does not cover it: a permission request blocks inside the
+      // session's own channel server, not in a hook client, and only a verdict over the pipe
+      // releases it. Measured 2026-08-13 - a `/stop` over a permission card, then nothing sent to
+      // the session at all, produced total silence for 8 minutes; a sibling session `/stop`ped the
+      // same way only emitted its abandoned call's `PostToolUse` once an unrelated operator message
+      // arrived ~3 minutes later. `deny` rather than `allow` because the operator just asked for the
+      // session to stop - the one verdict that cannot surprise them is the one that runs nothing.
+      if (!sendVerdict(row.slug, entry.requestId, "deny")) {
+        log("WARN", `/stop: no live channel for "${row.slug}", ${entry.toolName}'s pending permission left unanswered`);
+      }
       finalizePermissionMessage(entry.messageId, `🛑 interrupted: ${entry.toolName} (session was stopped before this was answered)`).catch((err) =>
         log("WARN", `failed to mark permission as interrupted for "${row.slug}": ${(err as Error).message}`),
       );
@@ -744,6 +799,8 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         );
       }
     }
+
+    if (row.state === "working" || row.state === "awaiting_input") feedWiring.maybeSetState(row.slug, "idle");
 
     const cleared = clearedPermissions.length + clearedQuestions;
     const clearedNote = cleared > 0 ? ` (cleared ${cleared} stale pending prompt${cleared === 1 ? "" : "s"})` : "";
@@ -954,6 +1011,14 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
    * here. Popping the entry and editing its card without sending one would leave no recovery path at
    * all - `sweepExpiredPermissions` iterates the registry this just emptied, so the session would
    * hang forever on a card claiming it was approved.
+   *
+   * That first sentence was **wrong for permissions**, and `handleStopCommand` now sends a verdict
+   * of its own - see its own comment. Both that claim and its (also corrected) "the hook pipeline
+   * will move the row" sibling came out of the same 2026-08-09 live session, and both turned out to
+   * generalize from the ask path, where the blocked party really is a hook client an Escape
+   * releases, to the permission path, where it is the session's own channel server and only a
+   * verdict releases it. What still distinguishes this function is the second half: nothing is
+   * interrupted here, so `allow` is the right verdict, where `/stop` sends `deny`.
    */
   function drainPendingPermissions(slug: string): void {
     for (const entry of permissionRegistry.removeForSlug(slug)) {

@@ -1,7 +1,7 @@
 ---
-version: 0.110.0
+version: 0.110.1
 status: solid
-last_modified_utc: 2026-08-13T06:30:00Z
+last_modified_utc: 2026-08-13T09:30:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,14 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.110.1 (2026-08-13): §12 Phase 4's ask-ceiling bullet said the 3540s path was \"not verified
+    under a real hour-long wait\". It was, earlier the same day - the wait ran 06:03:16 to 07:02:26,
+    the card was edited in place to \"no answer in an hour - cancelled\", and the hook was genuinely
+    unblocked rather than merely reported as such (the slug went silent for the full hour and then
+    resumed real tool calls and a `Stop`, which a still-blocked hook client could not have produced).
+    Recorded nowhere until now, so the plan understated what had been proven. Also notes that this is
+    the run that surfaced P1-11 (`codebase-hardening-plan.md`), which in turn led to P1-12 - the
+    hour-long wait paid for itself twice."
   - "0.110.0 (2026-08-13): ran the four remaining never-live-exercised paths named in §12, on the
     operator's instruction to close them all out. Two passed as designed and are now recorded as
     live-verified: **quiet mode** (`⚠️ feed throttled, 5 sessions active` posted mid-storm, behind
@@ -3980,8 +3988,14 @@ item 3 is moot until §7.6.
 - ~~The per-hook `timeout` and the cancel-on-timeout path (§6.4).~~ **Done** - `timeout: 3600` on
   the `AskUserQuestion`-matched hook entry, Bridge-side cancel at 3540s (the periodic sweep already
   used for §6.5's permission-expiry), hook-client's own 3550s local backstop behind that in case
-  the Bridge is unreachable for the whole hour. The 3540s path is unit-tested (scenario 23) and
-  spike-verified against the real stdout contract, not verified under a real hour-long wait.
+  the Bridge is unreachable for the whole hour. The 3540s path is unit-tested (scenario 23),
+  spike-verified against the real stdout contract, and - as of **2026-08-13** - verified under a real
+  hour-long wait: a genuine `AskUserQuestion` card was left untouched for the full ceiling, its card
+  was edited in place to "⌛ no answer in an hour - cancelled" (keyboard stripped), and the hook was
+  genuinely unblocked rather than merely reported as such - the slug went silent from 06:03:16 to
+  07:02:26 and then resumed real tool calls and a `Stop`, which a still-blocked hook client could not
+  have produced. That same run is what surfaced P1-11 (the row stayed `awaiting_input` across the
+  cancel), so the wait paid for itself twice.
 - **Live-verified 2026-08-03** against the real Telegram group and the real Claude Code binary: a
   genuine `AskUserQuestion` call produced no terminal picker at all, posted a real question card
   from the control bot, and tapping an option both finalized the card (checkmark, keyboard
