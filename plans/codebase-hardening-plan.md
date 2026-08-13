@@ -1,8 +1,77 @@
 ---
-version: 1.10.0
+version: 1.12.1
 status: solid
-last_modified_utc: 2026-08-13T09:30:00Z
+last_modified_utc: 2026-08-13T15:20:00Z
 changelog:
+  - "1.12.1 (2026-08-13): documentation only - `## Open findings` said `Open` while holding two
+    entries that both say **Fixed**, which contradicted CLAUDE.md's `Nothing in it is open` for
+    anyone who grepped the heading instead of reading to the end of each entry. The section now
+    opens with an explicit `**None.**` and keeps the recent fixed findings under a subheading, since
+    they are kept at full length on purpose - the reasoning, not the status, is why they are here."
+  - "1.12.0 (2026-08-13): both findings 1.11.0 opened are now fixed, and diagnosing the second one
+    turned it into something much larger than the single anecdote it was filed as. **P1-13**: the slug
+    is claimed synchronously now, in the same tick it is derived, against the union of
+    `sessionStore.slugs()` and an in-flight `Set` - and released in a `finally` in a thin
+    `handleNewCommand` wrapper, so no `return` or `throw` in the ~190-line body can leak a reservation
+    (a leaked one is permanent for the daemon's lifetime and would push every later `/new` with that
+    prompt onto `-2`, `-3`, ...). The wrapper also `catch`es, and `abandonHalfBuiltSession` tears down
+    exactly as much as the attempt actually built: `removeSessionRow` once the row exists, otherwise
+    kill the PTY, unwire routing/supervisor/feed, clean diff refs before the worktree that is their
+    `cwd`, remove the worktree, delete the topic, and tell the operator - naming the worktree path when
+    it could not be deleted, because that is what blocks the next `/new`. Exported and dep-injected
+    rather than left in the closure, on the principle that teardown code which only ever runs after
+    something else has gone wrong is exactly the code that turns out not to work. 15 new tests; the
+    three race tests were run against the unfixed derivation first and all three fail there.
+    **P2-7 was mis-filed as `a long prompt lost its middle`; it is a lost Enter, and it was not rare.**
+    Reproduced live with a position-marked prompt (`scripts/telegram-automation/long-prompt-check.js`,
+    new): at ~3.7KB the message was typed into the composer and never submitted - no `UserPromptSubmit`,
+    no retry, no error, the session idle behind a spinning `Thinking...` forever. The PTY log gives the
+    mechanism outright: a `renderChannelTag` body is multi-line, so Claude Code's TUI collapses it to
+    `[Pasted text #1]`, and a `\\r` arriving immediately behind it is swallowed into the paste as
+    `[Pasted text #2 +1 lines]` instead of read as Enter. Counted across a full `bridge.log`, that Enter
+    failed on **105 of 145** inbound messages - `confirmSubmitted`'s retry rescued most 2.5s later,
+    which is where that latency on nearly every turn came from, and 7 were never rescued at all. Past
+    ~3KB the retry is lost too, because the still-streaming echo lands inside the detector's fixed
+    500ms window and reads as `the turn started`. Fixed by writing the Enter only once the body's echo
+    has appeared *and* finished (bounded; a timeout still writes it), serializing per slug so the newly
+    split body/Enter pair cannot interleave with the next message, and taking `confirmSubmitted`'s
+    baseline from that same post-echo moment. A first version of this fix shipped as a no-op and was
+    caught by reading the live PTY log rather than by any test - `waitForPtyQuiet` measured the silence
+    that was already there, because the echo cannot have arrived a microsecond after `write` returns;
+    `afterActivityAt` now makes it wait for the write's own echo first, with its own tests.
+    **And with the Enter landing, the originally-filed symptom appeared underneath it**: a single
+    large `write()` overruns the PTY's input buffer, so the body arrives with its *middle* gone - at
+    3.8KB the session saw the first ~200 characters and the last ~350 and reported the gap itself
+    (`after C03 it jumps straight to C71`). Bracketed paste, which would have solved it cleanly, is
+    unavailable: the TUI never emits `?2004h`, so it detects pastes heuristically and would take
+    `\\e[200~` as literal text. Fixed by chunking the body - and **paced on the reader's echo, not on
+    a timer**: 400-character chunks 40ms apart recovered 54 of 77 markers instead of 10 but still lost
+    ~1.1KB, because the TUI's per-chunk cost grows as the composer fills and any constant picked for
+    the start of a message is too small by the end. Waiting for each chunk's own echo adapts to that.
+    Measured across four live runs of the same 3.8KB message: never submitted at all -> submitted but
+    10/77 markers -> 54/77 -> **77/77 intact, first Enter, 2.2s**. 14 more tests (1805 total)."
+  - "1.11.0 (2026-08-13): reopens with two findings, both surfaced while running §13's remaining
+    manual checks rather than by reading code. **P1-13**: `handleNewCommand` computes
+    `uniqueSlug(base, sessionStore.slugs())` at `session-lifecycle-commands.ts:381` but inserts the row
+    at 493, with `createForumTopic` and all of `launchSession` awaited in between - so two concurrent
+    `/new` deriving the same base slug both pass a uniqueness check against state neither has written
+    yet, both cut a worktree and spawn `claude`, and the loser's `insert` throws
+    `UNIQUE constraint failed: sessions.slug` as an unhandled rejection the operator never sees.
+    Measured consequences: two processes and two channel servers on one slug, `routing.add`/
+    `wireSession` called twice, the untracked process surviving `/kill` for 18 minutes and needing a
+    PID-level kill, and - because it held its directory open - `removeWorktree` failing
+    (`is not a working tree`) and every later `/new` for that slug failing at launch, poisoning the slug
+    until hand cleanup. Fix direction is a synchronous in-flight slug reservation before the first
+    `await`, plus a `try/catch` that tells the operator and tears down the half-built session. Reached
+    by an ordinary double-tap on send, not just by the multi-line-paste accident that found it.
+    **P2-7**: a ~1200-character `/new` prompt reached its session with the middle missing (beginning
+    and end intact - the shape of a dropped chunk, not a length cap); the same prompt at ~450
+    characters was delivered intact. One observation, not diagnosed, recorded with the next
+    instrumentation step rather than chased. Neither is fixed here. Also records what the same session
+    established on the verification side, in the main plan: §13 check 7 is now an expected-FAIL with a
+    host-computed digest as proof, check 5(c) passes, and check 6's permission half - plus a
+    count-based arrival baseline shared by the whole Telegram rig - had been reporting verdicts it never
+    earned since the day each was written."
   - "1.10.0 (2026-08-13): P1-12, found by live-verifying P1-11's own fix hours after shipping it, and fixed the same day. `/stop` deliberately wrote no state, on the documented reasoning that `Stop`/`StopFailure` would move the row once Claude aborted the turn. Measured against two real sessions: **an operator interrupt emits no `Stop`/`StopFailure` hook at all** - a `/stop` mid-turn left the row `working` with no subsequent hook of any kind, and a `/stop` on a permission card left it `awaiting_input` for the ~3 minutes between the interrupt clearing the last pending prompt and an unrelated operator message happening to arrive (`/ls` reporting \"waiting: reply\" throughout, for a session waiting on nothing). So every `/stop` stranded its session in whatever state it was interrupted from, on the most routine intervention the operator has. P1-11's new `awaiting_input -> idle` edge did not help alone - an edge only helps if something crosses it, and this fix is its first real caller. `handleStopCommand` now asserts the resting state, gated on `working`/`awaiting_input` so a stray `/stop` can't erase a `quota_stopped` row's rate-limit signal or claim a `starting` session is idle, and calls `stopIndicatorsForTopic` for the same root cause (the abandoned turn's \"Thinking...\" placeholder was left spinning indefinitely, observed live). 9 new tests (1778/1778), each verified to fail against a re-broken copy in both directions - write removed, then gate removed - and the harness's `maybeSetState` fake was made to write through `isValidTransition` rather than record calls, since a record-only spy would have passed throughout the period the edge was missing. Second half of the same finding: `/stop` also cleared pending *permission* entries without a verdict, on a 2026-08-09 note that generalized from the ask path (where an Escape really does release the blocked hook client) to the permission path (where the block is inside the session's own channel server and only a verdict releases it) - and since `/stop` removes the registry entry, `sweepExpiredPermissions` could never fire for it either, reaching exactly the \"no recovery path at all\" outcome `drainPendingPermissions`' comment warns about via the one caller it exempted. Measured: a session `/stop`ped over a permission card and then sent nothing stayed silent for 8 minutes. `/stop` now sends `deny`; asks stay verdict-free and that asymmetry is stated in both comments. **Both halves live-verified against the real Bridge after the fix**, in the same daemon that had stranded three sessions an hour earlier: `awaiting_input -> idle` with the deny releasing the blocked call 685ms later (against 8 minutes of silence pre-fix), and `working -> idle` (against 39 minutes stranded pre-fix). Records the general rule this pass earned: **verify the traversal, not just the path** - a unit test proving an edge works supplies the traversal itself, so it cannot notice that nothing real ever crosses it."
   - "1.9.0 (2026-08-13): P0-8 fixed, and a second finding (P1-11) found and fixed alongside it - both the same shape, *the Bridge acted and did not tell the state machine*. **P0-8**: `recoverWedgedPty` now records a TTL-bounded per-slug recovery mark immediately before `kill()` (never after - the dying process's `SessionEnd` reached the pipe 33ms behind the kill live, so a mark written afterwards loses that race just as reliably as no mark), and `feed-wiring.ts` skips *only the state write* for a `SessionEnd` inside that window; the event still renders, because it is true - the process did exit - and what was wrong was the conclusion \"therefore this session is over\", not the report. Suppressed rather than undone, since `dead` is terminal and a row allowed to reach it cannot be walked back. The mark clears on the successor's `SessionStart`, and otherwise expires at 30s so a recovery that quietly never happened cannot leave a dead session showing as live forever. **P1-11**, found while confirming §6.4's one-hour ceiling (which itself passed - card edited in place, hook genuinely unblocked): the row sat at `awaiting_input` an hour past the cancel, because §4.3's table had no `awaiting_input -> idle` edge, so the turn-ending `Stop` was rejected *silently* (`maybeSetState` only logs writes that land), and because three of the four Bridge-side resolution paths never made the `maybeSetState(..., \"working\")` call the button-tap path always has. Both halves fixed: three misses out of four paths is the argument for a backstop, not just for patching the sites. 22 new tests (1769/1769), every one of them run against a deliberately re-broken copy of its own fix first - six reversions, six confirmed failures - because both findings are ordering bugs whose tests are otherwise free to pass for the wrong reason."
   - "1.8.0 (2026-08-13): two findings from running the last of §12's never-live-exercised checks. **P1-10 (found and fixed)**: `/attach` produced nothing at all the first time it ran against a real multi-line PTY tail - the rendered card passed Telegram's 4096-unit cap, the P1 send failed three times with \"message is too long\", and a failed command confirmation is only a log line, so the operator saw silence. The raw ring buffer is bounded at 4000 chars but `renderAttach` HTML-escapes it afterwards and PTY output is dense in `<`, `>` and `&`, each expanding 4-5x; the fix bounds the *rendered* message instead, trimming the escaped tail from the front and never through an entity (a half-cut `&amp;` would swap the error for \"can't parse entities\"), with a visible trimmed-to-fit marker. 5 new tests. **P0-8 (found, not fixed - see ## Open findings)**: `wedged-recovery.ts` kills a wedged session expecting the crash-resume path to relaunch it, but the killed process runs its own `SessionEnd` hook on the way out, which marks the row `dead` 33ms later, and `resumeSession` then correctly refuses to resume a dead row - the session stays dead and the operator's next messages are dropped with only a WARN. That module's doc comment reasons carefully about not untracking the PTY and misses that a deliberate kill runs hooks a real crash never gets to run. Recorded in the main plan rather than here: quiet mode and `quota_stopped` both live-exercised for the first time, plus the structural reason a tool-heavy storm does not trip quiet mode while a turn-heavy one does - the coalescer's interval scaling holds card edits at the feed budget by design, so it is per-turn card creates and details anchors that exceed it."
@@ -266,11 +335,149 @@ some event actually traverses it, and no event does here. The general form: **a 
 path is only verified when something is observed taking that path**, which a unit test asserting the
 edge exists cannot show, because it supplies the traversal itself.
 
+Later the same day, running §13's remaining manual checks reopened this document with **P1-13** and
+**P2-7**, and produced a companion lesson about the checks themselves rather than about the Bridge.
+Four separate defects were found in the Telegram-automation rig, and every one of them had been
+reporting a verdict it had not earned since the day it was written: check 6's permission half printed
+`FAIL: no permission card appeared` against cards that were on screen (three independent causes, none
+in the Bridge), and `getMessageCount` — used as the arrival baseline by every script in the folder —
+went 35 → 36 → **32** while a reply landed, because Web K prunes bubbles it has scrolled past. That
+last one briefly read as a wedged daemon and was only settled by proving the Bridge had *executed* a
+command whose reply the rig claimed never arrived.
+
+So the shape to look for on the verification side is the mirror of the Bridge-side one above: **the
+check ran, and measured nothing.** It is strictly more dangerous than a check that is missing, because
+a red result looks like a finding and a green one looks like coverage. The discipline that catches it
+is the same one this document already applies to fixes — deliberately break the thing under test and
+confirm the check notices — and it is worth applying to the rig, not just to `bun test`. Check 7's own
+run is the case in point: it first returned `refused|failed|none`, which reads exactly like the Phase
+6b acceptance criterion, and was in fact Claude Code's safety classifier declining to run the script
+before it ever reached the filesystem. Scoring that as a pass would have retired the check while the
+thing it exists to measure stayed untested.
+
 ---
 
 ## Open findings
 
-_(None. **P0-8**, **P1-11** and **P1-12**, all found live on 2026-08-13, were fixed the same day —
+**None.** Every finding filed to date is fixed.
+
+The most recent ones are kept below at full length rather than compressed into **## Resolved**,
+because in each case the reasoning is the point: what the first diagnosis got wrong, what the fix
+deliberately does *not* do, and which measurement would have to change to revisit it. Every entry
+records when it was fixed. A genuinely open finding goes directly under this paragraph, above the
+subheading, and stays there until its own text says **Fixed**.
+
+### Recent findings, all fixed
+
+- **P1-13 — two concurrent `/new` commands that derive the same slug race past the uniqueness check,
+  and the loser survives as an untracked `claude` process holding a worktree directory nothing can
+  clean up.** Found live 2026-08-13, accidentally: a multi-line prompt typed into Telegram's composer
+  posts one message per line (newline is Enter, Enter sends), two of those lines each parsed as their
+  own `/new`, and both derived the same base slug from the same opening words.
+
+  `handleNewCommand` computes `uniqueSlug(base, sessionStore.slugs())` at
+  `session-lifecycle-commands.ts:381` but only inserts the row at line 493 — with
+  `createForumTopic` and the whole of `launchSession` awaited in between. The uniqueness check is
+  therefore a read against state that the winner has not written yet, so both callers pass it and
+  both proceed to cut a worktree and spawn a `claude` process under the same slug. The second
+  `sessionStore.insert` then throws `UNIQUE constraint failed: sessions.slug` as an **unhandled
+  rejection** — logged, but never surfaced to the operator, who sees one confirmation and assumes one
+  session.
+
+  What it actually left behind, measured: two `claude` processes and two channel servers on one slug;
+  `routing.add`/`wireSession` called twice so the routing table points at whichever PTY ran second;
+  the tracked process killed by `/kill` while **the untracked one stayed alive for 18 minutes** and
+  had to be found by `CommandLine` match and killed by PID; and — because that orphan held its
+  directory open — `/remove`'s `removeWorktree` failing with
+  `fatal: '...' is not a working tree`, then every later `/new` for that slug failing at launch
+  (`ERROR launch failed for "sbx-..."`) because the directory still existed. So one racing pair
+  poisons that slug until someone cleans up by hand.
+
+  **Fixed 2026-08-13** (v1.12.0). The slug is now claimed synchronously, in the tick it is derived,
+  against the union of `sessionStore.slugs()` and an in-flight `Set<string>` — the three lines that
+  derive, claim and record it sit together with no `await` between them, and that ordering *is* the
+  fix. It is released in a `finally` in a thin `handleNewCommand` wrapper rather than at each exit,
+  so none of the body's many `return`s can leak a reservation; a leaked one is permanent for the
+  daemon's lifetime and would silently push every later `/new` with that prompt onto `-2`, `-3`, …
+
+  The wrapper also `catch`es, and `abandonHalfBuiltSession` (exported, dependency-injected) undoes
+  exactly as much as the attempt actually built: `removeSessionRow` once the row exists, otherwise
+  kill the PTY, unwire supervisor/routing/feed, clean diff refs *before* deleting the worktree that
+  is their `cwd`, remove the worktree, delete the topic, and report — naming the worktree path when
+  removal failed, since that is the thing that blocks the next `/new`. It never rethrows, including
+  from its own operator-facing report: it runs from a `catch`, and a throw on the way out would put
+  the original failure back into the hole it exists to close. Exported rather than left in the
+  closure because `handleNewCommand` cannot be driven past `launchSession` from a unit test, and
+  teardown that only ever runs after something else has gone wrong is precisely the code that turns
+  out not to work.
+
+  15 new tests. The three concurrency tests were run against the unfixed derivation first and all
+  three fail there — the two-call one reports the same slug twice, which is the finding exactly.
+
+- **P2-7 — filed as "a long prompt lost its middle". It is a lost Enter, and it was never rare.**
+  Filed 2026-08-13 from a single anecdote (a ~1200-character `/new` whose session replied "Your
+  message came through truncated"), diagnosed and **fixed the same day** (v1.12.0).
+
+  `scripts/telegram-automation/long-prompt-check.js` (new) sends a prompt built from numbered
+  position markers and asks the session to report which ones it can see, so a loss says *where* it
+  is — a gap in the middle is a dropped chunk, a missing tail is a length cap, a missing head is a
+  reader starting late. At ~1.8KB and ~2.8KB every marker survived. At ~3.7KB the message was typed
+  into the composer and simply never submitted: no `UserPromptSubmit`, no retry, no error anywhere,
+  the session sitting `idle` behind a `Thinking...` placeholder indefinitely.
+
+  The PTY log gives the mechanism outright. A `renderChannelTag` body is multi-line, so Claude
+  Code's TUI collapses it into a `[Pasted text #1]` block — and the `\r` written immediately behind
+  it is absorbed *into the paste* as `[Pasted text #2 +1 lines]` rather than read as Enter. The
+  retry `\r` 2.5s later arrives alone and submits normally, which is why this was survivable at all.
+  Counted over a full `bridge.log`: **105 of 145** inbound messages needed that retry, and 7 were
+  never rescued. Past roughly 3KB even the retry is lost, because the echo is still streaming when
+  `confirmSubmitted` takes its baseline on a fixed 500ms timer, so the rest of the echo reads as
+  "the turn started" — a detector that stays silent about a message nothing submitted is strictly
+  worse than no detector.
+
+  The fix writes the Enter only once the body's echo has appeared **and** finished (bounded — a
+  timeout still writes it, so an interjection into a busy PTY is delayed rather than dropped),
+  serializes per slug so the newly-split body/Enter pair cannot interleave with the next message,
+  and takes `confirmSubmitted`'s baseline from that same post-echo moment. Live-verified after the
+  fix: `UserPromptSubmit` 984ms after the write, on the first Enter, no retry, one paste block
+  instead of two.
+
+  **With the Enter landing, the symptom this finding was originally filed for appeared underneath
+  it** — and it is a second, independent defect. A single large `write()` overruns the PTY's input
+  buffer: at 3.8KB the session received the first ~200 characters and the last ~350 and reported the
+  gap in its own words ("after C03 it jumps straight to C71"). Head-and-tail-survive is the
+  signature of a bounded buffer overrunning while the reader is busy, and nothing upstream notices —
+  `write()` returns cleanly and Telegram's own copy of the message is perfect, so only the PTY log
+  disagrees. Bracketed paste would have fixed it cleanly and is not available: Claude Code's TUI
+  never emits `?2004h`, so it is detecting pastes heuristically and would take `\e[200~` as literal
+  input.
+
+  So the body is chunked — and **paced on the reader's echo rather than on a timer**, which is the
+  part worth keeping. 400-character chunks 40ms apart were measured first: they recovered 54 of 77
+  markers instead of 10, and still lost ~1.1KB from the middle, because the TUI's per-chunk cost
+  grows as the composer fills, so any constant chosen for the start of a message is too small by the
+  end of it. Waiting for each chunk's own echo before sending the next adapts to whatever the reader
+  is actually doing. Four live runs of the same 3.8KB message, in order: **never submitted at all →
+  submitted but 10/77 markers → 54/77 → 77/77 intact, first Enter, 2.2s**. Confirmed on both write
+  paths afterwards: 66/66 markers through `/new`, 74/74 through an ordinary in-topic turn.
+
+  One honest cost, recorded rather than tuned away. `lastActivityAt` only counts output surviving
+  `stripAnsi`, and a TUI repainting a paste can emit chunks of pure escape sequences — so the
+  per-chunk wait often runs to its 2s ceiling instead of detecting an echo. Into a fresh session the
+  3.8KB message submitted 2.2s after the write; into a session with history, a 3.6KB one took 19.4s,
+  which is 9 chunks × that ceiling almost exactly. Both delivered intact. A few hundred characters is
+  a single chunk and waits not at all, so this is confined to unusually large messages, and the only
+  measured value below it — a flat 40ms — still lost ~1.1KB. Lowering it is a measurement, with
+  `long-prompt-check.js` on the in-topic path, not a judgement call.
+
+  **The first version of this fix shipped as a no-op**, and no test caught it — reading the live PTY
+  log did. `waitForPtyQuiet` was measuring the silence that was already there, because a write's
+  echo cannot have arrived a microsecond after `write()` returns, so it resolved instantly and the
+  Enter went out in the same tick as before. `afterActivityAt` now makes the wait require output
+  *newer* than the moment before the write, and has its own tests, since a wait that returns early
+  is the §9 silent-wrong bar in its purest form: it looks exactly like a working fix.
+
+_(**P0-8**, **P1-11** and **P1-12**, all found live on 2026-08-13, were fixed the same day —
 see **## Resolved**. P0-8 as originally filed is kept below for its reasoning.)_
 
 <details>

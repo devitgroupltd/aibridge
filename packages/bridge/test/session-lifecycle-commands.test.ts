@@ -7,7 +7,7 @@ import { FleetConfirmRegistry } from "../src/fleet-confirm.ts";
 import { PermissionRegistry } from "../src/permission-registry.ts";
 import { ReposRegistry } from "../src/repos-registry.ts";
 import { Routing } from "../src/routing.ts";
-import { applyPendingAttachment, createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE } from "../src/session-lifecycle-commands.ts";
+import { abandonHalfBuiltSession, applyPendingAttachment, createSessionLifecycleCommands, ORPHAN_TOPIC_NOTE, type NewSessionTeardownDeps } from "../src/session-lifecycle-commands.ts";
 import { isValidTransition, SessionStore, type SessionRow, type SessionState } from "../src/session-store.ts";
 
 function row(overrides: Partial<SessionRow> = {}): SessionRow {
@@ -1114,6 +1114,286 @@ describe("createSessionLifecycleCommands", () => {
       const { controlBot } = await runFailingLaunch();
 
       expect(controlBot.forumTopicCalls.deleted).toEqual([999]);
+    });
+  });
+
+  // codebase-hardening-plan.md P1-13, found live 2026-08-13: two `/new`s whose prompts sanitize to
+  // the same base both passed `uniqueSlug` against a `sessionStore` neither had written to yet,
+  // because the check and the `insert` sit ~110 lines and three `await`s apart. Driven through the
+  // same failing-launch harness as P1-9 above (the only way to reach `handleNewCommand`'s slug
+  // derivation without a real git worktree and PTY spawn) - the slug each call settled on is
+  // recoverable from the ERROR line the launch failure logs.
+  //
+  // Concurrency here is real, not simulated: `handleNewCommand` runs synchronously all the way to
+  // its first `await` (`createForumTopic`), so starting the second call before awaiting the first
+  // puts both in exactly the window the finding is about. That is also why the fix has to claim the
+  // slug in that same synchronous run rather than anywhere after it.
+  describe("handleNewCommand's slug race (P1-13)", () => {
+    const PROMPT = "probe the launch failure path";
+    const BASE_SLUG = "probe-the-launch-failure-path";
+
+    function failingLaunchHarness() {
+      const logs: Array<{ level: string; message: string }> = [];
+      const reposRegistry = new ReposRegistry([{ name: "demo-repo", path: os.tmpdir() }]);
+      const harness = setup({
+        getReposRegistry: () => reposRegistry,
+        fleetWorktreesRoot: path.join(os.tmpdir(), "aibridge-p1-13-never-created"),
+        log: (level, message) => logs.push({ level, message }),
+      });
+      // Each launch failure logs `launch failed for "<slug>" (repo ...)` - the one place the slug a
+      // given call actually settled on is observable from outside.
+      const slugsAttempted = (): string[] =>
+        logs.filter((entry) => entry.message.startsWith("launch failed for")).map((entry) => entry.message.match(/launch failed for "([^"]+)"/)?.[1] ?? "(unparsed)");
+      return { ...harness, logs, slugsAttempted };
+    }
+
+    test("two concurrent /new commands with the same prompt get distinct slugs", async () => {
+      const { sessionLifecycle, slugsAttempted } = failingLaunchHarness();
+
+      // Deliberately NOT awaited in turn: both promises must be in flight at once, or this asserts
+      // the sequential behaviour (which was always correct) and would pass against the bug.
+      await Promise.all([
+        sessionLifecycle.handleNewCommand({ kind: "new", repo: "demo-repo", prompt: PROMPT }, 1),
+        sessionLifecycle.handleNewCommand({ kind: "new", repo: "demo-repo", prompt: PROMPT }, 1),
+      ]);
+
+      const attempted = slugsAttempted();
+      expect(attempted).toHaveLength(2);
+      expect(new Set(attempted).size).toBe(2);
+      // The second one is `uniqueSlug`'s ordinary suffix, not some other disambiguation - a slug is
+      // also the worktree directory name (§7.5), so its shape is load-bearing, not cosmetic.
+      expect(attempted.sort()).toEqual([BASE_SLUG, `${BASE_SLUG}-2`]);
+    });
+
+    test("a reservation is released once the attempt finishes, so a later /new reuses the base slug", async () => {
+      const { sessionLifecycle, slugsAttempted } = failingLaunchHarness();
+
+      await Promise.all([
+        sessionLifecycle.handleNewCommand({ kind: "new", repo: "demo-repo", prompt: PROMPT }, 1),
+        sessionLifecycle.handleNewCommand({ kind: "new", repo: "demo-repo", prompt: PROMPT }, 1),
+      ]);
+      // Both failed, so nothing is persisted and nothing is in flight - the base slug is genuinely
+      // free again. A leaked reservation is permanent for the Bridge's lifetime and would show up
+      // here as an ever-climbing `-2`, `-3`, ... on a fleet that has no sessions at all.
+      await sessionLifecycle.handleNewCommand({ kind: "new", repo: "demo-repo", prompt: PROMPT }, 1);
+
+      expect(slugsAttempted()[2]).toBe(BASE_SLUG);
+    });
+
+    test("three concurrent /new commands get three distinct slugs", async () => {
+      const { sessionLifecycle, slugsAttempted } = failingLaunchHarness();
+
+      await Promise.all([
+        sessionLifecycle.handleNewCommand({ kind: "new", repo: "demo-repo", prompt: PROMPT }, 1),
+        sessionLifecycle.handleNewCommand({ kind: "new", repo: "demo-repo", prompt: PROMPT }, 1),
+        sessionLifecycle.handleNewCommand({ kind: "new", repo: "demo-repo", prompt: PROMPT }, 1),
+      ]);
+
+      expect(slugsAttempted().sort()).toEqual([BASE_SLUG, `${BASE_SLUG}-2`, `${BASE_SLUG}-3`]);
+    });
+
+    test("an in-flight slug is excluded on top of, not instead of, the persisted ones", async () => {
+      const { sessionLifecycle, sessionStore, slugsAttempted } = failingLaunchHarness();
+      // A live session already holds the base slug, so the two racing calls must skip past it to
+      // `-2` and `-3` - the union of both sources, not whichever one the fix happened to consult.
+      sessionStore.insert(row({ slug: BASE_SLUG, topicId: 42, sessionId: "sess-base" }));
+
+      await Promise.all([
+        sessionLifecycle.handleNewCommand({ kind: "new", repo: "demo-repo", prompt: PROMPT }, 1),
+        sessionLifecycle.handleNewCommand({ kind: "new", repo: "demo-repo", prompt: PROMPT }, 1),
+      ]);
+
+      expect(slugsAttempted().sort()).toEqual([`${BASE_SLUG}-2`, `${BASE_SLUG}-3`]);
+    });
+  });
+
+  // P1-13's other half. `handleNewCommand` cannot be driven past `launchSession` from a unit test
+  // (real git worktree + real PTY spawn - see the P1-9 block above), and this teardown only ever
+  // runs on a day something else has already gone wrong, so it is exported and driven directly
+  // rather than left as untested closure code. Same reasoning as `applyPendingAttachment`.
+  describe("abandonHalfBuiltSession (P1-13)", () => {
+    function teardownHarness(overrides: Partial<NewSessionTeardownDeps> = {}) {
+      const logs: Array<{ level: string; message: string }> = [];
+      const calls = {
+        untracked: [] as string[],
+        clearedPtyWrite: [] as string[],
+        forgottenRoutes: [] as string[],
+        forgottenFeeds: [] as string[],
+        deletedTopics: [] as number[],
+        removedWorktrees: [] as Array<{ repoPath: string; worktreePath: string }>,
+        cleanedDiffRefs: [] as string[],
+        forgottenInboxCaches: [] as string[],
+        removedRows: [] as string[],
+        killed: 0,
+      };
+      const confirmed: Array<{ topicId: number | undefined; text: string }> = [];
+      const deps: NewSessionTeardownDeps = {
+        log: (level, message) => logs.push({ level, message }),
+        confirmSessionCommand: (topicId, text) => confirmed.push({ topicId, text }),
+        removeSessionRow: async (r) => {
+          calls.removedRows.push(r.slug);
+          return true;
+        },
+        getRow: () => undefined,
+        untrack: (slug) => calls.untracked.push(slug),
+        clearPtyWrite: (slug) => calls.clearedPtyWrite.push(slug),
+        forgetRoute: (slug) => calls.forgottenRoutes.push(slug),
+        forgetFeed: (slug) => calls.forgottenFeeds.push(slug),
+        deleteForumTopic: async (topicId) => {
+          calls.deletedTopics.push(topicId);
+        },
+        removeWorktreeFn: async (repoPath, worktreePath) => {
+          calls.removedWorktrees.push({ repoPath, worktreePath });
+        },
+        cleanupDiffRefsFn: (_worktreePath, slug) => calls.cleanedDiffRefs.push(slug),
+        forgetInboxGitignoreCacheFn: (worktreePath) => calls.forgottenInboxCaches.push(worktreePath),
+        ...overrides,
+      };
+      const attempt = {
+        slug: "half-built",
+        topicId: 999,
+        launched: {
+          ptyProcess: {
+            kill: () => {
+              calls.killed += 1;
+            },
+          },
+          worktreePath: "c:\\data\\worktrees\\half-built",
+          repoPath: "c:\\data\\projects\\demo",
+        },
+        clearPlaceholder: async () => {
+          placeholderCleared += 1;
+        },
+      };
+      let placeholderCleared = 0;
+      return { deps, attempt, logs, calls, confirmed, placeholdersCleared: () => placeholderCleared };
+    }
+
+    test("a launched-but-untracked session is killed, unwired, its worktree and topic removed", async () => {
+      const { deps, attempt, calls } = teardownHarness();
+
+      await abandonHalfBuiltSession(attempt, 1, new Error("UNIQUE constraint failed: sessions.slug"), deps);
+
+      // The whole finding in one assertion: the process that used to survive this is killed.
+      expect(calls.killed).toBe(1);
+      expect(calls.untracked).toEqual(["half-built"]);
+      expect(calls.clearedPtyWrite).toEqual(["half-built"]);
+      expect(calls.forgottenRoutes).toEqual(["half-built"]);
+      expect(calls.forgottenFeeds).toEqual(["half-built"]);
+      expect(calls.removedWorktrees).toEqual([{ repoPath: "c:\\data\\projects\\demo", worktreePath: "c:\\data\\worktrees\\half-built" }]);
+      expect(calls.deletedTopics).toEqual([999]);
+      expect(calls.forgottenInboxCaches).toEqual(["c:\\data\\worktrees\\half-built"]);
+      // `removeSessionRow` is the tracked-row path only - there is no row here to remove.
+      expect(calls.removedRows).toEqual([]);
+    });
+
+    test("diff refs are cleaned before the worktree they need as their cwd is deleted", async () => {
+      // Ordering constraint `removeSessionRow` already documents; asserted rather than trusted,
+      // since getting it backwards fails silently (cleanupDiffRefs swallows its own errors).
+      const order: string[] = [];
+      const { deps, attempt } = teardownHarness({
+        cleanupDiffRefsFn: () => order.push("cleanupDiffRefs"),
+        removeWorktreeFn: async () => {
+          order.push("removeWorktree");
+        },
+      });
+
+      await abandonHalfBuiltSession(attempt, 1, new Error("boom"), deps);
+
+      expect(order).toEqual(["cleanupDiffRefs", "removeWorktree"]);
+    });
+
+    test("a tracked session goes through removeSessionRow instead, with no second kill", async () => {
+      const trackedRow = row({ slug: "half-built", topicId: 999 });
+      const { deps, attempt, calls } = teardownHarness({ getRow: () => trackedRow });
+
+      await abandonHalfBuiltSession({ ...attempt, tracked: true }, 1, new Error("boom"), deps);
+
+      expect(calls.removedRows).toEqual(["half-built"]);
+      // `removeSessionRow` does its own killing and worktree removal - doing it here as well would
+      // be a second teardown racing the first over the same directory.
+      expect(calls.killed).toBe(0);
+      expect(calls.removedWorktrees).toEqual([]);
+      expect(calls.deletedTopics).toEqual([]);
+    });
+
+    test("a worktree that will not delete is named in the operator's message, not just the log", async () => {
+      const { deps, attempt, confirmed, logs, calls } = teardownHarness({
+        removeWorktreeFn: async () => {
+          throw new Error("Device or resource busy");
+        },
+      });
+
+      await abandonHalfBuiltSession(attempt, 1, new Error("boom"), deps);
+
+      expect(confirmed[0]!.text).toContain("c:\\data\\worktrees\\half-built");
+      expect(logs.some((entry) => entry.level === "WARN" && entry.message.includes("removeWorktree failed"))).toBe(true);
+      // A failed worktree removal must not stop the topic being cleaned up too.
+      expect(calls.deletedTopics).toEqual([999]);
+    });
+
+    test("a topic that will not delete appends the orphan-topic note", async () => {
+      const { deps, attempt, confirmed } = teardownHarness({
+        deleteForumTopic: async () => {
+          throw new Error("TOPIC_ID_INVALID");
+        },
+      });
+
+      await abandonHalfBuiltSession(attempt, 1, new Error("boom"), deps);
+
+      expect(confirmed[0]!.text).toContain(ORPHAN_TOPIC_NOTE.trim());
+    });
+
+    test("an attempt that never launched anything tears nothing down but still reports", async () => {
+      const { deps, attempt, calls, confirmed } = teardownHarness();
+
+      await abandonHalfBuiltSession({ slug: attempt.slug, topicId: attempt.topicId }, 1, new Error("boom"), deps);
+
+      expect(calls.killed).toBe(0);
+      expect(calls.removedWorktrees).toEqual([]);
+      expect(calls.deletedTopics).toEqual([]);
+      expect(confirmed[0]!.text).toContain('Failed to create "half-built"');
+    });
+
+    test("logs the original failure at ERROR with its stack, and reports its message to the operator", async () => {
+      const { deps, attempt, logs, confirmed } = teardownHarness();
+
+      await abandonHalfBuiltSession(attempt, 7, new Error("UNIQUE constraint failed: sessions.slug"), deps);
+
+      const error = logs.find((entry) => entry.level === "ERROR");
+      expect(error!.message).toContain('/new failed for "half-built"');
+      // The stack is the point: this branch only runs for failures nothing anticipated.
+      expect(error!.message).toContain("session-lifecycle-commands.test");
+      expect(confirmed[0]).toEqual({
+        topicId: 7,
+        text: expect.stringContaining("UNIQUE constraint failed: sessions.slug") as unknown as string,
+      });
+    });
+
+    test("clears an NL-/new's thinking placeholder", async () => {
+      const { deps, attempt, placeholdersCleared } = teardownHarness();
+
+      await abandonHalfBuiltSession(attempt, 1, new Error("boom"), deps);
+
+      expect(placeholdersCleared()).toBe(1);
+    });
+
+    test("never rethrows, even when the report to the operator is what fails", async () => {
+      // This runs from a `catch`. A throw on the way out would put the original failure straight
+      // back into the hole this function exists to close - and, via fireAndForget, would replace a
+      // precise "/new failed for X" log with a generic unhandled-rejection one.
+      const { deps, attempt, logs, calls } = teardownHarness({
+        confirmSessionCommand: () => {
+          throw new Error("Telegram is down");
+        },
+      });
+
+      await abandonHalfBuiltSession(attempt, 1, new Error("boom"), deps);
+
+      // The teardown itself still completed - only the report failed, and it said so.
+      expect(calls.killed).toBe(1);
+      expect(calls.deletedTopics).toEqual([999]);
+      expect(logs.some((entry) => entry.level === "WARN" && entry.message.includes("could not report the failed /new"))).toBe(true);
     });
   });
 });

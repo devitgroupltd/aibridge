@@ -4,7 +4,7 @@
 // the response is the caller's job), so it covers every control command with one script.
 //
 // Usage: node send-command.js "<command 1>" ["<command 2>" ...]
-const { connect, openGroup, openTopic, sendMessage, getMessageTexts, getMessageCount } = require("./client.js");
+const { connect, openGroup, openTopic, sendMessage, getMaxMessageId, waitForMessagesAfter } = require("./client.js");
 
 function log(msg) {
   console.error(`[${new Date().toISOString()}] ${msg}`);
@@ -23,18 +23,20 @@ if (commands.length === 0) {
 
   const results = [];
   for (const command of commands) {
-    const before = await getMessageCount(page);
+    // Keyed on the highest message id, not the rendered bubble count - see `getMaxMessageId`'s doc
+    // comment for the three false "(none within timeout)" readings the count baseline produced on
+    // 2026-08-13 against commands the Bridge had already executed and answered.
+    const afterMid = await getMaxMessageId(page);
     await sendMessage(page, command);
     log(`sent: ${command}`);
 
-    let texts = [];
-    for (let i = 0; i < 20; i++) {
-      await page.waitForTimeout(2000);
-      const total = await getMessageCount(page);
-      if (total <= before) continue;
-      texts = await getMessageTexts(page, total - before);
-      break;
-    }
+    // `match` skips the echo of the command itself, which always renders first - without it this
+    // returns a "response" consisting solely of what was just typed.
+    const texts = await waitForMessagesAfter(page, afterMid, {
+      rounds: 20,
+      intervalMs: 2000,
+      match: (t) => !t.startsWith(command),
+    });
     log(`response: ${texts.join(" | ") || "(none within timeout)"}`);
     results.push({ command, response: texts });
   }

@@ -100,12 +100,95 @@ async function getMessageTexts(page, count = 10) {
   return texts.filter(Boolean);
 }
 
-/** Total message-bubble count currently rendered - use as a baseline before an action, then poll
- * for `getMessageTexts` only over bubbles *past* that baseline. Matching by content alone (e.g.
- * "the last message containing X") is unsafe once a chat has history: it can match a stale
- * historical message instead of the fresh one just sent (confirmed live 2026-08-04). */
+/** Total message-bubble count currently rendered.
+ *
+ * **Do not use this as a "did a reply arrive" baseline - use `getMaxMessageId` below instead.**
+ * Web K virtualizes the message list and prunes bubbles that scroll out of the rendered window, so
+ * this count does not grow monotonically with new messages: measured live 2026-08-13 in a busy
+ * control topic it went 35 -> 36 -> **32** while a reply was landing, and a `total > before` test
+ * therefore stayed false for the full timeout against a reply that was on screen. Three consecutive
+ * `send-command.js` runs reported "(none within timeout)" that way for commands the Bridge had
+ * already executed and answered - and, worse, the pattern fails hardest exactly when the topic is
+ * busy, which is when a check is most likely to be measuring something that matters. Kept only for
+ * the rare "how much is rendered right now" question. */
 async function getMessageCount(page) {
   return page.locator(".bubble-content .translatable-message, .bubble .message").count();
 }
 
-module.exports = { connect, openGroup, openTopic, openTopicByTitle, sendMessage, getMessageTexts, getMessageCount };
+/** Highest Telegram message id currently rendered. `data-mid` is per-message, stable and
+ * monotonically increasing, which makes it the right baseline for "anything new since this moment":
+ * unlike a bubble count it survives the virtualization pruning above, and unlike matching on text it
+ * still sees a reply that happens to be byte-identical to an earlier one (five `/ls` rounds in a row
+ * produce five identical tables - a content-diff baseline would call four of them stale). */
+async function getMaxMessageId(page) {
+  const mids = await page.locator(".bubble[data-mid]").evaluateAll((els) => els.map((e) => Number(e.getAttribute("data-mid"))));
+  const finite = mids.filter((n) => Number.isFinite(n));
+  return finite.length > 0 ? Math.max(...finite) : 0;
+}
+
+/** Text of every rendered bubble newer than `afterMid`, oldest first. Includes the echo of whatever
+ * the operator just sent, same as the count-based helper it replaces. */
+async function getMessagesAfter(page, afterMid) {
+  const texts = await page.locator(".bubble[data-mid]").evaluateAll(
+    (els, after) =>
+      els
+        .filter((e) => Number(e.getAttribute("data-mid")) > after)
+        .sort((a, b) => Number(a.getAttribute("data-mid")) - Number(b.getAttribute("data-mid")))
+        .map((e) => (e.querySelector(".translatable-message, .message")?.innerText ?? "").trim()),
+    afterMid,
+  );
+  return texts.filter(Boolean);
+}
+
+/**
+ * Poll until at least one message newer than `afterMid` satisfies `match`, then return *every* new
+ * message (not just the matching one). Returns [] on timeout - an empty result here really does
+ * mean nothing arrived, which is the whole point of keying on mids.
+ *
+ * `match` matters because the operator's own message echoes back as a bubble too, and it is always
+ * the first thing to appear: a bare "anything new?" test returns on that echo, typically a second
+ * or two before the Bridge's actual reply, and the caller then reads a response that contains only
+ * its own command. Pass a predicate that excludes the echo when you want the reply.
+ */
+async function waitForMessagesAfter(page, afterMid, { rounds = 20, intervalMs = 2000, match = () => true } = {}) {
+  for (let i = 0; i < rounds; i++) {
+    await page.waitForTimeout(intervalMs);
+    const texts = await getMessagesAfter(page, afterMid);
+    if (texts.some(match)) return texts;
+  }
+  return [];
+}
+
+/**
+ * The button analogue of `getMessageTexts`' emoji caveat above, and the same bug one layer down:
+ * Web K renders emoji as `<img class="emoji">` sprites, so a button the Bridge sends as `"✅ Allow"`
+ * has an innerText of just `" Allow"`, and a `hasText: "✅ Allow"` locator matches nothing, ever.
+ * Confirmed live 2026-08-13: rate-storm-check.js's permission probe had been hunting for `"✅ Allow"`
+ * since it was written and had therefore never once measured a permission latency - it printed
+ * "FAIL: no permission card appeared" against cards that were plainly on screen. Pass the label
+ * *without* its emoji.
+ *
+ * Anchored regex rather than the plain substring `hasText` takes, because Playwright's string form
+ * is case-insensitive: `"Allow"` also matches `"♾️ Always allow this pattern"`, and callers reach
+ * for `.last()` here, which would tap **Always allow** - writing a permanent permission rule
+ * instead of approving one call. A wrong tap that silently widens the allowlist is a far worse
+ * failure than no tap at all, so this refuses to match loosely.
+ */
+function buttonByLabel(page, label) {
+  const escaped = label.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return page.locator(".reply-markup-button", { hasText: new RegExp(`^\\s*${escaped}\\s*$`) });
+}
+
+module.exports = {
+  connect,
+  openGroup,
+  openTopic,
+  openTopicByTitle,
+  sendMessage,
+  getMessageTexts,
+  getMessageCount,
+  getMaxMessageId,
+  getMessagesAfter,
+  waitForMessagesAfter,
+  buttonByLabel,
+};
