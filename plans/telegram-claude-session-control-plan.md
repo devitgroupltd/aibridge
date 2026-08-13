@@ -1,7 +1,7 @@
 ---
-version: 0.111.0
+version: 0.112.0
 status: solid
-last_modified_utc: 2026-08-13T11:15:00Z
+last_modified_utc: 2026-08-13T14:05:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,27 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.112.0 (2026-08-13): both findings 0.111.0 filed are fixed (see codebase-hardening-plan.md
+    v1.12.0), and chasing the second one turned up something this plan had never noticed: **the
+    Bridge's own inbound write path was losing Enters on most turns and losing message content
+    outright past ~3KB**. New `scripts/telegram-automation/long-prompt-check.js` makes delivery
+    measurable - a prompt built from numbered position markers, sent through both `/new` and an
+    ordinary in-topic turn, with the session reporting which markers it can see, so a loss says
+    *where* it is rather than just that one happened. Two distinct defects, both in `sendChannelText`
+    and neither visible from Telegram's side (§5's feed shows the message perfectly; only the PTY log
+    disagrees). First: a `renderChannelTag` body is multi-line, so Claude Code's TUI collapses it to
+    `[Pasted text #1]` and swallows the `\\r` written behind it into the same paste as
+    `[Pasted text #2 +1 lines]` instead of reading it as Enter - 105 of 145 inbound messages in one
+    `bridge.log` needed `confirmSubmitted`'s 2.5s retry to submit at all, 7 never submitted, and past
+    ~3KB the retry is lost too because the still-streaming echo blinds the detector. Second: a single
+    large `write()` overruns the PTY's input buffer and the message arrives with its *middle* gone -
+    at 3.7KB the session received the first ~200 characters and the last ~350 and reported the gap
+    itself. Both fixed by pacing (chunked body, Enter held until the echo has appeared and finished,
+    per-slug serialization so the split pair cannot interleave), live-verified after each. Bracketed
+    paste would have been cleaner and is unavailable: the TUI never emits `?2004h`, so it is
+    detecting pastes heuristically. Relevant to §5.6 and §4.4: an inbound message is not delivered
+    when `write()` returns, and until now nothing in this plan said otherwise because nothing had
+    measured it."
   - "0.111.0 (2026-08-13): §13 checks 5(c) and 7 both run and recorded, taking the manual-check list
     from four outstanding to two-and-a-bit, and the storm rig's permission half repaired after being
     found vacuous since it was written. **Check 7 (sandbox holds) is now an expected-FAIL with

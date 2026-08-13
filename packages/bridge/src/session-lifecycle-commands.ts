@@ -165,6 +165,139 @@ export async function applyPendingAttachment(
   }
 }
 
+/** Everything `abandonHalfBuiltSession` needs from the factory's closure. Passed as a bag rather
+ * than left as a closure so the teardown can be driven directly from a test - `handleNewCommand`
+ * itself cannot be, past `launchSession` (git worktree + real PTY spawn), and untested teardown
+ * code that only ever runs on the day something else has already gone wrong is precisely the kind
+ * that turns out not to work. Same reasoning, and the same shape, as `applyPendingAttachment`. */
+export interface NewSessionTeardownDeps {
+  log: LogFn;
+  confirmSessionCommand: (topicId: number | undefined, text: string) => void;
+  /** `removeSessionRow` - `/rm`'s own teardown, reused verbatim once a row exists rather than
+   * reimplemented here where the two copies could drift. */
+  removeSessionRow: (row: SessionRow) => Promise<boolean>;
+  getRow: (slug: string) => SessionRow | undefined;
+  untrack: (slug: string) => void;
+  clearPtyWrite: (slug: string) => void;
+  forgetRoute: (slug: string) => void;
+  forgetFeed: (slug: string) => void;
+  deleteForumTopic: (topicId: number) => Promise<void>;
+  /** Defaulted to the real ones; overridable so a test can drive the failure branches without
+   * shelling out to git or touching a worktree that does not exist. */
+  removeWorktreeFn?: (repoPath: string, worktreePath: string) => Promise<unknown>;
+  cleanupDiffRefsFn?: (worktreePath: string, slug: string) => void;
+  forgetInboxGitignoreCacheFn?: (worktreePath: string) => void;
+}
+
+/**
+ * P1-13's other half: undo a `/new` that threw after it had already built something real. Before
+ * this, such a throw left the `claude` process running with no session row naming it - invisible to
+ * `/ls`, unreachable by `/kill` and `/remove`, still holding its worktree directory open, and
+ * blocking every later `/new` that derived the same slug. `fireAndForget` (command-dispatch.ts)
+ * catches the rejection and logs it, so the daemon itself survives; the process does not go away.
+ *
+ * Nothing here rethrows, including the operator-facing report at the end. This runs from a `catch`,
+ * and a teardown that throws on its way out would put the original failure straight back into the
+ * hole it exists to close.
+ */
+export async function abandonHalfBuiltSession(
+  attempt: NewSessionAttempt,
+  controlTopicId: number | undefined,
+  err: unknown,
+  deps: NewSessionTeardownDeps,
+): Promise<void> {
+  const { log, confirmSessionCommand } = deps;
+  const removeWorktreeFn = deps.removeWorktreeFn ?? removeWorktree;
+  const cleanupDiffRefsFn = deps.cleanupDiffRefsFn ?? cleanupDiffRefs;
+  const forgetInboxGitignoreCacheFn = deps.forgetInboxGitignoreCacheFn ?? forgetInboxGitignoreCache;
+  const label = attempt.slug ? `"${attempt.slug}"` : "an unnamed session";
+  // Full stack, at ERROR: this branch only runs for failures nothing anticipated, so the stack is
+  // the only thing that will identify the next one.
+  const detail = err instanceof Error ? (err.stack ?? err.message) : String(err);
+  log("ERROR", `/new failed for ${label} after it had already built part of a session - tearing it down: ${detail}`);
+
+  let leftBehind = "";
+  if (attempt.tracked && attempt.slug) {
+    const row = deps.getRow(attempt.slug);
+    if (row) {
+      try {
+        if (!(await deps.removeSessionRow(row))) leftBehind = ORPHAN_TOPIC_NOTE;
+      } catch (rmErr) {
+        log("WARN", `teardown of ${label} via removeSessionRow failed: ${(rmErr as Error).message}`);
+      }
+    }
+  } else if (attempt.launched) {
+    const { ptyProcess, worktreePath, repoPath } = attempt.launched;
+    try {
+      ptyProcess.kill();
+    } catch (killErr) {
+      log("WARN", `could not kill the PTY for ${label} during teardown: ${(killErr as Error).message}`);
+    }
+    if (attempt.slug) {
+      // All four are no-ops when the corresponding `wireSession`/`routing.add` never ran - the throw
+      // could have come from anywhere in the window, so teardown cannot assume which of them did.
+      deps.untrack(attempt.slug);
+      deps.clearPtyWrite(attempt.slug);
+      deps.forgetRoute(attempt.slug);
+      deps.forgetFeed(attempt.slug);
+      // Before `removeWorktree`, which deletes the checkout this needs as its `cwd` to reach
+      // `origin` at all - the same ordering constraint `removeSessionRow` documents.
+      cleanupDiffRefsFn(worktreePath, attempt.slug);
+    }
+    try {
+      await removeWorktreeFn(repoPath, worktreePath);
+    } catch (wtErr) {
+      // The realistic failure here, and the exact P1-13 symptom: the `claude` process killed just
+      // above can still hold its directory open for a moment. Named in the operator's own message
+      // rather than only in the log, because a worktree left behind is what blocks the next `/new`.
+      log("WARN", `removeWorktree failed during teardown of ${label}: ${(wtErr as Error).message}`);
+      leftBehind = ` Its worktree could not be deleted - remove ${worktreePath} by hand if the next /new complains.`;
+    }
+    forgetInboxGitignoreCacheFn(worktreePath);
+    if (attempt.topicId !== undefined) {
+      try {
+        await deps.deleteForumTopic(attempt.topicId);
+      } catch (topicErr) {
+        log("WARN", `deleteForumTopic failed during teardown of ${label}: ${(topicErr as Error).message}`);
+        leftBehind += ORPHAN_TOPIC_NOTE;
+      }
+    }
+  }
+
+  try {
+    // Cosmetic, and best-effort like the rest of this function - an NL-routed `/new` leaves its
+    // "🤔 Thinking..." placeholder for `handleNewCommand` to consume, so without this a crash on
+    // this path strands it in the control topic forever.
+    await attempt.clearPlaceholder?.();
+    const message = err instanceof Error ? err.message : String(err);
+    confirmSessionCommand(controlTopicId, `Failed to create ${label}: ${message}. What it had already created has been cleaned up.${leftBehind}`);
+  } catch (reportErr) {
+    log("WARN", `could not report the failed /new for ${label} to the operator: ${(reportErr as Error).message}`);
+  }
+}
+
+/**
+ * What a single `/new` has actually built so far, filled in as it goes (P1-13). `handleNewCommand`
+ * creates a Telegram topic, a git worktree, a branch and a live `claude` process well before it
+ * writes the session row that makes all four reachable by `/ls`, `/kill` and `/remove` - so a throw
+ * anywhere in that gap used to leave every one of them behind with nothing naming them. This is the
+ * record the wrapper's `catch` needs to undo exactly as much as was actually done, and no more.
+ */
+interface NewSessionAttempt {
+  slug?: string;
+  topicId?: number;
+  /** Set the instant `launchSession` returns - i.e. the instant a real `claude` process exists.
+   * Everything before this point already cleans up after itself with a plain `return`. */
+  launched?: { ptyProcess: { kill(): void }; worktreePath: string; repoPath: string };
+  /** Set once `sessionStore.insert` has succeeded, from which point the session is an ordinary
+   * tracked row and `removeSessionRow` is the right (and only) way to dismantle it. */
+  tracked?: boolean;
+  /** `handleNewCommand`'s own `clearThinkingPlaceholder`, exposed so a teardown can still clear an
+   * NL-routed `/new`'s "🤔 Thinking..." placeholder - `nl-dispatch.ts` deliberately leaves it
+   * pending for this function to consume, so a crash on this path otherwise strands it forever. */
+  clearPlaceholder?: () => Promise<void>;
+}
+
 export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOptions): SessionLifecycleCommands {
   const {
     sessionStore,
@@ -313,7 +446,58 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     }
   }
 
+  /**
+   * P1-13 (codebase-hardening-plan.md, found live 2026-08-13). `runNewCommand` below derives its
+   * slug from `sessionStore.slugs()` and only writes the row ~110 lines later, with
+   * `createForumTopic`, `launchSession` and three startup gates awaited in between. Two `/new`s
+   * whose prompts sanitize to the same base therefore both pass the uniqueness check against a
+   * store neither has written to yet, and the loser's `sessionStore.insert` throws `UNIQUE
+   * constraint failed: sessions.slug` *after* its `claude` process is already spawned.
+   *
+   * This closes the window: the slug is claimed synchronously, in the same tick it is derived and
+   * before the first `await`, so a concurrent call sees it in `uniqueSlug`'s exclusion set and
+   * derives `-2` instead. Released in `handleNewCommand`'s `finally` - by which point either the
+   * row is in the store (and `sessionStore.slugs()` covers it from then on) or the attempt has
+   * failed and the slug is genuinely free again.
+   *
+   * Deliberately not a `Set` keyed on the *base*: two different prompts can sanitize to the same
+   * base, and serializing them would be a behaviour change; two `/new`s racing here are meant to
+   * both succeed, on distinct slugs, exactly as two sequential ones already do.
+   */
+  const inFlightSlugs = new Set<string>();
+
+  const teardownDeps: NewSessionTeardownDeps = {
+    log,
+    confirmSessionCommand,
+    removeSessionRow,
+    getRow: (slug) => sessionStore.get(slug),
+    untrack: (slug) => sessionSupervisor.untrack(slug),
+    clearPtyWrite: (slug) => routing.clearPtyWrite(slug),
+    forgetRoute: (slug) => routing.remove(slug),
+    forgetFeed: (slug) => feedWiring.forgetSession(slug),
+    deleteForumTopic: (topicId) => controlBot.deleteForumTopic(supergroupChatId, topicId),
+  };
+
+  /**
+   * The public `/new` entry point. Thin on purpose: it exists so the slug reservation is released
+   * and a half-built session is torn down no matter which of `runNewCommand`'s many `return`s or
+   * `throw`s got taken, without threading that obligation through ~190 lines of body.
+   */
   async function handleNewCommand(cmd0: Extract<FleetCommand, { kind: "new" }>, controlTopicId: number | undefined): Promise<void> {
+    const attempt: NewSessionAttempt = {};
+    try {
+      await runNewCommand(cmd0, controlTopicId, attempt);
+    } catch (err) {
+      await abandonHalfBuiltSession(attempt, controlTopicId, err, teardownDeps);
+    } finally {
+      // Only ever the slug *this* call reserved, so a concurrent `/new` that reserved a different
+      // one is untouched. A leaked reservation would be permanent for the Bridge's lifetime and
+      // would silently push every later `/new` with the same prompt onto `-2`, `-3`, ...
+      if (attempt.slug !== undefined) inFlightSlugs.delete(attempt.slug);
+    }
+  }
+
+  async function runNewCommand(cmd0: Extract<FleetCommand, { kind: "new" }>, controlTopicId: number | undefined, attempt: NewSessionAttempt): Promise<void> {
     // Reassigned below, once the attachment (if any) is moved into the inbox and `sourceText` is
     // set - never before the topic-creation confirmation just under `topic` is created, which
     // must render the clean `cmd.prompt`, not an announcement string carrying a raw file path
@@ -378,7 +562,13 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     }
 
     const base = slugFromPrompt(cmd.prompt);
-    const slug = uniqueSlug(base, sessionStore.slugs());
+    // P1-13: derived and claimed in one synchronous step, with no `await` between them, against the
+    // union of what is already persisted and what a concurrent `/new` is mid-flight on. See
+    // `inFlightSlugs`' own doc comment - the ordering of these three lines is the whole fix.
+    const slug = uniqueSlug(base, new Set([...sessionStore.slugs(), ...inFlightSlugs]));
+    inFlightSlugs.add(slug);
+    attempt.slug = slug;
+    attempt.clearPlaceholder = clearThinkingPlaceholder;
 
     let topic: { message_thread_id: number };
     try {
@@ -388,6 +578,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       confirmSessionCommand(controlTopicId, `Failed to create a topic for "${slug}": ${(err as Error).message}`);
       return;
     }
+    attempt.topicId = topic.message_thread_id;
 
     // The topic's own title is truncated to 128 chars (Telegram's forum-topic-name limit) and the
     // actual delivery further below is a raw PTY keystroke into Claude's context, not a Telegram
@@ -451,6 +642,10 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       );
       return;
     }
+    // P1-13: from here on a real `claude` process exists, so every remaining exit path other than a
+    // clean fall-through has to dismantle it. Recorded before the next statement rather than after
+    // the `sessionStore.insert` further down, because the whole point is the window in between.
+    attempt.launched = { ptyProcess: session.ptyProcess, worktreePath: session.worktreePath, repoPath: repo.path };
 
     // Attachment-triggered-session-creation-plan.md's Attachment-to-Session Handoff section: must
     // run strictly *after* the topic-creation confirmation above (which shows the clean `cmd.prompt`,
@@ -517,6 +712,9 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
       createdUtc: nowIso(),
       lastEventUtc: nowIso(),
     });
+    // P1-13: the row now names the process, the worktree and the topic, so `/ls` sees it and
+    // `removeSessionRow` can dismantle it - which is what teardown switches to from here.
+    attempt.tracked = true;
 
     if (applied.saved) {
       // Distinct from a text-typed /new (attachment-triggered-session-creation-plan.md's

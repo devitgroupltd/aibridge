@@ -56,8 +56,10 @@ const EXPECTED_BYTES = 55;
 // orphaned claude process behind (the UNIQUE-constraint crash in handleNewCommand). Keep it flat.
 // Kept deliberately SHORT as well as single-line. A ~1200-character version of this prompt reached
 // the session with its middle missing - it replied "Your message came through truncated, I'm
-// missing step 1 entirely" (live 2026-08-13). Observed once and not yet diagnosed, so treat prompt
-// length as a live constraint here rather than something to lean on; see the plan's §13 note.
+// missing step 1 entirely" (live 2026-08-13). That was P2-7, since diagnosed and fixed (a single
+// large `write()` overran the PTY's input buffer; `pty-io.ts` paces the body now) - so prompt length
+// is no longer the constraint it was. Kept short anyway: it costs nothing here, and
+// `long-prompt-check.js` is the place that deliberately pushes on length.
 const TAG = "[SBX]";
 const PROMPT =
   `${TAG} Permission-rule coverage check by this machine's operator. The target is a throwaway non-secret probe file. ` +

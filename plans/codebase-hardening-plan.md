@@ -1,8 +1,50 @@
 ---
-version: 1.11.0
+version: 1.12.0
 status: solid
-last_modified_utc: 2026-08-13T11:15:00Z
+last_modified_utc: 2026-08-13T14:05:00Z
 changelog:
+  - "1.12.0 (2026-08-13): both findings 1.11.0 opened are now fixed, and diagnosing the second one
+    turned it into something much larger than the single anecdote it was filed as. **P1-13**: the slug
+    is claimed synchronously now, in the same tick it is derived, against the union of
+    `sessionStore.slugs()` and an in-flight `Set` - and released in a `finally` in a thin
+    `handleNewCommand` wrapper, so no `return` or `throw` in the ~190-line body can leak a reservation
+    (a leaked one is permanent for the daemon's lifetime and would push every later `/new` with that
+    prompt onto `-2`, `-3`, ...). The wrapper also `catch`es, and `abandonHalfBuiltSession` tears down
+    exactly as much as the attempt actually built: `removeSessionRow` once the row exists, otherwise
+    kill the PTY, unwire routing/supervisor/feed, clean diff refs before the worktree that is their
+    `cwd`, remove the worktree, delete the topic, and tell the operator - naming the worktree path when
+    it could not be deleted, because that is what blocks the next `/new`. Exported and dep-injected
+    rather than left in the closure, on the principle that teardown code which only ever runs after
+    something else has gone wrong is exactly the code that turns out not to work. 15 new tests; the
+    three race tests were run against the unfixed derivation first and all three fail there.
+    **P2-7 was mis-filed as `a long prompt lost its middle`; it is a lost Enter, and it was not rare.**
+    Reproduced live with a position-marked prompt (`scripts/telegram-automation/long-prompt-check.js`,
+    new): at ~3.7KB the message was typed into the composer and never submitted - no `UserPromptSubmit`,
+    no retry, no error, the session idle behind a spinning `Thinking...` forever. The PTY log gives the
+    mechanism outright: a `renderChannelTag` body is multi-line, so Claude Code's TUI collapses it to
+    `[Pasted text #1]`, and a `\\r` arriving immediately behind it is swallowed into the paste as
+    `[Pasted text #2 +1 lines]` instead of read as Enter. Counted across a full `bridge.log`, that Enter
+    failed on **105 of 145** inbound messages - `confirmSubmitted`'s retry rescued most 2.5s later,
+    which is where that latency on nearly every turn came from, and 7 were never rescued at all. Past
+    ~3KB the retry is lost too, because the still-streaming echo lands inside the detector's fixed
+    500ms window and reads as `the turn started`. Fixed by writing the Enter only once the body's echo
+    has appeared *and* finished (bounded; a timeout still writes it), serializing per slug so the newly
+    split body/Enter pair cannot interleave with the next message, and taking `confirmSubmitted`'s
+    baseline from that same post-echo moment. A first version of this fix shipped as a no-op and was
+    caught by reading the live PTY log rather than by any test - `waitForPtyQuiet` measured the silence
+    that was already there, because the echo cannot have arrived a microsecond after `write` returns;
+    `afterActivityAt` now makes it wait for the write's own echo first, with its own tests.
+    **And with the Enter landing, the originally-filed symptom appeared underneath it**: a single
+    large `write()` overruns the PTY's input buffer, so the body arrives with its *middle* gone - at
+    3.8KB the session saw the first ~200 characters and the last ~350 and reported the gap itself
+    (`after C03 it jumps straight to C71`). Bracketed paste, which would have solved it cleanly, is
+    unavailable: the TUI never emits `?2004h`, so it detects pastes heuristically and would take
+    `\\e[200~` as literal text. Fixed by chunking the body - and **paced on the reader's echo, not on
+    a timer**: 400-character chunks 40ms apart recovered 54 of 77 markers instead of 10 but still lost
+    ~1.1KB, because the TUI's per-chunk cost grows as the composer fills and any constant picked for
+    the start of a message is too small by the end. Waiting for each chunk's own echo adapts to that.
+    Measured across four live runs of the same 3.8KB message: never submitted at all -> submitted but
+    10/77 markers -> 54/77 -> **77/77 intact, first Enter, 2.2s**. 14 more tests (1805 total)."
   - "1.11.0 (2026-08-13): reopens with two findings, both surfaced while running §13's remaining
     manual checks rather than by reading code. **P1-13**: `handleNewCommand` computes
     `uniqueSlug(base, sessionStore.slugs())` at `session-lifecycle-commands.ts:381` but inserts the row
@@ -336,30 +378,89 @@ thing it exists to measure stayed untested.
   (`ERROR launch failed for "sbx-..."`) because the directory still existed. So one racing pair
   poisons that slug until someone cleans up by hand.
 
-  Fix direction: reserve the slug synchronously, before the first `await`. An in-memory
-  `Set<string>` of in-flight slugs, added to immediately after `uniqueSlug` and cleared in a
-  `finally`, passed to `uniqueSlug` as additional taken names, closes the window without a schema
-  change — the insert stays as the durable record, this just stops two callers agreeing on a name.
-  Independently, `handleNewCommand`'s body wants a `try/catch` that tells the operator and tears down
-  the half-built session, since an unhandled rejection here is how a live orphan becomes invisible.
-  Worth a test that drives two concurrent `handleNewCommand` calls with the same prompt and asserts
-  one confirmation, one row, one PTY.
+  **Fixed 2026-08-13** (v1.12.0). The slug is now claimed synchronously, in the tick it is derived,
+  against the union of `sessionStore.slugs()` and an in-flight `Set<string>` — the three lines that
+  derive, claim and record it sit together with no `await` between them, and that ordering *is* the
+  fix. It is released in a `finally` in a thin `handleNewCommand` wrapper rather than at each exit,
+  so none of the body's many `return`s can leak a reservation; a leaked one is permanent for the
+  daemon's lifetime and would silently push every later `/new` with that prompt onto `-2`, `-3`, …
 
-  Not urgent for a single operator sending one command at a time, which is why it has survived — but
-  it is reachable from an ordinary double-tap on send, or a retry after a slow confirmation, and its
-  failure mode is a live process nothing is tracking.
+  The wrapper also `catch`es, and `abandonHalfBuiltSession` (exported, dependency-injected) undoes
+  exactly as much as the attempt actually built: `removeSessionRow` once the row exists, otherwise
+  kill the PTY, unwire supervisor/routing/feed, clean diff refs *before* deleting the worktree that
+  is their `cwd`, remove the worktree, delete the topic, and report — naming the worktree path when
+  removal failed, since that is the thing that blocks the next `/new`. It never rethrows, including
+  from its own operator-facing report: it runs from a `catch`, and a throw on the way out would put
+  the original failure back into the hole it exists to close. Exported rather than left in the
+  closure because `handleNewCommand` cannot be driven past `launchSession` from a unit test, and
+  teardown that only ever runs after something else has gone wrong is precisely the code that turns
+  out not to work.
 
-- **P2-7 — a long single-line prompt reached a session with its middle missing.** Observed once,
-  2026-08-13, not diagnosed. A ~1200-character `/new` prompt produced a session that replied "Your
-  message came through truncated — I'm missing step 1 entirely and the source of the bytes for step
-  2": it had the beginning and the end but not the middle, which is the shape of a dropped chunk
-  rather than a length cap. The same prompt cut to ~450 characters was delivered intact and the
-  session completed the task. Recorded rather than chased because it is a single observation and the
-  delivery path (a PTY keystroke write, not a Telegram send) has several plausible chunking points;
-  the next step is to instrument `pty-io.ts`'s write path and re-send a long prompt with a
-  position-marked body so a gap can be located exactly rather than inferred from Claude noticing it.
-  Until then, treat prompt length as a live constraint — `scripts/telegram-automation/sandbox-check.js`
-  carries a comment saying so.
+  15 new tests. The three concurrency tests were run against the unfixed derivation first and all
+  three fail there — the two-call one reports the same slug twice, which is the finding exactly.
+
+- **P2-7 — filed as "a long prompt lost its middle". It is a lost Enter, and it was never rare.**
+  Filed 2026-08-13 from a single anecdote (a ~1200-character `/new` whose session replied "Your
+  message came through truncated"), diagnosed and **fixed the same day** (v1.12.0).
+
+  `scripts/telegram-automation/long-prompt-check.js` (new) sends a prompt built from numbered
+  position markers and asks the session to report which ones it can see, so a loss says *where* it
+  is — a gap in the middle is a dropped chunk, a missing tail is a length cap, a missing head is a
+  reader starting late. At ~1.8KB and ~2.8KB every marker survived. At ~3.7KB the message was typed
+  into the composer and simply never submitted: no `UserPromptSubmit`, no retry, no error anywhere,
+  the session sitting `idle` behind a `Thinking...` placeholder indefinitely.
+
+  The PTY log gives the mechanism outright. A `renderChannelTag` body is multi-line, so Claude
+  Code's TUI collapses it into a `[Pasted text #1]` block — and the `\r` written immediately behind
+  it is absorbed *into the paste* as `[Pasted text #2 +1 lines]` rather than read as Enter. The
+  retry `\r` 2.5s later arrives alone and submits normally, which is why this was survivable at all.
+  Counted over a full `bridge.log`: **105 of 145** inbound messages needed that retry, and 7 were
+  never rescued. Past roughly 3KB even the retry is lost, because the echo is still streaming when
+  `confirmSubmitted` takes its baseline on a fixed 500ms timer, so the rest of the echo reads as
+  "the turn started" — a detector that stays silent about a message nothing submitted is strictly
+  worse than no detector.
+
+  The fix writes the Enter only once the body's echo has appeared **and** finished (bounded — a
+  timeout still writes it, so an interjection into a busy PTY is delayed rather than dropped),
+  serializes per slug so the newly-split body/Enter pair cannot interleave with the next message,
+  and takes `confirmSubmitted`'s baseline from that same post-echo moment. Live-verified after the
+  fix: `UserPromptSubmit` 984ms after the write, on the first Enter, no retry, one paste block
+  instead of two.
+
+  **With the Enter landing, the symptom this finding was originally filed for appeared underneath
+  it** — and it is a second, independent defect. A single large `write()` overruns the PTY's input
+  buffer: at 3.8KB the session received the first ~200 characters and the last ~350 and reported the
+  gap in its own words ("after C03 it jumps straight to C71"). Head-and-tail-survive is the
+  signature of a bounded buffer overrunning while the reader is busy, and nothing upstream notices —
+  `write()` returns cleanly and Telegram's own copy of the message is perfect, so only the PTY log
+  disagrees. Bracketed paste would have fixed it cleanly and is not available: Claude Code's TUI
+  never emits `?2004h`, so it is detecting pastes heuristically and would take `\e[200~` as literal
+  input.
+
+  So the body is chunked — and **paced on the reader's echo rather than on a timer**, which is the
+  part worth keeping. 400-character chunks 40ms apart were measured first: they recovered 54 of 77
+  markers instead of 10, and still lost ~1.1KB from the middle, because the TUI's per-chunk cost
+  grows as the composer fills, so any constant chosen for the start of a message is too small by the
+  end of it. Waiting for each chunk's own echo before sending the next adapts to whatever the reader
+  is actually doing. Four live runs of the same 3.8KB message, in order: **never submitted at all →
+  submitted but 10/77 markers → 54/77 → 77/77 intact, first Enter, 2.2s**. Confirmed on both write
+  paths afterwards: 66/66 markers through `/new`, 74/74 through an ordinary in-topic turn.
+
+  One honest cost, recorded rather than tuned away. `lastActivityAt` only counts output surviving
+  `stripAnsi`, and a TUI repainting a paste can emit chunks of pure escape sequences — so the
+  per-chunk wait often runs to its 2s ceiling instead of detecting an echo. Into a fresh session the
+  3.8KB message submitted 2.2s after the write; into a session with history, a 3.6KB one took 19.4s,
+  which is 9 chunks × that ceiling almost exactly. Both delivered intact. A few hundred characters is
+  a single chunk and waits not at all, so this is confined to unusually large messages, and the only
+  measured value below it — a flat 40ms — still lost ~1.1KB. Lowering it is a measurement, with
+  `long-prompt-check.js` on the in-topic path, not a judgement call.
+
+  **The first version of this fix shipped as a no-op**, and no test caught it — reading the live PTY
+  log did. `waitForPtyQuiet` was measuring the silence that was already there, because a write's
+  echo cannot have arrived a microsecond after `write()` returns, so it resolved instantly and the
+  Enter went out in the same tick as before. `afterActivityAt` now makes the wait require output
+  *newer* than the moment before the write, and has its own tests, since a wait that returns early
+  is the §9 silent-wrong bar in its purest form: it looks exactly like a working fix.
 
 _(**P0-8**, **P1-11** and **P1-12**, all found live on 2026-08-13, were fixed the same day —
 see **## Resolved**. P0-8 as originally filed is kept below for its reasoning.)_

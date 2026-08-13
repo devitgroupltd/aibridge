@@ -99,4 +99,92 @@ describe("waitForPtyQuiet", () => {
     // slug-b has no recorded activity at all, regardless of slug-a's - still quiet immediately.
     expect(result).toBe(true);
   });
+
+  // `afterActivityAt` (P2-7). `pty-io.ts` waits for the echo of a body it has *just* written, and
+  // the echo cannot possibly have arrived yet - so without this the wait sees the silence that was
+  // already there, resolves instantly, and is a no-op that looks exactly like a working fix. That
+  // is the §9 silent-wrong bar, and it is not hypothetical: it shipped that way for one live run.
+  describe("afterActivityAt", () => {
+    test("does not treat pre-existing silence as quiet - waits for the write's own echo first", async () => {
+      const scheduler = makeScheduler();
+      let lastActivity = 100; // the last thing that happened, long before this write
+      const resultPromise = waitForPtyQuiet("slug-a", {
+        lastActivityAt: () => lastActivity,
+        afterActivityAt: 100, // read immediately before the write
+        quietMs: 300,
+        pollMs: 100,
+        timeoutMs: 5000,
+        now: scheduler.now,
+        setTimeoutFn: scheduler.setTimeoutFn,
+      });
+
+      // The PTY has been silent since t=100 and is silent still, which without `afterActivityAt`
+      // is "quiet" on the very first poll.
+      let settled = false;
+      void resultPromise.then(() => {
+        settled = true;
+      });
+      for (let i = 0; i < 5; i++) scheduler.advance(100);
+      await flushMicrotasks();
+      expect(settled).toBe(false);
+
+      lastActivity = 600; // the echo finally lands
+      for (let i = 0; i < 4; i++) scheduler.advance(100);
+      expect(await resultPromise).toBe(true);
+      // Quiet is measured from the echo, not from the silence before it: 600 + 300.
+      expect(scheduler.now()).toBe(900);
+    });
+
+    test("a write whose echo never arrives still gives up at timeoutMs rather than hanging", async () => {
+      const scheduler = makeScheduler();
+      const resultPromise = waitForPtyQuiet("slug-a", {
+        lastActivityAt: () => 100,
+        afterActivityAt: 100,
+        quietMs: 300,
+        pollMs: 100,
+        timeoutMs: 1000,
+        now: scheduler.now,
+        setTimeoutFn: scheduler.setTimeoutFn,
+      });
+
+      for (let i = 0; i < 11; i++) scheduler.advance(100);
+      // `false` is "gave up, proceed anyway" - pty-io.ts writes the Enter regardless.
+      expect(await resultPromise).toBe(false);
+    });
+
+    test("a PTY that has never produced anything is not instantly quiet when a write is being waited on", async () => {
+      const scheduler = makeScheduler();
+      const resultPromise = waitForPtyQuiet("slug-a", {
+        lastActivityAt: () => undefined, // the `Infinity` fast path
+        afterActivityAt: 0,
+        quietMs: 300,
+        pollMs: 100,
+        timeoutMs: 500,
+        now: scheduler.now,
+        setTimeoutFn: scheduler.setTimeoutFn,
+      });
+
+      for (let i = 0; i < 6; i++) scheduler.advance(100);
+      expect(await resultPromise).toBe(false);
+    });
+
+    test("omitting it keeps the original behaviour the /new startup gate relies on", async () => {
+      // `handleNewCommand` has no write of its own to wait for - it wants "quiet, whenever that
+      // started", and must still resolve immediately against an already-idle PTY.
+      const scheduler = makeScheduler();
+      const result = await waitForPtyQuiet("slug-a", {
+        lastActivityAt: () => 0,
+        quietMs: 300,
+        now: () => 10_000,
+        setTimeoutFn: scheduler.setTimeoutFn,
+      });
+      expect(result).toBe(true);
+    });
+  });
 });
+
+/** One turn of the real event loop, so a `.then` on a still-pending promise has had its chance to
+ * run before asserting it did not. `await Promise.resolve()` drains one microtask level only. */
+function flushMicrotasks(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}

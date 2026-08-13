@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { createPtyIo } from "../src/pty-io.ts";
+import { chunkForPty, createPtyIo } from "../src/pty-io.ts";
 import { createWedgedRecoveryMarks } from "../src/wedged-recovery.ts";
 import { Routing } from "../src/routing.ts";
 import { createTypingIndicator } from "../src/typing-indicator.ts";
@@ -39,6 +39,34 @@ function fakeRoutingWithWrite(slug: string) {
   const writes: string[] = [];
   routing.setPtyWrite(slug, (text: string) => writes.push(text));
   return { routing, writes };
+}
+
+/**
+ * A hand-operated stand-in for `waitForPtyQuiet` (P2-7). The echo-settle wait is a promise now, not
+ * a `setTimeoutFn` window, and it reads a clock as well as scheduling - so the fake scheduler above
+ * cannot drive it (a virtual clock paired with a real `Date.now` deadline never resolves). Holding
+ * the gate open is also the only way to express "the echo is *still streaming*", which is the exact
+ * state the finding is about.
+ */
+function makeQuietGate() {
+  let pending: Array<(quiet: boolean) => void> = [];
+  return {
+    waitForPtyQuietFn: () => new Promise<boolean>((resolve) => pending.push(resolve)),
+    waiting: () => pending.length,
+    /** Resolves every open wait as "the PTY went quiet", then lets the continuations run. */
+    release: async (quiet = true) => {
+      const waiters = pending;
+      pending = [];
+      for (const resolve of waiters) resolve(quiet);
+      await flush();
+    },
+  };
+}
+
+/** One turn of the real event loop - enough for the awaited continuations behind the gate to run.
+ * A bare `await Promise.resolve()` only drains one microtask level and silently under-flushes. */
+function flush(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
 }
 
 describe("createPtyIo", () => {
@@ -93,7 +121,7 @@ describe("createPtyIo", () => {
     expect(writes).toEqual(["/effort high", "\r", "\r"]);
   });
 
-  test("confirmSubmitted does nothing further when real PTY activity happens after the echo settles", () => {
+  test("confirmSubmitted does nothing further when real PTY activity happens after the Enter", () => {
     const { routing } = fakeRoutingWithWrite("fix-bug");
     const scheduler = makeScheduler();
     let activity: number | undefined;
@@ -106,12 +134,10 @@ describe("createPtyIo", () => {
       ptyLookup: { get: () => undefined },
       wedgedRecoveryMarks: createWedgedRecoveryMarks(),
       setTimeoutFn: scheduler.setTimeoutFn,
-      echoSettleMs: 500,
       submitConfirmWindowMs: 2500,
     });
 
-    ptyIo.confirmSubmitted("fix-bug", 2, (text) => writes.push(text));
-    scheduler.advance(500); // echo settle window elapses - baseline taken here
+    ptyIo.confirmSubmitted("fix-bug", 2, (text) => writes.push(text)); // baseline taken here
     activity = Date.now() + 1; // real activity lands after the baseline
     scheduler.advance(2500); // submit-confirm window elapses
     expect(writes).toEqual([]); // no retry \r - the turn genuinely produced output
@@ -137,17 +163,14 @@ describe("createPtyIo", () => {
       },
       wedgedRecoveryMarks: marks,
       setTimeoutFn: scheduler.setTimeoutFn,
-      echoSettleMs: 500,
       submitConfirmWindowMs: 2500,
     });
 
     ptyIo.confirmSubmitted("fix-bug", 2, (text) => writes.push(text));
-    scheduler.advance(500); // echo settle
     scheduler.advance(2500); // first submit-confirm window - retries the \r
     expect(writes).toEqual(["\r"]);
     expect(recovered).toBe(0);
 
-    scheduler.advance(500); // the retry's own echo settle
     scheduler.advance(2500); // second submit-confirm window - gives up and auto-recovers
     expect(writes).toEqual(["\r"]); // never a third \r - "gives up loudly instead"
     expect(recovered).toBe(1);
@@ -156,9 +179,45 @@ describe("createPtyIo", () => {
     expect(marks.isRecovering("fix-bug")).toBe(true);
   });
 
-  test("sendChannelText wraps the content in a channel tag with an incrementing seq, starts the indicators, and arms confirmSubmitted", () => {
+  // codebase-hardening-plan.md P2-7, reproduced live 2026-08-13 with a ~3.7KB message. The baseline
+  // used to be taken on a fixed 500ms timer of `confirmSubmitted`'s own; a long echo is still
+  // streaming at that point, so the rest of the echo counted as "the turn started" and the retry that
+  // would have rescued the message never fired. That is strictly worse than having no detector at
+  // all - the message was typed, never submitted, and nothing in the daemon ever said so.
+  test("a message whose echo was the only activity still gets its retry, however long that echo ran", async () => {
     const { routing, writes } = fakeRoutingWithWrite("fix-bug");
     const scheduler = makeScheduler();
+    const gate = makeQuietGate();
+    let activity = 1_000;
+    const ptyIo = createPtyIo({
+      routing,
+      typingIndicator: createTypingIndicator({ send: async () => {} }),
+      thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
+      lastActivityAt: () => activity,
+      ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
+      setTimeoutFn: scheduler.setTimeoutFn,
+      waitForPtyQuietFn: gate.waitForPtyQuietFn,
+      echoSettleMs: 500,
+      submitConfirmWindowMs: 2500,
+    });
+
+    ptyIo.sendChannelText("fix-bug", 2, "a very long message", "msg-1", "telegram");
+    await flush();
+    // The echo streams for a long time - real PTY output, none of it a sign the Enter landed.
+    activity = 10_000;
+    await gate.release(); // ...and then ends, and the Enter goes out into a genuinely quiet PTY
+    scheduler.advance(2500); // nothing happens after it: the Enter was swallowed
+
+    expect(writes).toHaveLength(3);
+    expect(writes[1]).toBe("\r"); // the paced Enter
+    expect(writes[2]).toBe("\r"); // the retry, which the old fixed-timer baseline suppressed
+  });
+
+  test("sendChannelText wraps the content in a channel tag with an incrementing seq, starts the indicators, and arms confirmSubmitted", async () => {
+    const { routing, writes } = fakeRoutingWithWrite("fix-bug");
+    const scheduler = makeScheduler();
+    const gate = makeQuietGate();
     const typingStarts: string[] = [];
     const thinkingStarts: string[] = [];
     const ptyIo = createPtyIo({
@@ -169,10 +228,16 @@ describe("createPtyIo", () => {
       ptyLookup: { get: () => undefined },
       wedgedRecoveryMarks: createWedgedRecoveryMarks(),
       setTimeoutFn: scheduler.setTimeoutFn,
+      waitForPtyQuietFn: gate.waitForPtyQuietFn,
     });
 
     ptyIo.sendChannelText("fix-bug", 2, "hello", "msg-1", "telegram");
     ptyIo.sendChannelText("fix-bug", 2, "world", "msg-2", "telegram");
+    // Both bodies cannot be on the wire yet: the second is queued behind the first message's Enter.
+    await flush();
+    expect(writes.length).toBe(1);
+    await gate.release(); // first message's echo settles -> its \r goes out, second body follows
+    await gate.release(); // second message's echo settles -> its \r goes out
 
     expect(writes.length).toBe(4); // two (channel-tag, \r) pairs
     expect(writes[0]).toContain("hello");
@@ -181,6 +246,89 @@ describe("createPtyIo", () => {
     expect(writes[2]).toMatch(/seq="2"/); // proves the counter increments across calls, not per-call-reset
     expect(typingStarts).toEqual(["2", "2"]);
     expect(thinkingStarts).toEqual(["2", "2"]);
+  });
+
+  // P2-7's primary fix. Measured over a full bridge.log, the same-tick `\r` failed to submit on 105
+  // of 145 inbound messages: the TUI is still ingesting the body when the Enter arrives and swallows
+  // it. `confirmSubmitted`'s retry rescued most of them 2.5s later - and past roughly 3KB, where the
+  // echo also blinds the detector, rescued none of them.
+  test("sendChannelText holds the Enter until the echo of its own body has finished", async () => {
+    const { routing, writes } = fakeRoutingWithWrite("fix-bug");
+    const gate = makeQuietGate();
+    const ptyIo = createPtyIo({
+      routing,
+      typingIndicator: createTypingIndicator({ send: async () => {} }),
+      thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
+      lastActivityAt: () => Date.now(),
+      ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
+      setTimeoutFn: makeScheduler().setTimeoutFn,
+      waitForPtyQuietFn: gate.waitForPtyQuietFn,
+    });
+
+    ptyIo.sendChannelText("fix-bug", 2, "hello", "msg-1", "telegram");
+    await flush();
+
+    // The body is out; the Enter is not, and is waiting on the PTY going quiet rather than racing it.
+    expect(writes).toHaveLength(1);
+    expect(writes[0]).toContain("hello");
+    expect(gate.waiting()).toBe(1);
+
+    await gate.release();
+    expect(writes[1]).toBe("\r");
+  });
+
+  test("a PTY that never goes quiet still gets its Enter once the wait times out", async () => {
+    // The wait is bounded, and a timeout resolves `false` rather than rejecting. An interjection into
+    // a running turn is exactly this case - it must still be submitted, just not sooner than it can be.
+    const { routing, writes } = fakeRoutingWithWrite("fix-bug");
+    const gate = makeQuietGate();
+    const ptyIo = createPtyIo({
+      routing,
+      typingIndicator: createTypingIndicator({ send: async () => {} }),
+      thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
+      lastActivityAt: () => Date.now(),
+      ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
+      setTimeoutFn: makeScheduler().setTimeoutFn,
+      waitForPtyQuietFn: gate.waitForPtyQuietFn,
+    });
+
+    ptyIo.sendChannelText("fix-bug", 2, "are you still there", "msg-1", "telegram");
+    await flush();
+    await gate.release(false); // never went quiet - gave up and proceeded
+
+    expect(writes[1]).toBe("\r");
+  });
+
+  test("two messages sent back to back never interleave into one prompt", async () => {
+    // The body and the Enter are no longer in the same tick, so without a per-slug queue the writes
+    // could land as body-1, body-2, \r, \r - submitting both as a single prompt and then pressing
+    // Enter on an empty composer.
+    const { routing, writes } = fakeRoutingWithWrite("fix-bug");
+    const gate = makeQuietGate();
+    const ptyIo = createPtyIo({
+      routing,
+      typingIndicator: createTypingIndicator({ send: async () => {} }),
+      thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
+      lastActivityAt: () => Date.now(),
+      ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
+      setTimeoutFn: makeScheduler().setTimeoutFn,
+      waitForPtyQuietFn: gate.waitForPtyQuietFn,
+    });
+
+    ptyIo.sendChannelText("fix-bug", 2, "first", "msg-1", "telegram");
+    ptyIo.sendChannelText("fix-bug", 2, "second", "msg-2", "telegram");
+    await flush();
+    await gate.release();
+    await gate.release();
+
+    expect(writes).toHaveLength(4);
+    expect(writes[0]).toContain("first");
+    expect(writes[1]).toBe("\r");
+    expect(writes[2]).toContain("second");
+    expect(writes[3]).toBe("\r");
   });
 
   test("sendChannelText drops the message and logs when there's no live PTY for the slug", () => {
@@ -198,6 +346,105 @@ describe("createPtyIo", () => {
 
     ptyIo.sendChannelText("gone-slug", 2, "hello", "msg-1", "telegram");
     expect(logs).toEqual(['WARN: no live session for slug "gone-slug" - inbound message dropped']);
+  });
+
+  // P2-7's second half. A single large write loses its *middle*: measured live at 3.7KB, the session
+  // got the first ~200 characters and the last ~350 and said so itself ("after C03 it jumps straight
+  // to C71"). Head-and-tail-survive is the signature of a bounded input buffer overrunning, and
+  // nothing upstream notices - `write()` succeeds and the message is simply missing a chunk by the
+  // time Claude reads it.
+  test("sendChannelText paces a long body across several writes, waiting for each chunk's echo", async () => {
+    const { routing, writes } = fakeRoutingWithWrite("fix-bug");
+    const gate = makeQuietGate();
+    const ptyIo = createPtyIo({
+      routing,
+      typingIndicator: createTypingIndicator({ send: async () => {} }),
+      thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
+      lastActivityAt: () => Date.now(),
+      ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
+      setTimeoutFn: makeScheduler().setTimeoutFn,
+      waitForPtyQuietFn: gate.waitForPtyQuietFn,
+      writeChunkChars: 100,
+    });
+
+    ptyIo.sendChannelText("fix-bug", 2, "x".repeat(450), "msg-1", "telegram");
+    await flush();
+    // Exactly one chunk is on the wire, and the next is genuinely blocked on the first one's echo
+    // rather than merely scheduled - a timer-paced version would pass this by advancing a clock.
+    expect(writes).toHaveLength(1);
+    expect(gate.waiting()).toBe(1);
+
+    // Each release lets one more chunk through. The body is 450 chars of `x` plus the channel tag,
+    // so the number of chunks depends on the tag's own length - drain until the Enter appears.
+    for (let i = 0; i < 40 && writes[writes.length - 1] !== "\r"; i++) await gate.release();
+
+    const enter = writes.pop();
+    expect(enter).toBe("\r");
+    expect(writes.length).toBeGreaterThan(1);
+    // Nothing lost, nothing duplicated, nothing reordered - the whole point.
+    expect(writes.join("")).toContain("x".repeat(450));
+    expect(writes.every((chunk) => Array.from(chunk).length <= 100)).toBe(true);
+  });
+
+  test("a short body is still a single write with no per-chunk wait at all", async () => {
+    const { routing, writes } = fakeRoutingWithWrite("fix-bug");
+    const gate = makeQuietGate();
+    const ptyIo = createPtyIo({
+      routing,
+      typingIndicator: createTypingIndicator({ send: async () => {} }),
+      thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
+      lastActivityAt: () => Date.now(),
+      ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
+      setTimeoutFn: makeScheduler().setTimeoutFn,
+      waitForPtyQuietFn: gate.waitForPtyQuietFn,
+      writeChunkChars: 4000,
+    });
+
+    ptyIo.sendChannelText("fix-bug", 2, "hello", "msg-1", "telegram");
+    await flush();
+
+    expect(writes).toHaveLength(1);
+    // One wait, and it is the pre-Enter one - the common case pays nothing for the chunk pacing.
+    expect(gate.waiting()).toBe(1);
+    await gate.release();
+    expect(writes[1]).toBe("\r");
+  });
+
+  describe("chunkForPty", () => {
+    test("returns the text as a single chunk when it fits, and nothing at all when empty", () => {
+      expect(chunkForPty("short", 400)).toEqual(["short"]);
+      expect(chunkForPty("", 400)).toEqual([]);
+      // The exact-fit boundary: 400 characters is not 401, and must not split.
+      expect(chunkForPty("a".repeat(400), 400)).toEqual(["a".repeat(400)]);
+    });
+
+    test("splits into ordered chunks that reassemble to exactly the input", () => {
+      const text = Array.from({ length: 1000 }, (_, i) => String(i % 10)).join("");
+      const chunks = chunkForPty(text, 128);
+
+      expect(chunks.length).toBe(8);
+      expect(chunks.join("")).toBe(text);
+      expect(chunks.slice(0, -1).every((c) => c.length === 128)).toBe(true);
+    });
+
+    test("never splits a surrogate pair", () => {
+      // A boundary falling inside a pair would not throw - it would put a replacement character in
+      // the middle of the operator's own message, which reads as a typo rather than as a bug.
+      const text = "a" + "😀".repeat(10); // 1 + 20 UTF-16 units, 11 code points
+      const chunks = chunkForPty(text, 3);
+
+      expect(chunks.join("")).toBe(text);
+      expect(chunks.every((c) => !/[\uD800-\uDBFF]$/.test(c))).toBe(true);
+      expect(chunks.every((c) => !/^[\uDC00-\uDFFF]/.test(c))).toBe(true);
+      expect(chunks.every((c) => Array.from(c).length <= 3)).toBe(true);
+    });
+
+    test("a non-positive chunk size means no chunking rather than an infinite loop", () => {
+      expect(chunkForPty("abc", 0)).toEqual(["abc"]);
+      expect(chunkForPty("abc", -1)).toEqual(["abc"]);
+    });
   });
 
   test("autoRecoverWedgedSession is a no-op (and logs nothing) when the slug has no tracked pty - a manual kill or real crash already raced it", () => {

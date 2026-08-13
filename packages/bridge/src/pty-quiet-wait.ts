@@ -28,6 +28,21 @@ export interface WaitForPtyQuietOptions {
   lastActivityAt: (slug: string) => number | undefined;
   /** How long the PTY must have produced no output before it's considered quiet. */
   quietMs?: number;
+  /**
+   * Only treat the PTY as quiet once it has produced output *newer* than this timestamp - i.e. wait
+   * for something to start before waiting for it to stop.
+   *
+   * Needed by `pty-io.ts`'s `sendChannelText` (P2-7), which waits for the echo of the body it has
+   * just written. Without this the wait is measured against activity from *before* that write, and
+   * a PTY that was already idle is trivially "quiet" the microsecond after a write is issued - the
+   * echo has not reached it yet. Live 2026-08-13 that made the wait a no-op and left the fix it
+   * exists for doing nothing at all, while looking exactly like a working fix.
+   *
+   * Callers pass the `lastActivityAt` they read immediately *before* their write. Omitted (the
+   * default) keeps the original "quiet, whenever that started" behaviour, which is what
+   * `handleNewCommand`'s startup gate wants - there is no write of its own to wait for there.
+   */
+  afterActivityAt?: number;
   /** Overall ceiling on how long to wait for quiet at all. */
   timeoutMs?: number;
   /** How often to re-check while waiting for quiet. */
@@ -61,8 +76,12 @@ export function waitForPtyQuiet(slug: string, opts: WaitForPtyQuietOptions): Pro
   return new Promise((resolve) => {
     function poll(): void {
       const last = lastActivityAt(slug);
+      // `Infinity` for a PTY that has never produced anything is the "already quiet" fast path - but
+      // only when the caller isn't waiting for its own write to show up first, or a never-echoing
+      // write would resolve instantly and defeat the wait entirely.
+      const started = opts.afterActivityAt === undefined || (last !== undefined && last > opts.afterActivityAt);
       const quietFor = last === undefined ? Infinity : now() - last;
-      if (quietFor >= quietMs) {
+      if (started && quietFor >= quietMs) {
         resolve(true);
         return;
       }
