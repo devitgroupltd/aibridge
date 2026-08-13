@@ -4281,13 +4281,17 @@ depend on this and remain the nearer-term work.
 Manual checks that automated tests cannot cover, run at the end of Phase 6a, and check 7 again after
 6b.
 
-Status as of 2026-08-13: 1, 4, 6 and 7 are done, and 5 is done for the only path that applies to a
-repo without its own guard hook. **What is left is 2, 3, 5(a)/(b)/(d) and 8 — and none of the four is
-blocked on more automation.** 2 and 3 need a real 30-minute sleep, which no script can perform; 8
-needs a BotFather token revocation; 5's remaining paths need a second repo registered, which is itself
-a Phase 6b trigger (see check 5). Checks 4, 6 and 7 were all specified as manual and turned out to be
-automatable, so the presumption should be that a check *is* scriptable until a physical or
-credential-level step proves otherwise - but these four are that.
+Status as of 2026-08-13: 1, 4, 6 and 7 are done; 5 is done for the only path that applies to a repo
+without its own guard hook; and 8's four fail-closed claims are automated and passing, leaving only its
+credential step. **What is left is 2, 3, 5(a)/(b)/(d) and 8's live revocation — and none of it is
+blocked on more automation.** 2 and 3 need a real 30-minute sleep, which no script can perform, and
+they share one lid-close: arm the stale command before sleeping and both are measured on the same
+resume. 8 needs a BotFather token revocation, but only to confirm the revocation *itself* behaves as
+assumed and that recovery works - everything it causes is now checked on every run (see check 8). 5's
+remaining paths need a second repo registered, which is itself a Phase 6b trigger (see check 5).
+Checks 4, 6, 7 and now most of 8 were all specified as manual and turned out to be automatable, so the
+presumption should be that a check *is* scriptable until a physical or credential-level step proves
+otherwise - and where one step is, the rest of the check usually is not.
 
 1. ~~**Cold boot.** Reboot Windows, log in, touch nothing. Within two minutes the bot answers `/ls`.
    Note that "log in" is load-bearing on this host and is the §7.2 gap being measured, not an
@@ -4390,3 +4394,43 @@ credential-level step proves otherwise - but these four are that.
 8. **Compromise drill.** Revoke the control bot token and confirm the fleet fails closed: sessions keep
    running locally, no Telegram control, no silent auto-approvals, and the feed bot alone cannot
    approve anything.
+
+   **Partially done 2026-08-13: all four fail-closed claims are now automated and passing**
+   (`packages/bridge/test/compromise-drill.test.ts`), leaving only the credential step manual. This
+   check was filed as manual because revoking a token is a BotFather action no script can perform -
+   which is true of the *revocation*, and not of anything it causes. What a revoked token does to the
+   Bridge is an ordinary reproducible HTTP condition: every Bot API call answers
+   `401 {"ok":false,"error_code":401,"description":"Unauthorized"}`. Serving that from a local server
+   turns "we believe it fails closed" into something measured on every run.
+
+   What the four claims now assert, and what each would catch:
+
+   - **Refused at boot**, through a real 401 rather than the hand-rolled rejecting `GetMeSource`
+     `telegram.test.ts` already uses - so it also proves the client treats Telegram's `{ok:false}`
+     envelope as a failure instead of parsing it as a result and continuing with an undefined username.
+   - **Revoked mid-flight, the daemon survives.** Previously untested in any form, and the most
+     important of the four: the loop was healthy and *then* lost its token, which is the order a real
+     compromise happens in. The assertion is not that it errors but that it keeps polling - a throw
+     out of the poll loop's async body would reach `index.ts`'s `unhandledRejection` handler and take
+     the whole daemon down, killing every live session, which is failing open in the worst direction.
+   - **A pending permission resolves to deny, never allow.** The crux of "no silent auto-approvals":
+     with no operator reachable, the TTL sweep is the only thing left that can resolve the request.
+     Asserted across the real 30-minute window, including that nothing resolves *early* in either
+     direction.
+   - **Only the control bot ever polls.** An approval is a tap, a tap is a `callback_query`, and
+     updates arrive only through `getUpdates` - so this reduces to "nothing polls the feed token",
+     and the regression that breaks it is a second `startPolling` call. Asserted against `index.ts`'s
+     source, deliberately: nothing in the suite stands up `main()`, and a test that built its own
+     poller would restate the wiring rather than check it.
+
+   Each of the four was verified to fail for the right reason before being kept, per check 6's lesson:
+   removing the 401 fails claims 1 and 2, making the sweep send `allow` fails claim 3, and adding
+   `startPolling(feedBot, ...)` fails claim 4 naming `feedBot`.
+
+   **What remains genuinely manual, and why it is still worth doing:** that BotFather's revocation
+   really does produce a 401 (rather than a 404, or worse, a silent 200 with an empty update list -
+   which would look identical to an idle fleet and satisfy none of the above), and that the operator's
+   own recovery path works end to end: new token into `%APPDATA%\aibridge`, Bridge restarted, control
+   restored. Note the drill is destructive to the live fleet's *control plane* for as long as that
+   takes, which is the one real cost of running it - sessions themselves keep running throughout,
+   which is claim 1 of the check.
