@@ -63,6 +63,14 @@ describe("isValidTransition (§4.3's state table)", () => {
     expect(isValidTransition("starting", "quota_stopped")).toBe(false);
     expect(isValidTransition("dead", "quota_stopped")).toBe(false);
   });
+
+  // Added 2026-08-13 after a live run left a row stranded at `awaiting_input` for an hour: the
+  // turn-ending `Stop` that should have released it was rejected here, silently (`maybeSetState`
+  // only logs the writes that land). A `Stop` is the stronger fact - the turn is over, so whatever
+  // the session was waiting on is moot, whichever resolution path did or didn't announce itself.
+  test("awaiting_input -> idle is allowed, so a turn-ending Stop is never silently dropped", () => {
+    expect(isValidTransition("awaiting_input", "idle")).toBe(true);
+  });
 });
 
 describe("SessionStore", () => {

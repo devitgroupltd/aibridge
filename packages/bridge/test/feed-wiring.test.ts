@@ -6,6 +6,7 @@ import { Routing } from "../src/routing.ts";
 import { SessionStore, type SessionRow } from "../src/session-store.ts";
 import type { HookEventMessage } from "@aibridge/protocol";
 import type { PendingPermissionRequest } from "../src/permission-registry.ts";
+import { createWedgedRecoveryMarks } from "../src/wedged-recovery.ts";
 
 function row(overrides: Partial<SessionRow> = {}): SessionRow {
   return {
@@ -74,6 +75,7 @@ function setup(overrides: Partial<Parameters<typeof createFeedWiring>[0]> = {}) 
   const finalized: Array<{ messageId: number; text: string }> = [];
   const typingStops: string[] = [];
   const noReplyNudges: Array<{ slug: string; topicId: number; content: string }> = [];
+  const wedgedRecoveryMarks = createWedgedRecoveryMarks();
   let permissionToResolve: PendingPermissionRequest | undefined;
 
   const feedWiring = createFeedWiring({
@@ -99,6 +101,7 @@ function setup(overrides: Partial<Parameters<typeof createFeedWiring>[0]> = {}) 
       stop: (topicId) => typingStops.push(topicId),
     },
     sendNoReplyNudge: (slug, topicId, content) => noReplyNudges.push({ slug, topicId, content }),
+    wedgedRecoveryMarks,
     ...overrides,
   });
 
@@ -114,6 +117,7 @@ function setup(overrides: Partial<Parameters<typeof createFeedWiring>[0]> = {}) 
     finalized,
     typingStops,
     noReplyNudges,
+    wedgedRecoveryMarks,
     setPermissionToResolve: (p: PendingPermissionRequest | undefined) => {
       permissionToResolve = p;
     },
@@ -190,6 +194,104 @@ describe("createFeedWiring", () => {
 
     expect(verdicts).toEqual([{ slug: "fix-bug", requestId: "req-1", behavior: "deny" }]);
     expect(finalized[0]?.text).toContain("⛔ Denied");
+  });
+
+  // 2026-08-13: the terminal-race path resolved the prompt but never moved the row, because the
+  // `maybeSetState(..., "working")` that does it lived only on the button-tap path in
+  // `callback-query-router.ts`. The session then ran on with `/ls` reporting it blocked.
+  test("handleHookEvent moves the row out of awaiting_input when the terminal-race fix resolves a permission", () => {
+    const { feedWiring, sessionStore, setPermissionToResolve } = setup();
+    sessionStore.insert(row({ state: "working" }));
+    sessionStore.setState("fix-bug", "awaiting_input", "2026-08-13T00:00:00.000Z");
+    setPermissionToResolve({
+      requestId: "req-1",
+      slug: "fix-bug",
+      toolName: "Bash",
+      description: "run a command",
+      inputPreview: "npm test",
+      topicId: 2,
+      messageId: 55,
+      createdAt: Date.now(),
+    });
+
+    feedWiring.handleHookEvent(
+      hookMsg({ hook_event_name: "PostToolUse", payload: { tool_use_id: "tu-1", tool_name: "Bash", tool_input: {} } }),
+    );
+
+    expect(sessionStore.get("fix-bug")?.state).toBe("working");
+  });
+
+  // P0-8, found live 2026-08-13. The order below is the entire test: `SessionEnd` has to arrive
+  // *after* the recovery kill and *before* the exit handler, which is what actually happened live
+  // (33ms end to end). Marking the row dead there makes `handleUnexpectedExit` bail on its own
+  // "already dead" guard, so the kill that exists purely to trigger a resume produces a permanently
+  // dead session instead - and `dead` is terminal, so nothing downstream can undo it.
+  test("handleHookEvent leaves the row alive for the SessionEnd of the Bridge's own wedged-recovery kill", () => {
+    const { feedWiring, sessionStore, wedgedRecoveryMarks } = setup();
+    sessionStore.insert(row({ state: "starting" }));
+    sessionStore.setState("fix-bug", "idle", "2026-08-13T00:00:00.000Z");
+
+    wedgedRecoveryMarks.mark("fix-bug"); // `recoverWedgedPty` does this immediately before kill()
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "SessionEnd", payload: { reason: "other" } }));
+
+    expect(sessionStore.get("fix-bug")?.state).toBe("idle");
+  });
+
+  test("handleHookEvent still marks the row dead for a SessionEnd with no recovery in flight", () => {
+    const { feedWiring, sessionStore } = setup();
+    sessionStore.insert(row({ state: "starting" }));
+    sessionStore.setState("fix-bug", "idle", "2026-08-13T00:00:00.000Z");
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "SessionEnd", payload: { reason: "other" } }));
+
+    expect(sessionStore.get("fix-bug")?.state).toBe("dead");
+  });
+
+  test("the recovery mark shields one slug's SessionEnd without shielding another session's", () => {
+    const { feedWiring, sessionStore, wedgedRecoveryMarks } = setup();
+    sessionStore.insert(row({ slug: "fix-bug", state: "starting" }));
+    sessionStore.insert(row({ slug: "other-task", topicId: 3, sessionId: "sess-2", state: "starting" }));
+    sessionStore.setState("fix-bug", "idle", "2026-08-13T00:00:00.000Z");
+    sessionStore.setState("other-task", "idle", "2026-08-13T00:00:00.000Z");
+
+    wedgedRecoveryMarks.mark("fix-bug");
+    feedWiring.handleHookEvent(hookMsg({ slug: "fix-bug", hook_event_name: "SessionEnd", payload: { reason: "other" } }));
+    feedWiring.handleHookEvent(hookMsg({ slug: "other-task", hook_event_name: "SessionEnd", payload: { reason: "other" } }));
+
+    expect(sessionStore.get("fix-bug")?.state).toBe("idle");
+    expect(sessionStore.get("other-task")?.state).toBe("dead");
+  });
+
+  // The mark must not outlive the recovery it was written for: once the successor process announces
+  // itself, a *genuine* exit right afterwards has to be able to mark the row dead again. Without
+  // this clear, only the 30s TTL would eventually let that happen.
+  test("a successor SessionStart clears the recovery mark, so the next real SessionEnd marks the row dead", () => {
+    const { feedWiring, sessionStore, wedgedRecoveryMarks } = setup();
+    sessionStore.insert(row({ state: "starting" }));
+    sessionStore.setState("fix-bug", "idle", "2026-08-13T00:00:00.000Z");
+
+    wedgedRecoveryMarks.mark("fix-bug");
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "SessionEnd", payload: { reason: "other" } }));
+    expect(sessionStore.get("fix-bug")?.state).toBe("idle");
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "SessionStart", session_id: "sess-2" }));
+    expect(wedgedRecoveryMarks.isRecovering("fix-bug")).toBe(false);
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "SessionEnd", payload: { reason: "other" } }));
+    expect(sessionStore.get("fix-bug")?.state).toBe("dead");
+  });
+
+  // 2026-08-13: `awaiting_input` had no `idle` edge, so a turn-ending `Stop` arriving while a
+  // resolved-but-unannounced prompt was still on the row was rejected - silently, since
+  // `maybeSetState` only logs writes that succeed. The row stayed `awaiting_input` indefinitely.
+  test("handleHookEvent applies a turn-ending Stop that arrives while the row still says awaiting_input", () => {
+    const { feedWiring, sessionStore } = setup();
+    sessionStore.insert(row({ state: "working" }));
+    sessionStore.setState("fix-bug", "awaiting_input", "2026-08-13T00:00:00.000Z");
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "Stop", payload: {} }));
+
+    expect(sessionStore.get("fix-bug")?.state).toBe("idle");
   });
 
   // 0.101.0: `SessionStore.setSessionId` existed and was unit-tested in isolation, but nothing in

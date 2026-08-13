@@ -23,12 +23,10 @@ rig are all real and covered by `bun test` (see `Commands` below).
 prompts-per-hour showing an uncomfortably broad allowlist, or registering a repo other than this one.
 Do not treat it as an open task on a calendar; re-read §12's 6b section when a trigger actually fires.
 [`plans/codebase-hardening-plan.md`](plans/codebase-hardening-plan.md) has its whole 2026-08-09 audit
-closed out (P0-1–P0-6, P1-1–P1-8, P2-1–P2-6), plus P0-7/P1-9 (2026-08-12) and P1-10 (2026-08-13);
-its **## Open findings** section currently holds one item, **P0-8** — a wedged session is killed for
-a crash-resume that never happens, because the killed process's own `SessionEnd` hook marks the row
-dead first. Outstanding work is therefore that, plus §13's manual
-verification checks 2, 3, 5, 7 and 8 — the ones automated tests cannot cover — plus a few
-built-but-never-live-exercised paths named in §12.
+closed out (P0-1–P0-6, P1-1–P1-8, P2-1–P2-6), plus P0-7/P1-9 (2026-08-12) and P1-10/P0-8/P1-11
+(2026-08-13); its **## Open findings** section is currently empty. Outstanding work is therefore
+§13's manual verification checks 2, 3, 5, 7 and 8 — the ones automated tests cannot cover — plus a
+few built-but-never-live-exercised paths named in §12.
 
 ## What this project is
 

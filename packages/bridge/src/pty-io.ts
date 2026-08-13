@@ -1,5 +1,5 @@
 import { renderChannelTag, type ChannelMetaFields } from "@aibridge/protocol";
-import { recoverWedgedPty, type PtyLookup } from "./wedged-recovery.ts";
+import { recoverWedgedPty, type PtyLookup, type WedgedRecoveryMarks } from "./wedged-recovery.ts";
 import type { Routing } from "./routing.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import type { TypingIndicator } from "./typing-indicator.ts";
@@ -22,6 +22,9 @@ export interface PtyIoOptions {
    * (deliberately not a kill-and-untrack: see that function's own doc comment). */
   lastActivityAt: (slug: string) => number | undefined;
   ptyLookup: PtyLookup;
+  /** P0-8: shared with `feed-wiring.ts`, which is the module that actually consults it - this one
+   * only ever writes. See `WedgedRecoveryMarks`'s own doc comment for the race it closes. */
+  wedgedRecoveryMarks: WedgedRecoveryMarks;
   log?: LogFn;
   submitConfirmWindowMs?: number;
   echoSettleMs?: number;
@@ -44,7 +47,7 @@ export interface PtyIo {
  * the per-message `seq` counter `sendChannelText` needs for `ChannelMetaFields`.
  */
 export function createPtyIo(opts: PtyIoOptions): PtyIo {
-  const { routing, typingIndicator, thinkingPlaceholder, lastActivityAt, ptyLookup } = opts;
+  const { routing, typingIndicator, thinkingPlaceholder, lastActivityAt, ptyLookup, wedgedRecoveryMarks } = opts;
   const log = opts.log ?? (() => {});
   const submitConfirmWindowMs = opts.submitConfirmWindowMs ?? DEFAULT_SUBMIT_CONFIRM_WINDOW_MS;
   const echoSettleMs = opts.echoSettleMs ?? DEFAULT_ECHO_SETTLE_MS;
@@ -137,9 +140,15 @@ export function createPtyIo(opts: PtyIoOptions): PtyIo {
    * continue" right: same slug, same topic, same worktree, `claude --resume <session_id>` on a
    * fresh PTY, with its own backoff/give-up safety net already in place for the rarer case where
    * the underlying process is now so broken even a resume immediately re-exits.
+   *
+   * "Indistinguishable from a real crash" turned out to be false in one respect the original
+   * reasoning missed, and P0-8 is the fix: a killed process still runs its own `SessionEnd` hook,
+   * which marked the row `dead` before `handleUnexpectedExit` could resume it. `recoverWedgedPty`
+   * now records the recovery in `wedgedRecoveryMarks` before killing, and `feed-wiring.ts` skips
+   * the mark-dead for exactly that window.
    */
   function autoRecoverWedgedSession(slug: string): void {
-    const recovered = recoverWedgedPty(ptyLookup, slug);
+    const recovered = recoverWedgedPty(ptyLookup, slug, wedgedRecoveryMarks);
     if (!recovered) return; // already gone - a manual /kill/rm, or a real crash, raced this same detection
     log(
       "WARN",

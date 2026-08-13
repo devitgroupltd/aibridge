@@ -3,7 +3,7 @@ import { randomUUID } from "node:crypto";
 import http from "node:http";
 import path from "node:path";
 import type * as pty from "node-pty";
-import { renderAskCancelledCard } from "./ask-callback.ts";
+import { sweepExpiredAsks } from "./ask-callback.ts";
 import { buildRunArgs } from "./autostart.ts";
 import { fireAndForget } from "./fire-and-forget.ts";
 import { loadConfig, STATE_DIR } from "./config.ts";
@@ -47,6 +47,7 @@ import { createTypingIndicator } from "./typing-indicator.ts";
 import { restartSettleDelayMs } from "./restart-settle.ts";
 import { createSessionSupervisor } from "./session-supervisor.ts";
 import { createPtyIo, DEFAULT_ECHO_SETTLE_MS, DEFAULT_SUBMIT_CONFIRM_WINDOW_MS } from "./pty-io.ts";
+import { createWedgedRecoveryMarks } from "./wedged-recovery.ts";
 import { createFeedWiring } from "./feed-wiring.ts";
 import { createQuotaAlarms, DEFAULT_BURN_RATE_THRESHOLD_USD } from "./quota-alarms.ts";
 import { createConfirmCards } from "./confirm-cards.ts";
@@ -551,12 +552,18 @@ async function main(): Promise<void> {
   // pty-io.ts: PTY write primitives, the lost-Enter detector, and its wedged-session auto-recovery.
   // Depends on sessionSupervisor's liveness accessors (constructed just above) rather than owning
   // any PTY-tracking state itself.
+  // P0-8: the one piece of state shared between the module that kills a wedged PTY (`ptyIo`) and
+  // the module that sees the resulting `SessionEnd` (`feedWiring`). Owned here rather than by
+  // either of them, since neither can see the other's half of the race.
+  const wedgedRecoveryMarks = createWedgedRecoveryMarks();
+
   const ptyIo = createPtyIo({
     routing,
     typingIndicator,
     thinkingPlaceholder,
     lastActivityAt: sessionSupervisor.lastActivityAt,
     ptyLookup: { get: (slug) => sessionSupervisor.getPtyProcess(slug) },
+    wedgedRecoveryMarks,
     log,
     submitConfirmWindowMs,
     echoSettleMs,
@@ -591,6 +598,7 @@ async function main(): Promise<void> {
     // already exists by this point in construction order (line ~484), so this can be a plain
     // closure rather than a `LateBound`; see `FeedWiringOptions.sendNoReplyNudge`'s own doc comment.
     sendNoReplyNudge: (slug, topicId, content) => ptyIo.sendChannelText(slug, topicId, content, "no-reply-nudge", "aibridge"),
+    wedgedRecoveryMarks,
     log,
   });
 
@@ -838,6 +846,7 @@ async function main(): Promise<void> {
       pipeHandle.permissionRegistry,
       pipeHandle.sendVerdict,
       pipeHandle.finalizePermissionMessage,
+      (slug) => feedWiring.maybeSetState(slug, "working"),
       (err) => log("WARN", `failed to mark permission request as expired: ${err.message}`),
     );
     browseRegistry.sweep();
@@ -860,17 +869,14 @@ async function main(): Promise<void> {
     for (const entry of voiceConfirmRegistry.takeExpired()) fireAndForget(confirmCards.markConfirmCardExpired(entry.confirmCardMessageId), log, "index sweep markConfirmCardExpired(voice)");
 
     // §6.4: past the 3540s ceiling, cancel rather than let the hook's own 3600s timeout expire
-    // silently - the operator sees an explicit "cancelled" card and Claude sees a `deny` it can
-    // recover from, never a wrong answer auto-picked on its behalf.
-    for (const entry of pipeHandle.askRegistry.expired()) {
-      pipeHandle.cancelAsk(entry.id);
-      for (const q of entry.questions) {
-        if (q.answerLabel !== undefined) continue;
-        pipeHandle
-          .finalizePermissionMessage(q.messageId, renderAskCancelledCard(entry.slug, q.question, q.header))
-          .catch((err) => log("WARN", `failed to mark question as cancelled: ${(err as Error).message}`));
-      }
-    }
+    // silently - see `sweepExpiredAsks` for both halves, including why the state write matters.
+    sweepExpiredAsks(
+      pipeHandle.askRegistry,
+      pipeHandle.cancelAsk,
+      pipeHandle.finalizePermissionMessage,
+      (slug) => feedWiring.maybeSetState(slug, "working"),
+      (err) => log("WARN", `failed to mark question as cancelled: ${err.message}`),
+    );
 
     // §5.4 point 4: more than half of P2 (feed card) sends dropped over the last 60s means the
     // feed bot's bucket is genuinely saturated, not just one unlucky edit - tell the operator once

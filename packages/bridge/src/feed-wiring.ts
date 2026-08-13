@@ -14,6 +14,7 @@ import { isPermanentEditFailure, type SendMessageSource } from "./telegram.ts";
 import type { PendingPermissionRequest } from "./permission-registry.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
 import type { TypingIndicator } from "./typing-indicator.ts";
+import type { WedgedRecoveryMarks } from "./wedged-recovery.ts";
 
 type LogFn = (level: "INFO" | "WARN" | "ERROR", message: string) => void;
 
@@ -57,6 +58,10 @@ export interface FeedWiringOptions {
    * exists, unlike `sessionSupervisor`, which is built before it - so the forward-reference problem
    * that motivated `LateBound` there doesn't exist here. */
   sendNoReplyNudge: (slug: string, topicId: number, content: string) => void;
+  /** P0-8: written by `pty-io.ts`'s `autoRecoverWedgedSession`, read here. A `SessionEnd` arriving
+   * inside a marked window is the Bridge's own recovery kill announcing itself, not the session
+   * ending - see `WedgedRecoveryMarks`'s doc comment for what marking it dead there breaks. */
+  wedgedRecoveryMarks: WedgedRecoveryMarks;
   log?: LogFn;
 }
 
@@ -100,7 +105,7 @@ export interface FeedWiring {
  * - both fire from the same hook events this module already normalizes.
  */
 export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
-  const { sessionStore, routing, detailsAnchorStore, feedGovernor, controlBot, feedBot, supergroupChatId, confirmSessionCommand, markQuotaStopped } = opts;
+  const { sessionStore, routing, detailsAnchorStore, feedGovernor, controlBot, feedBot, supergroupChatId, confirmSessionCommand, markQuotaStopped, wedgedRecoveryMarks } = opts;
   const { resolveByToolMatch, sendVerdict, finalizePermissionMessage, typingIndicator, sendNoReplyNudge } = opts;
   const log = opts.log ?? (() => {});
 
@@ -219,6 +224,11 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
     // nothing else will unblock it now that the entry is out of the registry (the expiry sweep
     // can no longer see it). Send the verdict the operator's own terminal answer implies.
     sendVerdict(resolved.slug, resolved.requestId, msg.hook_event_name === "PermissionDenied" ? "deny" : "allow");
+    // The row is still `awaiting_input` from `onAwaitingInput` when the card went up, and nothing
+    // else is going to move it: this path resolved the prompt without the button tap that
+    // `callback-query-router.ts` hangs its own `maybeSetState(..., "working")` off. Left out, `/ls`
+    // reported a session as blocked on a prompt the operator had already answered at the terminal.
+    maybeSetState(resolved.slug, "working");
     const behaviorLabel = msg.hook_event_name === "PermissionDenied" ? "⛔ Denied" : "✅ Allowed";
     finalizePermissionMessage(resolved.messageId, `${behaviorLabel}: ${resolved.toolName} (answered at terminal)`).catch((err) =>
       log("WARN", `failed to finalize permission message resolved at the terminal for "${msg.slug}": ${(err as Error).message}`),
@@ -262,6 +272,11 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
       sessionStore.setSessionId(msg.slug, msg.session_id);
     }
 
+    // P0-8: a `SessionStart` is the successor process announcing itself, so any wedged-recovery
+    // mark for this slug has served its purpose. Dropped here rather than left to expire so that a
+    // session which crashes for real shortly after a recovery still marks its row dead promptly.
+    if (msg.hook_event_name === "SessionStart") wedgedRecoveryMarks.clear(msg.slug);
+
     resolveTerminalRacePermission(msg);
 
     // §4.3's state table, the hook-driven half (the permission/ask half is wired via
@@ -269,13 +284,28 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
     // an error.
     const hookReason = typeof msg.payload.reason === "string" ? msg.payload.reason : undefined;
     const targetState = stateForHookEvent(msg.hook_event_name, hookReason);
-    if (targetState === "dead") {
+    // P0-8: this is the one `SessionEnd` whose *row* write has to be suppressed - it belongs to a
+    // process the Bridge itself just killed in order to have `handleUnexpectedExit` resume it, and
+    // a `dead` row makes that resume bail (`session-supervisor.ts`'s own guard). Suppressed rather
+    // than undone afterwards, because `dead` is terminal in `session-store.ts`: a row allowed to
+    // reach it could not be walked back at all. Only the state write is skipped - everything below
+    // still runs, because the event itself is *true*: that process really did exit, so its feed
+    // card and typing indicator should say so, immediately followed by the resume notice
+    // `handleUnexpectedExit` posts. What's wrong is only the conclusion "therefore this session is
+    // over".
+    const suppressedForRecovery = targetState === "dead" && wedgedRecoveryMarks.isRecovering(msg.slug);
+    if (suppressedForRecovery) {
+      log(
+        "WARN",
+        `session "${msg.slug}" hook event "${msg.hook_event_name}"${hookReason ? ` (reason: ${hookReason})` : ""} came from the Bridge's own wedged-recovery kill - leaving the row alive so the crash-resume path can relaunch it (P0-8)`,
+      );
+    } else if (targetState === "dead") {
       // Pinpoints *which* hook drove a dead transition - see maybeSetState's own log line for the
       // resulting old->new state. Without this, a dead row and a boot-reconciliation race that
       // skipped it (§4.5) were indistinguishable from the log alone (2026-08-11 live incident).
       log("WARN", `session "${msg.slug}" hook event "${msg.hook_event_name}"${hookReason ? ` (reason: ${hookReason})` : ""} is marking the row dead`);
     }
-    if (targetState) maybeSetState(msg.slug, targetState);
+    if (targetState && !suppressedForRecovery) maybeSetState(msg.slug, targetState);
 
     const event = normalizeHookEvent(msg.hook_event_name, msg.payload);
     if (!event) return;

@@ -215,11 +215,16 @@ export function sweepExpiredPermissions(
   registry: PermissionRegistry,
   sendVerdict: (slug: string, requestId: string, behavior: "deny") => void,
   finalizeMessage: (messageId: number, text: string) => Promise<void>,
+  onResolved: (slug: string) => void,
   onFinalizeError: (err: Error) => void,
 ): void {
   for (const entry of registry.expired()) {
     registry.remove(entry.requestId);
     sendVerdict(entry.slug, entry.requestId, "deny");
+    // Same contract (and the same 2026-08-13 finding) as `sweepExpiredAsks`'s own `onResolved`: the
+    // deny above unblocks the session, so the row must stop saying `awaiting_input` here rather
+    // than waiting for a button tap that is never going to come.
+    onResolved(entry.slug);
     finalizeMessage(entry.messageId, `⌛ expired: ${entry.toolName} (no answer in time)`).catch(onFinalizeError);
   }
 }
