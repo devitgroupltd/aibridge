@@ -4377,7 +4377,15 @@ otherwise - and where one step is, the rest of the check usually is not.
    Not deterministic: the `--rehearse` control run forwarded the byte-identical text to the session
    correctly, so this is a classifier outcome, not a structural mis-route.
 
-   **Fixed (2026-08-14).** `RouterContext` gains `confirmedReplay`, and `allowedKinds` drops
+   **Fixed (2026-08-14), and re-run live to confirm it:**
+   `RESULT|card=true|inertBeforeTap=true|executedAfterTap=true|PASS` - the same script, against the
+   same real 30-minute Telegram backlog, with the session replying `STALE-REPLAY-OK` only after the
+   tap. All three assertions hold now, including the one that caught the defect. Worth noting the
+   original failure was non-deterministic (the rehearsal passed), so this single PASS is confirmation
+   rather than proof on its own; what makes it proof is that `help` is no longer in the offered enum
+   at all, which the unit tests pin directly.
+
+   `RouterContext` gains `confirmedReplay`, and `allowedKinds` drops
    `help`/`about` when it is set; only `callback-query-router.ts`'s stale replay passes it. Both
    halves of the router are covered by the one exclusion: `buildSchema` never offers the kinds, and
    `mapRouterOutput` rejects them as a no-match if a backend returns one regardless - and a no-match

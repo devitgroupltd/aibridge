@@ -54,7 +54,8 @@ same day (`packages/bridge/test/compromise-drill.test.ts`). **Check 3 is now don
 that it needed a real sleep was false, since staleness is measured against Telegram's `message.date`
 and a *stopped Bridge* produces the same backlog; running it found a real defect (an operator-confirmed
 stale replay was swallowed by the NL router's `help` classification and never reached the session -
-**fixed**: `RouterContext.confirmedReplay` drops `help`/`about` from `allowedKinds` for a confirmed
+**fixed and re-run live to a PASS**: `RouterContext.confirmedReplay` drops `help`/`about` from
+`allowedKinds` for a confirmed
 replay only, so a no-match forwards the text instead of eating it. Note this was the *third*
 live defect from help/about over-triggering; the first two were fixed by narrowing the router prompt,
 which is why this one is structural - see §13 check 3). Check 2 cannot be driven from inside this host at all: it is a
