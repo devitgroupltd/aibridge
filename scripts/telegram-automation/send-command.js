@@ -4,13 +4,16 @@
 // the response is the caller's job), so it covers every control command with one script.
 //
 // Usage: node send-command.js "<command 1>" ["<command 2>" ...]
-const { connect, openGroup, openTopic, sendMessage, getMaxMessageId, waitForMessagesAfter } = require("./client.js");
+const { connect, openGroup, openTopic, sendMessage, getMaxMessageId, waitForMessagesAfter, unmangleMsysPath } = require("./client.js");
 
 function log(msg) {
   console.error(`[${new Date().toISOString()}] ${msg}`);
 }
 
-const commands = process.argv.slice(2);
+// Every command here starts with "/", which is exactly what Git Bash rewrites into a path - see
+// `unmangleMsysPath`. Repaired rather than rejected: the mangled form is still sendable, so without
+// this the script cheerfully sends "C:/Program Files/Git/kill <slug>" and reports the reply.
+const commands = process.argv.slice(2).map(unmangleMsysPath);
 if (commands.length === 0) {
   console.error('usage: node send-command.js "<command 1>" ["<command 2>" ...]');
   process.exit(1);

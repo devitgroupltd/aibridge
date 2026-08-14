@@ -1,4 +1,5 @@
 const { chromium } = require("playwright");
+const fs = require("fs");
 const path = require("path");
 
 const USER_DATA_DIR = path.join(__dirname, "profile");
@@ -179,12 +180,55 @@ function buttonByLabel(page, label) {
   return page.locator(".reply-markup-button", { hasText: new RegExp(`^\\s*${escaped}\\s*$`) });
 }
 
+/**
+ * Undoes Git Bash's POSIX-path translation of a leading-slash argument.
+ *
+ * MSYS rewrites any argument that *looks* like an absolute POSIX path into a Windows path before
+ * node ever sees it, and every command this rig sends starts with "/". So
+ * `node send-command.js "/kill my-session"` arrives in `process.argv` as
+ * `"C:/Program Files/Git/kill my-session"` - the command name silently becomes the tail of a path
+ * to the Git installation. Live-hit 2026-08-14 on a `/kill`; the same trap had already cost a
+ * detour on `powercfg /a` and `/ls`, so it is not specific to one command or one script.
+ *
+ * Two things made it worth repairing here rather than only documenting `MSYS_NO_PATHCONV=1`:
+ * the mangled text is still a *plausible* message, so it gets sent and the check reports whatever
+ * comes back rather than failing; and the NL router then reads it as a near-miss and answers with
+ * a confirm card ("I read that as /kill ... - run it?"), which looks enough like success to be
+ * mistaken for one in a log.
+ *
+ * Deliberately narrow, because over-eager unmangling would corrupt legitimate arguments: it only
+ * fires when the prefix is a real Git-for-Windows install root (checked on disk via `usr/bin/bash.exe`,
+ * not guessed from the string), which is the only directory MSYS ever substitutes for "/". A message
+ * that genuinely begins with a Windows path is left alone, because such a path's own prefix will not
+ * satisfy that test.
+ *
+ * Measured, not assumed - every leading-slash argument is rewritten, and only a leading one:
+ *   "/ls"                     -> "C:/Program Files/Git/ls"
+ *   "/kill some-slug"         -> "C:/Program Files/Git/kill some-slug"
+ *   "hello /ls"               -> unchanged
+ * **Known gap:** a *single-letter* command takes a different mangling - "/a" becomes "A:/", a drive
+ * root with no install-root prefix to recognise - so this cannot repair it and returns it untouched.
+ * No fleet command is one letter today, so nothing is currently affected; if one is ever added, pass
+ * `MSYS_NO_PATHCONV=1` for it rather than widening the rule here, since "A:/" is also a legitimate
+ * thing for a message to contain and guessing would corrupt it.
+ */
+function unmangleMsysPath(arg) {
+  const m = /^([A-Za-z]:[\\/](?:[^\\/]*[\\/])*)([^\\/\s]+)([\s\S]*)$/.exec(arg);
+  if (!m) return arg;
+  const [, prefix, firstWord, rest] = m;
+  if (!fs.existsSync(path.join(prefix, "usr", "bin", "bash.exe"))) return arg;
+  const repaired = `/${firstWord}${rest}`;
+  console.error(`[client] MSYS mangled the argument into a path; sending "${repaired}" instead of "${arg}"`);
+  return repaired;
+}
+
 module.exports = {
   connect,
   openGroup,
   openTopic,
   openTopicByTitle,
   sendMessage,
+  unmangleMsysPath,
   getMessageTexts,
   getMessageCount,
   getMaxMessageId,
