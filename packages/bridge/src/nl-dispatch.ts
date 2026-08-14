@@ -5,7 +5,7 @@ import { formatHistoryForPrompt } from "./control-topic-history.ts";
 import type { ControlTopicHistory } from "./control-topic-history.ts";
 import { buildNlConfirmKeyboard, NlConfirmRegistry } from "./nl-confirm.ts";
 import { answerControlTopicQuestion as realAnswerControlTopicQuestion, routeText as realRouteText } from "./nl-router.ts";
-import type { RouterAction } from "./nl-router.ts";
+import type { RouterAction, RouterContext } from "./nl-router.ts";
 import { buildRepoPickKeyboard, RepoPickRegistry } from "./repo-picker.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import type { Effort, Mode, Model, SessionCommand } from "./session-commands.ts";
@@ -64,7 +64,7 @@ export interface NlDispatch {
   postNlConfirm(command: FleetCommand | SessionCommand | RouterAction, threadId: number | undefined, currentSlug: string | undefined): Promise<void>;
   routeOrFallback(
     text: string,
-    ctx: { isControl: boolean; hasSession: boolean; repoNames?: string[] },
+    ctx: RouterContext,
     threadId: number | undefined,
     isControl: boolean,
     currentSlug: string | undefined,
@@ -228,7 +228,7 @@ export function createNlDispatch(opts: NlDispatchOptions): NlDispatch {
    */
   async function routeOrFallback(
     text: string,
-    ctx: { isControl: boolean; hasSession: boolean; repoNames?: string[] },
+    ctx: RouterContext,
     threadId: number | undefined,
     isControl: boolean,
     currentSlug: string | undefined,

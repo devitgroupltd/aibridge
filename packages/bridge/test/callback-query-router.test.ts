@@ -411,6 +411,31 @@ describe("createCallbackQueryRouter - every documented namespace resolves to its
     expect(s.commandDispatch.dispatched.length).toBe(1);
   });
 
+  /** §13 check 3: the replay must carry `confirmedReplay: true` (the 10th arg) so the NL router
+   * cannot reclassify an already-confirmed instruction as `help` and drop it - see `allowedKinds` in
+   * nl-router.ts. Asserted positionally because that is how the flag actually travels; a test that
+   * only counted the dispatch (the one above) passed throughout the live failure. */
+  test('"sc:" replay marks itself as an operator-confirmed replay', () => {
+    const s = setup();
+    s.staleConfirmRegistry.add({ id: "sc2", threadId: 5, messageId: 1, rawText: "push it", from: "op", confirmCardMessageId: 2, origin: {} });
+    s.router.routeCallbackQuery(cq("sc:sc2:y"));
+    expect(s.commandDispatch.dispatched[0]?.[9]).toBe(true);
+  });
+
+  /** The voice confirm deliberately does *not* set it: there the operator is confirming what they
+   * said, not re-authorising an instruction already understood, so a spoken "what can you do?" must
+   * still be allowed to reach `help`. Pins the fix as narrow rather than "every confirm replay". */
+  test('"vc:" replay does NOT mark itself confirmed - a spoken question must still reach help', () => {
+    const s = setup();
+    s.voiceConfirmRegistry.add({ id: "vc3", threadId: 5, messageId: 1, transcript: "what can you do?", from: "op", confirmCardMessageId: 2, origin: {} });
+    s.router.routeCallbackQuery(cq("vc:vc3:s"));
+    // The length assertion is load-bearing: `dispatched[0]?.[9]` is `undefined` when nothing was
+    // dispatched at all, so without it this test would pass for the wrong reason if the voice replay
+    // ever stopped dispatching.
+    expect(s.commandDispatch.dispatched.length).toBe(1);
+    expect(s.commandDispatch.dispatched[0]?.[9]).toBeUndefined();
+  });
+
   test('"vc:" send replays the transcript via commandDispatch.dispatchInboundMessage', () => {
     const s = setup();
     s.voiceConfirmRegistry.add({ id: "vc1", threadId: 5, messageId: 1, transcript: "hi", from: "op", confirmCardMessageId: 2, origin: {} });
