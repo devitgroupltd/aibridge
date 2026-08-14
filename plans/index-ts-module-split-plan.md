@@ -535,8 +535,11 @@ on the strength of the line count alone.
   in `/stop`'s card-clearing work at 0.101.1), nl-confirm (a real destructive-NL confirm card the
   operator hit, which is what produced `retry-store.ts`), and voice-confirm. The fourth, **stale-confirm,
   has never fired live for a genuinely >30-minute-old message** — that is not a gap this refactor
-  introduced, it is the main plan's own §13 check 3, still outstanding there for the same reason
-  (producing a real 30-minute-old backlog message means actually suspending the host).
+  introduced, it is the main plan's own §13 check 3. The reason given here for it staying outstanding
+  ("producing a real 30-minute-old backlog message means actually suspending the host") was simply
+  wrong, and is corrected in §13: staleness is measured against Telegram's own `message.date`, so a
+  **stopped Bridge** produces the identical >30-minute-old backlog through the identical code path,
+  no suspend involved. `scripts/telegram-automation/stale-command-check.js` now does it unattended.
 - ~~Confirm `index.ts` is reduced to roughly 300–400 lines and contains no business logic.~~ **Half
   done:** no business logic (confirmed by read-through — every remaining top-level statement is
   config/store construction or factory wiring), but 1,152 lines rather than 300–400. See ## Outcome
