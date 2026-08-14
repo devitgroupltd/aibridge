@@ -4,6 +4,7 @@ import { describeExecFailure, formatExecFailureForLog, formatExitClause } from "
 import { fireAndForget } from "./fire-and-forget.ts";
 import type { LateBound } from "./late-bound.ts";
 import { findOrphanProcesses } from "./orphan-scan.ts";
+import type { ProcessInfo } from "./orphan-scan.ts";
 import { listClaudeProcesses } from "./process-scan.ts";
 import { reconcile } from "./reconciliation.ts";
 import { attachPtyWriteGuard, type PtyLike } from "./pty-write-guard.ts";
@@ -78,6 +79,19 @@ export interface SessionSupervisorOptions {
    * check below. Defaults to the real probe; tests inject a fake so a fixture row's arbitrary
    * `ptyPid` never actually signals whatever real OS process happens to own that number. */
   isPidAlive?: (pid: number) => boolean;
+  /** Injectable in place of the real `process-scan.ts` WMI sweep. Defaults to the real
+   * `listClaudeProcesses`.
+   *
+   * Exists for the same reason `isPidAlive` does - the real one touches the host - but the concrete
+   * cost was a recurring CI failure rather than a stray signal. `runStartupReconciliation` awaits
+   * `reportOrphanProcesses()` unconditionally, before any early return, so *every* test that drives
+   * a startup reconciliation was spawning a real `powershell -Command "Get-CimInstance
+   * Win32_Process"` and waiting on WMI. That costs ~1s on a developer box and comfortably exceeds
+   * bun's 5000ms default test timeout on a loaded hosted Windows runner, which is exactly how it
+   * presented: green locally and on the PR, then a timeout on `main` (2026-08-13 took all three
+   * tests in the block, 2026-08-14 took one of them). A failure whose cause is "the runner was
+   * busy" teaches nothing and trains people to re-run CI, which is worse than no test. */
+  listProcesses?: () => Promise<ProcessInfo[]>;
   /** Injectable in place of the real `process.kill` - only `resumeSession`'s stale-orphan-before-
    * relaunch check (below) needs this. Defaults to the real kill; tests inject a fake to assert a
    * kill was requested without ever sending a real signal to a fixture's pid. */
@@ -166,6 +180,7 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
   const usageWaiters = opts.usageWaiters ?? new Map<string, { buffer: string; check: () => void }>();
   const launchSession = opts.launchSession ?? realLaunchSession;
   const killProcess = opts.killProcess ?? ((pid: number) => process.kill(pid));
+  const listProcesses = opts.listProcesses ?? listClaudeProcesses;
   const sendResumeNudge = opts.sendResumeNudge;
 
   const ptyProcessBySlug = new Map<string, pty.IPty>();
@@ -247,7 +262,7 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
    * surfaced to the control topic for manual review only - an unrecognized live process is never
    * auto-killed (deciding to kill something is the operator's call, not a startup heuristic's). */
   async function reportOrphanProcesses(): Promise<void> {
-    const processes = await listClaudeProcesses();
+    const processes = await listProcesses();
     if (processes.length === 0) return;
     const orphans = findOrphanProcesses(processes, sessionStore.all());
     if (orphans.length === 0) return;
