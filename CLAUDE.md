@@ -146,6 +146,15 @@ boundary as `scripts/dev-bridge.sh`).
   `getMaxMessageId` + `waitForMessagesAfter`. Each of these silently converted a real result into a
   confident wrong one, and (1) and (2) together had left check 6's permission half measuring nothing
   at all while printing `FAIL` on every run.
+- **A fourth trap, this one from the shell rather than the DOM:** Git Bash rewrites any
+  leading-slash argument into a Windows path before node sees it, so `node send-command.js "/kill x"`
+  arrives as `C:/Program Files/Git/kill x`. Measured: every leading-slash argument is affected
+  (`/ls` included), only leading ones, and a single-letter `/a` becomes `A:/` instead.
+  `client.js`'s `unmangleMsysPath` now repairs it in `send-command.js`/`send-to-topic.js` and logs
+  when it does; `MSYS_NO_PATHCONV=1` is still the fix everywhere else (`powercfg /a`, one-off
+  scripts). This one is nastier than it looks because the mangled text is still *sendable*: it gets
+  delivered, and the NL router answers it with a near-miss confirm card ("I read that as /kill ... -
+  run it?"), which reads like success in a log.
 - For anything not covered by an existing script (e.g. checking Telegram's native command-autocomplete
   popup), write a small one-off script in this folder that reuses `client.js` rather than declaring the
   check impossible — a real, already-logged-in browser profile is sitting right there.
