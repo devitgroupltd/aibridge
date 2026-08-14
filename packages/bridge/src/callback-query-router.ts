@@ -571,7 +571,23 @@ export function createCallbackQueryRouter(opts: CallbackQueryRouterOptions): Cal
         const pendingIsControl = isControlTopic(pending.threadId);
         const pendingRoute = pending.threadId !== undefined ? routing.getByTopicId(pending.threadId) : undefined;
         fireAndForget(
-          commandDispatch.dispatchInboundMessage(pending.messageId, pending.rawText, pending.threadId, pendingIsControl, pendingRoute, pendingRoute?.slug, pending.from, buildContextPrefix(pending.origin)),
+          // Trailing `undefined, true`: no `replyToText` (a stale card carries no reply context),
+          // and `confirmedReplay: true` - the operator has just been shown this exact text and said
+          // yes, so the NL router must not be allowed to reclassify it as `help`/`about` and drop it
+          // (§13 check 3; see `allowedKinds` in nl-router.ts). Everything else about the replay stays
+          // byte-identical to a live message on purpose.
+          commandDispatch.dispatchInboundMessage(
+            pending.messageId,
+            pending.rawText,
+            pending.threadId,
+            pendingIsControl,
+            pendingRoute,
+            pendingRoute?.slug,
+            pending.from,
+            buildContextPrefix(pending.origin),
+            undefined,
+            true,
+          ),
           log,
           "callback-query-router dispatchInboundMessage(stale replay)",
         );

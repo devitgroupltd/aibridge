@@ -96,6 +96,7 @@ export interface CommandDispatch {
     from: string,
     contextPrefix?: string,
     replyToText?: string,
+    confirmedReplay?: boolean,
   ): Promise<void>;
 }
 
@@ -215,7 +216,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     new: (cmd, ctx) =>
       controlTopicOnly("/new", ctx, () => fireAndForget(sessionLifecycle.handleNewCommand(cmd, ctx.threadId), log, "command-dispatch handleNewCommand")),
     budget: (_cmd, ctx) => controlTopicOnly("/budget", ctx, () => fleetReporting.handleBudgetCommand(ctx.threadId)),
-    default: (cmd, ctx) => controlTopicOnly("/default", ctx, () => voiceModeCommands.handleDefaultCommand(cmd, ctx.threadId)),
+    default: (cmd, ctx) => controlTopicOnly("/default", ctx, () => voiceModeCommands.handleDefaultCommand(cmd, ctx.threadId)),
     ls: (_cmd, ctx) => sessionLifecycle.handleLsCommand(ctx.threadId),
     attach: (cmd, ctx) => sessionLifecycle.handleAttachCommand(cmd, ctx.threadId, ctx.currentSlug),
     pause: (cmd, ctx) => sessionLifecycle.handlePauseCommand(cmd, ctx.threadId, ctx.currentSlug),
@@ -460,6 +461,11 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     // of the message this one replies to, if any - see the `isRetryPhrase` branch below and
     // inbound-media.ts's `routeInboundMessage` for where this comes from.
     replyToText?: string,
+    // §7.4/§13 check 3: set only by the stale-confirm "Yes, still want this" replay
+    // (callback-query-router.ts). Carried no further than the two `routeOrFallback` ctx objects
+    // below - every exact-syntax branch above deliberately behaves identically on a replay, which is
+    // the whole point of replaying through this function rather than approximating it at the tap.
+    confirmedReplay = false,
   ): Promise<void> {
     // Strip a Telegram-inserted "@botusername" before any command parsing below - see
     // stripBotMention's doc comment for why this has to happen exactly once, here.
@@ -556,7 +562,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
       // control-topic-only subset (`/new`/`/budget`); on no match, today's exact behaviour.
       await nlDispatch.routeOrFallback(
         text,
-        { isControl, hasSession: false, repoNames: getReposRegistry()?.names() },
+        { isControl, hasSession: false, repoNames: getReposRegistry()?.names(), confirmedReplay },
         threadId,
         isControl,
         undefined,
@@ -613,7 +619,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     // match, exactly as §10.1.2's note below always did.
     await nlDispatch.routeOrFallback(
       text,
-      { isControl, hasSession: true, repoNames: getReposRegistry()?.names() },
+      { isControl, hasSession: true, repoNames: getReposRegistry()?.names(), confirmedReplay },
       threadId,
       isControl,
       currentSlug,

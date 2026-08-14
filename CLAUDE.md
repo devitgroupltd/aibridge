@@ -49,12 +49,16 @@ misses it (see S-1).
 
 Outstanding verification work is §13's checks **2, 3, 5(a)/(b)/(d) and 8's live revocation** — checks
 5(c), 6 and 7 were run and recorded on 2026-08-13, and 8's four fail-closed claims were automated the
-same day (`packages/bridge/test/compromise-drill.test.ts`) — plus a few built-but-never-live-exercised
-paths named in §12. **Check 3 is now done and automated** (`stale-command-check.js`) - the old claim
+same day (`packages/bridge/test/compromise-drill.test.ts`). **Check 3 is now done and automated**
+(`stale-command-check.js`) - the old claim
 that it needed a real sleep was false, since staleness is measured against Telegram's `message.date`
 and a *stopped Bridge* produces the same backlog; running it found a real defect (an operator-confirmed
-stale replay can be swallowed by the NL router's `help` classification and never reach the session -
-see §13 check 3, fix not yet chosen). Check 2 cannot be driven from inside this host at all: it is a
+stale replay was swallowed by the NL router's `help` classification and never reached the session -
+**fixed and re-run live to a PASS**: `RouterContext.confirmedReplay` drops `help`/`about` from
+`allowedKinds` for a confirmed
+replay only, so a no-match forwards the text instead of eating it. Note this was the *third*
+live defect from help/about over-triggering; the first two were fixed by narrowing the router prompt,
+which is why this one is structural - see §13 check 3). Check 2 cannot be driven from inside this host at all: it is a
 VMware guest with no lid and no S3/modern-standby, though the VM runs on a laptop so the *host's* lid
 still suspends it; its scriptable half (`clock-jump-check.js`) **passes** - a pending permission card
 survives a +2h wall-clock jump and still resolves. What no automation covers is the *backward* skew a

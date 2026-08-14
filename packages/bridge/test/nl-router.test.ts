@@ -392,6 +392,51 @@ describe("mapRouterOutput - one case per kind", () => {
     expect(mapRouterOutput({ kind: "about" }, CONTROL)).toEqual({ matched: true, command: { kind: "about" }, destructive: false });
   });
 
+  /**
+   * §13 check 3, live 2026-08-13. A stale instruction was replayed after the operator tapped "Yes,
+   * still want this", the classifier read it as `kind='help'`, and the command was dropped under a
+   * card that had just said "Confirmed - processing now".
+   *
+   * This is the third time help/about over-triggering has caused a live defect - 2026-08-10 and
+   * 2026-08-11 (see the two `buildSystemInstructions` carve-out tests below) were both fixed by
+   * narrowing the prompt, which is exactly why this one is fixed structurally instead: prompt
+   * wording cannot be relied on for a path where the failure is silent and the operator has already
+   * said yes. The rehearsal run classified byte-identical text correctly, so a prompt-level fix here
+   * would have looked like it worked.
+   */
+  test("a confirmed stale replay refuses help/about - they are the only two kinds that can silently discard an already-confirmed instruction", () => {
+    expect(mapRouterOutput({ kind: "help" }, { ...CONTROL, confirmedReplay: true })).toEqual({ matched: false });
+    expect(mapRouterOutput({ kind: "about" }, { ...CONTROL, confirmedReplay: true })).toEqual({ matched: false });
+    expect(mapRouterOutput({ kind: "help" }, { ...SESSION, confirmedReplay: true })).toEqual({ matched: false });
+    expect(mapRouterOutput({ kind: "about" }, { ...SESSION, confirmedReplay: true })).toEqual({ matched: false });
+  });
+
+  /** The reason a blanket "a replay bypasses NL routing entirely" was rejected: a stale *fleet*
+   * command still has to classify, or confirming "restart the bridge" from a backlog would forward
+   * the words into a session (or fall to Unrecognised) instead of restarting anything. The fix has
+   * to be narrow enough to leave every other kind reachable, which is what this pins. */
+  test("a confirmed stale replay still routes real work - only help/about are withheld", () => {
+    expect(mapRouterOutput({ kind: "restart" }, { ...CONTROL, confirmedReplay: true })).toEqual({ matched: true, command: { kind: "restart" }, destructive: true });
+    expect(mapRouterOutput({ kind: "ls" }, { ...CONTROL, confirmedReplay: true })).toEqual({ matched: true, command: { kind: "ls" }, destructive: false });
+    expect(mapRouterOutput({ kind: "forward" }, { ...SESSION, confirmedReplay: true })).toEqual({ matched: false });
+  });
+
+  /** Both halves of the router have to agree, or the fix only holds for one backend: the schema must
+   * not offer the kinds, *and* `mapRouterOutput` must reject them if a backend returns one anyway. */
+  test("confirmedReplay drops help/about from the offered schema enum too, not just from validation", () => {
+    const enumOf = (ctx: Parameters<typeof buildRouteViaCliArgs>[1]) => {
+      const args = buildRouteViaCliArgs("do the thing", ctx, "sonnet");
+      const schema = JSON.parse(args[args.indexOf("--json-schema") + 1]!) as { properties: { kind: { enum: string[] } } };
+      return schema.properties.kind.enum;
+    };
+    expect(enumOf(CONTROL)).toContain("help");
+    expect(enumOf({ ...CONTROL, confirmedReplay: true })).not.toContain("help");
+    expect(enumOf({ ...CONTROL, confirmedReplay: true })).not.toContain("about");
+    // Unrelated kinds are untouched - this narrows one pair, not the whole context.
+    expect(enumOf({ ...CONTROL, confirmedReplay: true })).toContain("new");
+    expect(enumOf({ ...CONTROL, confirmedReplay: true })).toContain("restart");
+  });
+
   test("assist and router: their own status/on/off and status/api/cli enums", () => {
     // `assist off` is destructive by design: it removes the confirm card from every *subsequent*
     // destructive NL match, so an unconfirmed match that disables confirmation is self-propagating.

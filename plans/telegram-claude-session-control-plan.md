@@ -4375,11 +4375,47 @@ otherwise - and where one step is, the rest of the check usually is not.
    already explicitly confirmed that specific text.
 
    Not deterministic: the `--rehearse` control run forwarded the byte-identical text to the session
-   correctly, so this is a classifier outcome, not a structural mis-route. **Fix not yet chosen** - a
-   blanket "replay bypasses NL routing" is wrong, since a stale *fleet* command ("restart the
-   bridge") legitimately needs classifying; the narrower option is to drop `help`/`about` from
-   `allowedKinds` for an operator-confirmed replay, on the grounds that the operator has already been
-   shown the exact text and said yes, so re-interpreting it can only contradict them.
+   correctly, so this is a classifier outcome, not a structural mis-route.
+
+   **Fixed (2026-08-14), and re-run live to confirm it:**
+   `RESULT|card=true|inertBeforeTap=true|executedAfterTap=true|PASS` - the same script, against the
+   same real 30-minute Telegram backlog, with the session replying `STALE-REPLAY-OK` only after the
+   tap. All three assertions hold now, including the one that caught the defect. Worth noting the
+   original failure was non-deterministic (the rehearsal passed), so this single PASS is confirmation
+   rather than proof on its own; what makes it proof is that `help` is no longer in the offered enum
+   at all, which the unit tests pin directly.
+
+   `RouterContext` gains `confirmedReplay`, and `allowedKinds` drops
+   `help`/`about` when it is set; only `callback-query-router.ts`'s stale replay passes it. Both
+   halves of the router are covered by the one exclusion: `buildSchema` never offers the kinds, and
+   `mapRouterOutput` rejects them as a no-match if a backend returns one regardless - and a no-match
+   is the outcome wanted here, since `routeOrFallback`'s `onNoMatch` forwards the text to the session
+   instead of eating it.
+
+   The blanket alternative ("a replay bypasses NL routing entirely") was rejected and is pinned as a
+   test: a stale *fleet* command ("restart the bridge") still has to classify, or confirming it from
+   a backlog would forward the words into a session rather than restarting anything. The voice-confirm
+   replay deliberately does *not* set the flag - there the operator is confirming what they said, not
+   re-authorising an understood instruction, so a spoken "what can you do?" must still reach `help`.
+
+   The cost is accepted and small: a stale message that genuinely *was* a help request now gets the
+   unrecognised-command reply instead of the help card. Help is reachable by asking again; a swallowed
+   instruction is unrecoverable and indistinguishable from a completed one. Explicitly typed `/help`
+   is untouched on every path - `dispatchInboundMessage` matches it by exact syntax long before the
+   router is reached, so this narrows classification only.
+
+   **Why structural rather than a prompt fix, which is the reusable lesson here:** this was the third
+   live defect caused by `help`/`about` over-triggering. The 2026-08-10 one (a question naming a
+   specific command) and the 2026-08-11 one (a meta question about the router's own behaviour) were
+   both fixed by narrowing `buildSystemInstructions`' trigger sentence, and both fixes held. A third
+   occurrence in the same pair says the classifier will keep finding new phrasings that read as "this
+   person wants help", so on the one path where the operator has *already* said "yes, do this" the
+   answer is to stop offering the kinds at all rather than to describe them more carefully. Note the
+   rehearsal classified byte-identical text correctly, so a prompt-level fix here would have looked
+   like it worked.
+
+   Not fixed, and deliberately so: the same swallow can still happen to an ordinary (unconfirmed)
+   NL-routed message, where `help` is a legitimate reading and no promise of processing has been made.
 4. ~~**Terminal race.** Trigger a permission prompt, answer it at the terminal, confirm the Telegram
    buttons resolve rather than hanging.~~ **Done (0.71.0), automated rather than manual** - see that
    changelog entry. Automating this found the §6.5 resolution heuristic itself had never been built

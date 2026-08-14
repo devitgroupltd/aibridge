@@ -33,6 +33,12 @@ export type RouterContext = {
    * the real short name instead of something `handleNewCommand`'s own fuzzy-match then has to rescue.
    * Optional/empty is a legitimate value (e.g. `reposRegistry` unset) - just means no hint is given. */
   repoNames?: string[];
+  /** This text is being replayed because the operator was shown it verbatim on a §7.4 stale-inbound
+   * card and tapped "Yes, still want this" - see `allowedKinds` for the one thing it changes.
+   * Only the *stale* replay sets it, never the voice-transcript confirm: there the operator is
+   * confirming what they said, not re-authorising an already-understood instruction, so a genuine
+   * "what can you do?" spoken aloud should still reach `help` normally. */
+  confirmedReplay?: boolean;
 };
 
 /** Not real `FleetCommand`/`SessionCommand` kinds - each is handled by its own dedicated function
@@ -182,9 +188,30 @@ type RouterKind = (typeof ROUTER_KINDS)[number];
  * offered everywhere, as do `/help`/`/about`/`/assist`/`/router`.
  * `/commands`/`/skills`/`/compact`/`/clear`/`/browse`/`/find` are all session-scoped in practice (no
  * worktree/PTY to act on without one - `dispatchInboundMessage`'s own `route`/`currentSlug` checks
- * agree), so they follow the same `hasSession` gate as the three session commands. */
+ * agree), so they follow the same `hasSession` gate as the three session commands.
+ *
+ * `help`/`about` are the one pair narrowed by something other than topic shape. They are offered
+ * everywhere *except* on a `confirmedReplay`, because there they are the only two kinds that can
+ * turn an operator's explicit "yes, still want this" into nothing happening. §13 check 3 caught this
+ * live: a stale instruction was replayed, the classifier read it as a help request, and the operator
+ * got a help card under a message that had just promised "Confirmed - processing now" - the command
+ * itself was dropped. Every other kind either does the work or visibly refuses; only these two look
+ * like an answer while discarding the instruction.
+ *
+ * Excluding them here is enough for both halves of the router: `buildSchema` never offers the kinds,
+ * and `mapRouterOutput` rejects them as a no-match if a backend returns one anyway - and a no-match
+ * is exactly the desired outcome, since `routeOrFallback`'s `onNoMatch` forwards the text to the
+ * session (or, in the control topic, says so) instead of silently eating it.
+ *
+ * The cost is deliberate and small: a stale message that genuinely *was* "how do I use this?" now
+ * gets the unrecognised-command reply rather than the help card. That is the right trade - help is
+ * reachable by simply asking again, whereas a swallowed instruction is unrecoverable and, worse,
+ * indistinguishable from a completed one. Note this narrows *classification only*; an explicitly
+ * typed `/help` never reaches the router at all (`dispatchInboundMessage` matches it by exact syntax
+ * long before this point), so the command itself is unaffected on any path. */
 function allowedKinds(ctx: RouterContext): RouterKind[] {
   return ROUTER_KINDS.filter((kind) => {
+    if ((kind === "help" || kind === "about") && ctx.confirmedReplay) return false;
     if ((kind === "new" || kind === "budget" || kind === "default") && !ctx.isControl) return false;
     if (
       (kind === "session_model" ||
