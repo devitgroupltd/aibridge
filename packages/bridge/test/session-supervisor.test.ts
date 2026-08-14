@@ -1153,6 +1153,17 @@ describe("createSessionSupervisor", () => {
   // ("unify-work-with-voice-and"): a second Bridge restart before a resume nudge's own turn replies
   // otherwise leaves "🤔 Thinking..." stuck in Telegram forever.
   describe("runStartupReconciliation relabels a leftover thinking placeholder (P0-5)", () => {
+    /**
+     * Every test here drives a real `runStartupReconciliation`, which awaits `reportOrphanProcesses`
+     * unconditionally before any early return - and that spawns `powershell -Command "Get-CimInstance
+     * Win32_Process"` and waits on WMI. ~1s on a developer box, comfortably past bun's 5000ms default
+     * on a loaded hosted Windows runner, so these three were the only flaky tests in the suite:
+     * green locally and on every PR, then a timeout on `main` (2026-08-13 took all three,
+     * 2026-08-14 took one). Stubbed rather than given a longer timeout, because the WMI sweep is not
+     * what any of these tests is about and a slower runner would just move the threshold.
+     */
+    const noProcessScan = async () => [];
+
     test("a row with a non-null thinkingPlaceholderMsg gets it relabeled and cleared before resuming", async () => {
       const sessionStore = new SessionStore(":memory:");
       sessionStore.insert(row({ thinkingPlaceholderMsg: 3008 }));
@@ -1166,6 +1177,7 @@ describe("createSessionSupervisor", () => {
         confirmSessionCommand: confirm.fn,
         supergroupChatId: "-100",
         selfCheckSlug: "selfcheck",
+        listProcesses: noProcessScan,
         relabelStalePlaceholder: (topicId, messageId) => {
           relabeled.push({ topicId, messageId });
         },
@@ -1198,6 +1210,7 @@ describe("createSessionSupervisor", () => {
         confirmSessionCommand: confirm.fn,
         supergroupChatId: "-100",
         selfCheckSlug: "selfcheck",
+        listProcesses: noProcessScan,
         relabelStalePlaceholder: () => {
           relabelCalls += 1;
         },
@@ -1226,6 +1239,7 @@ describe("createSessionSupervisor", () => {
         confirmSessionCommand: confirm.fn,
         supergroupChatId: "-100",
         selfCheckSlug: "selfcheck",
+        listProcesses: noProcessScan,
         launchSession: () => ({
           worktreePath: "c:\\data\\worktrees\\fix-bug",
           branch: "claude/fix-bug-1",
