@@ -215,7 +215,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     new: (cmd, ctx) =>
       controlTopicOnly("/new", ctx, () => fireAndForget(sessionLifecycle.handleNewCommand(cmd, ctx.threadId), log, "command-dispatch handleNewCommand")),
     budget: (_cmd, ctx) => controlTopicOnly("/budget", ctx, () => fleetReporting.handleBudgetCommand(ctx.threadId)),
-    default: (cmd, ctx) => controlTopicOnly("/default", ctx, () => voiceModeCommands.handleDefaultCommand(cmd, ctx.threadId)),
+    default: (cmd, ctx) => controlTopicOnly("/default", ctx, () => voiceModeCommands.handleDefaultCommand(cmd, ctx.threadId)),
     ls: (_cmd, ctx) => sessionLifecycle.handleLsCommand(ctx.threadId),
     attach: (cmd, ctx) => sessionLifecycle.handleAttachCommand(cmd, ctx.threadId, ctx.currentSlug),
     pause: (cmd, ctx) => sessionLifecycle.handlePauseCommand(cmd, ctx.threadId, ctx.currentSlug),
