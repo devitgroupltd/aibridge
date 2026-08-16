@@ -6,7 +6,7 @@ import path from "node:path";
 import { encodeMessage, NdjsonDecoder, PROTOCOL_VERSION } from "@aibridge/protocol";
 import type { HelloFromChannel, HookAskMessage, Message, PermissionRequestMessage, ReplyMessage } from "@aibridge/protocol";
 import { ensureOutboxDir } from "../src/outbox.ts";
-import { startPipeServer } from "../src/pipe-server.ts";
+import { defaultFinalizeRetryDelayMs, startPipeServer } from "../src/pipe-server.ts";
 import { RateGovernor } from "../src/rate-governor.ts";
 import { Routing } from "../src/routing.ts";
 import { createThinkingPlaceholder } from "../src/thinking-placeholder.ts";
@@ -1416,12 +1416,37 @@ describe("startPipeServer", () => {
         },
       };
 
-      const handle = startPipeServer({ pipePath: path, routing, controlBot, chatId: "-1" });
+      // Zero backoff: the real ladder sleeps 1s then 2s, which made this the slowest test in the
+      // whole suite (3020ms measured in CI, 60% of bun's 5000ms default spent asleep). What the test
+      // asserts is the *number of attempts*, not how long the gaps between them were.
+      const backoffAttempts: number[] = [];
+      const handle = startPipeServer({
+        pipePath: path,
+        routing,
+        controlBot,
+        chatId: "-1",
+        finalizeRetryDelayMs: (attempt) => {
+          backoffAttempts.push(attempt);
+          return 0;
+        },
+      });
       servers.push(handle.server);
       await waitFor(() => handle.server.listening);
 
       await handle.finalizePermissionMessage(9, "✅ Allowed: Write (answered at terminal)");
       expect(attempts).toBe(3);
+      // It still backs off between attempts, and with the escalating attempt index - just not for
+      // real time here. Without this the injection would hide a "never waits at all" regression.
+      expect(backoffAttempts).toEqual([0, 1]);
+    });
+
+    /** Pins the *production* ladder, which the zero-delay injection above deliberately bypasses.
+     * Asserted directly rather than by timing, so it costs nothing: a default silently changed to 0
+     * would defeat the retry's whole purpose (waiting out a Telegram fresh-message race) and no
+     * other test would fail. */
+    test("the real backoff ladder is 1s then 2s", () => {
+      expect(defaultFinalizeRetryDelayMs(0)).toBe(1000);
+      expect(defaultFinalizeRetryDelayMs(1)).toBe(2000);
     });
 
     test("gives up and rethrows a non-transient editMessageText error immediately", async () => {

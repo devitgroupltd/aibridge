@@ -88,6 +88,15 @@ export interface PipeServerOptions {
    * stuck feed bot (empty-bucket P2 already resolves immediately, so this only bites on real network
    * stalls) never turns into a visibly "hung" reply. */
   onBeforeReplyTimeoutMs?: number;
+  /** Backoff before `finalizePermissionMessage` retries a "message to edit not found". Defaults to
+   * the real 1s-then-2s ladder; tests inject 0.
+   *
+   * Injectable for the same reason `session-supervisor.ts` injects `listProcesses`: without it the
+   * retry test has to *actually sleep* 3s, which is 60% of bun's 5000ms default before the runner
+   * has done anything else. Measured at 3020ms in CI - the single slowest test in the suite, and the
+   * next timeout waiting to happen on a loaded runner. Sleeping is not what the test is checking;
+   * it asserts the attempt count. */
+  finalizeRetryDelayMs?: (attempt: number) => number;
   /** §5.1: every hook firing forwards one `event` message here. The hook client is a one-shot
    * process (a fresh connection per firing, no persistent registration to track), so this is the
    * only wiring needed on this side - there is no per-hook `hello_ack` to send back. */
@@ -142,6 +151,14 @@ const MAX_SEND_FILE_BYTES = 50 * 1024 * 1024;
 
 /** See `PipeServerOptions.onBeforeReplyTimeoutMs`'s own doc comment. */
 const DEFAULT_ONBEFOREREPLY_TIMEOUT_MS = 1500;
+
+/** The real backoff `finalizePermissionMessage` uses between retries: 1s, then 2s.
+ *
+ * Exported so it can be asserted directly rather than by timing a test. The retry test injects a
+ * zero delay (it asserts the attempt *count*, not the gaps), which would otherwise leave nothing at
+ * all pinning the production ladder - a default quietly changed to 0 would defeat the entire point
+ * of the retry, since it exists to wait out a Telegram fresh-message race, and no test would notice. */
+export const defaultFinalizeRetryDelayMs = (attempt: number): number => 1000 * (attempt + 1);
 
 /** How much of a tool call's input preview an auto-approval notice shows. These are one-line
  * status notes in a topic that may get one per tool call, not the permission card's full detail -
@@ -833,7 +850,8 @@ export function startPipeServer(opts: PipeServerOptions): PipeServerHandle {
       } catch (err) {
         const isFreshMessageRace = /message to edit not found/i.test((err as Error).message);
         if (!isFreshMessageRace || attempt >= 2) throw err;
-        await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
+        const delayMs = (opts.finalizeRetryDelayMs ?? defaultFinalizeRetryDelayMs)(attempt);
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
       }
     }
   }
