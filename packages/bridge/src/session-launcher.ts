@@ -8,6 +8,7 @@ import { STATE_DIR } from "./config.ts";
 import { ensureOutboxDir, ensurePlaywrightSharedDir } from "./outbox.ts";
 import { attachPtyErrorSuppression } from "./pty-write-guard.ts";
 import type { PtyLike } from "./pty-write-guard.ts";
+import { buildProjectMcpPolicy, readProjectMcpServerNames } from "./project-mcp-policy.ts";
 import { generateSettings, writeSettingsFile } from "./settings.ts";
 import { ensureWorktree } from "./worktree.ts";
 import type { LogFn } from "./logger.ts";
@@ -243,6 +244,10 @@ export interface SessionLaunchOptions {
    * default. Overridable so integration tests can point a launched session at a throwaway listener
    * instead of the Bridge's real one. */
   otlpPort?: number;
+  /** This repo's `repos.toml` `projectMcp` opt-in - whether its own project-scoped MCP servers may
+   * run. Omitted means no, which is the whole point: every caller that cannot prove the opt-in gets
+   * the closed answer rather than the dialog. See `project-mcp-policy.ts`. */
+  projectMcp?: boolean;
 }
 
 export interface LaunchedSession {
@@ -444,7 +449,21 @@ export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   // requirement as the `.claude.json` registrations above. Resolving the hook client binary can
   // trigger a one-time `bun build --compile`, so it happens before the settings file (and
   // therefore the spawn) rather than racing it.
-  const settingsPath = writeSettingsFile(opts.stateDir ?? STATE_DIR, opts.slug, generateSettings(resolveHookClientBinary(log), opts.otlpPort));
+  //
+  // The target repo's own `.mcp.json` policy rides in the same file (project-mcp-policy.ts). It is
+  // read from the repo rather than the worktree deliberately: both hold the same tracked file, but
+  // the repo is readable before `ensureWorktree` has done anything, and a repo that ships no
+  // `.mcp.json` then costs one failed `readFileSync` rather than a decision that depends on how far
+  // the worktree got.
+  const projectMcpNames = readProjectMcpServerNames(opts.repoPath, log);
+  if (projectMcpNames.length > 0) {
+    log("INFO", `${opts.repoPath} declares ${projectMcpNames.length} project MCP server(s) - ${opts.projectMcp ? "enabled (projectMcp = true in repos.toml)" : "rejected (set projectMcp = true in repos.toml to enable)"}: ${projectMcpNames.join(", ")}`);
+  }
+  const settings = {
+    ...generateSettings(resolveHookClientBinary(log), opts.otlpPort),
+    ...buildProjectMcpPolicy(projectMcpNames, opts.projectMcp ?? false),
+  };
+  const settingsPath = writeSettingsFile(opts.stateDir ?? STATE_DIR, opts.slug, settings);
   log("INFO", `wrote permission settings baseline to ${settingsPath}`);
 
   // §10.1: `--channels plugin:aibridge-telegram@devitgroup-plugins` - the fleet's real default as

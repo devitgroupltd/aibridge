@@ -494,6 +494,7 @@ async function main(): Promise<void> {
     supergroupChatId: config.supergroupChatId,
     selfCheckSlug: config.selfCheck.slug,
     otlpPort,
+    getReposRegistry: () => reposRegistry,
     log,
     usageWaiters,
     sendResumeNudge,

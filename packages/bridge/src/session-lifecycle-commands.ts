@@ -768,6 +768,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         model,
         permissionMode: sessionMode,
         otlpPort,
+        projectMcp: repo.projectMcp,
         log,
       });
     } catch (err) {
