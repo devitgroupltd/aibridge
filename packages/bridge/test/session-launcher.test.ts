@@ -86,7 +86,7 @@ describe("waitForStartupPrompt", () => {
     const fake = new FakePty();
     const result = waitForStartupPrompt(fake as unknown as pty.IPty, () => {});
     fake.emit("some banner\r\n  ⏸ manual mode on · ? for shortcuts · ← for agents◐ medium · /effort  ");
-    expect(await result).toEqual({ resumeFailed: false });
+    expect(await result).toEqual({ resumeFailed: false, startupTimedOut: false });
   });
 
   // The live 2026-08-07 regression: `claude --resume <id>` failing doesn't exit the process or throw
@@ -96,7 +96,7 @@ describe("waitForStartupPrompt", () => {
     const fake = new FakePty();
     const result = waitForStartupPrompt(fake as unknown as pty.IPty, () => {}, "4885934b-a516-49b3-8c38-306373f27ba0");
     fake.emit("No conversation found with session ID: 4885934b-a516-49b3-8c38-306373f27ba0\r\n");
-    expect(await result).toEqual({ resumeFailed: true });
+    expect(await result).toEqual({ resumeFailed: true, startupTimedOut: false });
   });
 
   test("the same failure text is ignored when no resume was requested - a fresh /new session's prompt could plausibly echo similar wording without it meaning anything", async () => {
@@ -104,7 +104,28 @@ describe("waitForStartupPrompt", () => {
     const result = waitForStartupPrompt(fake as unknown as pty.IPty, () => {});
     fake.emit("No conversation found with session ID: whatever\r\n");
     fake.emit("  ⏸ manual mode on · ? for shortcuts · ← for agents◐ medium · /effort  ");
-    expect(await result).toEqual({ resumeFailed: false });
+    expect(await result).toEqual({ resumeFailed: false, startupTimedOut: false });
+  });
+
+  // The whole point of the flag: the 30s safety timeout resolves with the *same* `resumeFailed:
+  // false` a real settle does, so before this there was no way for `startFirstTurn` to tell "we are
+  // past startup" from "we gave up guessing" - and it wrote the operator's first prompt either way.
+  test("the safety timeout is distinguishable from a real settle", async () => {
+    const fake = new FakePty();
+    const timers: Array<() => void> = [];
+    const realSetTimeout = globalThis.setTimeout;
+    // @ts-expect-error - the test scheduler only needs the callback, not setTimeout's full surface.
+    globalThis.setTimeout = (fn: () => void) => {
+      timers.push(fn);
+      return 0;
+    };
+    try {
+      const result = waitForStartupPrompt(fake as unknown as pty.IPty, () => {});
+      timers.forEach((fire) => fire());
+      expect(await result).toEqual({ resumeFailed: false, startupTimedOut: true });
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+    }
   });
 });
 

@@ -80,12 +80,19 @@ function fakeSessionSupervisor() {
 }
 
 function fakePtyIo() {
+  // `channelWrites` records rather than discards: `startFirstTurn`'s degraded-gate tests assert the
+  // operator's prompt still went out, which is the half of that behaviour a notice-only assertion
+  // would silently stop covering.
+  const channelWrites: Array<{ slug: string; topicId: number; content: string }> = [];
   return {
     sendRaw: () => {},
     sendEffortCommand: () => {},
     confirmSubmitted: () => {},
     autoRecoverWedgedSession: () => {},
-    sendChannelText: () => {},
+    sendChannelText: (slug: string, topicId: number, content: string) => {
+      channelWrites.push({ slug, topicId, content });
+    },
+    channelWrites,
   };
 }
 
@@ -152,8 +159,11 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
     executeFleetActionDirect: async (kind, topicId, targets) => {
       executeFleetActionDirectCalls.push({ kind, topicId, targets: targets.map((r) => r.slug) });
     },
-    waitForChannelConnected: async () => {},
-    waitForPtyQuiet: async () => {},
+    // Both default to the happy answer ("it connected", "it went quiet") so no unrelated test starts
+    // getting `startup-gate-notice.ts`'s warning appended to its `confirmed` list. The cases that
+    // want a degraded gate override these.
+    waitForChannelConnected: async () => true,
+    waitForPtyQuiet: async () => true,
     isControlTopic: (topicId) => topicId === undefined || topicId === 1,
     getReposRegistry: () => undefined,
     settings: testRuntimeSettings({ defaultSessionMode: "manual", defaultSessionEffort: "medium" }).settings,
@@ -170,6 +180,7 @@ function setup(overrides: Partial<Parameters<typeof createSessionLifecycleComman
     routing,
     controlBot,
     sessionSupervisor,
+    ptyIo,
     fleetConfirmRegistry,
     permissionRegistry,
     askRegistry,
@@ -987,6 +998,78 @@ describe("createSessionLifecycleCommands", () => {
 
       expect(confirmed[0]?.text).toContain("Refused:");
       expect(confirmed[0]?.text).toContain("attachment you sent was not saved");
+    });
+  });
+
+  // `/new`'s startup tail. Reached directly rather than through `handleNewCommand`, which stops at a
+  // real `launchSession` (git worktree + PTY spawn, imported not injected) - see `startFirstTurn`'s
+  // own comment on the returned object. The gates are the injected `waitForChannelConnected` /
+  // `waitForPtyQuiet` doubles plus whatever `session.ready` resolves to, so every branch of
+  // `startup-gate-notice.ts` is drivable from here.
+  describe("startFirstTurn", () => {
+    const NEW_CMD = { kind: "new" as const, repo: "demo-repo", prompt: "add a README" };
+
+    function fakeSession(ready: { resumeFailed: boolean; startupTimedOut?: boolean } = { resumeFailed: false, startupTimedOut: false }) {
+      return {
+        worktreePath: "c:\\does\\not\\exist\\fix-bug",
+        branch: "claude/fix-bug-1",
+        ptyProcess: {} as never,
+        ready: Promise.resolve(ready),
+      };
+    }
+
+    test("a clean start sends the first turn and says nothing extra", async () => {
+      const { sessionLifecycle, ptyIo, confirmed } = setup();
+
+      await sessionLifecycle.startFirstTurn("fix-bug", 5, NEW_CMD, fakeSession(), "manual");
+
+      expect(ptyIo.channelWrites.map((w) => w.slug)).toEqual(["fix-bug"]);
+      expect(confirmed).toEqual([]);
+    });
+
+    // The live 2026-08-16 SeoWrite case: both severe gates timed out, the prompt was written into an
+    // open MCP-consent dialog and never ran, and the operator was told nothing - `/ls` said idle,
+    // `/usage` said $0.00. The assertion that matters is that *something* reaches the topic.
+    test("a startup that never settled and a channel that never connected tells the operator, in that session's own topic", async () => {
+      const { sessionLifecycle, ptyIo, confirmed } = setup({
+        waitForChannelConnected: async () => false,
+        waitForPtyQuiet: async () => true,
+      });
+
+      await sessionLifecycle.startFirstTurn("fix-bug", 5, NEW_CMD, fakeSession({ resumeFailed: false, startupTimedOut: true }), "manual");
+
+      expect(confirmed).toHaveLength(1);
+      expect(confirmed[0]?.topicId).toBe(5);
+      expect(confirmed[0]?.text).toContain("before it finished starting");
+      expect(confirmed[0]?.text).toContain("aibridge channel never connected");
+      // Still sent, not dropped - the notice says so, and this is what makes that true.
+      expect(ptyIo.channelWrites).toHaveLength(1);
+    });
+
+    // The noise guard, wired end to end rather than only in startup-gate-notice.test.ts: a cold
+    // `npx @playwright/mcp` on a brand-new worktree reaches the 8s quiet ceiling routinely, and a
+    // warning on every single `/new` is one nobody reads when a real one arrives.
+    test("a still-noisy PTY on its own posts nothing", async () => {
+      const { sessionLifecycle, ptyIo, confirmed } = setup({
+        waitForChannelConnected: async () => true,
+        waitForPtyQuiet: async () => false,
+      });
+
+      await sessionLifecycle.startFirstTurn("fix-bug", 5, NEW_CMD, fakeSession(), "manual");
+
+      expect(confirmed).toEqual([]);
+      expect(ptyIo.channelWrites).toHaveLength(1);
+    });
+
+    // `LaunchedSession.ready`'s `startupTimedOut` is optional so the suite's many
+    // `Promise.resolve({ resumeFailed: false })` doubles stay valid; absent must read as "no timeout",
+    // not as a falsy that trips the warning on every session created by an older code path.
+    test("a ready promise with no startupTimedOut field is treated as a clean start", async () => {
+      const { sessionLifecycle, confirmed } = setup();
+
+      await sessionLifecycle.startFirstTurn("fix-bug", 5, NEW_CMD, fakeSession({ resumeFailed: false }), "manual");
+
+      expect(confirmed).toEqual([]);
     });
   });
 

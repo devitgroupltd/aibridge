@@ -258,8 +258,15 @@ export interface LaunchedSession {
    * all, with no error anywhere. Everyone who writes to a freshly-launched PTY must await this
    * first. `resumeFailed` is only ever true for a `resumeSessionId` launch - see
    * `RESUME_FAILURE_PATTERN`'s own doc comment.
+   *
+   * `startupTimedOut` distinguishes "the status bar appeared, we really are past startup" from "the
+   * safety timeout fired and we are guessing". Both resolve the promise, which is the point - this
+   * must never wedge a caller - but they are not the same thing, and a caller that writes to the PTY
+   * on the second one is writing blind (see `startup-gate-notice.ts`). Optional so the many
+   * `Promise.resolve({ resumeFailed: false })` doubles in the suite stay valid; absent means "no
+   * timeout information", treated as not-timed-out.
    */
-  ready: Promise<{ resumeFailed: boolean }>;
+  ready: Promise<{ resumeFailed: boolean; startupTimedOut?: boolean }>;
 }
 
 function ptyEnv(extra: Record<string, string>): Record<string, string> {
@@ -358,7 +365,7 @@ export function buildClaudeSpawnArgs(opts: { model: string; settingsPath: string
   ];
 }
 
-export function waitForStartupPrompt(ptyProcess: pty.IPty, log: LogFn, resumeSessionId?: string): Promise<{ resumeFailed: boolean }> {
+export function waitForStartupPrompt(ptyProcess: pty.IPty, log: LogFn, resumeSessionId?: string): Promise<{ resumeFailed: boolean; startupTimedOut: boolean }> {
   return new Promise((resolve) => {
     let done = false;
     let rawBuffer = "";
@@ -370,7 +377,7 @@ export function waitForStartupPrompt(ptyProcess: pty.IPty, log: LogFn, resumeSes
       if (done) return;
       done = true;
       log("WARN", "timed out waiting for the startup prompt to settle - proceeding anyway");
-      resolve({ resumeFailed: false });
+      resolve({ resumeFailed: false, startupTimedOut: true });
     }, 30_000);
     ptyProcess.onData((data) => {
       if (done) return;
@@ -379,13 +386,13 @@ export function waitForStartupPrompt(ptyProcess: pty.IPty, log: LogFn, resumeSes
       if (resumeSessionId && RESUME_FAILURE_PATTERN.test(plain)) {
         done = true;
         clearTimeout(timeout);
-        resolve({ resumeFailed: true });
+        resolve({ resumeFailed: true, startupTimedOut: false });
         return;
       }
       if (/for shortcuts/i.test(plain) || /for agents/i.test(plain)) {
         done = true;
         clearTimeout(timeout);
-        resolve({ resumeFailed: false });
+        resolve({ resumeFailed: false, startupTimedOut: false });
       }
     });
   });
