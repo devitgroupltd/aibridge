@@ -1,4 +1,7 @@
 import { describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createConfirmSessionCommand, createFleetConfirmFlow, createStopIndicatorsForTopic } from "../src/fleet-confirm-flow.ts";
 import { FleetConfirmRegistry } from "../src/fleet-confirm.ts";
 import type { PendingFleetConfirm } from "../src/fleet-confirm.ts";
@@ -134,7 +137,7 @@ describe("createStopIndicatorsForTopic", () => {
   });
 });
 
-function setup(overrides: { killSessionRow?: (row: SessionRow) => Promise<void>; removeSessionRow?: (row: SessionRow) => Promise<RemoveSessionRowResult>; resolveTargetSlug?: (explicit: string | undefined, currentSlug: string | undefined) => { slug: string } | { error: string } } = {}) {
+function setup(overrides: { killSessionRow?: (row: SessionRow) => Promise<void>; removeSessionRow?: (row: SessionRow) => Promise<RemoveSessionRowResult>; resolveTargetSlug?: (explicit: string | undefined, currentSlug: string | undefined) => { slug: string } | { error: string }; worktreesRoot?: string } = {}) {
   const controlBot = fakeFleetBot();
   const routing = new Routing();
   const sessionStore = new SessionStore(":memory:");
@@ -180,6 +183,10 @@ function setup(overrides: { killSessionRow?: (row: SessionRow) => Promise<void>;
       confirmed.push({ topicId, text });
     },
     usageWaiters,
+    // Overridable, and every `rm-worktree` test points it at a real temp directory: the guards in
+    // `removeOrphanWorktree` are the point of that branch, and a root that does not exist would let
+    // it "pass" by finding nothing to delete.
+    worktreesRoot: overrides.worktreesRoot ?? "c:\\does\\not\\exist\\worktrees",
     supergroupChatId: "-100",
     log: () => {},
   });
@@ -260,6 +267,81 @@ describe("createFleetConfirmFlow", () => {
 
       expect(killed).toEqual(["a", "b"]);
       expect(finalizeCalls[0]?.text).toContain("Killed 2 sessions: a, b");
+    });
+
+    // §4.5's third orphan case. Driven against a real temp directory rather than a fake fs: the
+    // point of this branch is `removeOrphanWorktree`'s guards, and a root that does not exist would
+    // let every one of these "pass" by finding nothing to delete.
+    describe("rm-worktree", () => {
+      function worktreesRoot() {
+        const root = mkdtempSync(path.join(os.tmpdir(), "aibridge-fcf-wt-"));
+        const make = (name: string, opts: { git?: boolean } = {}) => {
+          mkdirSync(path.join(root, name), { recursive: true });
+          writeFileSync(path.join(root, name, "work.txt"), "left behind");
+          if (opts.git) writeFileSync(path.join(root, name, ".git"), "gitdir: ../repo/.git/worktrees/x");
+          return path.join(root, name);
+        };
+        return { root, make };
+      }
+      const pending = (slugs: string[]): PendingFleetConfirm => ({ id: "abc", kind: "rm-worktree", slugs, topicId: undefined, messageId: 1, createdAt: Date.now() });
+
+      test("deletes the confirmed directories and names them", async () => {
+        const { root, make } = worktreesRoot();
+        const a = make("orphan-a");
+        const b = make("orphan-b");
+        const { fleetConfirmFlow, finalizeCalls } = setup({ worktreesRoot: root });
+
+        await fleetConfirmFlow.executeFleetConfirm(pending(["orphan-a", "orphan-b"]));
+
+        expect(existsSync(a)).toBe(false);
+        expect(existsSync(b)).toBe(false);
+        expect(finalizeCalls[0]?.text).toContain("Deleted 2 orphaned worktree directories: orphan-a, orphan-b.");
+      });
+
+      // The card can be minutes old. A directory that has since been readopted by `/new` (which is
+      // what `ensureWorktree` does with an existing one) must survive the tap, and the operator has
+      // to be told it did rather than reading "deleted" and believing it.
+      test("refuses a directory readopted since the card was posted, and says so", async () => {
+        const { root, make } = worktreesRoot();
+        const readopted = make("readopted", { git: true });
+        const stale = make("still-orphaned");
+        const { fleetConfirmFlow, finalizeCalls } = setup({ worktreesRoot: root });
+
+        await fleetConfirmFlow.executeFleetConfirm(pending(["readopted", "still-orphaned"]));
+
+        expect(existsSync(readopted)).toBe(true);
+        expect(existsSync(stale)).toBe(false);
+        expect(finalizeCalls[0]?.text).toContain("Deleted 1 orphaned worktree directory: still-orphaned.");
+        expect(finalizeCalls[0]?.text).toContain("1 left in place");
+        expect(finalizeCalls[0]?.text).toContain("readopted");
+      });
+
+      test("refuses a slug a session now holds", async () => {
+        const { root, make } = worktreesRoot();
+        const claimed = make("fix-bug");
+        const { fleetConfirmFlow, sessionStore, finalizeCalls } = setup({ worktreesRoot: root });
+        sessionStore.insert(row()); // slug "fix-bug"
+
+        await fleetConfirmFlow.executeFleetConfirm(pending(["fix-bug"]));
+
+        expect(existsSync(claimed)).toBe(true);
+        expect(finalizeCalls[0]?.text).toContain("Nothing was deleted.");
+        expect(finalizeCalls[0]?.text).toContain("1 left in place");
+      });
+
+      // The payload has made a round trip through Telegram, so a traversal attempt must die at the
+      // guard rather than at whatever it would have reached.
+      test("a traversing slug is refused, not joined onto the root", async () => {
+        const { root } = worktreesRoot();
+        const outside = path.join(root, "..", `sibling-${path.basename(root)}`);
+        mkdirSync(outside, { recursive: true });
+        const { fleetConfirmFlow, finalizeCalls } = setup({ worktreesRoot: root });
+
+        await fleetConfirmFlow.executeFleetConfirm(pending([`../${path.basename(outside)}`]));
+
+        expect(existsSync(outside)).toBe(true);
+        expect(finalizeCalls[0]?.text).toContain("Nothing was deleted.");
+      });
     });
 
     test("rm appends the orphan-topic note when a topic couldn't be deleted", async () => {

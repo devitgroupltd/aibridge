@@ -403,9 +403,15 @@ export function waitForStartupPrompt(ptyProcess: pty.IPty, log: LogFn, resumeSes
   });
 }
 
+/** §7.5's worktree root, used when `AIBRIDGE_WORKTREES_ROOT` is unset. Exported so the boot-time
+ * orphan scan (`orphan-worktrees.ts`, wired in index.ts) reads the *same* directory sessions are
+ * actually cut into - two independent copies of this default would mean a scan that reports a clean
+ * tree while looking somewhere nothing has ever been written. */
+export const DEFAULT_WORKTREES_ROOT = "C:\\data\\worktrees";
+
 export function launchSession(opts: SessionLaunchOptions): LaunchedSession {
   const log = opts.log ?? (() => {});
-  const worktreesRoot = opts.worktreesRoot ?? "C:\\data\\worktrees";
+  const worktreesRoot = opts.worktreesRoot ?? DEFAULT_WORKTREES_ROOT;
   const worktreePath = path.join(worktreesRoot, opts.slug);
   // §2.3's `claude/<slug>-<id>`: `-1` is only the *preferred* name. `ensureWorktree` returns the
   // branch it actually cut, which differs when a leftover branch of that name still carries
