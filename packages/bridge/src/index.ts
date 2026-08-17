@@ -441,10 +441,14 @@ async function main(): Promise<void> {
    * Code process, or after `timeoutMs` if it never does (a misconfigured `.mcp.json`, say) - a
    * caller that needs this settled before writing must not wedge forever over a signal that never
    * arrives. Replaces a guessed fixed delay after the dev-channels dialog (confirmed live
-   * 2026-08-04 to be unreliable) with the real event that delay was standing in for. */
-  async function waitForChannelConnected(slug: string, timeoutMs = 15_000): Promise<void> {
+   * 2026-08-04 to be unreliable) with the real event that delay was standing in for.
+   *
+   * Returns whether it actually connected rather than swallowing that into a log line only the owner
+   * of the host can read - `startup-gate-notice.ts` has the story. */
+  async function waitForChannelConnected(slug: string, timeoutMs = 15_000): Promise<boolean> {
     const connected = await channelConnectCoordinator.waitFor(slug, timeoutMs);
     if (!connected) log("WARN", `timed out waiting for the channel server to connect for "${slug}" - proceeding anyway`);
+    return connected;
   }
 
   /** `pty-quiet-wait.ts`'s own doc comment has the full story - the third gate `handleNewCommand`
@@ -453,9 +457,10 @@ async function main(): Promise<void> {
    * on a brand-new worktree even once the aibridge channel's own handshake has resolved). Backed by
    * `sessionSupervisor.lastActivityAt`, the same PTY-liveness accessor `pty-io.ts`'s own
    * `confirmSubmitted` already reads. */
-  async function waitForPtyQuiet(slug: string): Promise<void> {
+  async function waitForPtyQuiet(slug: string): Promise<boolean> {
     const quiet = await waitForPtyQuietImpl(slug, { lastActivityAt: sessionSupervisor.lastActivityAt });
     if (!quiet) log("WARN", `PTY for "${slug}" never went quiet before its first message - proceeding anyway (some other MCP server may still be starting up)`);
+    return quiet;
   }
 
   // `/usage` (§4.2, added 2026-08-04): a slug can have at most one pending capture at a time - a
@@ -489,6 +494,7 @@ async function main(): Promise<void> {
     supergroupChatId: config.supergroupChatId,
     selfCheckSlug: config.selfCheck.slug,
     otlpPort,
+    getReposRegistry: () => reposRegistry,
     log,
     usageWaiters,
     sendResumeNudge,

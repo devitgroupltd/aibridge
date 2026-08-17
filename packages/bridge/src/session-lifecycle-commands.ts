@@ -21,6 +21,7 @@ import type { PtyIo } from "./pty-io.ts";
 import type { SessionSupervisor } from "./session-supervisor.ts";
 import { SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
 import { slugFromPrompt, uniqueSlug } from "./slug.ts";
+import { describeStartupGateFailures } from "./startup-gate-notice.ts";
 import { buildTopicDeepLink, type ForumTopicSource, type InlineKeyboardMarkup, type SendMessageSource } from "./telegram.ts";
 import type { ThinkingPlaceholder } from "./thinking-placeholder.ts";
 import { removeWorktree } from "./worktree.ts";
@@ -77,14 +78,14 @@ export interface SessionLifecycleCommandsOptions {
   executeFleetActionDirect: (kind: "kill" | "rm", topicId: number | undefined, targets: readonly SessionRow[]) => Promise<void>;
   /** Composition-root function today (channelConnectCoordinator isn't owned by any extracted
    * module) - injected rather than imported to avoid reaching back into index.ts. */
-  waitForChannelConnected: (slug: string, timeoutMs?: number) => Promise<void>;
+  waitForChannelConnected: (slug: string, timeoutMs?: number) => Promise<boolean>;
   /** `pty-quiet-wait.ts`'s own doc comment has the full story: closes a third race
    * `waitForChannelConnected` doesn't - Claude Code can still be busy registering its *other* MCP
    * servers (Playwright in particular, cold-spawned on every brand-new worktree) when the aibridge
    * channel's own handshake has already resolved, and that startup chatter fools `pty-io.ts`'s
    * `confirmSubmitted` into reading a lost Enter as a landed one. Called once, right before the
    * first `sendChannelText` write below - never for any later turn, which has no such startup race. */
-  waitForPtyQuiet: (slug: string) => Promise<void>;
+  waitForPtyQuiet: (slug: string) => Promise<boolean>;
   /** §4.1's control-topic predicate - same injection reasoning as inbound-media.ts's own copy of
    * this option: it's index.ts's one free top-level function today. */
   isControlTopic: (topicId: number | undefined) => boolean;
@@ -127,6 +128,10 @@ export interface SessionLifecycleCommands {
   /** Called by `fleet-confirm-flow.ts`'s `--all` branch: that path must go through this, not
    * `routing.setBypass`, or the fleet-bulk form silently skips the drain. */
   applyAutoToggle(slug: string, category: AutoCategory, on: boolean): void;
+  /** `/new`'s startup tail - the three gates, the fleet defaults, the first turn. Only ever called
+   * by `handleNewCommand`; on the interface purely so it can be tested, since `handleNewCommand`
+   * itself stops at a real `launchSession`. See its implementation comment. */
+  startFirstTurn(slug: string, topicId: number, cmd: Extract<FleetCommand, { kind: "new" }>, session: LaunchedSession, sessionMode: Mode): Promise<void>;
 }
 
 /** §4.5.2's note appended to an `/rm` confirmation whenever `deleteForumTopic` failed above -
@@ -564,8 +569,11 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
    *
    * Split out of `runNewCommand` because everything above it in that function is "build the session,
    * unwinding whatever is half-built if a step fails" while this is "the session exists - now start
-   * it". It is also the only part with no failure path of its own: each gate degrades to a WARN and
-   * proceeds rather than aborting (see `waitForChannelConnected`/`waitForPtyQuiet`).
+   * it". It still has no *abort* path - each gate degrades and proceeds rather than throwing (see
+   * `waitForChannelConnected`/`waitForPtyQuiet`) - but a degraded gate is no longer silent: it used
+   * to be a WARN in `bridge.log` and nothing else, which is how a first prompt eaten by a startup
+   * dialog presented to the operator as a perfectly healthy idle session. `startup-gate-notice.ts`
+   * has the live case and the reasoning for which gates say anything.
    */
   async function startFirstTurn(slug: string, topicId: number, cmd: Extract<FleetCommand, { kind: "new" }>, session: LaunchedSession, sessionMode: Mode): Promise<void> {
     // Two independent gates, both real events rather than guessed delays: the dev-channels dialog
@@ -573,8 +581,8 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // corrupts it, confirmed live 2026-08-04), and the channel server's own MCP handshake must have
     // completed (`waitForChannelConnected` - otherwise the write's trailing Enter can be silently
     // lost even with the dialog long since confirmed, also confirmed live 2026-08-04).
-    await session.ready;
-    await waitForChannelConnected(slug);
+    const { startupTimedOut } = await session.ready;
+    const channelConnected = await waitForChannelConnected(slug);
     // A third gate, closing the race the two above don't (`pty-quiet-wait.ts`'s own doc comment has
     // the full story, live-confirmed 2026-08-11): Claude Code can still be busy registering its
     // *other* MCP servers (Playwright's cold `npx` spawn on this brand-new worktree path, in
@@ -582,7 +590,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // startup chatter is enough real PTY output to fool `confirmSubmitted` below into reading a lost
     // Enter as a landed one - leaving the very first message sitting typed but never submitted, with
     // no error anywhere and no hook ever firing to say so.
-    await waitForPtyQuiet(slug);
+    const ptyQuiet = await waitForPtyQuiet(slug);
     // `/default effort`: applied before the initial prompt, not after, so the very first turn
     // already runs under the configured default rather than starting at the CLI's own "medium" and
     // switching mid-turn. Silent (no confirmSessionCommand) - a second "Switched..." message here
@@ -605,6 +613,10 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     if (settings.defaultBypassEnabled) autoCategorySpec("permission").set(slug, true);
     if (settings.defaultAutoAnswerEnabled) autoCategorySpec("answer").set(slug, true);
     ptyIo.sendChannelText(slug, topicId, newSessionContent(cmd), "new-1", "telegram");
+    // After the write, not before: the notice is about a message that has already gone out, and
+    // posting it first would read as "this failed, stopping" when the prompt is in fact on its way.
+    const gateNotice = describeStartupGateFailures(slug, { startupTimedOut: startupTimedOut ?? false, channelConnected, ptyQuiet });
+    if (gateNotice) confirmSessionCommand(topicId, gateNotice);
   }
 
   /**
@@ -756,6 +768,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         model,
         permissionMode: sessionMode,
         otlpPort,
+        projectMcp: repo.projectMcp,
         log,
       });
     } catch (err) {
@@ -1357,5 +1370,12 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     handleVerboseCommand,
     handleAutoCommand,
     applyAutoToggle,
+    // Exposed for the same reason `applyPendingAttachment` is a module-level export: `handleNewCommand`
+    // cannot be unit-tested past its `launchSession` call (a real git worktree and PTY spawn, imported
+    // directly rather than injected), so the startup tail would otherwise have no coverage at all -
+    // and "the notice helper is correct but nothing ever calls it" is exactly the failure this whole
+    // change exists to stop. Closes over deps, so it rides the returned object rather than being a
+    // free export.
+    startFirstTurn,
   };
 }

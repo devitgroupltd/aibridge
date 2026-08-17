@@ -65,6 +65,22 @@ model  = "sonnet"
   test("rejects an unquoted value", () => {
     expect(() => parseReposToml("[a]\npath = /x\n")).toThrow(/expected a quoted string/);
   });
+
+  test("projectMcp parses as a bare boolean, and is absent unless written", () => {
+    const entries = parseReposToml('[a]\npath = "/x"\nprojectMcp = true\n[b]\npath = "/y"\nprojectMcp = false\n[c]\npath = "/z"\n');
+    expect(entries[0]?.projectMcp).toBe(true);
+    expect(entries[1]?.projectMcp).toBe(false);
+    expect(entries[2]?.projectMcp).toBeUndefined();
+  });
+
+  // Load-bearing rather than pedantry: `projectMcp = "false"` accepted as a string would be truthy
+  // at every call site, i.e. a repo whose operator wrote the *rejecting* value would get its MCP
+  // servers enabled. This is the one direction this setting must never fail in.
+  test("a quoted or misspelled projectMcp is rejected rather than coerced", () => {
+    expect(() => parseReposToml('[a]\npath = "/x"\nprojectMcp = "true"\n')).toThrow(/bare true or false/);
+    expect(() => parseReposToml('[a]\npath = "/x"\nprojectMcp = "false"\n')).toThrow(/bare true or false/);
+    expect(() => parseReposToml('[a]\npath = "/x"\nprojectMcp = yes\n')).toThrow(/bare true or false/);
+  });
 });
 
 describe("ReposRegistry", () => {
@@ -82,6 +98,18 @@ describe("ReposRegistry", () => {
       { name: "b", path: "/y", model: "opus" },
     ]);
   });
+
+  // `session-supervisor.ts`'s resume path only has the persisted `repoPath`, never the registry
+  // name. A miss here is silent - the resumed session just loses its `projectMcp` opt-in and boots
+  // back into the consent dialog - so the sloppy-but-legal spellings a hand-edited repos.toml and a
+  // Windows path produce all have to resolve.
+  test("getByPath matches regardless of separator, case, or a trailing slash", () => {
+    const registry = new ReposRegistry(parseReposToml("[seowrite]\npath = 'C:\\data\\projects\\seowrite'\nprojectMcp = true\n"));
+    expect(registry.getByPath("C:\\data\\projects\\seowrite")?.name).toBe("seowrite");
+    expect(registry.getByPath("c:/data/projects/seowrite")?.name).toBe("seowrite");
+    expect(registry.getByPath("C:/DATA/Projects/SeoWrite/")?.name).toBe("seowrite");
+    expect(registry.getByPath("c:\\data\\projects\\aibridge")).toBeUndefined();
+  });
 });
 
 describe("serializeReposToml", () => {
@@ -95,6 +123,20 @@ describe("serializeReposToml", () => {
 
   test("an empty list serializes to an empty string", () => {
     expect(serializeReposToml([])).toBe("");
+  });
+
+  // `/repos add` rewrites the whole file, so anything written by default here spreads into every
+  // other entry on the next add - which is how a closed default quietly becomes an explicit one
+  // nobody chose. Only the opted-in value is ever emitted, and it round-trips.
+  test("projectMcp is written only when true, and survives a round trip", () => {
+    const entries = [
+      { name: "a", path: "c:\\repos\\a", projectMcp: true },
+      { name: "b", path: "c:\\repos\\b" },
+    ];
+    const serialized = serializeReposToml(entries);
+    expect(serialized).toContain("projectMcp = true");
+    expect(serialized.match(/projectMcp/g)).toHaveLength(1);
+    expect(parseReposToml(serialized)).toEqual(entries);
   });
 
   // Single-quoted TOML *literal* strings, because every value here is a Windows path and

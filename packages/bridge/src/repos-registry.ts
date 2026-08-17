@@ -4,14 +4,19 @@ import path from "node:path";
 
 /**
  * §7.5's repo registry: a minimal TOML subset (`[name]` sections, `key = "value"`/`key = 'value'`
- * string pairs, `#` comments, blank lines) - hand-rolled the same way `config.ts` hand-rolls its
- * own env-file format rather than pulling in a TOML library for three fields.
+ * string pairs and bare `true`/`false` booleans, `#` comments, blank lines) - hand-rolled the same
+ * way `config.ts` hand-rolls its own env-file format rather than pulling in a TOML library for four
+ * fields.
  */
 export interface RepoEntry {
   name: string;
   path: string;
   base?: string;
   model?: string;
+  /** Opt in to this repo's *own* project-scoped MCP servers (its tracked `.mcp.json`). Absent means
+   * no, and no is the default on purpose - `project-mcp-policy.ts` has the whole story, including
+   * the live case that made a repo's `.mcp.json` block `/new` outright. */
+  projectMcp?: boolean;
 }
 
 const SECTION_RE = /^\[([A-Za-z0-9_-]+)\]$/;
@@ -59,7 +64,20 @@ export function parseReposToml(contents: string): RepoEntry[] {
       throw new Error(`line ${i + 1} in repos.toml appears before any [section] header: "${raw}"`);
     }
     const key = kvMatch[1] as string;
-    const value = parseValue(kvMatch[2] as string, i + 1);
+    const rawValue = kvMatch[2] as string;
+    // The one boolean field, so it gets its own branch rather than teaching `parseValue` two return
+    // types. A quoted `"true"` is rejected the same way a bare `yes` is: TOML has one spelling for a
+    // boolean, and silently accepting a near-miss here means `projectMcp = "false"` reading as
+    // truthy - the exact direction this setting must never fail in.
+    if (key === "projectMcp") {
+      const bare = rawValue.trim();
+      if (bare !== "true" && bare !== "false") {
+        throw new Error(`malformed line ${i + 1} in repos.toml: "${raw}" (projectMcp must be bare true or false)`);
+      }
+      current.projectMcp = bare === "true";
+      continue;
+    }
+    const value = parseValue(rawValue, i + 1);
     if (key === "path") current.path = value;
     else if (key === "base") current.base = value;
     else if (key === "model") current.model = value;
@@ -74,6 +92,10 @@ export function parseReposToml(contents: string): RepoEntry[] {
   }
 
   return entries;
+}
+
+function normalizePathKey(value: string): string {
+  return value.replace(/[\\/]+/g, "/").replace(/\/+$/, "").toLowerCase();
 }
 
 export class ReposRegistry {
@@ -95,6 +117,17 @@ export class ReposRegistry {
    * rebuild this list by hand from `names()`/`get()` before this existed. */
   all(): RepoEntry[] {
     return [...this.byName.values()];
+  }
+
+  /** Lookup by clone path rather than by name, for the one caller that only has the path: a
+   * `claude --resume` relaunch (`session-supervisor.ts`) works from the persisted session row, which
+   * records `repoPath` and never the registry name it came from. Compared case-insensitively with
+   * separators normalized, since a Windows path is not case-sensitive and `repos.toml` is
+   * hand-edited - `C:\data\projects\seowrite` and `c:/data/projects/seowrite` are the same repo, and
+   * a miss here silently downgrades a resumed session's `projectMcp` to the closed default. */
+  getByPath(repoPath: string): RepoEntry | undefined {
+    const wanted = normalizePathKey(repoPath);
+    return [...this.byName.values()].find((e) => normalizePathKey(e.path) === wanted);
   }
 }
 
@@ -135,6 +168,10 @@ export function serializeReposToml(entries: readonly RepoEntry[]): string {
       const lines = [`[${e.name}]`, `path = ${quote("path", e.path)}`];
       if (e.base) lines.push(`base = ${quote("base", e.base)}`);
       if (e.model) lines.push(`model = ${quote("model", e.model)}`);
+      // Written only when true. `projectMcp = false` and the field being absent mean the same thing,
+      // and emitting the default on every rewrite would put the line into entries nobody chose it
+      // for - `/repos add` rewrites the whole file, so that spreads.
+      if (e.projectMcp) lines.push("projectMcp = true");
       return lines.join("\n");
     })
     .join("\n\n") + (entries.length > 0 ? "\n" : "");

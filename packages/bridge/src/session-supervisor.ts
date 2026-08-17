@@ -7,6 +7,7 @@ import { findOrphanProcesses } from "./orphan-scan.ts";
 import type { ProcessInfo } from "./orphan-scan.ts";
 import { listClaudeProcesses } from "./process-scan.ts";
 import { reconcile } from "./reconciliation.ts";
+import type { ReposRegistry } from "./repos-registry.ts";
 import { attachPtyWriteGuard, type PtyLike } from "./pty-write-guard.ts";
 import { isTopicDeleted, type ChatActionSource } from "./topic-probe.ts";
 import { launchSession as realLaunchSession, stripAnsi } from "./session-launcher.ts";
@@ -56,6 +57,12 @@ export interface SessionSupervisorOptions {
    * §12 Phase 1: it predates this table and isn't itself in Phase 5's reconciliation scope). */
   selfCheckSlug: string;
   otlpPort?: number;
+  /** Live getter (`/repos add`/`/repos reload` reassign the registry at runtime), used for exactly
+   * one thing: recovering a resumed session's `projectMcp` opt-in. A session row records
+   * `repoPath` and never the registry name it came from, so this looks the entry up by path -
+   * see `ReposRegistry.getByPath`. Absent, or a path no longer registered, resolves to the closed
+   * default, which is the right way for this particular lookup to fail. */
+  getReposRegistry?: () => ReposRegistry | undefined;
   log?: LogFn;
   /** Injectable clock, so `resumeSession`'s `sessionStore.setState`/`nowIso()` calls and (more
    * importantly) `handleUnexpectedExit`'s backoff delay are fakeable in tests without real waits.
@@ -173,7 +180,7 @@ export interface SessionSupervisor {
  * are the only sanctioned access points for the handful of other modules that need one.
  */
 export function createSessionSupervisor(opts: SessionSupervisorOptions): SessionSupervisor {
-  const { sessionStore, routing, controlBot, confirmSessionCommand, supergroupChatId, selfCheckSlug, otlpPort } = opts;
+  const { sessionStore, routing, controlBot, confirmSessionCommand, supergroupChatId, selfCheckSlug, otlpPort, getReposRegistry } = opts;
   const log = opts.log ?? (() => {});
   const now = opts.now ?? (() => new Date().toISOString());
   const delay = opts.delay ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -637,6 +644,11 @@ export function createSessionSupervisor(opts: SessionSupervisorOptions): Session
         permissionMode: routing.getMode(slug),
         resumeSessionId: current.sessionId,
         otlpPort,
+        // Looked up by path, not by name - the row has no registry name. A resume that silently
+        // dropped this would boot the session straight back into the consent dialog that
+        // `project-mcp-policy.ts` exists to keep out of the way, on a repo the operator had already
+        // opted in.
+        projectMcp: getReposRegistry?.()?.getByPath(current.repoPath)?.projectMcp,
         log,
       });
       wireSession(slug, session.ptyProcess, topicId, session.ready);

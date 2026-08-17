@@ -31,7 +31,10 @@ This is `scripts/setup-windows.ps1` (§12 P-1/P-2). At the end you have a popula
 - **`repos.toml`.** Create `%LOCALAPPDATA%\aibridge\repos.toml` by hand, one `[name]` block per repo
   you want `/new` to be able to open (path, base branch, optional default model) - see §7.5 of the
   plan for the format. `/new` refuses an unregistered name with the list of what is registered, rather
-  than guessing a path.
+  than guessing a path. If a registered repo ships its own project-scoped `.mcp.json`, those servers
+  are **rejected by default** in every session cut from it; add `projectMcp = true` to that repo's
+  block to run them. Closed by default because an MCP server is a long-lived process holding
+  credentials, not a per-tool-call hook - see `packages/bridge/src/project-mcp-policy.ts`.
 - **Claude Code login.** `claude` must be logged in, interactively, as the same Windows account the
   Bridge will run as, once, before the first session launch - otherwise every session in the fleet
   fails at launch with an auth error, which from a phone looks like "the whole thing is broken" (§7.5).

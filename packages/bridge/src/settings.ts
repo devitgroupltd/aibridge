@@ -14,6 +14,12 @@ export interface PermissionSettings {
   };
   hooks?: Record<string, HookEntry[]>;
   env?: Record<string, string>;
+  /** `project-mcp-policy.ts`'s two keys, merged in by `launchSession` rather than by
+   * `generateSettings` - they depend on the target repo, which this file knows nothing about.
+   * Declared here so an `Always` tap (`addAlwaysRule` -> `writeSettingsFile`) round-trips them
+   * instead of typing them away. */
+  enabledMcpjsonServers?: string[];
+  disabledMcpjsonServers?: string[];
 }
 
 /**
