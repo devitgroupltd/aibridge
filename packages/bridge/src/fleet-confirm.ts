@@ -7,13 +7,14 @@ import type { InlineKeyboardButton } from "./telegram.ts";
  * reports fleet status instead of posting a card: there would be no valid kind to construct. */
 export type AutoConfirmKind = `${AutoCategory}-${"on" | "off"}`;
 
-export type FleetConfirmKind = "kill" | "rm" | "rm-topic" | "rm-worktree" | AutoConfirmKind;
+export type FleetConfirmKind = "kill" | "rm" | "rm-topic" | "rm-worktree" | "rm-branch" | AutoConfirmKind;
 
-/** Everything `postFleetConfirm` can post a card for - i.e. `FleetConfirmKind` minus the two kinds
+/** Everything `postFleetConfirm` can post a card for - i.e. `FleetConfirmKind` minus the three kinds
  * that have no session rows and their own posters (`rm-topic`/`postOrphanTopicRmConfirm`,
- * `rm-worktree`/`postOrphanWorktreeConfirm`). Both carry their targets in the pending entry itself
- * rather than as slugs to look up, which is what makes them postable with nothing in the DB. */
-export type FleetBulkKind = Exclude<FleetConfirmKind, "rm-topic" | "rm-worktree">;
+ * `rm-worktree`/`postOrphanWorktreeConfirm`, `rm-branch`/`handleBranchesCommand`). All three carry
+ * their targets in the pending entry itself rather than as slugs to look up, which is what makes
+ * them postable with nothing in the DB. */
+export type FleetBulkKind = Exclude<FleetConfirmKind, "rm-topic" | "rm-worktree" | "rm-branch">;
 
 export const autoConfirmKind = (category: AutoCategory, on: boolean): AutoConfirmKind => `${category}-${on ? "on" : "off"}`;
 
@@ -53,9 +54,18 @@ export interface PendingFleetConfirm {
    * For `rm-worktree` these are directory names under the worktrees root rather than slugs anything
    * can be looked up by - same reason, opposite side of the matrix: the whole point is that no row
    * exists. `orphan-worktrees.ts` re-validates every one of them at deletion time rather than
-   * trusting a value that has made a round trip through Telegram. */
+   * trusting a value that has made a round trip through Telegram.
+   *
+   * For `rm-branch` they are full branch names (`claude/<slug>-<id>`) in `repoPath`, re-validated
+   * the same way by `orphan-branches.ts`. */
   slugs: string[];
   topicId: number | undefined;
+  /** `rm-branch` only: the repo whose `claude/<slug>-<id>` branches `slugs` names. Carried on the
+   * pending entry rather than re-derived at tap time so the repo a card was posted about and the
+   * repo a tap deletes in cannot drift apart - the same reasoning `worktreesRoot` gets in
+   * `fleet-confirm-flow.ts`, and it matters more here because there can be several registered repos
+   * and a branch name says nothing about which one it came from. */
+  repoPath?: string;
   messageId: number;
   createdAt: number;
 }
@@ -99,6 +109,7 @@ const FLEET_CONFIRM_KINDS = Object.keys({
   rm: true,
   "rm-topic": true,
   "rm-worktree": true,
+  "rm-branch": true,
   "permission-on": true,
   "permission-off": true,
   "answer-on": true,

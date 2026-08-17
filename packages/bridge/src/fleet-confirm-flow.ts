@@ -4,6 +4,7 @@ import type { FleetBulkKind, FleetConfirmKind, PendingFleetConfirm } from "./fle
 import type { ConfirmCards } from "./confirm-cards.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import type { SessionLifecycleCommands } from "./session-lifecycle-commands.ts";
+import { removeOrphanBranch } from "./orphan-branches.ts";
 import { removeOrphanWorktree } from "./orphan-worktrees.ts";
 import type { RateGovernor } from "./rate-governor.ts";
 import { renderBulkRemoveNotes } from "./remove-outcome.ts";
@@ -221,6 +222,35 @@ export function createFleetConfirmFlow(opts: FleetConfirmFlowOptions): FleetConf
       }
       const note = refused.length > 0 ? ` ${refused.length} left in place - a session claimed the slug, or it stopped looking orphaned (see bridge.log): ${refused.join(", ")}` : "";
       await confirmCards.finalizeFleetConfirmMessage(pending, removed.length > 0 ? `Deleted ${removed.length} orphaned worktree director${removed.length === 1 ? "y" : "ies"}: ${removed.join(", ")}.${note}` : `Nothing was deleted.${note}`);
+      return;
+    }
+
+    // §4.5's fourth debris class (`orphan-branches.ts`): `claude/<slug>-<id>` branches with no
+    // session. `pending.slugs` are branch names and `pending.repoPath` says where they live - both
+    // re-validated inside `removeOrphanBranch`, which finishes with `git branch -d` so git itself
+    // refuses anything holding unmerged commits even if every check upstream were wrong.
+    if (pending.kind === "rm-branch") {
+      if (pending.repoPath === undefined) {
+        log("WARN", `rm-branch confirm ${pending.id} had no repoPath - nothing to act on`);
+        await confirmCards.finalizeFleetConfirmMessage(pending, "Nothing left to act on.");
+        return;
+      }
+      const deleted: string[] = [];
+      const refused: string[] = [];
+      for (const branch of pending.slugs) {
+        try {
+          removeOrphanBranch(pending.repoPath, branch, (slug) => sessionStore.get(slug) === undefined);
+          deleted.push(branch);
+        } catch (err) {
+          refused.push(branch);
+          log("WARN", `refused to delete orphaned branch "${branch}": ${(err as Error).message}`);
+        }
+      }
+      const note = refused.length > 0 ? ` ${refused.length} left in place - git refused, or a session claimed the slug (see bridge.log): ${refused.join(", ")}` : "";
+      await confirmCards.finalizeFleetConfirmMessage(
+        pending,
+        deleted.length > 0 ? `Deleted ${deleted.length} orphaned branch${deleted.length === 1 ? "" : "es"}: ${deleted.join(", ")}.${note}` : `Nothing was deleted.${note}`,
+      );
       return;
     }
 

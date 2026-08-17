@@ -49,6 +49,7 @@ import { createTypingIndicator } from "./typing-indicator.ts";
 import { restartSettleDelayMs } from "./restart-settle.ts";
 import { createSessionSupervisor } from "./session-supervisor.ts";
 import { createPtyIo, DEFAULT_ECHO_SETTLE_MS, DEFAULT_SUBMIT_CONFIRM_WINDOW_MS } from "./pty-io.ts";
+import { createBranchCleanupCommands } from "./branch-cleanup-commands.ts";
 import { classifyOrphanWorktrees, hasGitEntry, listWorktreeDirs, renderOrphanWorktreeReport } from "./orphan-worktrees.ts";
 import { createTurnStartWatchdog, DEFAULT_TURN_START_TIMEOUT_MS, renderNoTurnStartedNotice } from "./turn-start-watchdog.ts";
 import { createWedgedRecoveryMarks } from "./wedged-recovery.ts";
@@ -785,6 +786,17 @@ async function main(): Promise<void> {
     log,
   });
 
+  const branchCleanup = createBranchCleanupCommands({
+    controlBot,
+    sessionStore,
+    fleetConfirmRegistry,
+    confirmSessionCommand,
+    isControlTopic,
+    getReposRegistry: () => reposRegistry,
+    supergroupChatId: config.supergroupChatId,
+    log,
+  });
+
   // `respawnSelfAndExit` is a hoisted function declaration (defined further down this same scope,
   // adjacent to `main()`'s own startup sequencing per the plan's Risks - its `bootReadyAt` settle
   // delay is safety-critical and stays put) - injected here as a callback rather than relocated.
@@ -1058,6 +1070,7 @@ async function main(): Promise<void> {
       confirmSessionCommand,
       sessionLifecycle,
       fleetReporting,
+      branchCleanup,
       fleetConfirmFlow: fleetConfirmFlow.get(),
       deployLifecycle,
       osPowerCommands,
