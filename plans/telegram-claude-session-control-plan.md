@@ -1,7 +1,7 @@
 ---
-version: 0.113.0
+version: 0.114.0
 status: solid
-last_modified_utc: 2026-08-17T14:40:00Z
+last_modified_utc: 2026-08-17T16:15:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,29 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.114.0 (2026-08-17): **the modal-eats-the-next-message class is closed, by a detector rather
+    than by a list of dialogs** (`turn-start-watchdog.ts`). 0.113.0 recorded three instances in two
+    days and fixed two of them at source; the third (`/auto-mode-setup`, which opens *after* the
+    first turn) proved the list is not aibridge's to control, since it grew by one the same day two
+    entries were closed. What every instance shares is dialog-independent and observable: the message
+    reached the PTY and no turn ever started. `pty-io.ts`'s `confirmSubmitted` cannot see it - it asks
+    whether the PTY produced output, and a modal being answered and redrawn is plenty - so the signal
+    is Claude Code's own `UserPromptSubmit`, which fires only when text is accepted *as a prompt*.
+    Armed after each inbound Enter, disarmed by that hook, and on timeout the PTY tail goes into the
+    session's own topic, because the tail holds the dialog verbatim and is the entire diagnosis; the
+    notice names `/stop`, which writes a bare ESC, as the recovery, since every dialog seen so far
+    offers ESC as its way out. **Reporting-only on purpose** - `confirmSubmitted` already retries the
+    Enter, and a blind retry into an open modal is precisely how instance (1) answered a consent
+    dialog by accident. Two guards against the opposite failure, a detector that cries wolf: it arms
+    only for an `idle` session (Claude Code queues a mid-turn message and fires the hook for it
+    minutes later, which would flag every healthy follow-up) and re-reads the row before speaking, so
+    `working`/`awaiting_input`/gone all stay silent. `turn-watchdog-check.js` measures that direction
+    live - four watched messages across three turn shapes including one sent behind a running turn,
+    all answered, zero notices - and requires the turns to have actually completed, since zero notices
+    on a session where nothing ran is the vacuous pass §13 keeps rediscovering. The notice renders
+    through `renderAttach`'s bounded-tail helper, extracted for the purpose: a message about a silent
+    session that Telegram then rejects for being too long produces exactly the silence it exists to
+    break (P1-10, inherited rather than re-earned)."
   - "0.113.0 (2026-08-17): **§13 check 5 is done in full** - SeoWrite registered in `repos.toml`
     (2026-08-16, firing §12's third Phase 6b trigger, recorded there) and (a)/(b)/(d) all PASS against
     its real guard hooks via `scripts/telegram-automation/seowrite-guardrail-check.js`, every verdict
@@ -33,8 +56,16 @@ changelog:
     lesson is bigger than either fix and is **not** closed: a fleet session has no human at its
     terminal, so *any* modal Claude Code opens eats the next message into that topic - a third
     instance (`/auto-mode-setup`, which fires after the first turn) turned up the same day and neither
-    fix catches it. The durable form is a detector, not a list of dialogs: a turn producing no
-    `UserPromptSubmit` is a wedge whatever opened the modal."
+    fix catches it. **The class is closed by `turn-start-watchdog.ts` in the same version**: a turn
+    producing no `UserPromptSubmit` is a wedge whatever opened the modal, so that is what is measured -
+    armed after each inbound Enter, disarmed by the hook, and on timeout the PTY tail goes into the
+    session's own topic, since the tail holds the dialog verbatim and is the whole diagnosis.
+    Reporting-only by design (a blind retry into an open modal is what answered a consent dialog by
+    accident to begin with), and guarded against the opposite failure - it arms only for an `idle`
+    session and re-checks the row before speaking, because Claude Code queues a mid-turn message and
+    fires its hook minutes later, which would otherwise flag every healthy follow-up.
+    `turn-watchdog-check.js` measures exactly that: four watched messages across three turn shapes,
+    all answered, zero notices."
   - "0.112.0 (2026-08-13): both findings 0.111.0 filed are fixed (see codebase-hardening-plan.md
     v1.12.0), and chasing the second one turned up something this plan had never noticed: **the
     Bridge's own inbound write path was losing Enters on most turns and losing message content
@@ -4314,10 +4345,15 @@ anything a session's first prompt is written into while such a dialog is open sw
 The general lesson is broader than either fix and is not fully addressed: **a fleet session has no
 human at its terminal, so any modal Claude Code opens eats the next message sent into that topic.**
 A third instance turned up the same day - the `/auto-mode-setup` environment-onboarding dialog, which
-fires *after* the first turn rather than at startup, so neither fix catches it (worked around by
-setting `autoModeEnvSetup.dismissed` in the operator's own `~/.claude.json`). The durable fix is a
-detector rather than a list: a turn that produces no `UserPromptSubmit` is a wedge, whatever opened
-the modal. That belongs in Phase 6a's hardening, not here.
+fires *after* the first turn rather than at startup, so neither of those two fixes can catch it
+(worked around by setting `autoModeEnvSetup.dismissed` in the operator's own `~/.claude.json`).
+
+**The class is now closed by a detector rather than a list of dialogs** (`turn-start-watchdog.ts`,
+2026-08-17): a turn that produces no `UserPromptSubmit` is a wedge, whatever opened the modal. It
+arms after each inbound Enter, disarms on that hook, and on timeout posts the PTY tail into the
+session's topic - the tail being the diagnosis, since it holds the dialog verbatim. Reporting-only on
+purpose: `confirmSubmitted` already retries the Enter, and a blind retry into an open modal is what
+answered a consent dialog by accident in instance (1).
 
 **Otherwise still deliberately deferred (0.56.0) - not skipped, not lost track of.** The operator made
 that call explicitly rather than it falling out by silence; re-read this section when a trigger fires,

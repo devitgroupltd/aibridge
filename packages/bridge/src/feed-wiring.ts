@@ -36,6 +36,11 @@ export interface FeedWiringOptions {
   /** Injected rather than imported - `quota-alarms.ts` (a later module in the split) owns this;
    * for now it's `index.ts`'s own hoisted function declaration, passed by reference. */
   markQuotaStopped: (slug: string) => void;
+  /** `turn-start-watchdog.ts`'s disarm half. Wired to `UserPromptSubmit` specifically rather than to
+   * `maybeSetState(..., "working")`, which the permission relay also drives: the claim being
+   * retracted is "Claude Code accepted this text as a prompt", and that hook is the only event that
+   * means exactly it. Optional so unrelated tests can omit it. */
+  onTurnStarted?: (slug: string) => void;
   /** The three `pipeHandle` members §6.5's terminal-race fix needs - injected individually (not
    * the whole handle) to keep this module's dependency surface minimal. `index.ts` wires these as
    * thin closures over `pipeHandle`, constructed *after* this factory (see the plan's Risks
@@ -275,6 +280,11 @@ export function createFeedWiring(opts: FeedWiringOptions): FeedWiring {
     // mark for this slug has served its purpose. Dropped here rather than left to expire so that a
     // session which crashes for real shortly after a recovery still marks its row dead promptly.
     if (msg.hook_event_name === "SessionStart") wedgedRecoveryMarks.clear(msg.slug);
+
+    // The message aibridge wrote became a real turn - `turn-start-watchdog.ts` can stand down.
+    // Before the state write below rather than after, so the disarm cannot be skipped by any of the
+    // suppression branches that follow.
+    if (msg.hook_event_name === "UserPromptSubmit") opts.onTurnStarted?.(msg.slug);
 
     resolveTerminalRacePermission(msg);
 

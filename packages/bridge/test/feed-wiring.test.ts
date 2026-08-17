@@ -170,6 +170,24 @@ describe("createFeedWiring", () => {
     expect(finalized[0]?.text).toContain("✅ Allowed");
   });
 
+  // turn-start-watchdog.ts's disarm half. `UserPromptSubmit` is the *only* event that means "Claude
+  // Code accepted this text as a prompt", which is the exact claim the watchdog is waiting to have
+  // retracted - so it is wired to that hook rather than to the `working` transition, which the
+  // permission relay also drives from a button tap.
+  test("handleHookEvent reports a started turn on UserPromptSubmit, and on nothing else", () => {
+    const started: string[] = [];
+    const { feedWiring, sessionStore } = setup({ onTurnStarted: (slug) => started.push(slug) });
+    sessionStore.insert(row());
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "SessionStart", payload: {} }));
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "PreToolUse", payload: { tool_name: "Bash", tool_input: {} } }));
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "Stop", payload: {} }));
+    expect(started).toEqual([]);
+
+    feedWiring.handleHookEvent(hookMsg({ hook_event_name: "UserPromptSubmit", payload: { prompt: "hello" } }));
+    expect(started).toEqual(["fix-bug"]);
+  });
+
   test("handleHookEvent sends a deny verdict for PermissionDenied", () => {
     const { feedWiring, sessionStore, verdicts, finalized, setPermissionToResolve } = setup();
     sessionStore.insert(row());

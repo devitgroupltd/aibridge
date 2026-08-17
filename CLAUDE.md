@@ -82,13 +82,23 @@ server — now rejected by default with a per-repo `projectMcp` opt-in, `project
 first prompt written into any such dialog vanished with **no operator-visible sign at all** — `/ls`
 `idle`, `/usage` $0.00, a `🤔 Thinking...` placeholder, and its trailing `\r` answering the dialog.
 `confirmSubmitted` cannot catch this: it only asks whether the PTY produced output, and a dialog being
-answered and redrawn is plenty. `startup-gate-notice.ts` makes that case loud. **What is not fixed is
-the class:** a fleet session has no human at its terminal, so *any* modal Claude Code opens eats the
-next message sent into that topic. A third instance turned up the same day — `/auto-mode-setup`, which
-fires *after* the first turn, so neither fix catches it (worked around by setting
-`autoModeEnvSetup.dismissed` in `~/.claude.json`, which is where that gate reads from). Don't chase
-dialogs one at a time; the durable form is a detector — a turn that produces no `UserPromptSubmit` is a
-wedge, whatever opened the modal.
+answered and redrawn is plenty. `startup-gate-notice.ts` makes that case loud. A third instance turned
+up the same day — `/auto-mode-setup`, which fires *after* the first turn, so neither of those two fixes
+can see it (worked around by setting `autoModeEnvSetup.dismissed` in `~/.claude.json`, which is where
+that gate reads from).
+
+**The class itself is now covered by `turn-start-watchdog.ts`, and that is the piece to reach for
+rather than patching the next dialog.** The list of dialogs is not aibridge's to control and grew by
+one the same day two entries were closed; what every instance has in common is dialog-independent —
+the message reached the PTY and no turn ever started. It arms after each inbound Enter, disarms on the
+`UserPromptSubmit` that proves a turn began, and on timeout posts the PTY tail into the session's own
+topic, because the tail *is* the diagnosis. Two things about it are load-bearing and easy to undo by
+accident: it **only arms when the session is `idle`** (Claude Code queues a mid-turn message and fires
+`UserPromptSubmit` for it minutes later, so arming there flags every healthy follow-up), and it
+**re-reads the row at fire time** and stays silent unless still `idle`. It is deliberately
+reporting-only — a blind retry into an open modal is what answered a security dialog by accident in
+the first place. `scripts/telegram-automation/turn-watchdog-check.js` is its false-positive check;
+run that, not just `bun test`, before changing either guard.
 
 ## What this project is
 

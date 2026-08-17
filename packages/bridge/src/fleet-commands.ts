@@ -1056,8 +1056,20 @@ function trimEscapedTail(escaped: string, budget: number): string {
  */
 export function renderAttach(row: SessionRow, tail: string): string {
   const resumeHint = row.sessionId ? `claude --resume ${row.sessionId}` : "(no session_id recorded yet)";
-  const header = `${escapeForFeed(row.slug)} - last output:\n`;
-  const footer = `</pre>\nLocal pickup: <code>${escapeForFeed(resumeHint)}</code>`;
+  return renderWithBoundedTail(`${escapeForFeed(row.slug)} - last output:\n`, tail, `</pre>\nLocal pickup: <code>${escapeForFeed(resumeHint)}</code>`);
+}
+
+/**
+ * `renderAttach`'s body, shared so anything else that shows a PTY tail inherits P1-10's fix instead
+ * of reproducing the bug it closed. `turn-start-watchdog.ts`'s notice is the second caller, and it is
+ * the one that makes sharing worth a function: a message about a session that has gone silent, which
+ * itself fails to send because it is too long, produces exactly the silence it exists to break.
+ *
+ * `header` and `footer` must already be escaped (they are literal text the caller composes); `tail`
+ * is raw and is escaped and trimmed here. The caller's `footer` is responsible for closing the
+ * `<pre>` this opens.
+ */
+export function renderWithBoundedTail(header: string, tail: string, footer: string): string {
   const budget = ATTACH_MESSAGE_LIMIT - header.length - footer.length - "<pre>".length - ATTACH_TRUNCATION_NOTE.length;
   const escaped = escapeForFeed(tail);
   const trimmed = trimEscapedTail(escaped, budget);
