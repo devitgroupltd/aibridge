@@ -167,6 +167,19 @@ against a real, already-authenticated profile — `status.txt` in that folder re
 session exists). It is dev/QA tooling for aibridge, not aibridge itself (same "not aibridge's own code"
 boundary as `scripts/dev-bridge.sh`).
 
+- **`run-checks.js` — runs the checks back to back and prints one table.** `--list` first; `--only
+  a,b` for a subset, `--all` to include the measurement scripts, `--slow` for the hour-long
+  `ask-timeout-check`. It exists because only one browser may use the persisted profile at a time, so
+  the checks were only ever run one at a time by hand, and therefore only when something was already
+  suspected. Three things about it are deliberate: every script in the folder must be in either its
+  `CHECKS` or its `EXCLUDED` list (it warns about any that is in neither, so a check written next
+  month cannot be silently skipped forever); scripts that print JSON and claim no verdict
+  (`rate-storm`, `terminal-race`, `quiet-mode`, `always-rule`) are classified `measurement` and always
+  report `READ-LOG` rather than being called green; and a check whose verdict cannot be found reports
+  `UNKNOWN`, which fails the run. `sandbox-check`'s expected outcome is `EXPECTED-FAIL`, so if Phase 6b
+  ever flips it the table says `CHANGED` instead of quietly going green. Full output of every run is
+  always written to `run-checks-logs/<timestamp>/`, because piping a check through `tail` is how two
+  real findings were lost earlier in this project.
 - `login.js` — one-time interactive login (run manually, scan the QR code). Skip this if `status.txt`
   already says `logged_in`.
 - `client.js` — shared helpers (`connect`, `openGroup`, `openTopic`, `sendMessage`, `getMessageTexts`,
