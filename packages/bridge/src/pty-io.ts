@@ -114,6 +114,11 @@ export interface PtyIoOptions {
    * reads a clock as well as scheduling, and a fake scheduler paired with a real `Date.now` polls
    * against a deadline that never arrives. */
   waitForPtyQuietFn?: (slug: string, quietMs: number, timeoutMs: number, afterActivityAt?: number) => Promise<boolean>;
+  /** `turn-start-watchdog.ts` - armed after each inbound message's Enter, and the only detector that
+   * can see a message eaten by a dialog (`confirmSubmitted` cannot: a modal being answered and
+   * redrawn is exactly the PTY output it reads as success). Optional so the many `createPtyIo` call
+   * sites in tests that are about something else stay unchanged; omitted means no watchdog. */
+  turnStartWatchdog?: { arm(slug: string, topicId: number): void };
 }
 
 export interface PtyIo {
@@ -334,6 +339,11 @@ export function createPtyIo(opts: PtyIoOptions): PtyIo {
       // that Enter may have been queued behind another message's. The PTY is quiet at this point by
       // construction, which is exactly the precondition its baseline needs.
       confirmSubmitted(slug, topicId, write);
+      // Same reasoning for the same reason, one layer out: this measures whether a *turn* started,
+      // not whether the PTY twitched, and its window must likewise begin at this Enter. It reads the
+      // session state itself to decide whether arming is even meaningful - see `arm`'s doc comment
+      // on why a message written into a mid-turn session must not be watched.
+      opts.turnStartWatchdog?.arm(slug, topicId);
     });
   }
 

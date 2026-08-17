@@ -49,6 +49,7 @@ import { createTypingIndicator } from "./typing-indicator.ts";
 import { restartSettleDelayMs } from "./restart-settle.ts";
 import { createSessionSupervisor } from "./session-supervisor.ts";
 import { createPtyIo, DEFAULT_ECHO_SETTLE_MS, DEFAULT_SUBMIT_CONFIRM_WINDOW_MS } from "./pty-io.ts";
+import { createTurnStartWatchdog, DEFAULT_TURN_START_TIMEOUT_MS, renderNoTurnStartedNotice } from "./turn-start-watchdog.ts";
 import { createWedgedRecoveryMarks } from "./wedged-recovery.ts";
 import { createFeedWiring } from "./feed-wiring.ts";
 import { createQuotaAlarms, DEFAULT_BURN_RATE_THRESHOLD_USD } from "./quota-alarms.ts";
@@ -540,6 +541,20 @@ async function main(): Promise<void> {
   // either of them, since neither can see the other's half of the race.
   const wedgedRecoveryMarks = createWedgedRecoveryMarks();
 
+  // turn-start-watchdog.ts: the general form of "a modal Claude Code opened ate the operator's
+  // message". Armed by `ptyIo` after each inbound Enter, disarmed by `feedWiring` on the
+  // `UserPromptSubmit` that proves a turn really started. Constructed here, before both, because it
+  // is the one piece of state they share - and it reads the session row directly, so that neither of
+  // them has to grow a `sessionStore` dependency for it.
+  const turnStartWatchdog = createTurnStartWatchdog({
+    getState: (slug) => sessionStore.get(slug)?.state,
+    onNoTurnStarted: (slug, topicId) => {
+      const tail = routing.getOutputTail(slug) || "";
+      log("WARN", `session "${slug}" was written to but no turn started within ${DEFAULT_TURN_START_TIMEOUT_MS}ms - its terminal is probably sitting on a dialog`);
+      confirmSessionCommand(topicId, renderNoTurnStartedNotice(slug, tail, DEFAULT_TURN_START_TIMEOUT_MS), "HTML");
+    },
+  });
+
   const ptyIo = createPtyIo({
     routing,
     typingIndicator,
@@ -550,6 +565,7 @@ async function main(): Promise<void> {
     log,
     submitConfirmWindowMs,
     echoSettleMs,
+    turnStartWatchdog,
   });
   // Fixed msgId/from pair identifies this as Bridge-generated, not a real Telegram message - same
   // convention session-lifecycle-commands.ts's `/new` first-turn injection already uses
@@ -573,6 +589,7 @@ async function main(): Promise<void> {
     supergroupChatId: config.supergroupChatId,
     confirmSessionCommand,
     markQuotaStopped: quotaAlarms.markQuotaStopped,
+    onTurnStarted: turnStartWatchdog.turnStarted,
     resolveByToolMatch: (slug, toolName, toolInput) => pipeHandle.permissionRegistry.resolveByToolMatch(slug, toolName, toolInput),
     sendVerdict: (slug, requestId, behavior) => pipeHandle.sendVerdict(slug, requestId, behavior),
     finalizePermissionMessage: (messageId, text) => pipeHandle.finalizePermissionMessage(messageId, text),

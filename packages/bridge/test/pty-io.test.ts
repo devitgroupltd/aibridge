@@ -248,6 +248,63 @@ describe("createPtyIo", () => {
     expect(thinkingStarts).toEqual(["2", "2"]);
   });
 
+  // The wiring half of turn-start-watchdog.ts. Its own tests cover when it should fire; this one
+  // exists so "the watchdog is correct but nothing ever arms it" cannot pass - the same failure mode
+  // startup-gate-notice.ts had to be guarded against, and the one that makes a detector worthless.
+  //
+  // Armed *after* the Enter, not at call time: the second message's Enter is queued behind the
+  // first's, so arming at call time would start the second window while the first message was still
+  // being written, and measure a stretch of time the message had no chance to be submitted in.
+  test("sendChannelText arms the turn-start watchdog, once per message, only after that message's Enter", async () => {
+    const { routing } = fakeRoutingWithWrite("fix-bug");
+    const gate = makeQuietGate();
+    const armed: Array<{ slug: string; topicId: number }> = [];
+    const ptyIo = createPtyIo({
+      routing,
+      typingIndicator: createTypingIndicator({ send: async () => {} }),
+      thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
+      lastActivityAt: () => Date.now(),
+      ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
+      waitForPtyQuietFn: gate.waitForPtyQuietFn,
+      turnStartWatchdog: { arm: (slug, topicId) => armed.push({ slug, topicId }) },
+    });
+
+    ptyIo.sendChannelText("fix-bug", 2, "hello", "msg-1", "telegram");
+    ptyIo.sendChannelText("fix-bug", 2, "world", "msg-2", "telegram");
+    await flush();
+    expect(armed).toEqual([]); // body written, Enter not out yet
+
+    await gate.release();
+    expect(armed).toEqual([{ slug: "fix-bug", topicId: 2 }]);
+
+    await gate.release();
+    expect(armed).toEqual([
+      { slug: "fix-bug", topicId: 2 },
+      { slug: "fix-bug", topicId: 2 },
+    ]);
+  });
+
+  // A dead PTY returns early, before anything is written - so there is no Enter to watch and no
+  // message in flight to report on. Arming there would produce a "your message never started a turn"
+  // notice for a message that was never sent, on top of the `WARN` that already says so.
+  test("a message dropped for want of a live PTY does not arm the watchdog", () => {
+    const armed: string[] = [];
+    const ptyIo = createPtyIo({
+      routing: { getPtyWrite: () => undefined } as unknown as Parameters<typeof createPtyIo>[0]["routing"],
+      typingIndicator: createTypingIndicator({ send: async () => {} }),
+      thinkingPlaceholder: createThinkingPlaceholder({ send: async () => 1 }),
+      lastActivityAt: () => Date.now(),
+      ptyLookup: { get: () => undefined },
+      wedgedRecoveryMarks: createWedgedRecoveryMarks(),
+      turnStartWatchdog: { arm: (slug) => armed.push(slug) },
+    });
+
+    ptyIo.sendChannelText("gone", 2, "hello", "msg-1", "telegram");
+
+    expect(armed).toEqual([]);
+  });
+
   // P2-7's primary fix. Measured over a full bridge.log, the same-tick `\r` failed to submit on 105
   // of 145 inbound messages: the TUI is still ingesting the body when the Enter arrives and swallows
   // it. `confirmSubmitted`'s retry rescued most of them 2.5s later - and past roughly 3KB, where the
