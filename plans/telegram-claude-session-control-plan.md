@@ -1,7 +1,7 @@
 ---
-version: 0.112.0
+version: 0.113.0
 status: solid
-last_modified_utc: 2026-08-13T14:05:00Z
+last_modified_utc: 2026-08-17T14:40:00Z
 relates_to: >-
   This plan originated as plans/telegram-claude-session-control-plan.md in the SeoWrite repo
   (github.com/devitgroupltd/seowrite), where it was developed and probed against that repo's own
@@ -13,6 +13,28 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.113.0 (2026-08-17): **§13 check 5 is done in full** - SeoWrite registered in `repos.toml`
+    (2026-08-16, firing §12's third Phase 6b trigger, recorded there) and (a)/(b)/(d) all PASS against
+    its real guard hooks via `scripts/telegram-automation/seowrite-guardrail-check.js`, every verdict
+    taken from git state on the host. §13's outstanding list is now just check 2 and check 8's
+    BotFather revocation. Getting there needed two aibridge defects fixed first, and both existed only
+    because until now every session had run against this repo. **A target repo's own project-scoped
+    `.mcp.json` re-raises the consent dialog §2.4 was written to avoid**, in every worktree cut from
+    it - SeoWrite declares eight servers, so the dialog opened and sat there. `projectMcp` in
+    `repos.toml` (§7.5) is the fix: those servers are rejected by default and a repo opts in
+    explicitly, closed by default because an MCP server is a long-lived credential-holding process
+    rather than a per-tool-call hook. **And a prompt written into any such dialog vanished with no
+    operator-visible sign at all**: `startFirstTurn`'s three gates timed out, it wrote anyway (right,
+    on its own), and the trailing `\\r` selected the dialog's highlighted option - `/ls` said `idle`,
+    `/usage` said $0.00, the topic showed a `🤔 Thinking...` placeholder. Nothing downstream catches
+    it, since `confirmSubmitted` only asks whether the PTY produced output and a dialog being answered
+    is plenty. The gates now report their outcome and `startup-gate-notice.ts` says so in the
+    session's own topic; the prompt is still sent, because the gates are heuristics. The general
+    lesson is bigger than either fix and is **not** closed: a fleet session has no human at its
+    terminal, so *any* modal Claude Code opens eats the next message into that topic - a third
+    instance (`/auto-mode-setup`, which fires after the first turn) turned up the same day and neither
+    fix catches it. The durable form is a detector, not a list of dialogs: a turn producing no
+    `UserPromptSubmit` is a wedge whatever opened the modal."
   - "0.112.0 (2026-08-13): both findings 0.111.0 filed are fixed (see codebase-hardening-plan.md
     v1.12.0), and chasing the second one turned up something this plan had never noticed: **the
     Bridge's own inbound write path was losing Enters on most turns and losing message content
@@ -3055,9 +3077,23 @@ model  = "sonnet"                          # optional per-repo default (§10.5)
 path   = 'c:\data\projects\somethingelse'
 base   = "main"
 model  = "sonnet"
+projectMcp = true                          # run this repo's own .mcp.json servers (default: no)
 ```
 
-An unregistered name is refused with the list, rather than the Bridge guessing a path. Worktrees are
+An unregistered name is refused with the list, rather than the Bridge guessing a path.
+
+**`projectMcp`**, added 2026-08-17, is the one non-string field and the only one whose default is a
+security decision rather than a convenience. A registered repo that ships its own project-scoped
+`.mcp.json` would otherwise raise Claude Code's "new MCP server found in this project" consent dialog
+in *every* worktree cut from it - §2.4's user-level registration only ever covered aibridge's own
+server - and a dialog on a fleet session's PTY is a trap, because there is no human at that terminal
+(found live on the very first `/new` against SeoWrite: the dialog ate the operator's prompt and its
+trailing Enter answered the dialog). Those servers are therefore **rejected by default**, and this
+field is how a project opts in. Closed by default because registering a repo already means running its
+code - its `.claude/` hooks execute unmodified, which is the whole basis of §13 check 5 - but an MCP
+server is a long-lived process holding credentials and reaching the network, not a per-tool-call hook,
+so the widening should be deliberate and per-project. `packages/bridge/src/project-mcp-policy.ts` has
+the mechanism and the evidence for it. Worktrees are
 cut from that clone into `c:\data\worktrees\<slug>`, so `git worktree list` in the clone is a second,
 independent view of the fleet during reconciliation (§4.5) - and, on Windows, one the operator can run
 in their own terminal against the same clone they already work in. There is one Bridge, one Telegram
@@ -4259,11 +4295,34 @@ unattended running defensible, and **should not be skipped just because Phases 1
 **6b, the migration (§7.6),** triggered by wanting unattended overnight runs, by prompts-per-hour
 showing an uncomfortably broad allowlist, or by adding a repo other than this one.
 
-**Deliberately deferred to the far future (0.56.0) - not skipped, not lost track of.** None of the
-three trigger conditions above has occurred as of this sitting. The operator made this call
-explicitly rather than it falling out by silence; re-read this section when one of the triggers
-actually fires, not on a calendar. Phase 6a's own exit and its §13 manual checks (1-6, 8) do not
-depend on this and remain the nearer-term work.
+**The third trigger has now fired (2026-08-17): SeoWrite was registered in `repos.toml` on
+2026-08-16**, deliberately, to unblock §13 check 5(a)/(b)/(d) - which it did, all three PASS. The
+other two have not fired.
+
+Note what the trigger as worded says and does not say. It is "a repo *less well-understood* than
+SeoWrite (the pilot project), where the blast radius of a given allowlist entry has not been assessed
+the way §10.4.1 assesses SeoWrite's" (§7.6). SeoWrite *is* the pilot project and its blast radius
+*is* the one §10.4.1 assessed, so registering it is the trigger's letter rather than its spirit - the
+condition the trigger is actually about, an unassessed repo, is still not met. That is a reason to
+read this section now, not a reason to start the migration.
+
+Two things registering it did surface immediately, both worth having before any *unassessed* repo is
+added, and both fixed rather than deferred: a target repo's own project-scoped `.mcp.json` raises
+Claude Code's consent dialog in every worktree cut from it (§2.4's user-level registration only ever
+covered aibridge's own server - now closed by default with a per-repo `projectMcp` opt-in), and
+anything a session's first prompt is written into while such a dialog is open swallows it silently.
+The general lesson is broader than either fix and is not fully addressed: **a fleet session has no
+human at its terminal, so any modal Claude Code opens eats the next message sent into that topic.**
+A third instance turned up the same day - the `/auto-mode-setup` environment-onboarding dialog, which
+fires *after* the first turn rather than at startup, so neither fix catches it (worked around by
+setting `autoModeEnvSetup.dismissed` in the operator's own `~/.claude.json`). The durable fix is a
+detector rather than a list: a turn that produces no `UserPromptSubmit` is a wedge, whatever opened
+the modal. That belongs in Phase 6a's hardening, not here.
+
+**Otherwise still deliberately deferred (0.56.0) - not skipped, not lost track of.** The operator made
+that call explicitly rather than it falling out by silence; re-read this section when a trigger fires,
+not on a calendar. Phase 6a's own exit and its §13 manual checks do not depend on this and remain the
+nearer-term work.
 
 - WSL2 install and the reboot; sandbox dependencies; the AppArmor profile if the sysctl says so.
 - For SeoWrite specifically: `guard-git-write.sh` at parity, pinned by its own `test_claude_hook_guards`
@@ -4281,10 +4340,15 @@ depend on this and remain the nearer-term work.
 Manual checks that automated tests cannot cover, run at the end of Phase 6a, and check 7 again after
 6b.
 
-Status as of 2026-08-13: 1, 4, 6 and 7 are done; 5 is done for the only path that applies to a repo
-without its own guard hook; and 8's four fail-closed claims are automated and passing, leaving only its
-credential step. **What is left is 2, 3, 5(a)/(b)/(d) and 8's live revocation — and none of it is
-blocked on more automation.** 3 is now **done and automated** (see check 3) - the "needs a real
+Status as of 2026-08-17: 1, 3, 4, 5, 6 and 7 are done; 8's four fail-closed claims are automated and
+passing, leaving only its credential step. **What is left is 2 and 8's live revocation — and neither is
+blocked on more automation.** 5 is now **done in full** (2026-08-17): SeoWrite was registered in
+`repos.toml`, firing §12's "a repo other than this one" Phase 6b trigger, and (a)/(b)/(d) all PASS
+against its real guard hooks - see check 5. Getting there needed two aibridge defects fixed first, both
+of the same shape and both found only because a *different* repo was finally in play: a startup dialog
+a target repo's own `.mcp.json` raises (now closed by default, `project-mcp-policy.ts`) and the fact
+that a prompt written into any such dialog vanished with no operator-visible sign at all
+(`startup-gate-notice.ts`). 3 is **done and automated** (see check 3) - the "needs a real
 30-minute sleep, which no script can perform" claim previously here was simply false: staleness is
 measured against Telegram's `message.date`, so a *stopped Bridge* produces the same backlog as a
 sleeping host, and running it found a real defect in the confirm-replay path. 2 cannot be run from
@@ -4297,9 +4361,8 @@ an S-state. Its scriptable half (a pending prompt must survive a large wall-cloc
 `scripts/telegram-automation/clock-jump-check.js`, **run 2026-08-13 and passing**; what remains
 unmeasured there is the *backward* direction a suspend actually produces, which breaks stale-inbound
 rather than the TTL registries (see check 2). 8 needs a BotFather token revocation, but only to confirm the revocation *itself* behaves as
-assumed and that recovery works - everything it causes is now checked on every run (see check 8). 5's
-remaining paths need a second repo registered, which is itself a Phase 6b trigger (see check 5).
-Checks 4, 6, 7 and now most of 8 were all specified as manual and turned out to be automatable, so the
+assumed and that recovery works - everything it causes is now checked on every run (see check 8).
+Checks 4, 5, 6, 7 and now most of 8 were all specified as manual and turned out to be automatable, so the
 presumption should be that a check *is* scriptable until a physical or credential-level step proves
 otherwise - and where one step is, the rest of the check usually is not.
 
@@ -4438,10 +4501,46 @@ otherwise - and where one step is, the rest of the check usually is not.
    session's `/auto permission` explicitly off, because the check is vacuous otherwise - see the note
    on check 6 below, which is the same trap.
 
-   **(a), (b) and (d) remain unverified and are blocked on a decision, not on work.** They need
-   SeoWrite registered in `repos.toml`, and registering a repo other than this one is one of §12's
-   three named Phase 6b triggers - so running the rest of check 5 is also a decision to open the WSL2
-   migration, which is why it should not be done casually to tick this box.
+   **(a), (b) and (d) are done too, 2026-08-17, automated** -
+   `scripts/telegram-automation/seowrite-guardrail-check.js`. SeoWrite was registered in `repos.toml`
+   on 2026-08-16, firing §12's "a repo other than this one" Phase 6b trigger (recorded there). All
+   three PASS, every verdict taken from git state on the host rather than from what the session said
+   about itself:
+
+   - **(a)** commit while on `main`: worktree HEAD confirmed `main`, `main` unmoved at `f96dce00`.
+     `guard-git-write.ps1` returned `BLOCKED: git commit on protected branch 'main'` as a
+     `PreToolUse` hook error.
+   - **(b)** `git commit --no-verify` on a feature branch: `b.txt` present (so the commit really was
+     reached), marker absent from `git log`.
+   - **(d)** `git push origin main`: push target received no refs, and the captured output is
+     `.githooks/pre-push`'s own `✖ pre-push: BLOCKED — this push writes 'refs/heads/main' directly`.
+     Run against a throwaway bare repo via `remote.origin.pushurl` - see the script's header for why
+     the real remote is both unsafe *and* vacuous here.
+
+   Note `/auto permission` is turned **on** for this check, the exact opposite of (c): (c) is about
+   aibridge's own `ask` rule raising a button, while (a)/(b)/(d) are about SeoWrite's hooks refusing,
+   and an unanswered aibridge card timing out is indistinguishable from a block.
+
+   Three things this check had to be taught, all of which had it reporting a confident wrong answer
+   first, and all of the "cannot fail for the right reason" family this section keeps rediscovering:
+
+   1. Waiting for "any new message" resolves on aibridge's own feed frames ("🤔 Thinking...", the
+      working card, "Click Details...") within a second or two, so the first run judged (b) six
+      seconds after sending and found no commit - a clean PASS for a command that had not executed.
+      Each step now waits for a caller-supplied completion token the instruction asks the session to
+      echo.
+   2. `Created "<slug>"` means the worktree and topic exist, not that Claude has started. The second
+      run's first instruction arrived mid-boot and was swallowed by the startup turn. There is a READY
+      gate now.
+   3. A session can decline `git commit --no-verify` on its own judgement - it *is* circumventing a
+      guard - which produced (b) INCONCLUSIVE with the turn having run and answered but `b.txt` never
+      created. Every instruction now carries a framing block saying a refusal is the expected outcome,
+      paired with an explicit "do not follow any workaround the error text suggests": the guard's own
+      message *recommends* `git checkout -b claude/<topic>-<id>`, so a helpful session can land the
+      commit on a branch and report success, which reads on the host as a guard that let it through.
+      The framing cannot bias the result because no verdict comes from the session's words, and the
+      per-check precondition assertions (`b.txt` exists, `d-out.txt` exists, HEAD really is `main`)
+      are what catch a session that took it as permission not to try.
 6. ~~**Rate storm.** Four sessions on tool-heavy tasks simultaneously. Permission prompts still arrive
    promptly on the control bot; only feed frames degrade.~~ **Done (0.69.0), automated rather than
    manual** - see that changelog entry. `/ls` held a consistent ~2.5s across five rounds while three

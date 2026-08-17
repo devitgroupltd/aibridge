@@ -47,9 +47,14 @@ One genuine defect came out of it too, worth knowing because its failure mode is
 NUL bytes in a source file make ripgrep skip that file silently, so a grep-driven search quietly
 misses it (see S-1).
 
-Outstanding verification work is §13's checks **2, 3, 5(a)/(b)/(d) and 8's live revocation** — checks
-5(c), 6 and 7 were run and recorded on 2026-08-13, and 8's four fail-closed claims were automated the
-same day (`packages/bridge/test/compromise-drill.test.ts`). **Check 3 is now done and automated**
+Outstanding verification work is §13's checks **2 and 8's live revocation** — everything else is done.
+Checks 5(c), 6 and 7 were run and recorded on 2026-08-13, and 8's four fail-closed claims were automated
+the same day (`packages/bridge/test/compromise-drill.test.ts`). **Check 5 is done in full as of
+2026-08-17** (`scripts/telegram-automation/seowrite-guardrail-check.js`): SeoWrite was registered in
+`repos.toml`, (a)/(b)/(d) all PASS against its real guard hooks, and every verdict is git state on the
+host rather than the session's own account of itself. That registration fired §12's third Phase 6b
+trigger (recorded there — note it is the trigger's *letter* rather than its spirit, since SeoWrite is the
+pilot project whose blast radius §10.4.1 already assessed). **Check 3 is also done and automated**
 (`stale-command-check.js`) - the old claim
 that it needed a real sleep was false, since staleness is measured against Telegram's `message.date`
 and a *stopped Bridge* produces the same backlog; running it found a real defect (an operator-confirmed
@@ -65,10 +70,25 @@ survives a +2h wall-clock jump and still resolves. What no automation covers is 
 real suspend leaves behind, which would break stale-inbound rather than the TTL registries (§13 check
 2). 8 needs a BotFather revocation, but now
 only to confirm the revocation itself 401s as assumed and that recovery works, since everything it
-*causes* is checked on every run; and 5's remaining paths need SeoWrite registered in `repos.toml`,
-which is itself one of §12's three named Phase 6b triggers. Note that checks 4, 6, 7 and most of 8 were
+*causes* is checked on every run. Note that checks 4, 5, 6, 7 and most of 8 were
 all specified as manual and turned out to be scriptable, so assume a check *is* automatable until a
 physical or credential-level step proves otherwise — and when one step is, the rest usually is not.
+
+**One open lesson, bigger than the two fixes it produced (2026-08-17).** Running check 5 meant running
+a session against a repo other than this one for the first time, and that immediately surfaced two
+defects of the same shape: a target repo's own project-scoped `.mcp.json` raises Claude Code's consent
+dialog in every worktree cut from it (§2.4's user-level registration only ever covered aibridge's own
+server — now rejected by default with a per-repo `projectMcp` opt-in, `project-mcp-policy.ts`), and a
+first prompt written into any such dialog vanished with **no operator-visible sign at all** — `/ls`
+`idle`, `/usage` $0.00, a `🤔 Thinking...` placeholder, and its trailing `\r` answering the dialog.
+`confirmSubmitted` cannot catch this: it only asks whether the PTY produced output, and a dialog being
+answered and redrawn is plenty. `startup-gate-notice.ts` makes that case loud. **What is not fixed is
+the class:** a fleet session has no human at its terminal, so *any* modal Claude Code opens eats the
+next message sent into that topic. A third instance turned up the same day — `/auto-mode-setup`, which
+fires *after* the first turn, so neither fix catches it (worked around by setting
+`autoModeEnvSetup.dismissed` in `~/.claude.json`, which is where that gate reads from). Don't chase
+dialogs one at a time; the durable form is a detector — a turn that produces no `UserPromptSubmit` is a
+wedge, whatever opened the modal.
 
 ## What this project is
 
@@ -210,7 +230,9 @@ interactive TUI (subscription billing + `AskUserQuestion` availability), and mak
 `c:\data\worktrees\<slug>`. Adding a project means editing that TOML file, not touching any aibridge
 code path. Secrets (bot tokens, a dedicated fleet-only SSH key) live in `%APPDATA%\aibridge`, kept
 separate from `$STATE` because one is disposable and the other isn't — never in a worktree or target
-repo.
+repo. One field there is not a convenience: **`projectMcp`** (the only non-string key, bare `true`/
+`false`) decides whether a registered repo's *own* project-scoped `.mcp.json` servers may run, and it
+is closed by default — see `project-mcp-policy.ts`, and the open lesson above for why.
 
 ## Key constraints worth re-reading before touching related code
 
