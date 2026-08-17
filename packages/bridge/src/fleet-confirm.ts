@@ -7,11 +7,13 @@ import type { InlineKeyboardButton } from "./telegram.ts";
  * reports fleet status instead of posting a card: there would be no valid kind to construct. */
 export type AutoConfirmKind = `${AutoCategory}-${"on" | "off"}`;
 
-export type FleetConfirmKind = "kill" | "rm" | "rm-topic" | AutoConfirmKind;
+export type FleetConfirmKind = "kill" | "rm" | "rm-topic" | "rm-worktree" | AutoConfirmKind;
 
-/** Everything `postFleetConfirm` can post a card for - i.e. `FleetConfirmKind` minus `rm-topic`,
- * which has no session rows and its own poster (`postOrphanTopicRmConfirm`). */
-export type FleetBulkKind = Exclude<FleetConfirmKind, "rm-topic">;
+/** Everything `postFleetConfirm` can post a card for - i.e. `FleetConfirmKind` minus the two kinds
+ * that have no session rows and their own posters (`rm-topic`/`postOrphanTopicRmConfirm`,
+ * `rm-worktree`/`postOrphanWorktreeConfirm`). Both carry their targets in the pending entry itself
+ * rather than as slugs to look up, which is what makes them postable with nothing in the DB. */
+export type FleetBulkKind = Exclude<FleetConfirmKind, "rm-topic" | "rm-worktree">;
 
 export const autoConfirmKind = (category: AutoCategory, on: boolean): AutoConfirmKind => `${category}-${on ? "on" : "off"}`;
 
@@ -46,7 +48,12 @@ export interface PendingFleetConfirm {
   id: string;
   kind: FleetConfirmKind;
   /** Empty for `rm-topic` - that variant acts on `topicId` directly, there is no session row (by
-   * definition: it's an orphaned topic with nothing in the DB to look up). */
+   * definition: it's an orphaned topic with nothing in the DB to look up).
+   *
+   * For `rm-worktree` these are directory names under the worktrees root rather than slugs anything
+   * can be looked up by - same reason, opposite side of the matrix: the whole point is that no row
+   * exists. `orphan-worktrees.ts` re-validates every one of them at deletion time rather than
+   * trusting a value that has made a round trip through Telegram. */
   slugs: string[];
   topicId: number | undefined;
   messageId: number;
@@ -91,6 +98,7 @@ const FLEET_CONFIRM_KINDS = Object.keys({
   kill: true,
   rm: true,
   "rm-topic": true,
+  "rm-worktree": true,
   "permission-on": true,
   "permission-off": true,
   "answer-on": true,
