@@ -4421,6 +4421,17 @@ nearer-term work.
 Manual checks that automated tests cannot cover, run at the end of Phase 6a, and check 7 again after
 6b.
 
+**Running them: `node scripts/telegram-automation/run-checks.js`** (2026-08-17). Almost every check
+below turned out to be scriptable, and the scripts accumulated one per finding - but only one browser
+may use the persisted profile at a time, so they were only ever run one at a time by hand, and
+therefore only when something was already suspected. The runner runs them sequentially and prints one
+table. It refuses to flatter itself in three specific ways: a script in neither its `CHECKS` nor its
+`EXCLUDED` list is reported as UNACCOUNTED (so a check added later cannot be silently skipped
+forever), scripts that deliberately claim no verdict are classified `measurement` and always report
+READ-LOG rather than being counted green, and a check whose verdict cannot be found reports UNKNOWN
+and fails the run. `sandbox-check`'s *expected* outcome is EXPECTED-FAIL, so the day Phase 6b flips it
+the table says CHANGED instead of quietly going green.
+
 Status as of 2026-08-17: 1, 3, 4, 5, 6 and 7 are done; 8's four fail-closed claims are automated and
 passing, leaving only its credential step. **What is left is 2 and 8's live revocation — and neither is
 blocked on more automation.** 5 is now **done in full** (2026-08-17): SeoWrite was registered in
