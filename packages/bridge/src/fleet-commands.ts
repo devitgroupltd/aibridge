@@ -79,6 +79,11 @@ export type FleetCommand =
   | { kind: "repos"; action: "list" }
   | { kind: "repos"; action: "add"; name: string; path?: string; base?: string; model?: string }
   | { kind: "repos"; action: "rm"; name: string }
+  /** `/branches [<repo>]` - §4.5's fourth debris class (`orphan-branches.ts`): `claude/<slug>-<id>`
+   * branches whose session is gone. Its own kind rather than a `/repos branches` action because it
+   * acts on session leftovers rather than on the registry, and because a confirm card is nothing
+   * `fleet-reporting-commands.ts` is shaped to post. */
+  | { kind: "branches"; repo?: string }
   /** `/voice model [<name>]` / `/voice confirm [status|on|off]` - one command, two facets, same
    * "category first" shape `/auto`/`/default` already use (operator feedback, 2026-08-12: two
    * separately-named commands for two voice-input settings was one more thing to remember than
@@ -566,7 +571,7 @@ export function parseSkillsQuery(text: string): { term: string } | null {
  * forces the engine to backtrack into the `autostart` alternative (the same mechanism `voice` and
  * `voiceconfirm` have relied on here since before either was written). Any hand-rolled
  * `startsWith("/auto")` check added elsewhere would not have that property. */
-const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|remove|attach|pause|stop|resume|usage|budget|restart|merge|ship|detail|verbose|settings|auto|autostart|repos|voice|voiceconfirm|assist|router|default|os)\b/;
+const FLEET_COMMAND_NAME_RE = /^\/(new|ls|kill|remove|attach|pause|stop|resume|usage|budget|restart|merge|ship|detail|verbose|settings|auto|autostart|repos|branches|voice|voiceconfirm|assist|router|default|os)\b/;
 
 /**
  * Same command-name match as `parseFleetCommand`, but returns the bare word even when the rest of
@@ -638,6 +643,10 @@ export function parseFleetCommand(text: string): FleetCommand | null {
       return parseOs(rest);
     case "repos":
       return parseRepos(rest);
+    case "branches": {
+      const repo = rest.trim();
+      return { kind: "branches", repo: repo.length > 0 ? repo : undefined };
+    }
     case "voice":
       return parseVoice(rest);
     case "remove":
@@ -898,6 +907,8 @@ export function renderHelp(): string {
     "    off, only visible once /detail is full)",
     "  /settings - registered repos + concurrency budget",
     "  /repos [list|add <name> [path|git-url] [--base <b>] [--model <m>]|rm <name>] - manage repos.toml",
+    "  /branches [<repo>] - claude/<slug> branches whose session is gone; offers to delete only the",
+    "    fully-merged ones, and lists the rest with their commit counts",
     "  /autostart [status|install|uninstall] - manage the logon Task Scheduler entry",
     "  /voice model [<model>] - show/switch the Whisper model used for voice-note transcription",
     "    (bare /voice, or /voice <model> with no 'model' keyword, both still work)",

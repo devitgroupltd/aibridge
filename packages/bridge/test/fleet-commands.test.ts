@@ -584,6 +584,12 @@ describe("parseFleetCommand", () => {
     expect(parseFleetCommand("/repos list")).toEqual({ kind: "repos", action: "list" });
   });
 
+  test("/branches takes an optional repo name", () => {
+    expect(parseFleetCommand("/branches")).toEqual({ kind: "branches", repo: undefined });
+    expect(parseFleetCommand("/branches  ")).toEqual({ kind: "branches", repo: undefined });
+    expect(parseFleetCommand("/branches seowrite")).toEqual({ kind: "branches", repo: "seowrite" });
+  });
+
   test("/repos add with name and path only", () => {
     expect(parseFleetCommand("/repos add seowrite c:\\data\\projects\\seowrite")).toEqual({
       kind: "repos",

@@ -1,5 +1,5 @@
 ---
-version: 0.114.0
+version: 0.115.0
 status: solid
 last_modified_utc: 2026-08-17T16:15:00Z
 relates_to: >-
@@ -13,6 +13,24 @@ relates_to: >-
   is assumed to exist. aibridge's own testing convention is stated directly in §9 rather than deferred
   to a companion plan.
 changelog:
+  - "0.115.0 (2026-08-17): **§4.5's orphan matrix has a fourth case, and it is now reported**
+    (`orphan-branches.ts`, `/branches [<repo>]`). A session runs on `claude/<slug>-<id>`; `/rm`
+    deletes the topic, the row and the worktree directory and deliberately leaves the branch, because
+    slugs come from a prompt's first few words and two similar prompts weeks apart collide - at which
+    point the leftover branch is a finished session's real, unpushed work, which is why
+    `ensureWorktree` has always used `git branch -d` and never `-D`. Nothing was broken by that. What
+    was missing is that **nothing ever told the operator the branches exist**: measured on this host,
+    25 of them carrying unmerged commits, the oldest 11 days old, reachable from no topic, `/ls`, or
+    any other surface. Most were throwaway verification runs, which is exactly the problem - the few
+    that are not look identical and nobody has been shown either. Deliberately a command rather than
+    a boot card, unlike §4.5's third case: an orphaned *directory* causes an invisible `/new` failure
+    (`ensureWorktree`'s doc comment), while an orphaned *branch* causes nothing, and a 25-line card on
+    every restart is how the worktree card - which is load-bearing - stops being read. Only branches
+    fully merged into the repo's base are offered for deletion; unmerged ones are listed with their
+    commit counts and left alone, and an unresolvable base makes everything report as unmerged rather
+    than guessing (fail-closed). `removeOrphanBranch` re-checks every guard at tap time, as
+    `removeOrphanWorktree` does, and finishes with `git branch -d` so git itself refuses unmerged
+    commits even if every check above it were wrong."
   - "0.114.0 (2026-08-17): **the modal-eats-the-next-message class is closed, by a detector rather
     than by a list of dialogs** (`turn-start-watchdog.ts`). 0.113.0 recorded three instances in two
     days and fixed two of them at source; the third (`/auto-mode-setup`, which opens *after* the
@@ -1924,6 +1942,33 @@ reach (the thread itself is already dead to the Bot API) at all. The second is a
 not a gap left to close - the only remaining path is deleting it by hand from the Telegram client
 (Delete Topic), via the operator's own MTProto session rather than the bot; building bot-side detection
 for it would need the same missing topic-listing call already ruled out above.
+
+### 4.5.3 Orphaned session branches (implemented 0.115.0)
+
+The fourth "exists on one side, not the other" case, and the one the matrix never named. §2.3's
+session branch `claude/<slug>-<id>` outlives its session by design: `/rm` deletes the topic, the row
+and the worktree directory, and leaves the branch, because `ensureWorktree` cannot tell an empty husk
+from a finished session's unpushed work - slugs come from a prompt's first few words (`slug.ts`), so
+two similar prompts weeks apart collide. It therefore tries `git branch -d`, never `-D`, and on
+refusal takes the next free `-<id>` instead of destroying anything.
+
+That is correct and stays. What was missing is any *report*: measured on this host 2026-08-17, 25
+session branches carrying unmerged commits, oldest 11 days, reachable from no operator surface at all.
+`/branches [<repo>]` lists them per registered repo with each branch's commit count and date, and
+offers a confirm-gated delete for the fully-merged ones only.
+
+Two decisions distinguish it from §4.5's third case (`orphan-worktrees.ts`), and both are about not
+spending the operator's attention:
+
+- **A command, not a boot card.** An orphaned worktree *directory* causes an invisible failure - a
+  freed slug plus a leftover directory makes a later `/new` fail for reasons nothing surfaces - so it
+  earns an interrupt. An orphaned branch causes nothing. A 25-line report on every restart is how the
+  worktree card stops being read, and that one matters.
+- **Report-heavy, delete-light.** Unmerged is the *normal* state of a session branch, so the common
+  case posts no button at all rather than one that would act on zero branches. An unresolvable base
+  makes every branch report as unmerged (fail-closed), and `removeOrphanBranch` re-checks the branch
+  shape, the checked-out state and the session store at tap time before handing the last word to
+  `git branch -d`.
 
 ---
 

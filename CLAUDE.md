@@ -100,7 +100,20 @@ reporting-only — a blind retry into an open modal is what answered a security 
 the first place. `scripts/telegram-automation/turn-watchdog-check.js` is its false-positive check;
 run that, not just `bun test`, before changing either guard.
 
-**§4.5's orphan matrix has three cases, and all three are covered as of 2026-08-17.** An orphaned
+**§4.5's orphan matrix turned out to have four cases, and all four are covered as of 2026-08-17.**
+The fourth is an **orphaned session branch** (`orphan-branches.ts`, `/branches [<repo>]`):
+`claude/<slug>-<id>` outlives its session on purpose - `ensureWorktree` uses `git branch -d` and never
+`-D` because a leftover branch can be a finished session's real unpushed work - but nothing ever told
+the operator they existed (25 of them here, oldest 11 days, on no operator surface at all). Two things
+about it are deliberate and easy to undo: it is a **command, not a boot card** (an orphaned *directory*
+causes an invisible `/new` failure and earns an interrupt; an orphaned *branch* causes nothing, and a
+25-line card on every restart is how the worktree card stops being read), and it **only offers to
+delete fully-merged branches** - unmerged is the normal state of a session branch, so the usual result
+is a report with no button, and an unresolvable base makes everything read as unmerged rather than
+guessing. `removeOrphanBranch` re-checks every guard at tap time and gives `git branch -d` the last
+word.
+
+The first three: An orphaned
 Telegram topic (§4.5.2's `rm-topic` confirm) and an orphaned `claude.exe` (`orphan-scan.ts`) were
 already handled; a **worktree directory with no session row** was not, and `reconciliation.ts` cannot
 see it by construction — it walks rows and never touches the filesystem. That gap let 94M of debris

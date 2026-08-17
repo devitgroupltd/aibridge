@@ -38,6 +38,7 @@ import type { VoiceModeCommands } from "./voice-mode-commands.ts";
 import type { CardSenders } from "./card-senders.ts";
 import type { FeedWiring } from "./feed-wiring.ts";
 import type { NlDispatch } from "./nl-dispatch.ts";
+import type { BranchCleanupCommands } from "./branch-cleanup-commands.ts";
 import type { ReposRegistry } from "./repos-registry.ts";
 import type { LogFn } from "./logger.ts";
 import type { RuntimeSettings } from "./runtime-settings.ts";
@@ -63,6 +64,7 @@ export interface CommandDispatchOptions {
     | "handleResumeCommand"
   >;
   fleetReporting: FleetReportingCommands;
+  branchCleanup: Pick<BranchCleanupCommands, "handleBranchesCommand">;
   fleetConfirmFlow: Pick<FleetConfirmFlow, "handleUsageCommand">;
   deployLifecycle: Pick<DeployLifecycleCommands, "handleRestartCommand" | "handleMergeCommand" | "handleShipCommand" | "handleAutostartCommand">;
   osPowerCommands: Pick<OsPowerCommands, "handleOsCommand">;
@@ -174,6 +176,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
     confirmSessionCommand,
     sessionLifecycle,
     fleetReporting,
+    branchCleanup,
     fleetConfirmFlow,
     deployLifecycle,
     osPowerCommands,
@@ -233,6 +236,7 @@ export function createCommandDispatch(opts: CommandDispatchOptions): CommandDisp
 
     settings: (_cmd, ctx) => fleetReporting.handleSettingsCommand(ctx.threadId),
     repos: (cmd, ctx) => fleetReporting.handleReposCommand(cmd, ctx.threadId),
+    branches: (cmd, ctx) => fireAndForget(branchCleanup.handleBranchesCommand(cmd, ctx.threadId), log, "command-dispatch handleBranchesCommand"),
 
     usage: (cmd, ctx) => fireAndForget(fleetConfirmFlow.handleUsageCommand(cmd, ctx.threadId, ctx.currentSlug), log, "command-dispatch handleUsageCommand"),
 
