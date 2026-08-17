@@ -4,6 +4,7 @@ import type { FleetBulkKind, FleetConfirmKind, PendingFleetConfirm } from "./fle
 import type { ConfirmCards } from "./confirm-cards.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import type { SessionLifecycleCommands } from "./session-lifecycle-commands.ts";
+import { removeOrphanWorktree } from "./orphan-worktrees.ts";
 import type { RateGovernor } from "./rate-governor.ts";
 import { renderBulkRemoveNotes } from "./remove-outcome.ts";
 import type { Routing } from "./routing.ts";
@@ -99,6 +100,10 @@ export interface FleetConfirmFlowOptions {
   sessionLifecycle: Pick<SessionLifecycleCommands, "killSessionRow" | "removeSessionRow" | "resolveTargetSlug" | "applyAutoToggle">;
   confirmSessionCommand: ConfirmSessionCommand;
   usageWaiters: Map<string, { buffer: string; check: () => void }>;
+  /** Where session worktrees live (`fleetWorktreesRoot`, defaulting the same way `launchSession`
+   * does). Only the `rm-worktree` branch uses it, and it is passed rather than re-derived so the
+   * root a card was posted about and the root a tap deletes under cannot drift apart. */
+  worktreesRoot: string;
   supergroupChatId: string;
   log: LogFn;
 }
@@ -143,7 +148,7 @@ const BULK_KIND_COPY = {
 } satisfies Record<FleetBulkKind, { empty: string; verb: string }>;
 
 export function createFleetConfirmFlow(opts: FleetConfirmFlowOptions): FleetConfirmFlow {
-  const { controlBot, routing, sessionStore, confirmCards, fleetConfirmRegistry, sessionLifecycle, confirmSessionCommand, usageWaiters, supergroupChatId, log } = opts;
+  const { controlBot, routing, sessionStore, confirmCards, fleetConfirmRegistry, sessionLifecycle, confirmSessionCommand, usageWaiters, worktreesRoot, supergroupChatId, log } = opts;
 
   /** `BULK_KIND_COPY` for a kind that isn't statically known to be in it - i.e. `pending.kind`, which
    * is the full `FleetConfirmKind` including `rm-topic` (already early-returned by every caller).
@@ -194,6 +199,28 @@ export function createFleetConfirmFlow(opts: FleetConfirmFlowOptions): FleetConf
         log("WARN", `deleteForumTopic failed for orphan topic ${pending.topicId}: ${(err as Error).message}`);
         await confirmCards.finalizeFleetConfirmMessage(pending, "Telegram would not delete this topic - it may need to be removed by hand (topic menu -> Delete Topic).");
       }
+      return;
+    }
+
+    // §4.5's third orphan case, the mirror of `rm-topic` above: directories on disk with no session
+    // row. `pending.slugs` are directory names here, not slugs anything can be looked up by - by
+    // definition, since the absence of a row is the whole condition. Every guard is re-checked
+    // inside `removeOrphanWorktree` at the moment of deletion rather than inherited from whatever
+    // posted the card, which may be minutes old and has made a round trip through Telegram.
+    if (pending.kind === "rm-worktree") {
+      const removed: string[] = [];
+      const refused: string[] = [];
+      for (const slug of pending.slugs) {
+        try {
+          removeOrphanWorktree(worktreesRoot, slug, (s) => sessionStore.get(s) === undefined);
+          removed.push(slug);
+        } catch (err) {
+          refused.push(slug);
+          log("WARN", `refused to remove orphaned worktree "${slug}": ${(err as Error).message}`);
+        }
+      }
+      const note = refused.length > 0 ? ` ${refused.length} left in place - a session claimed the slug, or it stopped looking orphaned (see bridge.log): ${refused.join(", ")}` : "";
+      await confirmCards.finalizeFleetConfirmMessage(pending, removed.length > 0 ? `Deleted ${removed.length} orphaned worktree director${removed.length === 1 ? "y" : "ies"}: ${removed.join(", ")}.${note}` : `Nothing was deleted.${note}`);
       return;
     }
 

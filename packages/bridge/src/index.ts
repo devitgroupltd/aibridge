@@ -11,7 +11,7 @@ import { initFileLogging, log } from "./logger.ts";
 import { clearDeployMarker, isDeployMarkerStale, readDeployMarker, rollbackStaleDeploy } from "./deploy.ts";
 import { DetailsAnchorStore, DETAILS_ANCHOR_RETENTION_MS } from "./details-anchor-store.ts";
 import { BrowseRegistry } from "./browse-nav.ts";
-import { FleetConfirmRegistry } from "./fleet-confirm.ts";
+import { buildFleetConfirmKeyboard, FleetConfirmRegistry } from "./fleet-confirm.ts";
 import { createOsPowerCommands } from "./os-power-commands.ts";
 import { OsConfirmRegistry } from "./os-confirm.ts";
 import { StaleConfirmRegistry } from "./stale-confirm.ts";
@@ -34,7 +34,7 @@ import { CostStore } from "./cost-store.ts";
 import { startOtlpListener } from "./otlp-listener.ts";
 import { sweepExpiredPermissions } from "./permission-registry.ts";
 import { loadReposRegistry, type ReposRegistry } from "./repos-registry.ts";
-import { launchSession, resolveNodeExecutable } from "./session-launcher.ts";
+import { DEFAULT_WORKTREES_ROOT, launchSession, resolveNodeExecutable } from "./session-launcher.ts";
 import { startPipeServer } from "./pipe-server.ts";
 import { RateGovernor } from "./rate-governor.ts";
 import { Routing } from "./routing.ts";
@@ -49,6 +49,7 @@ import { createTypingIndicator } from "./typing-indicator.ts";
 import { restartSettleDelayMs } from "./restart-settle.ts";
 import { createSessionSupervisor } from "./session-supervisor.ts";
 import { createPtyIo, DEFAULT_ECHO_SETTLE_MS, DEFAULT_SUBMIT_CONFIRM_WINDOW_MS } from "./pty-io.ts";
+import { classifyOrphanWorktrees, hasGitEntry, listWorktreeDirs, renderOrphanWorktreeReport } from "./orphan-worktrees.ts";
 import { createTurnStartWatchdog, DEFAULT_TURN_START_TIMEOUT_MS, renderNoTurnStartedNotice } from "./turn-start-watchdog.ts";
 import { createWedgedRecoveryMarks } from "./wedged-recovery.ts";
 import { createFeedWiring } from "./feed-wiring.ts";
@@ -159,6 +160,10 @@ async function main(): Promise<void> {
   const selfCheckWorktreesRoot = process.env.SELF_CHECK_WORKTREES_ROOT ?? path.join(config.selfCheck.repoPath, ".worktrees");
   const selfCheckWorktreePath = path.join(selfCheckWorktreesRoot, config.selfCheck.slug);
   const fleetWorktreesRoot = process.env.AIBRIDGE_WORKTREES_ROOT;
+  // The same value `launchSession` resolves, made explicit here because the boot orphan scan and the
+  // `rm-worktree` tap both have to look at the directory sessions are genuinely cut into. Deriving
+  // it twice is how a scan ends up reporting a clean tree while pointed somewhere else entirely.
+  const effectiveWorktreesRoot = fleetWorktreesRoot ?? DEFAULT_WORKTREES_ROOT;
 
   // Constructed before `Routing` (moved 2026-08-11) so `Routing` can take it as its persistence
   // sink for `/auto permission`/`/auto answer` - see routing.ts's own doc comment on why those two
@@ -723,10 +728,47 @@ async function main(): Promise<void> {
       sessionLifecycle,
       confirmSessionCommand,
       usageWaiters,
+      worktreesRoot: effectiveWorktreesRoot,
       supergroupChatId: config.supergroupChatId,
       log,
     }),
   );
+
+  /**
+   * §4.5's third orphan case: a worktree directory with no session row. Posted at boot, once, into
+   * the control topic - see `orphan-worktrees.ts` for why this case existed unreported for months
+   * and why only some of what it finds is offered for deletion.
+   *
+   * Silent when there is nothing to report, unlike the "✅ Bridge is back up." line that follows it:
+   * a clean tree is the normal state and a 🧹 line on every single restart is how a real one stops
+   * being read.
+   */
+  async function postOrphanWorktreeConfirm(): Promise<void> {
+    const orphans = classifyOrphanWorktrees({
+      dirNames: listWorktreeDirs(effectiveWorktreesRoot),
+      knownSlugs: sessionStore.all().map((r) => r.slug),
+      hasGitEntry: (name) => hasGitEntry(effectiveWorktreesRoot, name),
+    });
+    if (orphans.length === 0) return;
+    const removable = orphans.filter((o) => o.removable).map((o) => o.slug);
+    log("WARN", `${orphans.length} worktree director(ies) under ${effectiveWorktreesRoot} have no session row (§4.5); ${removable.length} removable: ${orphans.map((o) => o.slug).join(", ")}`);
+    const text = renderOrphanWorktreeReport(effectiveWorktreesRoot, orphans);
+    try {
+      // No button at all when nothing is safe to delete - a "Yes, proceed" that would act on zero
+      // directories is a card that lies about what tapping it does.
+      if (removable.length === 0) {
+        confirmSessionCommand(undefined, text);
+        return;
+      }
+      const id = randomUUID().slice(0, 8);
+      const sent = await controlBot.sendMessage(config.supergroupChatId, undefined, `${text}\n\nDelete the ${removable.length} listed above?`, {
+        inline_keyboard: buildFleetConfirmKeyboard("rm-worktree", id),
+      });
+      fleetConfirmRegistry.add({ id, kind: "rm-worktree", slugs: removable, topicId: undefined, messageId: sent.message_id });
+    } catch (err) {
+      log("WARN", `failed to post the orphaned-worktree report: ${(err as Error).message}`);
+    }
+  }
 
   const fleetReporting = createFleetReportingCommands({
     controlBot,
@@ -939,6 +981,11 @@ async function main(): Promise<void> {
   // Telegram topic was deleted while the Bridge was down, then resumes everything else live.
   if (process.env.AIBRIDGE_SKIP_LAUNCH !== "1") {
     await sessionSupervisor.runStartupReconciliation();
+    // §4.5's third orphan case (orphan-worktrees.ts): directories on disk with no session row.
+    // Deliberately *outside* `runStartupReconciliation`, which returns early when there are no rows
+    // to reconcile - and "every session removed, every directory left behind" is precisely the state
+    // this exists to notice, so it must run in exactly the case that function skips.
+    await postOrphanWorktreeConfirm();
     // Unconditional, unlike reportOrphanProcesses'/reapRowsWithDeletedTopics' own messages above
     // (which only post when there's something to report) - /restart's own "...once it's back up"
     // message otherwise has no matching confirmation, so there was no way to tell a clean restart
