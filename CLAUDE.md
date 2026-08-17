@@ -100,6 +100,20 @@ reporting-only — a blind retry into an open modal is what answered a security 
 the first place. `scripts/telegram-automation/turn-watchdog-check.js` is its false-positive check;
 run that, not just `bun test`, before changing either guard.
 
+**§4.5's orphan matrix has three cases, and all three are covered as of 2026-08-17.** An orphaned
+Telegram topic (§4.5.2's `rm-topic` confirm) and an orphaned `claude.exe` (`orphan-scan.ts`) were
+already handled; a **worktree directory with no session row** was not, and `reconciliation.ts` cannot
+see it by construction — it walks rows and never touches the filesystem. That gap let 94M of debris
+accumulate unnoticed over months, all of it from `/rm`s that lost `removeWorktree`'s documented
+Windows lock race, and it is not merely untidy: `ensureWorktree`'s doc comment explains how a freed
+slug plus a leftover directory turns into a `/new` that fails for invisible reasons.
+`orphan-worktrees.ts` scans at boot and posts a confirm card. Two things about it are deliberate: it
+reports every row-less directory but **only offers to delete those with no `.git` entry** (a live
+worktree always has one, and the operator may have cut their own under the same root), and
+`removeOrphanWorktree` re-checks every guard *at deletion time* rather than trusting the card — it is
+the only code in aibridge that recursively deletes a directory it did not create, and the card's
+payload has round-tripped through Telegram.
+
 ## What this project is
 
 aibridge is a daemon (the **Bridge**) that lets one developer drive several parallel Claude Code
