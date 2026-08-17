@@ -706,7 +706,6 @@ async function main(): Promise<void> {
       sessionLifecycle,
       confirmSessionCommand,
       usageWaiters,
-      orphanTopicNote: ORPHAN_TOPIC_NOTE,
       supergroupChatId: config.supergroupChatId,
       log,
     }),

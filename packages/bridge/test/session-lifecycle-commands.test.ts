@@ -671,6 +671,24 @@ describe("createSessionLifecycleCommands", () => {
       await sessionLifecycle.handleRmCommand({ kind: "rm", slug: "fix-bug" }, 1, undefined);
       expect(sessionStore.get("fix-bug")).toBeUndefined();
       expect(confirmed[0]?.text).toContain('Removed "fix-bug"');
+      expect(confirmed[0]?.text).toContain("worktree and topic deleted");
+    });
+
+    // End-to-end for the 2026-08-17 finding, so "the renderer is correct but nothing calls it" is not
+    // a way for this to regress. The confirmation the operator actually receives must stop claiming a
+    // worktree deletion that didn't happen, and must name the directory left behind.
+    test("handleRmCommand's single-slug form stops claiming a worktree it could not delete", async () => {
+      const { sessionLifecycle, sessionStore, confirmed } = setup({
+        removeWorktree: async () => {
+          throw new Error("error: failed to delete '...': Permission denied");
+        },
+      });
+      sessionStore.insert(row());
+      await sessionLifecycle.handleRmCommand({ kind: "rm", slug: "fix-bug" }, 1, undefined);
+      expect(sessionStore.get("fix-bug")).toBeUndefined();
+      expect(confirmed[0]?.text).toContain('Removed "fix-bug" - topic deleted.');
+      expect(confirmed[0]?.text).toContain("c:\\does\\not\\exist\\fix-bug");
+      expect(confirmed[0]?.text).not.toContain("worktree and topic deleted");
     });
   });
 
@@ -908,12 +926,11 @@ describe("createSessionLifecycleCommands", () => {
       expect(controlBot.forumTopicCalls.closed).toEqual([5]);
     });
 
-    test("removeSessionRow deletes the row and its topic, reporting whether the topic delete succeeded", async () => {
+    test("removeSessionRow deletes the row and its topic, reporting both teardown steps", async () => {
       const { sessionLifecycle, sessionStore, controlBot } = setup();
       const r = row();
       sessionStore.insert(r);
-      const topicDeleted = await sessionLifecycle.removeSessionRow(r);
-      expect(topicDeleted).toBe(true);
+      expect(await sessionLifecycle.removeSessionRow(r)).toEqual({ topicDeleted: true, worktreeRemoved: true });
       expect(sessionStore.get("fix-bug")).toBeUndefined();
       expect(controlBot.forumTopicCalls.deleted).toEqual([5]);
     });
@@ -929,8 +946,26 @@ describe("createSessionLifecycleCommands", () => {
       });
       const r = row();
       sessionStore.insert(r);
-      const topicDeleted = await sessionLifecycle.removeSessionRow(r);
-      expect(topicDeleted).toBe(false);
+      expect(await sessionLifecycle.removeSessionRow(r)).toEqual({ topicDeleted: false, worktreeRemoved: true });
+      expect(sessionStore.get("fix-bug")).toBeUndefined();
+    });
+
+    // The half that was invisible until 2026-08-17: `removeWorktree` losing its Windows lock race
+    // logged a WARN and nothing else, and `/rm` then told the operator "worktree and topic deleted".
+    // Nine orphaned directories under c:\data\worktrees had accumulated that way, each one a full
+    // source tree from a `/rm` that reported a clean deletion.
+    //
+    // The row still goes, deliberately - `worktree.ts` and §4.5.2 both turn on a failed teardown not
+    // wedging the slug - so the returned outcome is the only thing that can carry the fact.
+    test("removeSessionRow reports a failed worktree removal, and still frees the row", async () => {
+      const { sessionLifecycle, sessionStore } = setup({
+        removeWorktree: async () => {
+          throw new Error("error: failed to delete 'node_modules/...': Permission denied");
+        },
+      });
+      const r = row();
+      sessionStore.insert(r);
+      expect(await sessionLifecycle.removeSessionRow(r)).toEqual({ topicDeleted: true, worktreeRemoved: false });
       expect(sessionStore.get("fix-bug")).toBeUndefined();
     });
   });
@@ -1308,7 +1343,7 @@ describe("createSessionLifecycleCommands", () => {
         confirmSessionCommand: (topicId, text) => confirmed.push({ topicId, text }),
         removeSessionRow: async (r) => {
           calls.removedRows.push(r.slug);
-          return true;
+          return { topicDeleted: true, worktreeRemoved: true };
         },
         getRow: () => undefined,
         untrack: (slug) => calls.untracked.push(slug),

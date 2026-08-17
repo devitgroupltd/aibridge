@@ -11,6 +11,7 @@ import { AUTO_CATEGORIES, buildLsDetail, newSessionContent, renderAttach, render
 import { checkConcurrencyCap, WEIGHTED_CAP } from "./concurrency-cap.ts";
 import { monotonicNowMs } from "./monotonic-clock.ts";
 import { PermissionRegistry } from "./permission-registry.ts";
+import { ORPHAN_TOPIC_NOTE, orphanWorktreeNote, renderBulkRemoveNotes, renderRemoveConfirmation, type RemoveSessionRowResult } from "./remove-outcome.ts";
 import type { ReposRegistry, RepoEntry } from "./repos-registry.ts";
 import { resolveRepoNameFuzzy } from "./repos-registry.ts";
 import type { Routing } from "./routing.ts";
@@ -107,12 +108,19 @@ export interface SessionLifecycleCommandsOptions {
   log?: LogFn;
   /** Injectable clock, same convention as quota-alarms.ts. */
   now?: () => string;
+  /** Injectable in place of `worktree.ts`'s real `removeWorktree` - the same treatment
+   * `NewSessionTeardownDeps.removeWorktreeFn` already gets, and for the same reason: the real one
+   * shells out to `git worktree remove` against the host. `removeSessionRow`'s *failure* branch is
+   * the point, since a fixture row's path never exists and the real function early-returns, so
+   * without this the "the worktree could not be deleted" outcome is unreachable from a test - which
+   * is precisely how it went unreported to the operator for as long as it did. */
+  removeWorktree?: (repoPath: string, worktreePath: string) => Promise<unknown>;
 }
 
 export interface SessionLifecycleCommands {
   resolveTargetSlug(explicit: string | undefined, currentSlug: string | undefined): { slug: string } | { error: string };
   killSessionRow(row: SessionRow): Promise<void>;
-  removeSessionRow(row: SessionRow): Promise<boolean>;
+  removeSessionRow(row: SessionRow): Promise<RemoveSessionRowResult>;
   postOrphanTopicRmConfirm(topicId: number): Promise<void>;
   handleNewCommand(cmd: Extract<FleetCommand, { kind: "new" }>, controlTopicId: number | undefined): Promise<void>;
   handleLsCommand(topicId: number | undefined): void;
@@ -134,12 +142,10 @@ export interface SessionLifecycleCommands {
   startFirstTurn(slug: string, topicId: number, cmd: Extract<FleetCommand, { kind: "new" }>, session: LaunchedSession, sessionMode: Mode): Promise<void>;
 }
 
-/** §4.5.2's note appended to an `/rm` confirmation whenever `deleteForumTopic` failed above -
- * without this the operator only finds out days later, by eye, that a topic was left behind
- * (as happened live: two such orphans had accumulated with nothing pointing at them). Naming
- * `/rm` explicitly rather than just describing the fix, since that's the exact recovery step
- * (§4.5.2's `rm-topic` confirm below, keyed off the orphaned topic's own thread id). */
-export const ORPHAN_TOPIC_NOTE = " (Telegram topic itself could not be deleted - send /remove inside it directly to clean it up)";
+/** Re-exported from `remove-outcome.ts`, where it now lives beside the worktree half it was missing
+ * a counterpart for. Kept exported from here because it is part of this module's public surface and
+ * both the test suite and `fleet-confirm-flow.ts` already import it from this path. */
+export { ORPHAN_TOPIC_NOTE } from "./remove-outcome.ts";
 
 /** Extracted out of `handleNewCommand` so the pendingAttachment-after-launch logic (note text, log
  * line, `sourceText` override) is independently testable - `handleNewCommand` itself can't be, past
@@ -179,7 +185,7 @@ export interface NewSessionTeardownDeps {
   confirmSessionCommand: (topicId: number | undefined, text: string) => void;
   /** `removeSessionRow` - `/rm`'s own teardown, reused verbatim once a row exists rather than
    * reimplemented here where the two copies could drift. */
-  removeSessionRow: (row: SessionRow) => Promise<boolean>;
+  removeSessionRow: (row: SessionRow) => Promise<RemoveSessionRowResult>;
   getRow: (slug: string) => SessionRow | undefined;
   untrack: (slug: string) => void;
   clearPtyWrite: (slug: string) => void;
@@ -225,7 +231,12 @@ export async function abandonHalfBuiltSession(
     const row = deps.getRow(attempt.slug);
     if (row) {
       try {
-        if (!(await deps.removeSessionRow(row))) leftBehind = ORPHAN_TOPIC_NOTE;
+        // Both halves, same as `/rm`'s own form: this path already told the operator about a
+        // worktree it could not delete when it tears one down itself (the `else if` branch below),
+        // and had no reason to stay quieter when the teardown goes through `removeSessionRow`.
+        const outcome = await deps.removeSessionRow(row);
+        if (!outcome.topicDeleted) leftBehind += ORPHAN_TOPIC_NOTE;
+        if (!outcome.worktreeRemoved) leftBehind += orphanWorktreeNote(row.worktreePath);
       } catch (rmErr) {
         log("WARN", `teardown of ${label} via removeSessionRow failed: ${(rmErr as Error).message}`);
       }
@@ -333,6 +344,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
   } = opts;
   const log = opts.log ?? (() => {});
   const nowIso = opts.now ?? (() => new Date().toISOString());
+  const removeWorktreeFn = opts.removeWorktree ?? removeWorktree;
 
   /** Fleet-lifecycle commands take an optional `<slug>`, falling back to "the session this
    * message's own topic belongs to" (§4.2: "`/kill` with no argument inside a session topic kills
@@ -387,11 +399,13 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
   }
 
   /** The actual teardown `/rm` does for one row - shared by the single-slug form and the bulk
-   * `--dead`/`--prefix` forms below, so the two can't drift. Returns whether the Telegram topic
-   * itself was actually deleted - the DB row is removed either way (§4.5.2: a Telegram-side
-   * failure here, e.g. `TOPIC_ID_INVALID`, shouldn't leave a zombie row behind), but callers use
-   * this to tell the operator when a topic was left orphaned rather than silently succeeding. */
-  async function removeSessionRow(row: SessionRow): Promise<boolean> {
+   * `--dead`/`--prefix` forms below, so the two can't drift. Reports both teardown steps
+   * independently: the DB row is removed whatever happens (§4.5.2: a Telegram-side failure here,
+   * e.g. `TOPIC_ID_INVALID`, shouldn't leave a zombie row behind, and a worktree git could not
+   * delete must not wedge the slug forever), so the outcomes are the only thing that can tell the
+   * operator what was actually left behind. `remove-outcome.ts` renders them, and has the story of
+   * why the worktree half used to be a `bridge.log` `WARN` and nothing more. */
+  async function removeSessionRow(row: SessionRow): Promise<RemoveSessionRowResult> {
     const { slug } = row;
     if (row.state !== "dead") {
       sessionSupervisor.getPtyProcess(slug)?.kill();
@@ -404,9 +418,11 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     // its `cwd` to reach `origin` at all.
     cleanupDiffRefs(row.worktreePath, slug);
 
+    let worktreeRemoved = true;
     try {
-      await removeWorktree(row.repoPath, row.worktreePath);
+      await removeWorktreeFn(row.repoPath, row.worktreePath);
     } catch (err) {
+      worktreeRemoved = false;
       log("WARN", `removeWorktree failed for "${slug}": ${(err as Error).message}`);
     }
     // attachment-inbox.ts's own doc comment on `commonDirByWorktree`: this path (always
@@ -425,7 +441,7 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     sessionStore.remove(slug);
     routing.remove(slug);
     feedWiring.forgetSession(slug);
-    return topicDeleted;
+    return { topicDeleted, worktreeRemoved };
   }
 
   /** §4.5.2: posts the confirm card for deleting a Telegram topic that has no matching session
@@ -898,13 +914,16 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
         confirmSessionCommand(topicId, "No dead sessions matched - nothing removed.");
         return;
       }
-      let allTopicsDeleted = true;
+      let anyTopicLeft = false;
+      const worktreesLeft: string[] = [];
       for (const row of targets) {
-        if (!(await removeSessionRow(row))) allTopicsDeleted = false;
+        const outcome = await removeSessionRow(row);
+        if (!outcome.topicDeleted) anyTopicLeft = true;
+        if (!outcome.worktreeRemoved) worktreesLeft.push(row.slug);
       }
       confirmSessionCommand(
         topicId,
-        `Removed ${targets.length} dead session${targets.length === 1 ? "" : "s"}: ${targets.map((r) => r.slug).join(", ")}${allTopicsDeleted ? "" : ORPHAN_TOPIC_NOTE}`,
+        `Removed ${targets.length} dead session${targets.length === 1 ? "" : "s"}: ${targets.map((r) => r.slug).join(", ")}${renderBulkRemoveNotes(anyTopicLeft, worktreesLeft)}`,
       );
       return;
     }
@@ -925,8 +944,8 @@ export function createSessionLifecycleCommands(opts: SessionLifecycleCommandsOpt
     }
     const row = getRowOrReportMissing(resolved.slug, topicId);
     if (!row) return;
-    const topicDeleted = await removeSessionRow(row);
-    confirmSessionCommand(topicId, `Removed "${row.slug}" - worktree and topic deleted.${topicDeleted ? "" : ORPHAN_TOPIC_NOTE}`);
+    const outcome = await removeSessionRow(row);
+    confirmSessionCommand(topicId, renderRemoveConfirmation(row.slug, row.worktreePath, outcome));
   }
 
   function handleAttachCommand(cmd: Extract<FleetCommand, { kind: "attach" }>, topicId: number | undefined, currentSlug: string | undefined): void {
