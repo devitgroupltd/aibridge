@@ -5,6 +5,7 @@ import type { ConfirmCards } from "./confirm-cards.ts";
 import type { FleetCommand } from "./fleet-commands.ts";
 import type { SessionLifecycleCommands } from "./session-lifecycle-commands.ts";
 import type { RateGovernor } from "./rate-governor.ts";
+import { renderBulkRemoveNotes } from "./remove-outcome.ts";
 import type { Routing } from "./routing.ts";
 import type { SessionRow, SessionStore } from "./session-store.ts";
 import type { ConfirmSessionCommand } from "./session-supervisor.ts";
@@ -98,7 +99,6 @@ export interface FleetConfirmFlowOptions {
   sessionLifecycle: Pick<SessionLifecycleCommands, "killSessionRow" | "removeSessionRow" | "resolveTargetSlug" | "applyAutoToggle">;
   confirmSessionCommand: ConfirmSessionCommand;
   usageWaiters: Map<string, { buffer: string; check: () => void }>;
-  orphanTopicNote: string;
   supergroupChatId: string;
   log: LogFn;
 }
@@ -143,7 +143,7 @@ const BULK_KIND_COPY = {
 } satisfies Record<FleetBulkKind, { empty: string; verb: string }>;
 
 export function createFleetConfirmFlow(opts: FleetConfirmFlowOptions): FleetConfirmFlow {
-  const { controlBot, routing, sessionStore, confirmCards, fleetConfirmRegistry, sessionLifecycle, confirmSessionCommand, usageWaiters, orphanTopicNote, supergroupChatId, log } = opts;
+  const { controlBot, routing, sessionStore, confirmCards, fleetConfirmRegistry, sessionLifecycle, confirmSessionCommand, usageWaiters, supergroupChatId, log } = opts;
 
   /** `BULK_KIND_COPY` for a kind that isn't statically known to be in it - i.e. `pending.kind`, which
    * is the full `FleetConfirmKind` including `rm-topic` (already early-returned by every caller).
@@ -216,19 +216,22 @@ export function createFleetConfirmFlow(opts: FleetConfirmFlowOptions): FleetConf
       return;
     }
 
-    let allTopicsDeleted = true;
+    let anyTopicLeft = false;
+    const worktreesLeft: string[] = [];
     for (const row of rows) {
       if (pending.kind === "kill") {
         await sessionLifecycle.killSessionRow(row);
       } else if (pending.kind === "rm") {
-        if (!(await sessionLifecycle.removeSessionRow(row))) allTopicsDeleted = false;
+        const outcome = await sessionLifecycle.removeSessionRow(row);
+        if (!outcome.topicDeleted) anyTopicLeft = true;
+        if (!outcome.worktreeRemoved) worktreesLeft.push(row.slug);
       } else {
         // Unreachable: `rm-topic` and every auto kind returned above. Loud rather than silently
         // falling into a teardown - see this loop's own history for why that default matters.
         log("WARN", `executeFleetConfirm reached the kill/rm loop with unhandled kind "${pending.kind}" - "${row.slug}" left untouched`);
       }
     }
-    await confirmCards.finalizeFleetConfirmMessage(pending, summary(pending.kind === "rm" && !allTopicsDeleted ? orphanTopicNote : ""));
+    await confirmCards.finalizeFleetConfirmMessage(pending, summary(pending.kind === "rm" ? renderBulkRemoveNotes(anyTopicLeft, worktreesLeft) : ""));
   }
 
   /** `/kill --all --force`/`/rm --all --force` (operator-requested 2026-08-08): the same teardown
@@ -241,16 +244,19 @@ export function createFleetConfirmFlow(opts: FleetConfirmFlowOptions): FleetConf
       confirmSessionCommand(topicId, BULK_KIND_COPY[kind].empty);
       return;
     }
-    let allTopicsDeleted = true;
+    let anyTopicLeft = false;
+    const worktreesLeft: string[] = [];
     for (const row of targets) {
       if (kind === "kill") {
         await sessionLifecycle.killSessionRow(row);
-      } else if (!(await sessionLifecycle.removeSessionRow(row))) {
-        allTopicsDeleted = false;
+      } else {
+        const outcome = await sessionLifecycle.removeSessionRow(row);
+        if (!outcome.topicDeleted) anyTopicLeft = true;
+        if (!outcome.worktreeRemoved) worktreesLeft.push(row.slug);
       }
     }
     const { verb } = BULK_KIND_COPY[kind];
-    const note = kind === "rm" && !allTopicsDeleted ? orphanTopicNote : "";
+    const note = kind === "rm" ? renderBulkRemoveNotes(anyTopicLeft, worktreesLeft) : "";
     confirmSessionCommand(topicId, `${verb} ${targets.length} session${targets.length === 1 ? "" : "s"}: ${targets.map((r) => r.slug).join(", ")}${note}`);
   }
 

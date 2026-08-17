@@ -4,6 +4,7 @@ import { FleetConfirmRegistry } from "../src/fleet-confirm.ts";
 import type { PendingFleetConfirm } from "../src/fleet-confirm.ts";
 import { RateGovernor } from "../src/rate-governor.ts";
 import { Routing } from "../src/routing.ts";
+import type { RemoveSessionRowResult } from "../src/remove-outcome.ts";
 import { SessionStore, type SessionRow } from "../src/session-store.ts";
 import { fakeControlBot } from "./helpers.ts";
 
@@ -133,7 +134,7 @@ describe("createStopIndicatorsForTopic", () => {
   });
 });
 
-function setup(overrides: { killSessionRow?: (row: SessionRow) => Promise<void>; removeSessionRow?: (row: SessionRow) => Promise<boolean>; resolveTargetSlug?: (explicit: string | undefined, currentSlug: string | undefined) => { slug: string } | { error: string } } = {}) {
+function setup(overrides: { killSessionRow?: (row: SessionRow) => Promise<void>; removeSessionRow?: (row: SessionRow) => Promise<RemoveSessionRowResult>; resolveTargetSlug?: (explicit: string | undefined, currentSlug: string | undefined) => { slug: string } | { error: string } } = {}) {
   const controlBot = fakeFleetBot();
   const routing = new Routing();
   const sessionStore = new SessionStore(":memory:");
@@ -155,7 +156,7 @@ function setup(overrides: { killSessionRow?: (row: SessionRow) => Promise<void>;
     }),
     removeSessionRow: overrides.removeSessionRow ?? (async (r: SessionRow) => {
       removed.push(r.slug);
-      return true;
+      return { topicDeleted: true, worktreeRemoved: true };
     }),
     resolveTargetSlug: overrides.resolveTargetSlug ?? ((explicit: string | undefined, currentSlug: string | undefined) => {
       const slug = explicit ?? currentSlug;
@@ -179,7 +180,6 @@ function setup(overrides: { killSessionRow?: (row: SessionRow) => Promise<void>;
       confirmed.push({ topicId, text });
     },
     usageWaiters,
-    orphanTopicNote: " (note: some topics couldn't be deleted)",
     supergroupChatId: "-100",
     log: () => {},
   });
@@ -263,14 +263,33 @@ describe("createFleetConfirmFlow", () => {
     });
 
     test("rm appends the orphan-topic note when a topic couldn't be deleted", async () => {
-      const { fleetConfirmFlow, sessionStore, finalizeCalls } = setup({ removeSessionRow: async () => false });
+      const { fleetConfirmFlow, sessionStore, finalizeCalls } = setup({ removeSessionRow: async () => ({ topicDeleted: false, worktreeRemoved: true }) });
       sessionStore.insert(row({ slug: "a", sessionId: "s-a" }));
       const pending: PendingFleetConfirm = { id: "abc", kind: "rm", slugs: ["a"], topicId: 1, messageId: 1, createdAt: Date.now() };
 
       await fleetConfirmFlow.executeFleetConfirm(pending);
 
       expect(finalizeCalls[0]?.text).toContain("Removed 1 session: a");
-      expect(finalizeCalls[0]?.text).toContain("couldn't be deleted");
+      expect(finalizeCalls[0]?.text).toContain("Telegram topic itself could not be deleted");
+      // The other half must stay quiet: a note about worktrees still on disk, on a run where every
+      // worktree came away cleanly, is the same lie in the opposite direction.
+      expect(finalizeCalls[0]?.text).not.toContain("still on disk");
+    });
+
+    // The bulk half of the 2026-08-17 finding. The previous shape of this code read
+    // `if (!(await removeSessionRow(row)))`, which an object return makes permanently falsy - so this
+    // note would silently never appear, and TypeScript has nothing to say about `!someObject`.
+    test("rm reports worktrees left on disk, naming them, and pluralizes for one", async () => {
+      const { fleetConfirmFlow, sessionStore, finalizeCalls } = setup({ removeSessionRow: async () => ({ topicDeleted: true, worktreeRemoved: false }) });
+      sessionStore.insert(row({ slug: "a", sessionId: "s-a" }));
+      sessionStore.insert(row({ slug: "b", topicId: 6, sessionId: "s-b" }));
+
+      await fleetConfirmFlow.executeFleetConfirm({ id: "abc", kind: "rm", slugs: ["a", "b"], topicId: 1, messageId: 1, createdAt: Date.now() });
+      expect(finalizeCalls[0]?.text).toContain("2 worktrees could not be deleted and are still on disk (a, b)");
+      expect(finalizeCalls[0]?.text).not.toContain("Telegram topic");
+
+      await fleetConfirmFlow.executeFleetConfirm({ id: "def", kind: "rm", slugs: ["a"], topicId: 1, messageId: 2, createdAt: Date.now() });
+      expect(finalizeCalls[1]?.text).toContain("1 worktree could not be deleted and is still on disk (a) - remove it by hand.");
     });
 
     // bypass-and-autoanswer-plan.md §0.3: the four `/auto <category> --all` kinds must be handled by
