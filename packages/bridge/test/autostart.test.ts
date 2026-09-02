@@ -90,6 +90,23 @@ describe("buildFixTaskSettingsScript", () => {
     expect(buildFixTaskSettingsScript(TASK_NAME)).toContain("$t.Settings.MultipleInstances = 'Parallel'");
   });
 
+  // Live-verified 2026-09-02 that a task created by buildCreateArgs really does come back with
+  // RestartCount 0 and an empty RestartInterval, i.e. no restart policy: two VM boots onto a broken
+  // network produced two crashed Bridges and no further attempt at all. Both properties have to be
+  // written or Task Scheduler ignores the pair, and PT1M is its documented minimum interval.
+  test("also writes back a restart-on-failure policy, both halves of it", () => {
+    const script = buildFixTaskSettingsScript(TASK_NAME);
+    expect(script).toContain("$t.Settings.RestartCount = 3");
+    expect(script).toContain("$t.Settings.RestartInterval = 'PT1M'");
+  });
+
+  // Not a stylistic preference: a network condition on the task is documented-broken since Windows
+  // 10 1607 (it can stop the task triggering at all), and the boot-time network wait lives in
+  // `awaitTokenValidation` instead. Asserted so a future "obvious fix" has to read the doc comment.
+  test("never sets a network condition on the task", () => {
+    expect(buildFixTaskSettingsScript(TASK_NAME)).not.toContain("RunOnlyIfNetworkAvailable");
+  });
+
   test("defaults to the real task name when called with no argument", () => {
     expect(buildFixTaskSettingsScript()).toContain(`'${TASK_NAME}'`);
   });

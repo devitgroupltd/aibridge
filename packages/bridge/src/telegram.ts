@@ -269,13 +269,48 @@ export async function fetchWithTimeout(url: string, init: RequestInit, timeoutMs
   });
 }
 
+/**
+ * "Telegram answered, but with a server-side failure rather than a verdict on the request" - a 5xx,
+ * or a body that isn't the Bot API envelope at all (a captive portal, or a proxy's HTML error page).
+ * Neither can be an authentication rejection: Telegram refuses a revoked token with a 401 carrying a
+ * perfectly well-formed `{ok:false}` JSON body, which still takes the plain-`Error` path below.
+ *
+ * Tagged with a `code` rather than another recognisable message so `isTransportFailure` classifies it
+ * through the one list it already walks, instead of growing a fourth message pattern (DRY - and each
+ * extra pattern is another chance to accidentally match a real rejection).
+ */
+function telegramUnavailable(method: string, detail: string, cause?: unknown): Error {
+  return Object.assign(
+    new Error(`Telegram ${method} is unavailable: ${detail}`, cause === undefined ? undefined : { cause }),
+    { code: "TELEGRAM_UNAVAILABLE" },
+  );
+}
+
 async function parseTelegramResponse<T>(res: Response, method: string): Promise<T> {
-  const body = (await res.json()) as {
+  let body: {
     ok: boolean;
     result?: T;
     description?: string;
     parameters?: { retry_after?: number };
   };
+  try {
+    body = (await res.json()) as typeof body;
+  } catch (err) {
+    // `fetchWithTimeout` rewrites a stalled body read into its own timeout message - that is already
+    // a classified transport failure and must be rethrown untouched, not re-labelled as a malformed
+    // response. Re-wrapping it here would strip exactly the classification the boot-time wait needs.
+    if (isTransportFailure(err)) throw err;
+    throw telegramUnavailable(method, `HTTP ${res.status} with a body that isn't JSON`, err);
+  }
+  // `res.json()` accepts the JSON literal `null` (and a bare string or array) perfectly happily, so
+  // parsing succeeding is not the same as having the Bot API's envelope. Reading `.ok` off that
+  // would throw a TypeError from the middle of a response handler - a crash, and one more shape
+  // that reaches the boot-time classifier as "not transport" and so gets called an invalid token.
+  // `Array.isArray` is not redundant: `typeof [] === "object"`, so an array body would otherwise
+  // sail past this, land on `!body.ok` (undefined), and be reported as a Telegram *rejection*.
+  if (body === null || typeof body !== "object" || Array.isArray(body)) {
+    throw telegramUnavailable(method, `HTTP ${res.status} with a body that isn't a Bot API response`);
+  }
   if (!body.ok) {
     // §5.4: "honour `retry_after` from the response body exactly" - a real 429 carries it under
     // `parameters.retry_after` seconds. `RateGovernor` is the only thing that knows what to do
@@ -283,6 +318,12 @@ async function parseTelegramResponse<T>(res: Response, method: string): Promise<
     // a plain `Error` and falls into the governor's fixed 1s/2s/4s retry policy instead.
     if (res.status === 429) {
       throw new RateLimitedError(body.parameters?.retry_after ?? 1);
+    }
+    // A well-formed `{ok:false}` can still be Telegram's own side failing rather than a verdict on
+    // the request - it returns 5xx during maintenance. Boot must wait that out like any other
+    // outage instead of announcing an invalid token; every 4xx below stays a plain, fatal Error.
+    if (res.status >= 500) {
+      throw telegramUnavailable(method, `HTTP ${res.status}${body.description ? ` - ${body.description}` : ""}`);
     }
     throw new Error(`Telegram ${method} failed: ${body.description ?? JSON.stringify(body)}`);
   }
@@ -489,17 +530,147 @@ export class TelegramClient implements UpdatesSource {
   }
 }
 
+/** Node/undici surface a dead network as a bare `TypeError: fetch failed` whose real cause hangs off
+ * `err.cause` (often several links deep), so the code has to be dug out rather than read off the top
+ * error. */
+function errorCodes(err: unknown): string[] {
+  const codes: string[] = [];
+  let cursor: unknown = err;
+  for (let depth = 0; cursor instanceof Error && depth < 8; depth += 1) {
+    const code = (cursor as { code?: unknown }).code;
+    if (typeof code === "string") codes.push(code);
+    cursor = (cursor as { cause?: unknown }).cause;
+  }
+  return codes;
+}
+
+/**
+ * "Telegram was unreachable" as distinct from "Telegram answered, and the answer was no."
+ *
+ * Found live 2026-09-02: `validateTokens` treated every `getMe` rejection as a bad token, so a VM
+ * that logged on with its VMware NAT still broken killed the autostarted Bridge twice in a row with
+ * `CONTROL_BOT_TOKEN is invalid: TypeError: fetch failed` - a fatal exit *and* a diagnosis pointing
+ * at BotFather when nothing was wrong with the token at all. The running `getUpdates` loop already
+ * rides out exactly this outage (see `startPolling`'s backoff); only the boot-time preflight was
+ * fatal, and it is the only network-dependent call in the whole startup path.
+ *
+ * §9's silent-wrong bar in both directions, which is why this is deliberately **conservative**: an
+ * error shape it does not recognise is reported as *not* transport, i.e. still fatal. Widening it by
+ * accident is how §13 check 8's fail-closed guarantee (`compromise-drill.test.ts` claim 1 of 4 - a
+ * revoked token must refuse to boot) turns into a daemon that retries a revoked token forever and
+ * never tells anyone. A real revocation reaches here as `parseTelegramResponse`'s
+ * `Telegram getMe failed: Unauthorized`, thrown off an `{ok:false}` 401 *body* - it matches nothing
+ * below, by construction.
+ */
+export function isTransportFailure(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  // `fetchWithTimeout`'s own two aborts (headers phase and body phase) - a connection that stalls
+  // rather than refusing outright looks like this, and is every bit as retriable. Runtime-independent
+  // because that function rewrites both aborts into this wording itself.
+  if (/Telegram request timed out after \d+ms/.test(message)) return true;
+  // undici (Node) collapses every pre-response failure into this one opaque wrapper, with the real
+  // code buried in `cause` - and sometimes not present at all, hence matching the message too.
+  if (/^fetch failed$/i.test(message)) return true;
+  // Bun is a *different* shape, not a variant of the above, and both runtimes really do run this
+  // code: `package.json`'s `start` and the autostart task use Node, but a `/restart` issued from
+  // Telegram respawns via `bun run .../src/index.ts` (scripts/dev-bridge.sh's own doc comment
+  // records that divergence, found live 2026-08-07). Measured on this host 2026-09-02 - Bun reports
+  // both a refused connection and a DNS failure as `code: "ConnectionRefused"` with the message
+  // below, carrying neither `fetch failed` nor any errno-style code, so a Node-only classifier
+  // silently reports every Bun network failure as an invalid token: the exact fatal misdiagnosis
+  // this function exists to prevent, still live on the one restart path that uses Bun.
+  if (/^Unable to connect\./.test(message)) return true;
+  return errorCodes(err).some((code) =>
+    // Node/undici errno + undici's own UND_ERR_* codes, then Bun's. None of these can be produced by
+    // a Telegram *rejection* (that path always has an HTTP response and reaches `parseTelegramResponse`
+    // as `Telegram getMe failed: ...`), so widening the list here cannot weaken the fail-closed rule.
+    /^(ENOTFOUND|EAI_AGAIN|ECONNREFUSED|ECONNRESET|ENETUNREACH|ENETDOWN|EHOSTUNREACH|EHOSTDOWN|ETIMEDOUT|EPIPE|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|UND_ERR_HEADERS_TIMEOUT|UND_ERR_BODY_TIMEOUT|ConnectionRefused|ConnectionClosed|FailedToOpenSocket|TELEGRAM_UNAVAILABLE)$/.test(code),
+  );
+}
+
 /**
  * Refuses to start with a named error identifying which token failed, rather than surfacing a
  * bad token for the first time deep inside a live sendMessage (§12 P-2).
+ *
+ * The original rejection is preserved as `cause` (and the wording distinguishes "invalid" from
+ * "unreachable") so `awaitTokenValidation` can tell the two apart without re-parsing this message.
+ * When *both* fail and either failure is a real rejection from Telegram, the real one is reported:
+ * a revoked feed token behind a flaky control connection must still be fatal rather than retried.
  */
 export async function validateTokens(control: GetMeSource, feed: GetMeSource): Promise<void> {
   const [controlResult, feedResult] = await Promise.allSettled([control.getMe(), feed.getMe()]);
-  if (controlResult.status === "rejected") {
-    throw new Error(`CONTROL_BOT_TOKEN is invalid: ${controlResult.reason}`);
-  }
-  if (feedResult.status === "rejected") {
-    throw new Error(`FEED_BOT_TOKEN is invalid: ${feedResult.reason}`);
+  const failures = ([
+    ["CONTROL_BOT_TOKEN", controlResult],
+    ["FEED_BOT_TOKEN", feedResult],
+  ] as const).filter(([, result]) => result.status === "rejected");
+  if (failures.length === 0) return;
+  const [name, result] = failures.find(([, r]) => !isTransportFailure((r as PromiseRejectedResult).reason)) ?? failures[0]!;
+  const reason = (result as PromiseRejectedResult).reason;
+  throw new Error(
+    isTransportFailure(reason)
+      ? `${name} could not be validated - Telegram is unreachable: ${reason}`
+      : `${name} is invalid: ${reason}`,
+    { cause: reason },
+  );
+}
+
+export interface TokenValidationWaitOptions {
+  /** Delay before the first re-check, doubling per consecutive failure. Mirrors `startPolling`. */
+  retryDelayMs?: number;
+  /** Ceiling for that backoff. Default 30s, same as the poll loop's. */
+  maxRetryDelayMs?: number;
+  /** Fires on each transport failure, before the wait - the only operator-visible sign anything is
+   * happening, since Telegram itself is by definition unavailable to report into. */
+  onWaiting?: (err: Error, attempt: number, nextDelayMs: number) => void;
+  /** Injected by tests so an unbounded retry loop doesn't need real timers. */
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+/**
+ * `validateTokens`, but a *transport* failure waits and re-checks instead of killing the process.
+ * Retries without bound: the network coming back an hour later is the case this exists for, and
+ * there is nothing else for the Bridge to usefully do in the meantime. Anything Telegram itself
+ * rejected (a revoked or malformed token) is rethrown untouched on the first attempt.
+ *
+ * Returns how long it spent waiting, so the caller can say so once it finally has a channel to say
+ * it on - a fleet that was dark for 40 minutes at boot should not come up silently as if nothing
+ * happened. Measured from the *first failure*, not from entry, and exactly `0` when there was never
+ * a failure at all: callers branch on `> 0` to decide whether to report an outage, and timing the
+ * happy path instead would make a clean boot claim a 1ms outage whenever the clock ticked mid-call.
+ */
+export async function awaitTokenValidation(
+  control: GetMeSource,
+  feed: GetMeSource,
+  opts: TokenValidationWaitOptions = {},
+): Promise<number> {
+  const baseDelayMs = opts.retryDelayMs ?? 1000;
+  const maxDelayMs = opts.maxRetryDelayMs ?? 30_000;
+  const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const now = opts.now ?? Date.now;
+  let unreachableSince: number | undefined;
+  let delayMs = baseDelayMs;
+  for (let attempt = 1; ; attempt += 1) {
+    // Stamped before the attempt, not after it fails: a blackholed network (packets dropped rather
+    // than refused - what a broken VMware NAT actually looks like) spends a full `DEFAULT_TIMEOUT_MS`
+    // inside each getMe, and that time is every bit as offline as the sleeps between them. Timing
+    // from the failure instead undercounts by one whole timeout, which index.ts then subtracts from
+    // the deploy-marker clock - leaving the §5.9 crash-loop threshold correct only for as long as
+    // the Telegram timeout stays smaller than it. That coupling is nobody's invariant; don't rely
+    // on it.
+    const attemptStartedAt = now();
+    try {
+      await validateTokens(control, feed);
+      return unreachableSince === undefined ? 0 : now() - unreachableSince;
+    } catch (err) {
+      // `validateTokens` classified this already and hung the original on `cause`; re-testing the
+      // cause (not the wrapper, whose message is prose) keeps the two classifications identical.
+      if (!isTransportFailure((err as Error).cause ?? err)) throw err;
+      unreachableSince ??= attemptStartedAt;
+      opts.onWaiting?.(err as Error, attempt, delayMs);
+      await sleep(delayMs);
+      delayMs = Math.min(delayMs * 2, maxDelayMs);
+    }
   }
 }
 

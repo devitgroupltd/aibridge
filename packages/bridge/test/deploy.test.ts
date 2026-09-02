@@ -422,6 +422,27 @@ describe("isDeployMarkerStale", () => {
   test("a caller-supplied threshold overrides the default", () => {
     expect(isDeployMarkerStale(marker, deployedAtMs + 5_000, 1_000)).toBe(true);
   });
+
+  // index.ts passes `Date.now() - bootOfflineMs`, not `Date.now()`, and this is why. A `/merge`
+  // respawns the Bridge; if that successor boots onto a network that isn't up yet it now waits in
+  // `awaitTokenValidation` instead of dying (telegram.ts). Charging that wait against the threshold
+  // would make a merge that was completely fine read as a crash loop the moment the wait exceeded
+  // 45s - rolling back good work and telling the operator the deploy "didn't come back up cleanly".
+  // The wait is this same boot attempt still starting, not a previous one having failed.
+  test("a boot that waited out a network outage is not thereby a crash loop", () => {
+    const threeMinuteWait = 180_000;
+    const wallClockNow = deployedAtMs + threeMinuteWait + 2_000;
+    expect(isDeployMarkerStale(marker, wallClockNow)).toBe(true); // what the wall clock alone claims
+    expect(isDeployMarkerStale(marker, wallClockNow - threeMinuteWait)).toBe(false); // what index.ts asks
+  });
+
+  // The guard must not blind the check entirely: a boot that waited AND then genuinely crash-looped
+  // still has to be caught, or §5.9's whole safety net is off whenever the network was slow.
+  test("still stale when the excess is real elapsed time rather than the network wait", () => {
+    const wait = 180_000;
+    const now = deployedAtMs + wait + DEPLOY_CRASH_LOOP_THRESHOLD_MS + 1_000;
+    expect(isDeployMarkerStale(marker, now - wait)).toBe(true);
+  });
 });
 
 describe("rollbackStaleDeploy", () => {
