@@ -2,7 +2,7 @@ import { createServer } from "node:net";
 import { describe, expect, test } from "bun:test";
 import { StubTelegramServer } from "@aibridge/stub-telegram";
 import { RateLimitedError } from "../src/rate-governor.ts";
-import { buildTopicDeepLink, fetchWithTimeout, startPolling, TelegramClient, validateTokens } from "../src/telegram.ts";
+import { awaitTokenValidation, buildTopicDeepLink, fetchWithTimeout, isTransportFailure, startPolling, TelegramClient, validateTokens } from "../src/telegram.ts";
 import type { GetMeSource, TelegramUpdate, UpdatesSource } from "../src/telegram.ts";
 
 function waitFor(predicate: () => boolean, timeoutMs = 2000): Promise<void> {
@@ -106,6 +106,264 @@ describe("validateTokens", () => {
     const bad: GetMeSource = { getMe: async () => { throw new Error("401 Unauthorized"); } };
     const ok: GetMeSource = { getMe: async () => ({ id: 1, username: "ok" }) };
     await expect(validateTokens(ok, bad)).rejects.toThrow(/FEED_BOT_TOKEN/);
+  });
+
+  // The wording is what sent a real diagnosis to the wrong place on 2026-09-02: an unreachable
+  // Telegram was reported as "CONTROL_BOT_TOKEN is invalid", which reads as "go to BotFather".
+  test("says unreachable, not invalid, when the network is down", async () => {
+    const down: GetMeSource = { getMe: async () => { throw new TypeError("fetch failed"); } };
+    const ok: GetMeSource = { getMe: async () => ({ id: 1, username: "ok" }) };
+    await expect(validateTokens(down, ok)).rejects.toThrow(/CONTROL_BOT_TOKEN could not be validated - Telegram is unreachable/);
+  });
+
+  // Both fail at once whenever the host is offline, so the "which failure do we report" tiebreak
+  // isn't hypothetical: reporting the transport half of this pair would send a revoked feed token
+  // into awaitTokenValidation's retry loop forever instead of refusing to boot.
+  test("a real rejection wins over a transport failure when both tokens fail", async () => {
+    const down: GetMeSource = { getMe: async () => { throw new TypeError("fetch failed"); } };
+    const revoked: GetMeSource = { getMe: async () => { throw new Error("Telegram getMe failed: Unauthorized"); } };
+    await expect(validateTokens(down, revoked)).rejects.toThrow(/FEED_BOT_TOKEN is invalid/);
+  });
+});
+
+describe("isTransportFailure", () => {
+  test("recognises undici's opaque wrapper and fetchWithTimeout's own aborts", () => {
+    expect(isTransportFailure(new TypeError("fetch failed"))).toBe(true);
+    expect(isTransportFailure(new Error("Telegram request timed out after 20000ms: https://api.telegram.org/x"))).toBe(true);
+    expect(isTransportFailure(new Error("Telegram request timed out after 20000ms while reading the response body: https://x"))).toBe(true);
+  });
+
+  // Not a synthetic shape: measured on this host 2026-09-02. Bun reports a refused connection AND a
+  // DNS failure identically, with neither `fetch failed` nor an errno code - so a Node-only
+  // classifier calls every Bun network failure an invalid token. That matters because a `/restart`
+  // from Telegram respawns the Bridge under `bun run`, not Node (scripts/dev-bridge.sh's own note).
+  test("recognises Bun's connect failure, which shares nothing with Node's", () => {
+    const bunErr = Object.assign(new Error("Unable to connect. Is the computer able to access the url?"), { code: "ConnectionRefused" });
+    expect(isTransportFailure(bunErr)).toBe(true);
+    // Either half alone is enough - Bun's code strings aren't a documented stable API, and the
+    // message is prose that could be reworded; a miss here is a fatal misdiagnosis, not a warning.
+    expect(isTransportFailure(new Error("Unable to connect. Is the computer able to access the url?"))).toBe(true);
+    expect(isTransportFailure(Object.assign(new Error("reworded by a future Bun"), { code: "ConnectionRefused" }))).toBe(true);
+  });
+
+  // The live version of the test above, and the one that cannot rot: it asks the *actual* runtime
+  // running this suite what a dead endpoint looks like, through the real client. If Bun (or Node)
+  // ever changes its error shape, this fails instead of the Bridge silently regaining the
+  // fatal-exit-on-boot bug.
+  test("classifies a real dead endpoint on whatever runtime is running this suite", async () => {
+    // Port 9 (discard) with nothing bound: refused immediately, no timeout, no network needed.
+    const client = new TelegramClient("tok", "http://127.0.0.1:9");
+    let thrown: unknown;
+    try {
+      await client.getMe();
+    } catch (err) {
+      thrown = err;
+    }
+    expect(thrown).toBeDefined();
+    expect(isTransportFailure(thrown)).toBe(true);
+  });
+
+  test("digs the real code out of a nested cause chain", () => {
+    const err = new TypeError("fetch failed", { cause: new Error("boom", { cause: Object.assign(new Error("dns"), { code: "ENOTFOUND" }) }) });
+    expect(isTransportFailure(err)).toBe(true);
+  });
+
+  // The load-bearing half. §13 check 8 / compromise-drill claim 1: a revoked token must refuse to
+  // boot, and it only stays fatal for as long as this returns false for it.
+  test("a revoked token is NOT transport, however it is phrased", () => {
+    expect(isTransportFailure(new Error("Telegram getMe failed: Unauthorized"))).toBe(false);
+    expect(isTransportFailure(new Error("401 Unauthorized"))).toBe(false);
+    expect(isTransportFailure(new Error("Telegram getMe failed: Not Found"))).toBe(false);
+  });
+
+  // Telegram's own side failing is not a verdict on the token. Both shapes measured: a 5xx with a
+  // JSON envelope, and a captive portal / proxy answering with HTML, which makes res.json() throw a
+  // SyntaxError whose wording differs per runtime and so can never be matched on text.
+  test("Telegram's own 5xx and a non-JSON body are transport, not a bad token", async () => {
+    // Driven through a real server so the whole getMe -> parseTelegramResponse path runs, rather
+    // than a hand-built Response that skips fetchWithTimeout's body-read wrapper.
+    const { createServer } = await import("node:http");
+    for (const [status, body, type] of [
+      [502, "<html>502 Bad Gateway</html>", "text/html"],
+      [500, JSON.stringify({ ok: false, description: "Internal Server Error" }), "application/json"],
+    ] as const) {
+      const server = createServer((_req, res) => { res.writeHead(status, { "content-type": type }); res.end(body); });
+      await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+      const port = (server.address() as { port: number }).port;
+      try {
+        let thrown: unknown;
+        try { await new TelegramClient("tok", `http://127.0.0.1:${port}`).getMe(); } catch (err) { thrown = err; }
+        expect(thrown).toBeDefined();
+        expect(isTransportFailure(thrown)).toBe(true);
+      } finally {
+        server.close();
+      }
+    }
+  });
+
+  // res.json() is happy with the JSON literal `null`; reading .ok off it would throw a TypeError
+  // from inside a response handler, which then reaches the boot classifier as "not transport".
+  test("a body that parses but isn't a Bot API envelope is transport, not a crash", async () => {
+    const { createServer } = await import("node:http");
+    for (const body of ["null", '"just a string"', "[1,2,3]"]) {
+      const server = createServer((_req, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(body);
+      });
+      await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+      const port = (server.address() as { port: number }).port;
+      try {
+        let thrown: unknown;
+        try { await new TelegramClient("tok", `http://127.0.0.1:${port}`).getMe(); } catch (err) { thrown = err; }
+        expect(thrown).toBeInstanceOf(Error);
+        expect((thrown as Error).name).not.toBe("TypeError");
+        expect(isTransportFailure(thrown)).toBe(true);
+      } finally {
+        server.close();
+      }
+    }
+  });
+
+  // The boundary that keeps §13 check 8 intact: 401 is a verdict, 500 is an outage.
+  test("a 401 stays fatal even though a 500 does not", async () => {
+    const { createServer } = await import("node:http");
+    const server = createServer((_req, res) => {
+      res.writeHead(401, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: false, error_code: 401, description: "Unauthorized" }));
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    const port = (server.address() as { port: number }).port;
+    try {
+      let thrown: unknown;
+      try { await new TelegramClient("revoked", `http://127.0.0.1:${port}`).getMe(); } catch (err) { thrown = err; }
+      expect(isTransportFailure(thrown)).toBe(false);
+    } finally {
+      server.close();
+    }
+  });
+
+  // Conservative by construction: an error shape it doesn't recognise stays fatal rather than
+  // being retried forever with nobody able to see it.
+  test("an unrecognised failure is not treated as transport", () => {
+    expect(isTransportFailure(new Error("something else entirely"))).toBe(false);
+    expect(isTransportFailure("fetch failed but as a string")).toBe(false);
+    expect(isTransportFailure(undefined)).toBe(false);
+  });
+
+  test("does not match a message that merely mentions fetch failing", () => {
+    expect(isTransportFailure(new Error("Telegram getMe failed: fetch failed on their side"))).toBe(false);
+  });
+});
+
+describe("awaitTokenValidation", () => {
+  // Exactly 0, on the real clock, not "small": index.ts branches on `> 0` to decide whether to post
+  // an "the fleet was dark" card, so timing the happy path would fire that card on a clean boot
+  // whenever Date.now() happened to tick during the call.
+  test("returns exactly zero, with no wait, when the first attempt succeeds", async () => {
+    const ok: GetMeSource = { getMe: async () => ({ id: 1, username: "ok" }) };
+    const slept: number[] = [];
+    const waitedMs = await awaitTokenValidation(ok, ok, { sleep: async (ms) => { slept.push(ms); } });
+    expect(slept).toEqual([]);
+    expect(waitedMs).toBe(0);
+  });
+
+  // The 2026-09-02 scenario end to end: unreachable at logon, reachable some minutes later.
+  test("waits out an unreachable Telegram and comes up when it returns", async () => {
+    let attempts = 0;
+    // Distinct from the feed source on purpose: each attempt calls getMe once per token, so a
+    // single shared double counts two calls per round and quietly halves the round count.
+    const flaky: GetMeSource = {
+      getMe: async () => {
+        attempts += 1;
+        if (attempts <= 4) throw new TypeError("fetch failed");
+        return { id: 1, username: "ok" };
+      },
+    };
+    const ok: GetMeSource = { getMe: async () => ({ id: 1, username: "ok" }) };
+    const slept: number[] = [];
+    const waiting: number[] = [];
+    let clock = 0;
+    const waitedMs = await awaitTokenValidation(flaky, ok, {
+      retryDelayMs: 1000,
+      maxRetryDelayMs: 4000,
+      sleep: async (ms) => { slept.push(ms); clock += ms; },
+      now: () => clock,
+      onWaiting: (_err, attempt) => waiting.push(attempt),
+    });
+    // Doubling, capped - the same shape startPolling uses, so a sustained outage settles at the cap
+    // rather than either hammering the endpoint or backing off without bound.
+    expect(slept).toEqual([1000, 2000, 4000, 4000]);
+    expect(waiting).toEqual([1, 2, 3, 4]);
+    expect(waitedMs).toBe(11_000);
+  });
+
+  // A blackholed network spends the whole timeout inside each getMe rather than in the sleeps, so
+  // timing from the failure would drop a full timeout from the total. index.ts subtracts this from
+  // the deploy-marker clock, and an undercount there is a good /merge rolled back.
+  test("counts time spent inside the failing call, not just the sleeps between them", async () => {
+    let clock = 0;
+    let attempts = 0;
+    const blackholed: GetMeSource = {
+      getMe: async () => {
+        attempts += 1;
+        clock += 20_000; // the full DEFAULT_TIMEOUT_MS, as a stalled connection would burn
+        if (attempts <= 2) throw new Error("Telegram request timed out after 20000ms: https://x");
+        return { id: 1, username: "ok" };
+      },
+    };
+    const ok: GetMeSource = { getMe: async () => ({ id: 1, username: "ok" }) };
+    const waitedMs = await awaitTokenValidation(blackholed, ok, {
+      retryDelayMs: 1000,
+      maxRetryDelayMs: 1000,
+      sleep: async (ms) => { clock += ms; },
+      now: () => clock,
+    });
+    // Three calls of 20s plus two 1s sleeps - all of it offline. Timing from the first *failure*
+    // instead would report 42s, silently losing the first 20s.
+    expect(waitedMs).toBe(62_000);
+  });
+
+  test("reports the elapsed wait so the caller can say the fleet was dark", async () => {
+    let attempts = 0;
+    const flaky: GetMeSource = {
+      getMe: async () => {
+        attempts += 1;
+        if (attempts <= 2) throw new TypeError("fetch failed");
+        return { id: 1, username: "ok" };
+      },
+    };
+    const ok: GetMeSource = { getMe: async () => ({ id: 1, username: "ok" }) };
+    let clock = 1_000_000;
+    const waitedMs = await awaitTokenValidation(flaky, ok, {
+      retryDelayMs: 60_000,
+      maxRetryDelayMs: 60_000,
+      sleep: async (ms) => { clock += ms; },
+      now: () => clock,
+    });
+    expect(waitedMs).toBe(120_000);
+  });
+
+  // §13 check 8's fail-closed guarantee, at the one call site that could quietly undo it.
+  test("a revoked token throws on the first attempt instead of being retried", async () => {
+    let attempts = 0;
+    const revoked: GetMeSource = {
+      getMe: async () => { attempts += 1; throw new Error("Telegram getMe failed: Unauthorized"); },
+    };
+    const ok: GetMeSource = { getMe: async () => ({ id: 1, username: "ok" }) };
+    const slept: number[] = [];
+    await expect(awaitTokenValidation(revoked, ok, { sleep: async (ms) => { slept.push(ms); } }))
+      .rejects.toThrow(/CONTROL_BOT_TOKEN is invalid/);
+    expect(attempts).toBe(1);
+    expect(slept).toEqual([]);
+  });
+
+  test("a revoked token behind an unreachable one is still fatal, not retried", async () => {
+    const down: GetMeSource = { getMe: async () => { throw new TypeError("fetch failed"); } };
+    const revoked: GetMeSource = { getMe: async () => { throw new Error("Telegram getMe failed: Unauthorized"); } };
+    const slept: number[] = [];
+    await expect(awaitTokenValidation(down, revoked, { sleep: async (ms) => { slept.push(ms); } }))
+      .rejects.toThrow(/FEED_BOT_TOKEN is invalid/);
+    expect(slept).toEqual([]);
   });
 });
 

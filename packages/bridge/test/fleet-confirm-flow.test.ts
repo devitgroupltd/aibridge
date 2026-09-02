@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -341,6 +342,82 @@ describe("createFleetConfirmFlow", () => {
 
         expect(existsSync(outside)).toBe(true);
         expect(finalizeCalls[0]?.text).toContain("Nothing was deleted.");
+      });
+    });
+
+    // §4.5's fourth debris class. Also driven against a real repo, for the same reason `rm-worktree`
+    // above is driven against a real directory: `removeOrphanBranch`'s last guard *is* `git branch
+    // -d`, and a faked git would be checking the mock rather than the guard.
+    describe("rm-branch", () => {
+      function repo() {
+        const dir = mkdtempSync(path.join(os.tmpdir(), "aibridge-fcf-branch-"));
+        const git = (args: string[]) => execFileSync("git", args, { cwd: dir, stdio: "pipe" }).toString();
+        git(["init", "-b", "main"]);
+        git(["config", "user.email", "test@example.com"]);
+        git(["config", "user.name", "Test"]);
+        writeFileSync(path.join(dir, "README.md"), "hi\n");
+        git(["add", "README.md"]);
+        git(["commit", "-m", "initial"]);
+        return { dir, git };
+      }
+      const pendingBranches = (repoPath: string | undefined, slugs: string[]): PendingFleetConfirm => ({
+        id: "abc",
+        kind: "rm-branch",
+        slugs,
+        topicId: 1,
+        repoPath,
+        messageId: 1,
+        createdAt: Date.now(),
+      });
+
+      test("deletes the confirmed merged branches and names them", async () => {
+        const { dir, git } = repo();
+        git(["branch", "claude/gone-1"]);
+        git(["branch", "claude/gone-2"]);
+        const { fleetConfirmFlow, finalizeCalls } = setup();
+
+        await fleetConfirmFlow.executeFleetConfirm(pendingBranches(dir, ["claude/gone-1", "claude/gone-2"]));
+
+        expect(git(["branch", "--list", "claude/*"]).trim()).toBe("");
+        expect(finalizeCalls[0]?.text).toContain("Deleted 2 orphaned branches: claude/gone-1, claude/gone-2.");
+      });
+
+      // The card is minutes old and has round-tripped through Telegram. A branch that has since
+      // gained unmerged commits must survive the tap, and the operator has to be told it did.
+      test("git's own refusal leaves the branch alone and is reported, not swallowed", async () => {
+        const { dir, git } = repo();
+        git(["checkout", "-q", "-b", "claude/work-1"]);
+        writeFileSync(path.join(dir, "work.txt"), "work\n");
+        git(["add", "work.txt"]);
+        git(["commit", "-m", "work"]);
+        git(["checkout", "-q", "main"]);
+        git(["branch", "claude/gone-1"]);
+        const { fleetConfirmFlow, finalizeCalls } = setup();
+
+        await fleetConfirmFlow.executeFleetConfirm(pendingBranches(dir, ["claude/work-1", "claude/gone-1"]));
+
+        expect(git(["branch", "--list", "claude/work-1"])).toContain("claude/work-1");
+        expect(finalizeCalls[0]?.text).toContain("Deleted 1 orphaned branch: claude/gone-1.");
+        expect(finalizeCalls[0]?.text).toContain("1 left in place");
+        expect(finalizeCalls[0]?.text).toContain("claude/work-1");
+      });
+
+      test("refuses a branch whose slug a session now holds", async () => {
+        const { dir, git } = repo();
+        git(["branch", "claude/fix-bug-1"]);
+        const { fleetConfirmFlow, sessionStore, finalizeCalls } = setup();
+        sessionStore.insert(row()); // slug "fix-bug"
+
+        await fleetConfirmFlow.executeFleetConfirm(pendingBranches(dir, ["claude/fix-bug-1"]));
+
+        expect(git(["branch", "--list", "claude/fix-bug-1"])).toContain("claude/fix-bug-1");
+        expect(finalizeCalls[0]?.text).toContain("Nothing was deleted.");
+      });
+
+      test("a pending entry with no repoPath acts on nothing rather than guessing a repo", async () => {
+        const { fleetConfirmFlow, finalizeCalls } = setup();
+        await fleetConfirmFlow.executeFleetConfirm(pendingBranches(undefined, ["claude/gone-1"]));
+        expect(finalizeCalls[0]?.text).toBe("Nothing left to act on.");
       });
     });
 

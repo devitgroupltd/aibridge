@@ -43,9 +43,9 @@ export function buildRunArgs(): string[] {
 }
 
 /**
- * Two `schtasks /Create` defaults have no flag to fix via `schtasks.exe` itself - both need the
+ * Three `schtasks /Create` defaults have no flag to fix via `schtasks.exe` itself - all need the
  * `ScheduledTasks` PowerShell module instead, so `/autostart install` runs this once right after
- * `/Create` succeeds. Fetches the task by name and writes back only these two settings (not a fresh
+ * `/Create` succeeds. Fetches the task by name and writes back only these settings (not a fresh
  * settings object), so everything else `/Create` already applied (idle behaviour, power management,
  * `/RL LIMITED`) survives untouched.
  *
@@ -58,12 +58,29 @@ export function buildRunArgs(): string[] {
  *   the old instance exits anyway (per `/restart`'s own logic), leaving nothing running at all - no
  *   crash, no error, just silence. Set to `Parallel` so the re-trigger actually starts a second
  *   instance instead of being ignored; the old one still exits itself moments later exactly as before.
+ * - **`RestartCount`/`RestartInterval`** default to no restart policy at all, so a logon-triggered
+ *   Bridge that exits non-zero is simply gone until the next logon - live-verified 2026-09-02, where
+ *   two consecutive VM boots onto a broken network produced two crashes and nothing else. The
+ *   crash that caused it is fixed in-process (`awaitTokenValidation`, telegram.ts), which is where a
+ *   *network* wait belongs; this is the belt-and-braces layer for the crashes that happen before
+ *   `main()` can run at all - a bad env file, a throw during module load - which is why the
+ *   module-scope `initFileLogging` + crash handlers exist in index.ts. Both must be set together or
+ *   Task Scheduler ignores the pair.
+ *
+ * Deliberately NOT set here: **`RunOnlyIfNetworkAvailable`**. It looks like the obvious fix for the
+ * boot-onto-no-network case and is documented-broken for it - since Windows 10 1607 a network
+ * condition can stop the task triggering at all, and can surface as "Task Scheduler service is not
+ * available", with the standard advice being to disable network conditions and do the waiting inside
+ * the program instead. Which is exactly what `awaitTokenValidation` now does.
  */
 export function buildFixTaskSettingsScript(taskName: string = TASK_NAME): string {
   return (
     `$t = Get-ScheduledTask -TaskName '${taskName}'; ` +
     `$t.Settings.ExecutionTimeLimit = 'PT0S'; ` +
     `$t.Settings.MultipleInstances = 'Parallel'; ` +
+    // PT1M is Task Scheduler's own documented minimum interval; anything smaller is rejected.
+    `$t.Settings.RestartCount = 3; ` +
+    `$t.Settings.RestartInterval = 'PT1M'; ` +
     `Set-ScheduledTask -InputObject $t | Out-Null`
   );
 }

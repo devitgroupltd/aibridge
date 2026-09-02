@@ -41,7 +41,7 @@ import { Routing } from "./routing.ts";
 import { DEFAULT_MODE } from "./session-commands.ts";
 import type { SessionCommand } from "./session-commands.ts";
 import { SessionStore, type SessionRow, type SessionState } from "./session-store.ts";
-import { startPolling, TelegramClient, validateTokens } from "./telegram.ts";
+import { awaitTokenValidation, startPolling, TelegramClient } from "./telegram.ts";
 import type { InlineKeyboardMarkup } from "./telegram.ts";
 import { loadOffset, saveOffset } from "./telegram-offset.ts";
 import { createThinkingPlaceholder } from "./thinking-placeholder.ts";
@@ -49,6 +49,7 @@ import { createTypingIndicator } from "./typing-indicator.ts";
 import { restartSettleDelayMs } from "./restart-settle.ts";
 import { createSessionSupervisor } from "./session-supervisor.ts";
 import { createPtyIo, DEFAULT_ECHO_SETTLE_MS, DEFAULT_SUBMIT_CONFIRM_WINDOW_MS } from "./pty-io.ts";
+import { createBranchCleanupCommands } from "./branch-cleanup-commands.ts";
 import { classifyOrphanWorktrees, hasGitEntry, listWorktreeDirs, renderOrphanWorktreeReport } from "./orphan-worktrees.ts";
 import { createTurnStartWatchdog, DEFAULT_TURN_START_TIMEOUT_MS, renderNoTurnStartedNotice } from "./turn-start-watchdog.ts";
 import { createWedgedRecoveryMarks } from "./wedged-recovery.ts";
@@ -111,7 +112,15 @@ async function main(): Promise<void> {
   // same instance rather than building its own.
   const processRunner = createProcessRunner();
 
-  await validateTokens(controlBot, feedBot);
+  // Waits out an unreachable Telegram rather than exiting on it (telegram.ts's `isTransportFailure`
+  // has the full story). Found live 2026-09-02: this was a plain `validateTokens`, so a VM whose
+  // NAT was still broken at logon killed the autostarted Bridge on both boots, and the scheduled
+  // task has no failure-restart policy to pick it back up. A token Telegram itself rejects still
+  // throws here on the first attempt - §13 check 8's fail-closed guarantee.
+  const bootOfflineMs = await awaitTokenValidation(controlBot, feedBot, {
+    onWaiting: (err, attempt, nextDelayMs) =>
+      log("WARN", `Telegram unreachable at startup (attempt ${attempt}), retrying in ${Math.round(nextDelayMs / 1000)}s: ${err.message}`),
+  });
   log("INFO", "both bot tokens validated via getMe");
 
   // §5.9's crash-loop safety net for `/merge`'s self-restart path: a marker written just before
@@ -122,7 +131,13 @@ async function main(): Promise<void> {
   // so. A fresh marker (this boot IS that attempt) is left alone here and consumed later instead.
   {
     const marker = readDeployMarker(STATE_DIR);
-    if (marker && isDeployMarkerStale(marker, Date.now())) {
+    // `Date.now() - bootOfflineMs`, not `Date.now()`: staleness is meant to measure "a boot attempt
+    // has had a full cycle to either clear this marker or crash again" (deploy.ts's own doc
+    // comment), and time spent blocked in `awaitTokenValidation` is not a boot attempt failing - it
+    // is this same attempt, still waiting for a network it cannot proceed without. Charging that
+    // wait against the 45s threshold makes a perfectly good `/merge` that happened to respawn into
+    // a slow network look like a crash loop, and roll itself back.
+    if (marker && isDeployMarkerStale(marker, Date.now() - bootOfflineMs)) {
       log("WARN", `deploy marker for "${marker.branch}" is stale - Bridge never started cleanly after that merge, rolling back to ${marker.previousHeadSha.slice(0, 8)}`);
       const reset = await rollbackStaleDeploy(marker);
       clearDeployMarker(STATE_DIR);
@@ -785,6 +800,17 @@ async function main(): Promise<void> {
     log,
   });
 
+  const branchCleanup = createBranchCleanupCommands({
+    controlBot,
+    sessionStore,
+    fleetConfirmRegistry,
+    confirmSessionCommand,
+    isControlTopic,
+    getReposRegistry: () => reposRegistry,
+    supergroupChatId: config.supergroupChatId,
+    log,
+  });
+
   // `respawnSelfAndExit` is a hoisted function declaration (defined further down this same scope,
   // adjacent to `main()`'s own startup sequencing per the plan's Risks - its `bootReadyAt` settle
   // delay is safety-critical and stays put) - injected here as a callback rather than relocated.
@@ -1058,6 +1084,7 @@ async function main(): Promise<void> {
       confirmSessionCommand,
       sessionLifecycle,
       fleetReporting,
+      branchCleanup,
       fleetConfirmFlow: fleetConfirmFlow.get(),
       deployLifecycle,
       osPowerCommands,
@@ -1138,6 +1165,26 @@ async function main(): Promise<void> {
   });
 
   log("INFO", "Bridge started - getUpdates loop running");
+
+  // The one thing that couldn't be reported while it was happening. A boot that waited for the
+  // network came up with the fleet dark for that whole stretch, and the operator has no other way
+  // to learn it: Telegram *is* the operator surface, so every log line written during the wait went
+  // somewhere only reachable from the desk. Best-effort, like every other boot notice here.
+  if (bootOfflineMs > 0) {
+    // floor, not round: rounding reports a 30-second blip as "1m", in the one message whose entire
+    // job is telling the operator how long they were dark.
+    const minutes = Math.floor(bootOfflineMs / 60_000);
+    const waited = minutes >= 1 ? `${minutes}m` : `${Math.round(bootOfflineMs / 1000)}s`;
+    try {
+      await controlBot.sendMessage(
+        config.supergroupChatId,
+        undefined,
+        `🌐 Bridge is up - Telegram was unreachable for ${waited} at startup, so the fleet was offline until now.`,
+      );
+    } catch (err) {
+      log("WARN", `failed to send startup-offline notice: ${(err as Error).message}`);
+    }
+  }
 
   // §5.9: this boot reached the end of startup without throwing, so any deploy marker still
   // sitting here is *this* attempt succeeding, not a crash-loop - confirm it to the operator and

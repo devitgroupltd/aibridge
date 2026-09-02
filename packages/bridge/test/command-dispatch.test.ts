@@ -80,6 +80,16 @@ function fakeSessionLifecycle() {
   };
 }
 
+function fakeBranchCleanup() {
+  const calls: Array<{ fn: string; args: unknown[] }> = [];
+  return {
+    handleBranchesCommand: async (...args: unknown[]) => {
+      calls.push({ fn: "handleBranchesCommand", args });
+    },
+    calls,
+  };
+}
+
 function fakeFleetReporting() {
   const calls: Array<{ fn: string; args: unknown[] }> = [];
   const record = (fn: string) => (...args: unknown[]) => calls.push({ fn, args });
@@ -189,6 +199,7 @@ function setup(overrides: Partial<{ sessionStore: SessionStore; defaultSessionMo
   const confirmSessionCommand = fakeConfirmSessionCommand();
   const sessionLifecycle = fakeSessionLifecycle();
   const fleetReporting = fakeFleetReporting();
+  const branchCleanup = fakeBranchCleanup();
   const fleetConfirmFlow = fakeFleetConfirmFlow();
   const deployLifecycle = fakeDeployLifecycle();
   const osPowerCommands = fakeOsPowerCommands();
@@ -207,6 +218,7 @@ function setup(overrides: Partial<{ sessionStore: SessionStore; defaultSessionMo
     confirmSessionCommand: confirmSessionCommand as never,
     sessionLifecycle: sessionLifecycle as never,
     fleetReporting: fleetReporting as never,
+    branchCleanup: branchCleanup as never,
     fleetConfirmFlow: fleetConfirmFlow as never,
     deployLifecycle: deployLifecycle as never,
     osPowerCommands: osPowerCommands as never,
@@ -229,6 +241,7 @@ function setup(overrides: Partial<{ sessionStore: SessionStore; defaultSessionMo
     confirmSessionCommand,
     sessionLifecycle,
     fleetReporting,
+    branchCleanup,
     fleetConfirmFlow,
     deployLifecycle,
     osPowerCommands,
