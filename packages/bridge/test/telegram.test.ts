@@ -297,6 +297,44 @@ describe("awaitTokenValidation", () => {
     expect(waitedMs).toBe(11_000);
   });
 
+  // The one piece of evidence the tests above cannot provide: everything else in this describe
+  // block drives `awaitTokenValidation` with a mocked `GetMeSource` and a fake clock, which proves
+  // the retry *logic* but never touches a real socket. `fetchWithTimeout`'s own doc comment
+  // (telegram.ts) explains the specific risk that leaves open: Node/Bun pool connections per
+  // origin, and one earlier version of that pooling left an indefinitely-stalled request wedging
+  // every later call to the same origin, with the process staying alive throughout. A classifier
+  // that is correct on paper is not evidence the *pool* recovers - only a real down-to-up
+  // transition, on the real runtime's real fetch, is. This is the permanent form of a check that
+  // was run by hand and its script discarded on 2026-09-02: a real `TelegramClient` against a port
+  // nothing is listening on yet, brought up mid-wait by an actual `http` server.
+  test("a real socket that starts refused and comes up mid-wait is not left wedged", async () => {
+    const { createServer } = await import("node:http");
+    // Reserve a free port by briefly binding and releasing it, so the client's first few attempts
+    // hit a real, immediate ECONNREFUSED (nothing listening) rather than a synthetic one.
+    const probe = createServer();
+    await new Promise<void>((r) => probe.listen(0, "127.0.0.1", r));
+    const port = (probe.address() as { port: number }).port;
+    await new Promise<void>((r) => probe.close(() => r()));
+
+    const client = new TelegramClient("tok", `http://127.0.0.1:${port}`);
+    const server = createServer((_req, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ ok: true, result: { id: 1, username: "late_bot" } }));
+    });
+    const bringUpAfterMs = 300;
+    const startedAt = Date.now();
+    setTimeout(() => server.listen(port, "127.0.0.1"), bringUpAfterMs);
+    try {
+      const waitedMs = await awaitTokenValidation(client, client, { retryDelayMs: 100, maxRetryDelayMs: 100 });
+      // Real elapsed time, not a fake clock - loose bounds because this is a real timer racing a
+      // real socket, not the deterministic sleeps used everywhere else in this file.
+      expect(Date.now() - startedAt).toBeGreaterThanOrEqual(bringUpAfterMs);
+      expect(waitedMs).toBeGreaterThan(0);
+    } finally {
+      server.close();
+    }
+  });
+
   // A blackholed network spends the whole timeout inside each getMe rather than in the sleeps, so
   // timing from the failure would drop a full timeout from the total. index.ts subtracts this from
   // the deploy-marker clock, and an undercount there is a good /merge rolled back.
