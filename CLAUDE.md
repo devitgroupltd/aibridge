@@ -127,6 +127,53 @@ worktree always has one, and the operator may have cut their own under the same 
 the only code in aibridge that recursively deletes a directory it did not create, and the card's
 payload has round-tripped through Telegram.
 
+**A boot-time preflight is a crash waiting for a bad network (2026-09-02).** A VM that logged on
+with its VMware NAT still broken killed the autostarted Bridge on two consecutive boots with
+`CONTROL_BOT_TOKEN is invalid: TypeError: fetch failed` - a fatal exit, and a diagnosis pointing at
+BotFather when the token was fine. The lesson is not "add a retry": it is that the `getUpdates` loop
+three hundred lines away had been riding out this *exact* outage correctly for months (exponential
+backoff, unbounded, `startPolling`), while the one-line preflight next to it died on it. **When a
+failure mode is already handled somewhere in a file, check whether the other callers of the same
+transport handle it too** - resilience does not generalise by proximity. `awaitTokenValidation`
+(telegram.ts) now waits it out, and `isTransportFailure` is the piece to extend rather than adding
+another special case; it is deliberately conservative, because an unrecognised shape staying *fatal*
+is what keeps §13 check 8's revoked-token guarantee alive. Four things about it are load-bearing and
+non-obvious:
+
+- **Node and Bun report a dead network in shapes that share nothing.** Node says `TypeError: fetch
+  failed` with the errno buried in a nested `cause`; Bun says `ConnectionRefused` /
+  `"Unable to connect."` and carries neither, and collapses DNS failures into the same code. Both
+  runtimes really do run the Bridge - `package.json`'s `start` and the autostart task use Node, but
+  a `/restart` issued *from Telegram* respawns via `bun run` (scripts/dev-bridge.sh records that
+  divergence). A Node-only classifier left the original bug live on that one path. The regression
+  test asks whichever runtime is running the suite what a dead endpoint looks like, rather than
+  asserting a string.
+- **`parseTelegramResponse` decides on HTTP status, not message text.** A 5xx, a captive portal's
+  HTML, and a body that parses but isn't the Bot API envelope are all transport; a 401 is a verdict.
+  A non-JSON body throws a `SyntaxError` whose wording differs per runtime, so it can never be
+  matched on text - and `Array.isArray` in that guard is not redundant, since `typeof [] ===
+  "object"` would otherwise sail past it and be reported as a Telegram rejection.
+- **The wait is subtracted from the deploy-marker clock** (`isDeployMarkerStale(marker, Date.now() -
+  bootOfflineMs)`). §5.9 calls a marker stale after 45s of wall clock; without the subtraction a
+  `/merge` that respawned into a slow network reads as a crash loop and rolls back perfectly good
+  work. Related: the wait is timed from *before* each attempt, so a blackholed network's in-call time
+  counts - timing from the failure instead undercounts by a whole `DEFAULT_TIMEOUT_MS`, which left
+  §5.9 correct only while the Telegram timeout stayed smaller than the threshold. That coupling was
+  nobody's invariant; don't reintroduce it.
+- **The Task Scheduler half is `RestartCount`/`RestartInterval` only.** `RunOnlyIfNetworkAvailable`
+  is the obvious-looking lever and is documented-broken for this case since Windows 10 1607 (a
+  network condition can stop the task triggering at all); the wait belongs in-process. The restart
+  policy covers only what a wait cannot: a crash *before* `main()` runs, which is why the
+  module-scope `initFileLogging` and crash handlers exist in index.ts.
+
+`backoff.ts` came out of the same work: `startPolling` and `awaitTokenValidation` are meant to back
+off identically and said so only in a comment. A comment is not a mechanism - the poll loop's own
+backoff was a flat delay for months before being found live on 2026-08-09, and nothing would have
+carried that fix into a copy written afterwards. It is deliberately *not* shared with
+`packages/channel-server` or `packages/hook-client`, which also back off: hoisting it into
+`@aibridge/protocol` would put it inside the hook client's compiled binary, where startup latency is
+load-bearing (§2.2).
+
 ## What this project is
 
 aibridge is a daemon (the **Bridge**) that lets one developer drive several parallel Claude Code

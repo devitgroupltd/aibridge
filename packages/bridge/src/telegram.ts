@@ -1,3 +1,4 @@
+import { createBackoff } from "./backoff.ts";
 import { RateLimitedError } from "./rate-governor.ts";
 
 /** Bot API 7.0+'s `forward_origin` (replaced the older flat `forward_from`/`forward_from_chat`/
@@ -644,12 +645,10 @@ export async function awaitTokenValidation(
   feed: GetMeSource,
   opts: TokenValidationWaitOptions = {},
 ): Promise<number> {
-  const baseDelayMs = opts.retryDelayMs ?? 1000;
-  const maxDelayMs = opts.maxRetryDelayMs ?? 30_000;
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   const now = opts.now ?? Date.now;
+  const backoff = createBackoff(opts.retryDelayMs, opts.maxRetryDelayMs);
   let unreachableSince: number | undefined;
-  let delayMs = baseDelayMs;
   for (let attempt = 1; ; attempt += 1) {
     // Stamped before the attempt, not after it fails: a blackholed network (packets dropped rather
     // than refused - what a broken VMware NAT actually looks like) spends a full `DEFAULT_TIMEOUT_MS`
@@ -667,9 +666,9 @@ export async function awaitTokenValidation(
       // cause (not the wrapper, whose message is prose) keeps the two classifications identical.
       if (!isTransportFailure((err as Error).cause ?? err)) throw err;
       unreachableSince ??= attemptStartedAt;
-      opts.onWaiting?.(err as Error, attempt, delayMs);
-      await sleep(delayMs);
-      delayMs = Math.min(delayMs * 2, maxDelayMs);
+      opts.onWaiting?.(err as Error, attempt, backoff.delayMs);
+      await sleep(backoff.delayMs);
+      backoff.advance();
     }
   }
 }
@@ -720,15 +719,13 @@ export function startPolling(source: UpdatesSource, opts: PollLoopOptions): () =
   let stopped = false;
   let offset = opts.initialOffset ?? 0;
   const timeoutSec = opts.timeoutSec ?? 25;
-  const baseRetryDelayMs = opts.retryDelayMs ?? 1000;
-  const maxRetryDelayMs = opts.maxRetryDelayMs ?? 30_000;
-  let retryDelayMs = baseRetryDelayMs;
+  const backoff = createBackoff(opts.retryDelayMs, opts.maxRetryDelayMs);
 
   const loop = async () => {
     while (!stopped) {
       try {
         const updates = await source.getUpdates(offset, timeoutSec);
-        retryDelayMs = baseRetryDelayMs; // a successful call resets the backoff
+        backoff.reset(); // a successful call resets the backoff
         for (const update of updates) {
           offset = update.update_id + 1;
           opts.onOffsetChange?.(offset);
@@ -740,8 +737,8 @@ export function startPolling(source: UpdatesSource, opts: PollLoopOptions): () =
         }
       } catch (err) {
         opts.onError?.(err);
-        await new Promise((resolve) => setTimeout(resolve, retryDelayMs));
-        retryDelayMs = Math.min(retryDelayMs * 2, maxRetryDelayMs);
+        await new Promise((resolve) => setTimeout(resolve, backoff.delayMs));
+        backoff.advance();
       }
     }
   };
